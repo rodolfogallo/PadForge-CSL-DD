@@ -1,0 +1,173 @@
+﻿Add-Type -AssemblyName System.Drawing
+# The GitHub wiki was retired 2026-07-30; the live docs source is the
+# padforge.org repo, which is where capture_all.ps1 now writes.
+$srcDir = "C:\Users\sonic\OneDrive\Documents\GitHub\padforge.org\wiki\images"
+$dstDir = "C:\Users\sonic\OneDrive\Documents\GitHub\PadForge\screenshots"
+
+$map = @{
+    'settings-steamvr'       = 'settings-steamvr'
+    'pad-vr-preview'         = 'vr-preview'
+    'colorway-dualsense-spiderman2' = 'colorway-dualsense-spiderman2'
+    'colorway-dualsense-ffxvi'      = 'colorway-dualsense-ffxvi'
+    'colorway-dualsense-cosmicred'  = 'colorway-dualsense-cosmicred'
+    'colorway-dualsense-novapink'   = 'colorway-dualsense-novapink'
+    'colorway-dualsense-cobalt'     = 'colorway-dualsense-cobalt'
+    'colorway-dualsense-volcanic'   = 'colorway-dualsense-volcanic'
+    'colorway-dualsense-graycamo'   = 'colorway-dualsense-graycamo'
+    'colorway-xbox-halo'            = 'colorway-xbox-halo'
+    'colorway-xbox-starfield'       = 'colorway-xbox-starfield'
+    'colorway-xbox-stellarshift'    = 'colorway-xbox-stellarshift'
+    'colorway-xbox-porsche'         = 'colorway-xbox-porsche'
+    'colorway-xbox-velocitygreen'   = 'colorway-xbox-velocitygreen'
+    'colorway-xbox-remix'           = 'colorway-xbox-remix'
+    'profiles-starter-gallery' = 'starter-profiles'
+    "dashboard"              = "dashboard"
+    "pad-controller-3d"      = "controller"
+    "pad-controller-2d"      = "controller-2d"
+    "pad-mappings"           = "mappings"
+    "pad-sticks"             = "sticks"
+    "pad-triggers"           = "triggers"
+    "pad-forcefeedback"      = "force-feedback"
+    "pad-macros"             = "macros"
+    "pad-kbm-preview"        = "kbm-preview"
+    "pad-midi-configbar"     = "midi"
+    "pad-extended-schematic" = "extended"
+    "pad-playstation-configbar" = "playstation"
+    "pad-nintendo-configbar" = "nintendo"
+    "pad-adaptive-triggers"  = "adaptive-triggers"
+    "pad-lighting"           = "lighting"
+    "pad-gyro"               = "gyro"
+    "pad-audio"              = "audio"
+    "pad-audio-dsp"          = "audio-dsp"
+    "pad-touchpad"           = "touchpad"
+    "pad-impulse-triggers"   = "impulse-triggers"
+    "pad-trigger-routing"    = "trigger-routing"
+    "pad-wheel"              = "wheel"
+    "midi-input"             = "midi-input"
+    "remote-link"            = "remote-link"
+    "wii-pair"               = "wii-pair"
+    "pad-pointer"            = "pointer"
+    "devices-nfc"            = "devices-nfc"
+    "nfc-register"           = "nfc-register"
+    "devices-consumer"       = "devices-consumer"
+    "devices-power"          = "devices-power"
+    "add-controller-popup"   = "add-controller-popup"
+    "profiles"               = "profiles"
+    "devices"                = "devices"
+    "settings"               = "settings"
+    "settings-hidhide"       = "settings-hidhide"
+    "settings-drivers"       = "settings-drivers"
+    "about"                  = "about"
+    "web-landing"            = "web-landing"
+    "web-controller"         = "web-controller"
+    "pad-sticks-deadzone-dropdown"      = "sticks-deadzone-dropdown"
+    "pad-sticks-sensitivity-dropdown"   = "sticks-sensitivity-dropdown"
+    "pad-triggers-sensitivity-dropdown" = "triggers-sensitivity-dropdown"
+    # v4 additions
+    "pad-lighting-guide-led" = "guide-led"
+    "pad-kbm-socd"           = "kbm-socd"
+    "pad-mouse-gestures"     = "mouse-gestures"
+    "pad-ds3-gyro"           = "ds3-gyro"
+    "devices-ds3"            = "devices-ds3"
+    "ds3-pair"               = "ds3-pair"
+    "wii-balance-sources"    = "wii-balance-sources"
+    "joycon-ir-source"       = "joycon-ir-source"
+    "joycon2-mouse-sources"  = "joycon2-mouse-sources"
+    "macro-disconnect"       = "macro-disconnect"
+    "pad-extended-configbar" = "extended-configbar"
+    # wiki completeness additions (2026-07-12): one entry per new placeholder.
+    # jpg names drop the pad- prefix, like the rest of the map.
+    "pad-config-tabs"             = "config-tabs"
+    "pad-mapping-annotations"     = "mapping-annotations"
+    "3d-model-annotation-overlay" = "3d-model-annotation-overlay"
+    "2d-annotation-overlay"       = "2d-annotation-overlay"
+    "2d-touchpad-finger-dots"     = "2d-touchpad-finger-dots"
+    "pad-stick-trim"              = "stick-trim"
+    "pad-trigger-instrument"      = "trigger-instrument"
+    "pad-sticks-boundary-calibration" = "sticks-boundary-calibration"
+    "macro-add-from-list"         = "macro-add-from-list"
+    "pad-audio-haptic-controls"   = "audio-haptic-controls"
+    "pad-motor-activity"          = "motor-activity"
+    "touchpad-gesture-recorder"   = "touchpad-gesture-recorder"
+    "wii-pointer-mode"            = "wii-pointer-mode"
+    "nfc-live-preview"            = "nfc-live-preview"
+    "midi-input-mode-devices-page" = "midi-input-mode-devices-page"
+    "pad-extended-clone-device"   = "extended-clone-device"
+    "devices-facet-chips"         = "devices-facet-chips"
+    "devices-dossier"             = "devices-dossier"
+    "dashboard-slot-card"         = "dashboard-slot-card"
+    "dashboard-polling-readout"   = "dashboard-polling-readout"
+    "dsu-port-box"                = "dsu-port-box"
+    "driver-status-flames"        = "driver-status-flames"
+    "settings-driver-cards"       = "settings-driver-cards"
+    "profiles-foreground-readout" = "profiles-foreground-readout"
+    # v4.1.0 additions (#9 Workshop import + macro/mapping editors)
+    "workshop-cold"               = "workshop-cold"
+    "workshop-search"             = "workshop-search"
+    "workshop-configs"            = "workshop-configs"
+    "workshop-manifest"           = "workshop-manifest"
+    "workshop-applied"            = "workshop-applied"
+    "settings-community-configs"  = "settings-community-configs"
+    "macro-move-mouse"            = "macro-move-mouse"
+    "macro-repeat-key"            = "macro-repeat-key"
+    "mapping-sensitivity"         = "mapping-sensitivity"
+    "gamepad-source-picker"       = "gamepad-source-picker"
+    # v4.4.0 additions. A new shot with no entry here never refreshes its
+    # repo JPG, which is the trap this file has fallen into once per release:
+    # membership in this table decides whether a picture updates, and a stale
+    # one looks exactly like a fresh one until somebody opens it. jpg names
+    # drop the pad- prefix, like the rest of the map.
+    "dashboard-lightbar-mirrors"    = "dashboard-lightbar-mirrors"
+    "dashboard-head-tracking"       = "dashboard-head-tracking"
+    "settings-handheld-buttons"     = "settings-handheld-buttons"
+    "settings-assignment-prompts"   = "settings-assignment-prompts"
+    "devices-quick-charge"          = "devices-quick-charge"
+    "devices-head-tracking"         = "devices-head-tracking"
+    "pad-gyro-grip"                 = "gyro-grip"
+    "macro-switch-layer"            = "macro-switch-layer"
+    "menu-macro-cell"               = "menu-macro-cell"
+    "menu-icon-packs"               = "menu-icon-packs"
+    "profiles-external-control"     = "profiles-external-control"
+    "profile-polling-override"      = "profile-polling-override"
+    "pad-extended-steam-controller" = "extended-steam-controller"
+    "pad-extended-steam-deck"       = "extended-steam-deck"
+    # Captured since 4.0 and never mapped, so its repo JPG has never been
+    # written from a capture. The site asset resolves through the mirror's
+    # ALIAS table, which is why nothing caught it here.
+    "pad-bass-shakers"              = "bass-shakers"
+    "settings-diagnostics"          = "settings-diagnostics"
+    "settings-updates"              = "settings-updates"
+    # v5.0.0 additions
+    "dashboard-web-plain"           = "dashboard-web-plain"
+    "settings-input-engine"         = "settings-input-engine"
+    "devices-analog-keyboard"       = "devices-analog-keyboard"
+    "devices-light-gun"             = "devices-light-gun"
+    "move-pair"                     = "move-pair"
+    "serial-pair"                   = "serial-pair"
+    "dji-pair"                      = "dji-pair"
+    "mapping-rapid-trigger"         = "mapping-rapid-trigger"
+    "mapping-motion-rows"           = "mapping-motion-rows"
+    "macro-set-chroma-color"        = "macro-set-chroma-color"
+    "pad-playstation-ds3"           = "playstation-ds3"
+    "pad-menus"                     = "menus"
+    "icon-picker"                   = "icon-picker"
+}
+
+$jpgEncoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq "image/jpeg" }
+$encParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+$encParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 90L)
+
+foreach ($kv in $map.GetEnumerator()) {
+    $src = Join-Path $srcDir "$($kv.Key).png"
+    $dst = Join-Path $dstDir "$($kv.Value).jpg"
+    if (Test-Path $src) {
+        $img = [System.Drawing.Image]::FromFile($src)
+        $img.Save($dst, $jpgEncoder, $encParams)
+        $img.Dispose()
+        $kb = [math]::Round((Get-Item $dst).Length / 1024)
+        Write-Host "  $($kv.Key).png -> $($kv.Value).jpg (${kb}KB)"
+    } else {
+        Write-Host "  MISSING: $src" -ForegroundColor Red
+    }
+}
+Write-Host "Done converting."

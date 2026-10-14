@@ -1,0 +1,110 @@
+name: Bug Report
+description: Report a verified bug or unexpected behavior in PadForge
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before You Start
+
+        Most "it does not work" reports turn out to be setup-order or configuration questions, not bugs. The PadForge issue tracker is for behavior that has already been raised in Discussions and either went unanswered or was confirmed as a bug.
+
+        If you are not certain this is a bug, open a [Q&A Discussion](https://github.com/hifihedgehog/PadForge/discussions/new?category=q-a) first. Bug reports filed without a prior Discussion link will be closed and redirected automatically.
+
+        Please use this form only after a Discussion thread confirmed the behavior is a bug, or your question went unanswered after a reasonable wait.
+
+  - type: input
+    id: discussion_link
+    attributes:
+      label: Discussion link
+      description: |
+        Link to the Discussion thread where this was raised as a question. The URL must point to a thread at `https://github.com/hifihedgehog/PadForge/discussions/N`. Reports without a valid link are closed automatically.
+      placeholder: "https://github.com/hifihedgehog/PadForge/discussions/123"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen instead?
+      placeholder: "Describe the bug..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this issue?
+      placeholder: |
+        1. Open PadForge
+        2. Go to...
+        3. Click on...
+        4. See error
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: PadForge Version
+      description: Found in Settings or the title bar
+      placeholder: "e.g., v2.0.0-beta6"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows Version
+      description: "Run `winver` to check"
+      placeholder: "e.g., Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Controller/Device
+      description: Which device(s) were you using when the bug occurred?
+      placeholder: "e.g., Xbox Wireless Controller, DualSense"
+
+  - type: dropdown
+    id: output_type
+    attributes:
+      label: Virtual Controller Type
+      description: Which output type were you using?
+      options:
+        - Xbox
+        - PlayStation
+        - Extended
+        - Keyboard+Mouse
+        - MIDI
+        - N/A
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Screenshots, logs, or anything else that might help
+
+  - type: checkboxes
+    id: validations
+    attributes:
+      label: Pre-submission checklist
+      description: All five boxes must be checked before submitting.
+      options:
+        - label: I searched [existing issues](https://github.com/hifihedgehog/PadForge/issues?q=is%3Aissue) and [Discussions](https://github.com/hifihedgehog/PadForge/discussions) for the same problem.
+          required: true
+        - label: I opened a Q&A Discussion first, and the question was not resolved as a setup issue. The Discussion link is in the field above.
+          required: true
+        - label: I am running the latest PadForge release and can reproduce on a clean PadForge.xml.
+          required: true
+        - label: This is a verified bug, not a usage question.
+          required: true
+        - label: I am not requesting support for a pirated or otherwise illegitimately obtained game.
+          required: true

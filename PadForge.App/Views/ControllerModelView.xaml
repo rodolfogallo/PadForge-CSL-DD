@@ -1,0 +1,83 @@
+<!-- 3D controller model view adapted from Handheld Companion
+     https://github.com/Valkirie/HandheldCompanion
+     Copyright (c) CasperH2O, Lesueur Benjamin, trippyone
+     Licensed under CC BY-NC-SA 4.0 -->
+<UserControl x:Class="PadForge.Views.ControllerModelView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:helix="clr-namespace:HelixToolkit.Wpf;assembly=HelixToolkit.Core.Wpf"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:strings="clr-namespace:PadForge.Resources.Strings"
+             xmlns:reset="clr-namespace:PadForge.Controls">
+
+    <Grid>
+        <helix:HelixViewport3D x:Name="ModelViewPort"
+                               IsRotationEnabled="False"
+                               IsPanEnabled="False"
+                               IsMoveEnabled="False"
+                               IsZoomEnabled="False"
+                               ShowViewCube="False"
+                               ZoomExtentsWhenLoaded="False"
+                               Background="Transparent"
+                               IsManipulationEnabled="False">
+
+            <helix:SunLight />
+            <helix:DirectionalHeadLight Brightness="0.35" />
+
+            <!-- Ember rim light (#175): warm directional from behind-below
+                 so the model catches a forge-glow edge. Dim RGB keeps it a
+                 rim, not a wash. -->
+            <ModelVisual3D>
+                <ModelVisual3D.Content>
+                    <DirectionalLight Color="#5A321C" Direction="0,-0.7,0.7"/>
+                </ModelVisual3D.Content>
+            </ModelVisual3D>
+
+            <ModelVisual3D x:Name="ModelVisual3D" />
+
+            <helix:HelixViewport3D.Camera>
+                <PerspectiveCamera FieldOfView="55"
+                                   LookDirection="0,0.793,-0.609"
+                                   Position="0,-172,132"
+                                   UpDirection="0,0,1" />
+            </helix:HelixViewport3D.Camera>
+        </helix:HelixViewport3D>
+
+        <!-- Annotation overlay (#175 roadmap 1): chips + leader lines + trigger
+             level bars, projected from the 3D model. No Background so empty
+             space stays click-through to the viewport. -->
+        <Canvas x:Name="AnnotationCanvas" Visibility="Collapsed" ClipToBounds="True"/>
+
+        <!-- Annotation toggle + Reset View. Tag glyph (E8EC), not the
+             info glyph: info is the About/help vocabulary, this button
+             puts labels on the model (#175 item 6). -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                    VerticalAlignment="Top" Margin="0,8,8,0">
+            <!-- Colorway picker: shown only when the current model family
+                 ships more than one appearance. Per virtual controller
+                 (persisted with the slot), so two VCs of the
+                 same family can wear different colorways. -->
+            <ComboBox x:Name="AppearancePicker"
+                      AutomationProperties.AutomationId="AppearancePicker"
+                      MinWidth="130"
+                      Margin="0,0,8,0"
+                      Visibility="Collapsed"
+                      ToolTip="{Binding Pad_Colorway, Source={x:Static strings:Strings.Instance}}"
+                      SelectionChanged="AppearancePicker_SelectionChanged" />
+            <reset:SettingResetButton Click="ResetAppearance_Click" Tag="" Visibility="{Binding Visibility, ElementName=AppearancePicker}" IsEnabled="{Binding IsEnabled, ElementName=AppearancePicker}" SettingLabel="{Binding Pad_Colorway, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_?dialog_AppearancePicker_65" Margin="4,0,8,0"/>
+            <ui:Button x:Name="AnnotationToggleButton"
+                       AutomationProperties.AutomationId="AnnotationToggle"
+                       Style="{StaticResource EmberIconButton}"
+                       Margin="0,0,8,0"
+                       ToolTip="{Binding Pad_ToggleAnnotations, Source={x:Static strings:Strings.Instance}}"
+                       Click="AnnotationToggle_Click">
+                <TextBlock x:Name="AnnotationToggleGlyph" FontFamily="Segoe MDL2 Assets"
+                           FontSize="14" Text="&#xE8EC;"/>
+            </ui:Button>
+            <Button x:Name="ResetViewButton"
+                    Content="{Binding Pad_ResetView, Source={x:Static strings:Strings.Instance}}"
+                    Padding="8,4"
+                    Click="ResetView_Click" />
+        </StackPanel>
+    </Grid>
+</UserControl>

@@ -1,0 +1,42 @@
+<UserControl x:Class="PadForge.Views.Controls.LabeledShapeIcon"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             SnapsToDevicePixels="True"
+             UseLayoutRounding="True">
+    <!-- The shape used to be sourced from a DrawingImage resource in
+         ControllerIcons.xaml. DrawingImage is a Freezable and auto-freezes
+         when stored in a ResourceDictionary, which captures its DynamicResource
+         brush bindings at first resolution. Theme changes never propagated, so
+         a pad started in dark mode kept rendering as white-on-white after the
+         user switched to light. Path elements are FrameworkElement, not Freezable
+         on the Fill property's binding chain, so DynamicResource keeps tracking. -->
+    <Grid>
+        <Viewbox Stretch="Uniform">
+            <Grid Width="512" Height="512">
+                <Path x:Name="StickOuterPath" Visibility="Collapsed"
+                      Fill="{DynamicResource EmberBrush}"
+                      Data="{StaticResource ZackslyStickOuterRingGeometry}"/>
+                <Path x:Name="StickInnerPath" Visibility="Collapsed"
+                      Fill="{DynamicResource EmberBrush}"
+                      Data="{StaticResource ZackslyStickInnerDiscGeometry}"/>
+                <Path x:Name="TriggerLeftPath" Visibility="Collapsed"
+                      Fill="{DynamicResource EmberBrush}"
+                      Data="{StaticResource ZackslyTriggerOuterBodyGeometry}"/>
+                <Path x:Name="TriggerRightPath" Visibility="Collapsed"
+                      Fill="{DynamicResource EmberBrush}"
+                      Data="{StaticResource ZackslyTriggerOuterBodyRightGeometry}"/>
+            </Grid>
+        </Viewbox>
+        <Viewbox x:Name="LabelHost" Stretch="Uniform">
+            <Canvas Width="512" Height="512" Background="Transparent" IsHitTestVisible="False">
+                <!-- Label fill is the inverse of the shape's primary text
+                     color, so the glyph reads as a knockout in both
+                     themes. -->
+                <!-- Steel knockout on the ember shape (#175): constant
+                     because the ember fill is constant across themes. -->
+                <Path x:Name="LabelPath"
+                      Fill="#FF0B0E14"/>
+            </Canvas>
+        </Viewbox>
+    </Grid>
+</UserControl>

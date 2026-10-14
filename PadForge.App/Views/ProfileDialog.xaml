@@ -1,0 +1,126 @@
+<ui:FluentWindow x:Class="PadForge.Views.ProfileDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        xmlns:strings="clr-namespace:PadForge.Resources.Strings"
+        FontFamily="{StaticResource BodyFontFamily}"
+        ExtendsContentIntoTitleBar="True"
+        WindowBackdropType="Mica"
+        Title="{Binding ProfileDialog_SaveAs, Source={x:Static strings:Strings.Instance}}"
+        Height="470" Width="500"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+             xmlns:reset="clr-namespace:PadForge.Controls">
+
+    <ui:FluentWindow.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </ui:FluentWindow.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Dialog head (#175 item 11): ExtendsContentIntoTitleBar strips the
+             system title bar, so the localized Title never rendered anywhere.
+             Ember tick + display-face title makes it visible. The X stands in
+             for the caption close button WindowChrome no longer provides. -->
+        <Border Padding="14"
+                BorderBrush="{DynamicResource SteelLineSoftBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                           Fill="{DynamicResource EmberBrush}"
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <TextBlock Grid.Column="1"
+                           Text="{Binding Title, RelativeSource={RelativeSource AncestorType=Window}}"
+                           FontFamily="{StaticResource DisplayFontFamily}"
+                           FontWeight="SemiBold" FontSize="15"
+                           Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                           VerticalAlignment="Center" Margin="0,0,8,0"
+                           TextTrimming="CharacterEllipsis"/>
+                <ui:Button Grid.Column="2" Style="{StaticResource EmberIconButton}"
+                           VerticalAlignment="Center" Click="CancelButton_Click"
+                           ToolTip="{Binding Common_Close, Source={x:Static strings:Strings.Instance}}">
+                    <TextBlock Text="&#xE8BB;" FontFamily="Segoe MDL2 Assets" FontSize="10"/>
+                </ui:Button>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" Margin="16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Mode description: what saving stores. Default is the Save As
+                 flavor. LoadForEdit swaps in the Edit flavor. -->
+            <TextBlock x:Name="ModeDescText"
+                       Text="{Binding ProfileDialog_SaveAsDescription, Source={x:Static strings:Strings.Instance}}"
+                       TextWrapping="Wrap" Margin="0,0,0,12"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+
+            <TextBlock Grid.Row="1" Text="{Binding ProfileDialog_ProfileName, Source={x:Static strings:Strings.Instance}}" Margin="0,0,0,4"/>
+            <TextBox Grid.Row="2" x:Name="NameBox" Margin="0,0,0,12"/>
+
+            <TextBlock Grid.Row="3" Text="{Binding ProfileDialog_Executables, Source={x:Static strings:Strings.Instance}}"
+                       Margin="0,0,0,4"/>
+            <ListBox Grid.Row="4" x:Name="ExeListBox" Margin="0,0,0,8"
+                     MinHeight="80"
+                     ItemContainerStyle="{StaticResource EmberSelectListItem}">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis"
+                                   FontFamily="{StaticResource TelemetryFontFamily}"
+                                   ToolTip="{Binding}"/>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <!-- Browse/Remove edit the staged exe list, so both stay
+                 neutral (nothing is committed until Save). -->
+            <StackPanel Grid.Row="5" Orientation="Horizontal">
+                <Button Content="{Binding Common_Browse, Source={x:Static strings:Strings.Instance}}" Click="BrowseButton_Click"
+                        MinWidth="80" Margin="0,0,8,0"/>
+                <Button Content="{Binding Common_Remove, Source={x:Static strings:Strings.Instance}}" Click="RemoveButton_Click"
+                        MinWidth="80"/>
+            </StackPanel>
+
+            <!-- Polling rate override (#365, discussion #362): the loop
+                 stays global, this profile just retunes it while active.
+                 Default follows the Settings knob. -->
+            <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,10,0,0">
+                <TextBlock Text="{Binding ProfileDialog_PollingRate, Source={x:Static strings:Strings.Instance}}"
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <ComboBox x:Name="PollingRateBox" MinWidth="200" SelectedIndex="0"/>
+                <reset:SettingResetButton Click="ResetPollingRate_Click" Tag="" Visibility="{Binding Visibility, ElementName=PollingRateBox}" IsEnabled="{Binding IsEnabled, ElementName=PollingRateBox}" SettingLabel="{Binding ProfileDialog_PollingRate, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_?dialog_PollingRateBox_109"/>
+            </StackPanel>
+
+            <!-- Footer band (#175 dialog language): Save is the dialog's
+                 primary affirmative and wears the ember accent. -->
+            <StackPanel Grid.Row="7" Orientation="Horizontal"
+                        HorizontalAlignment="Right" Margin="0,18,0,0">
+                <Button Content="{Binding Common_Save, Source={x:Static strings:Strings.Instance}}" MinWidth="90" Margin="0,0,8,0"
+                        IsDefault="True" Click="SaveButton_Click"
+                        Style="{StaticResource EmberAccentButton}"/>
+                <Button Content="{Binding Common_Cancel, Source={x:Static strings:Strings.Instance}}" MinWidth="90"
+                        IsCancel="True" Click="CancelButton_Click"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</ui:FluentWindow>

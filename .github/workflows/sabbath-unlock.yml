@@ -1,0 +1,51 @@
+# Sabbath unlock.
+#
+# Two triggers:
+#   1. Weekly cron every Monday 00:01 America/New_York. The lock set
+#      by sabbath-lock.yml on Sat 23:59 ET has its own 24-hour
+#      self-expiry that fires at Sun 23:59 ET, so this cron is
+#      normally a no-op DELETE on an already-expired lock. It exists
+#      to release any one-off mid-week lock (e.g. someone manually
+#      PUTting interaction-limits outside the normal Sat 23:59
+#      cadence) that would otherwise leak into Monday daytime.
+#   2. workflow_dispatch for manual emergency release any time.
+#
+# Same authentication requirement as sabbath-lock.yml. The repository
+# secret SABBATH_PAT must be a fine-grained Personal Access Token with
+# `Administration: write` for this repository. See the header comment
+# in sabbath-lock.yml for setup steps.
+#
+# If SABBATH_PAT is missing, both this workflow and sabbath-lock.yml
+# fail loudly in the Actions tab. The lock set by interaction-limits
+# always self-expires after 24 hours regardless, so a missed unlock
+# means a few extra hours of restriction, not a permanent state.
+
+name: Sabbath unlock
+
+on:
+  schedule:
+    - cron: "1 0 * * 1"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  unlock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove interaction limit
+        env:
+          PAT: ${{ secrets.SABBATH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "SABBATH_PAT secret is not set. See header comment in sabbath-lock.yml." >&2
+            exit 1
+          fi
+          curl -fsSL -X DELETE \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/interaction-limits"

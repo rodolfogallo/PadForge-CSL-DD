@@ -1,0 +1,1196 @@
+﻿using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace PadForge.Engine.RemoteLink
+{
+    /// <summary>A reliable, ordered, message-framed duplex channel (the TCP control
+    /// path). The in-memory implementation in tests and the TCP socket adapter both
+    /// satisfy it, so the connection orchestration is transport-agnostic and
+    /// deterministically testable.</summary>
+    public interface ILinkControlChannel
+    {
+        Task SendAsync(byte[] message, CancellationToken ct);
+        Task<byte[]> ReceiveAsync(CancellationToken ct);
+    }
+
+    /// <summary>What a first-contact peer presents for the human grant.</summary>
+    public sealed class PendingPairing
+    {
+        public string Sas { get; init; }
+        public string PeerFingerprintHex { get; init; }
+    }
+
+    /// <summary>The human's pairing decision: approve, and whether to restrict the
+    /// peer to gamepad-only output. Implicitly converts from bool so a simple
+    /// auto-approve callback (<c>_ => true</c>) still works.</summary>
+    public sealed class PairingApproval
+    {
+        public bool Approved { get; init; }
+        public bool GamepadOnly { get; init; }
+        public bool AllowRemoteAssignments { get; init; }
+        public static implicit operator PairingApproval(bool approved) => new() { Approved = approved };
+    }
+
+    /// <summary>Result of a completed control handshake: the data key for the UDP
+    /// LinkSession, plus the RemotePeerDevices the peer exposed.</summary>
+    public sealed class LinkConnectionResult
+    {
+        public byte[] DataKey { get; init; }
+        internal byte[] PeerPublicKey { get; init; }
+        internal LinkAdmission Admission { get; init; }
+        public bool IsInitiator { get; init; }
+        public byte[] PeerFingerprint { get; init; }
+        public string PeerFingerprintHex { get; init; }
+        public IReadOnlyList<RemotePeerDevice> RemoteDevices { get; init; }
+
+        /// <summary>The peer's own list carried the metadata extension, so
+        /// it runs 3.6.0 or later and reads a device list datagram up to the
+        /// UDP limit (LinkConnection.MaxListPayload). An older peer reads
+        /// into 4 KB and parses the basic records only.</summary>
+        internal bool PeerReadsFullLists { get; init; }
+    }
+
+    /// <summary>Raised to abort a connection that failed authentication, approval, or framing.</summary>
+    public sealed class LinkConnectionException : Exception
+    {
+        public LinkConnectionException(string message) : base(message) { }
+    }
+
+    /// <summary>
+    /// Orchestrates one Remote Link connection over a control channel (issue #138):
+    /// run the pairing handshake, gate first-contact on an explicit approval, derive
+    /// separate control/data keys, exchange exposed-device lists under the control
+    /// key, and hand back the data key + the peer's devices. Raw sockets are a thin
+    /// adapter over <see cref="ILinkControlChannel"/>; this logic is transport-free.
+    /// </summary>
+    public static class LinkConnection
+    {
+        private static readonly byte[] ControlInfo = Encoding.ASCII.GetBytes("padforge-link v1 control");
+        private static readonly byte[] DataInfo = Encoding.ASCII.GetBytes("padforge-link v1 data");
+        private const byte CtrlDeviceList = 1;
+
+        public static Task<LinkConnectionResult> RunInitiatorAsync(
+            ILinkControlChannel channel, PeerIdentity identity, PeerTrustStore trust,
+            IReadOnlyList<RemotePeerDeviceInfo> exposeLocal, byte[] capabilities,
+            Func<PendingPairing, PairingApproval> approve, string nowUtc, CancellationToken ct = default)
+            => RunAsync(true, channel, identity, trust, exposeLocal, capabilities, approve, nowUtc, ct);
+
+        public static Task<LinkConnectionResult> RunResponderAsync(
+            ILinkControlChannel channel, PeerIdentity identity, PeerTrustStore trust,
+            IReadOnlyList<RemotePeerDeviceInfo> exposeLocal, byte[] capabilities,
+            Func<PendingPairing, PairingApproval> approve, string nowUtc, CancellationToken ct = default)
+            => RunAsync(false, channel, identity, trust, exposeLocal, capabilities, approve, nowUtc, ct);
+
+        private static async Task<LinkConnectionResult> RunAsync(
+            bool isInitiator, ILinkControlChannel channel, PeerIdentity identity, PeerTrustStore trust,
+            IReadOnlyList<RemotePeerDeviceInfo> exposeLocal, byte[] capabilities,
+            Func<PendingPairing, PairingApproval> approve, string nowUtc, CancellationToken ct)
+        {
+            var admission = (exposeLocal as LinkExposureSnapshot)?.AdmissionFactory?.Invoke(ct);
+            bool transferred = false;
+            if (admission != null) ct = admission.Token;
+            try
+            {
+            var hs = new LinkHandshake(identity, capabilities ?? Array.Empty<byte>(), isInitiator);
+
+            // ── Authenticated key exchange over the reliable channel ──
+            if (isInitiator)
+            {
+                await channel.SendAsync(hs.StartCommit(), ct);
+                byte[] revealR = await channel.ReceiveAsync(ct);
+                await channel.SendAsync(hs.OnResponderReveal(revealR), ct);
+                byte[] confirm = await channel.ReceiveAsync(ct);
+                hs.OnResponderConfirm(confirm);
+            }
+            else
+            {
+                byte[] commit = await channel.ReceiveAsync(ct);
+                await channel.SendAsync(hs.OnInitiatorCommit(commit), ct);
+                byte[] revealI = await channel.ReceiveAsync(ct);
+                await channel.SendAsync(hs.OnInitiatorReveal(revealI), ct);
+            }
+
+            HandshakeResult result = hs.Result
+                ?? throw new LinkConnectionException("Handshake did not complete.");
+
+            // A session reset continues an existing pairing and cannot select another peer.
+            if (exposeLocal is LinkExposureSnapshot prepared && prepared.Reconnect != null
+                && !prepared.Reconnect.Allows(result.PeerStaticPublicKey))
+                throw new LinkConnectionException("The reconnect is no longer authorized for this peer.");
+
+            string fingerprint = Convert.ToHexString(result.PeerFingerprint);
+            if (admission != null)
+                await admission.BindAsync(fingerprint, isInitiator,
+                    isInitiator == (identity.Fingerprint.AsSpan().SequenceCompareTo(result.PeerFingerprint) < 0)).ConfigureAwait(false);
+
+            void UpdateTrust(Action update)
+            {
+                if (admission == null) update();
+                else if (!admission.TryRun(update)) throw new LinkConnectionException("Connection admission was canceled.");
+            }
+
+            // ── Admission: an unknown key always needs an explicit grant ──
+            var decision = trust.Decide(result.PeerStaticPublicKey);
+            if (decision == TrustDecision.FirstContact)
+            {
+                PairingApproval approval = approve?.Invoke(new PendingPairing
+                {
+                    Sas = result.Sas,
+                    PeerFingerprintHex = Convert.ToHexString(result.PeerFingerprint),
+                }) ?? false;
+                if (!approval.Approved)
+                    throw new LinkConnectionException("Pairing rejected by the user.");
+                void Grant() => trust.Grant(result.PeerStaticPublicKey, name: "", pairedUtc: nowUtc, reconnect: true,
+                    gamepadOnly: approval.GamepadOnly, allowRemoteAssignments: approval.AllowRemoteAssignments);
+                UpdateTrust(Grant);
+            }
+            // KnownAutoSelect / KnownManual: already pinned, the signature proved possession.
+
+            // Derive and persist the pairwise DHT rendezvous capability (#294)
+            // on the FIRST handshake that lacks one. Both peers run this in the
+            // SAME session, so both derive the identical value from the shared
+            // session secret and the symmetric (sorted-fingerprint) transcript,
+            // then store it. Later sessions find it already set and skip
+            // (SetRendezvousCapability is set-if-absent), so the value is stable
+            // for the life of the pairing even though each session's ephemeral
+            // secret differs. Legacy peers paired before the lane existed get one
+            // on their next reconnect. Never overwrites, never weakens trust.
+            if (trust.GetRendezvousCapability(result.PeerStaticPublicKey) == null)
+            {
+                var transcript = Dht.PresenceRecord.PairingTranscript(identity.Fingerprint, result.PeerFingerprint);
+                var capability = Dht.PresenceRecord.DeriveCapability(result.SessionKey, transcript);
+                UpdateTrust(() => trust.SetRendezvousCapability(result.PeerStaticPublicKey, capability));
+            }
+
+            // ── Separate control + data keys from the one session secret ──
+            byte[] controlKey = PeerCrypto.DeriveKey(result.SessionKey, salt: null, ControlInfo);
+            byte[] dataKey = PeerCrypto.DeriveKey(result.SessionKey, salt: null, DataInfo);
+            // One session per side: its send salt pairs with the peer's recv salt and
+            // vice versa, so the same object seals outbound and opens inbound.
+            var control = new LinkSession(controlKey, isInitiator);
+
+            // ── Exchange exposed-device lists (sealed). Send then receive: both
+            //    sides write first, so a buffered channel never deadlocks. ──
+            byte[] listPayload = EncodeDeviceList(exposeLocal ?? Array.Empty<RemotePeerDeviceInfo>());
+            byte[] localSealed = control.Seal(LinkMessageType.Input, CtrlDeviceList, 0, listPayload);
+            // A failed write can still reach the peer and let it publish this session.
+            (exposeLocal as LinkExposureSnapshot)?.HandshakeProgress?.MarkInventorySendStarted();
+            await channel.SendAsync(localSealed, ct);
+
+            byte[] peerSealed = await channel.ReceiveAsync(ct);
+            if (!control.Open(peerSealed, out _, out byte ctrlType, out _, out byte[] peerListPayload) || ctrlType != CtrlDeviceList)
+                throw new LinkConnectionException("Bad or unauthenticated device-list message.");
+
+            string peerFpHex = Convert.ToHexString(result.PeerFingerprint);
+            List<RemotePeerDeviceInfo> peerInfos;
+            string peerMachineName = null;
+            bool peerReadsFullLists;
+            try { peerInfos = DecodeDeviceList(peerListPayload, out peerMachineName, out peerReadsFullLists); }
+            catch { throw new LinkConnectionException("Malformed device-list payload."); }
+            // Persist the peer's machine name so every later surface (device
+            // rows, the peer manager, the hot-plug reconcile) labels it too.
+            if (!string.IsNullOrWhiteSpace(peerMachineName))
+                UpdateTrust(() => trust?.SetHostName(result.PeerStaticPublicKey, peerMachineName));
+
+            var remoteDevices = new List<RemotePeerDevice>();
+            foreach (var info in peerInfos)
+            {
+                info.PeerFingerprintHex = peerFpHex; // identity is salted by the authenticated peer key
+                // Name each device under the peer it came from, e.g. "DualSense (John's PC)",
+                // the same labeling the hot-plug reconcile path applies. Without this, devices
+                // already shared when the link comes up (the common case) carried no peer label,
+                // because only ReconcileRemoteDevices did the suffixing.
+                string peerLabel = trust?.ResolvePeerLabel(peerFpHex);
+                // Handshake-carried name is the authoritative fallback: the
+                // punch / code path never runs LAN discovery, so without it the
+                // peer's devices would show unlabeled.
+                if (string.IsNullOrWhiteSpace(peerLabel)) peerLabel = peerMachineName;
+                if (!string.IsNullOrWhiteSpace(peerLabel))
+                    info.Name = $"{info.Name} ({peerLabel})";
+                remoteDevices.Add(new RemotePeerDevice(info));
+            }
+
+            ct.ThrowIfCancellationRequested();
+            transferred = true;
+            return new LinkConnectionResult
+            {
+                DataKey = dataKey,
+                PeerPublicKey = result.PeerStaticPublicKey,
+                Admission = admission,
+                IsInitiator = isInitiator,
+                PeerFingerprint = result.PeerFingerprint,
+                PeerFingerprintHex = peerFpHex,
+                RemoteDevices = remoteDevices,
+                PeerReadsFullLists = peerReadsFullLists,
+            };
+            }
+            finally { if (!transferred) admission?.Dispose(); }
+        }
+
+        // ── Device-list framing ─────────────────────────────────────────────
+
+        // Marks the metadata extension appended after the v1 records: serial,
+        // touchpad shape, and the forwarded DeviceObjects (named inputs). An
+        // old decoder reads its `count` records and never looks at the tail,
+        // so mixed versions interoperate; a new decoder facing an old sender
+        // simply finds no tail. Same compat mechanism as the input codec's
+        // appended blocks.
+        private const byte DeviceListExtMagic = 0xE2;
+
+        // Second extension tail, appended after the v1 metadata section. One
+        // clamped byte per device: RawButtonCount. Guarded by its own magic
+        // and its own try/catch on decode, so an old peer (which stops after
+        // the v1 tail) ignores it, and a malformed v2 tail costs only the raw
+        // button counts, never the already-decoded v1 metadata.
+        private const byte DeviceListExtV2Magic = 0xE3;
+
+        // Third extension tail, same shape and same guarantees: one packed
+        // capability byte per device for the flags that arrived after the v1
+        // caps byte was exhausted at bit 128 (issue #199's HasAccelAux). The
+        // wire-format extension that byte's own comment demanded, rather
+        // than a second overloaded bit. Bit 1 = HasNfcReader (#241): without
+        // it a remote Switch controller's NFC sources were undiscoverable,
+        // and the consumer had to infer the reader from VID/PID, which is a
+        // guess the owner already knows the answer to.
+        private const byte DeviceListExtV3Magic = 0xE4;
+
+        // Fourth extension tail, same shape and same guarantees: one clamped
+        // byte per device for RawAxisCount, the axis twin of the v2 tail's
+        // RawButtonCount. The local side has tracked both since #193; only the
+        // button half ever crossed the wire, so a remote fight stick's or
+        // DS3's extra analog axes stayed undiscoverable on the consumer.
+        private const byte DeviceListExtV4Magic = 0xE5;
+
+        // Fifth extension tail: the SENDER'S machine name, once (not per
+        // device). Device rows are suffixed with the owning peer's name so a
+        // consumer can tell "DualSense (Living Room PC)" from its own pad. That
+        // name used to arrive ONLY via LAN discovery, so the punch / code path
+        // (no discovery) left every remote device unlabeled and the list read
+        // as one undifferentiated pile (owner report 2026-08-11). Carrying it
+        // in the handshake makes labeling independent of how the peer was
+        // found. Same append-only guarantees: an old peer stops before it.
+        private const byte DeviceListExtV5Magic = 0xE6;
+
+        // Sixth extension tail: the owner's REAL supported-button set, per
+        // device. NumButtons is the standardized 22-slot space for every SDL
+        // gamepad, not a count of what the pad physically has: the owner gates
+        // slots 11-21 on SDL_GamepadHasButton, so a 2026 Steam Controller
+        // supports 18 of the 22. Only the owner can know that, and it never
+        // crossed the wire, so the consumer synthesized a dense range and
+        // listed four buttons that do not exist (owner report 2026-08-12).
+        //
+        // Encoding, per device: [maskLen][maskLen bytes], LSB-first bitmask
+        // over button indices. maskLen 0 means "dense" (every index below the
+        // raw count is supported), which is the truth for keyboards, mice and
+        // raw joysticks and keeps them at one byte instead of 32.
+        private const byte DeviceListExtV6Magic = 0xE7;
+
+        // Seventh extension tail: the axis twin of v6, plus the SDL GUID.
+        //  - SupportedAxisIndices, same bitmask shape as v6. NumAxes is pinned
+        //    to 6 for every SDL gamepad, so a stickless or triggerless pad
+        //    advertised phantom Left/Right Stick axes on the consumer, and the
+        //    default profile auto-bound both virtual sticks to axes that do
+        //    not exist (SettingsManager's HasAxis() trusts this list).
+        //  - SdlGuid, so a peer's controller can be reported upstream with a
+        //    complete dossier. The Devices page hides the row and drops the
+        //    sdl_guid query parameter when it is empty, so a mapping report
+        //    filed for a peer's pad was silently incomplete.
+        private const byte DeviceListExtV7Magic = 0xE8;
+
+        // Eighth extension tail: one flag byte per device, bit 0 for the
+        // button set and bit 1 for the axis set, each set when that set is
+        // explicitly EMPTY. The v6 and v7 masks spell "dense" as a single 0
+        // byte, and an empty set had no other spelling, so a pad whose owner
+        // knows it has no sticks arrived on the consumer advertising all six,
+        // and the consumer's default profile auto-bound both of them. The flag
+        // rides its own tail rather than a reserved mask length so an older
+        // peer, which stops before it, is unaffected.
+        private const byte DeviceListExtV8Magic = 0xE9;
+
+        // Ninth extension tail (#468 over the wire): the owner's analog key
+        // order, for the rows that carry one. The peer's copy of an analog
+        // keyboard otherwise listed the catalog's keys for the VID and PID,
+        // the whole keyboard for most families, and never the keys the row
+        // learned: a position-coded key, a handshake's own list. Written only
+        // when some row carries one, so a list without an analog keyboard is
+        // byte for byte what it was before the tail, and only while the list
+        // with it fits the old peers' budget (EncodeDeviceList). Encoding:
+        // [magic][records], then per record [record index][u16 count][u16
+        // code]*, codes 1 to 0x6FF, each once.
+        private const byte DeviceListExtV9Magic = 0xEA;
+
+        // Tenth extension tail (#469 over the wire): which native axes of a
+        // Bliss-Box port read raw rest at 0, the triggers of the controller in
+        // the owner's port. The peer finds no port on its own PC to ask, so its
+        // copy counted them as centered. Written only when some row carries a
+        // mask and the list with it fits the old peers' budget. Encoding:
+        // [magic][records], then per record [record index][mask], bit N for
+        // native axis N.
+        private const byte DeviceListExtV10Magic = 0xEB;
+
+        // Eleventh extension tail (#474 over the wire): a DualShock 3's
+        // identity as the owner names it ("address/source"). A calibration on
+        // the peer keys on it, and the peer has no address of its own to read
+        // for a shared pad. Written only when some row carries one and the
+        // list with it fits the old peers' budget. Encoding: [magic][records],
+        // then per record [record index][string].
+        private const byte DeviceListExtV11Magic = 0xEC;
+
+        /// <summary>The longest identity the v11 tail accepts: twelve hex
+        /// digits, "/node:", a driver release and "/cal" fit with room to
+        /// spare.</summary>
+        private const int MaxDs3IdentityLength = 64;
+
+        /// <summary>The most a device list datagram's payload holds for a peer
+        /// older than 3.6.0, whose UDP loop reads into 4 KB with a 14-byte
+        /// header and a 16-byte tag, less a margin. A full list budgets its
+        /// optional parts to it too.</summary>
+        internal const int OldPeerPayloadBudget = 3800;
+
+        /// <summary>The most a device list datagram's payload holds for a
+        /// 3.6.0 or later peer: the IPv4 UDP payload limit, 65,507 bytes, less
+        /// the seal's header and tag.</summary>
+        internal const int MaxListPayload = 65507 - LinkSession.HeaderSize - PeerCrypto.TagSize;
+
+        // Shared by the handshake exchange AND the post-connect DeviceList sync (#138).
+        // Each entry leads with the owner's STABLE slot, and caps now carry HasHaptic +
+        // Online so a remote wheel's FFB pipeline runs and active/inactive propagates.
+        /// <param name="tailBudget">The budget the v9, v10 and v11 tails
+        /// fit in: <see cref="OldPeerPayloadBudget"/> for the connect-time
+        /// list, the one list a peer older than 3.6.0 can receive, and
+        /// <see cref="MaxListPayload"/> for a publication to a peer that reads
+        /// full lists. The named objects keep the older budget either
+        /// way.</param>
+        internal static byte[] EncodeDeviceList(IReadOnlyList<RemotePeerDeviceInfo> devices,
+            string localMachineName = null, int tailBudget = OldPeerPayloadBudget)
+        {
+            var buf = new List<byte>();
+            int count = WriteBasicRecords(buf, devices);
+
+            const int PayloadBudget = OldPeerPayloadBudget;
+
+            // Every tail after the metadata extension, encoded first so the
+            // named objects below can leave room for it.
+            var tail = EncodeTails(devices, count, localMachineName);
+
+            // What each device's metadata section needs whatever its objects
+            // get: the serial, the touchpad shape and the object count.
+            // after[i] is that sum over the devices written after device i.
+            var after = new int[count];
+            for (int i = count - 2; i >= 0; i--)
+                after[i] = after[i + 1] + MandatoryMetadataBytes(devices[i + 1]);
+
+            // The v9, v10 and v11 tails are metadata, as the names are, and
+            // ride only while the list with them fits the budget without a
+            // single name: they must never push a list an older peer could
+            // read past what it can. Only the connect-time list can reach
+            // one, so a publication to a peer that reads full lists passes
+            // that peer's budget, and a large inventory keeps them. The rest
+            // masks go first, since they change how a trigger reads, then the
+            // DualShock 3 identities, which decide what a calibration takes,
+            // where a key list changes only what the picker offers.
+            var keyOrders = EncodeKeyOrderTail(devices, count);
+            var restMasks = EncodeRestMaskTail(devices, count);
+            var identities = EncodeDs3IdentityTail(devices, count);
+            int required = buf.Count + 1 + tail.Count + (count > 0 ? after[0] + MandatoryMetadataBytes(devices[0]) : 0);
+            var fit = FitOptionalTails(required, tailBudget, restMasks.Count, identities.Count, keyOrders.Count);
+            // The names get the room the older budget leaves them whichever
+            // budget the tails ride in, so a tail only a full-list peer takes
+            // never costs a device its names.
+            int namesTail = tail.Count + FitOptionalTails(required, OldPeerPayloadBudget,
+                restMasks.Count, identities.Count, keyOrders.Count).Bytes;
+            if (fit.KeyOrders) tail.AddRange(keyOrders);
+            if (fit.Masks) tail.AddRange(restMasks);
+            if (fit.Identities) tail.AddRange(identities);
+
+            // Metadata extension (one section per v1 record, same order), so
+            // a remote device's mapping picker and Devices-page preview show
+            // the SAME named inputs the owner sees locally. Budgeted: the
+            // periodic push travels as ONE UDP datagram and old peers receive
+            // into a 4 KB buffer, so once the payload nears that floor the
+            // remaining devices get empty object sections (the consumer falls
+            // back to synthesized names for them) rather than the whole list
+            // becoming undeliverable. The budget covers the whole payload: the
+            // room for a device's objects leaves out what the devices after it
+            // and every tail still need. It counted only what was already
+            // written, so a list whose objects filled the budget went past it
+            // by every later section and tail.
+            buf.Add(DeviceListExtMagic);
+            for (int i = 0; i < count; i++)
+            {
+                var d = devices[i];
+                WriteString(buf, d.SerialNumber);
+                int pads = Math.Clamp(d.NumTouchpads, 0, 255);
+                buf.Add((byte)pads);
+                for (int p = 0; p < pads; p++)
+                {
+                    int fingers = (d.TouchpadFingerCounts != null && p < d.TouchpadFingerCounts.Length)
+                        ? d.TouchpadFingerCounts[p] : 0;
+                    buf.Add((byte)Math.Clamp(fingers, 0, 255));
+                }
+                var objs = d.DeviceObjects ?? Array.Empty<DeviceObjectItem>();
+                int objCount = Math.Min(objs.Length, 1024);
+                // Per object, 26 fixed bytes plus the UTF-8 name. Two limits
+                // apply. The first is what is left in the payload. The second
+                // is a per-device share, because all-or-nothing let ONE large
+                // row eat the budget and leave every device encoded after it
+                // with no names at all: a Logitech G-Keys row publishes 102
+                // named buttons, which is most of the payload on its own, and
+                // a head tracker sharing the same link came out reading
+                // "Axis 0" through "Axis 5".
+                if (objCount > 0)
+                {
+                    int room = Math.Min(PayloadBudget - buf.Count - 2 - after[i] - namesTail, PayloadBudget / 2);
+                    int used = 0;
+                    int fits = 0;
+                    for (int j = 0; j < objCount; j++)
+                    {
+                        int cost = 26 + Encoding.UTF8.GetByteCount(objs[j].Name ?? "");
+                        if (used + cost > room) break;
+                        used += cost;
+                        fits++;
+                    }
+                    objCount = fits;
+                }
+                WriteU16(buf, (ushort)objCount);
+                for (int j = 0; j < objCount; j++)
+                {
+                    var obj = objs[j];
+                    WriteString(buf, obj.Name);
+                    WriteU16(buf, (ushort)Math.Clamp(obj.InputIndex, 0, ushort.MaxValue));
+                    WriteU16(buf, (ushort)Math.Clamp(obj.Offset, 0, ushort.MaxValue));
+                    WriteU32(buf, (uint)obj.ObjectType);
+                    buf.AddRange(obj.ObjectTypeGuid.ToByteArray());
+                }
+            }
+
+            buf.AddRange(tail);
+            return buf.ToArray();
+        }
+
+        /// <summary>The v1 record for each device, after the count byte.</summary>
+        private static int WriteBasicRecords(List<byte> buf, IReadOnlyList<RemotePeerDeviceInfo> devices)
+        {
+            int count = Math.Min(devices.Count, 255);
+            buf.Add((byte)count);
+            for (int i = 0; i < count; i++)
+            {
+                var d = devices[i];
+                buf.Add(d.Slot);
+                WriteString(buf, d.PeerLocalDeviceId);
+                WriteString(buf, d.Name);
+                WriteU16(buf, d.VendorId);
+                WriteU16(buf, d.ProductId);
+                buf.Add((byte)Math.Clamp(d.NumAxes, 0, 255));
+                buf.Add((byte)Math.Clamp(d.NumButtons, 0, 255));
+                buf.Add((byte)Math.Clamp(d.NumHats, 0, 255));
+                byte caps = 0;
+                if (d.HasRumble) caps |= 1;
+                if (d.HasRumbleTriggers) caps |= 2;
+                if (d.HasGyro) caps |= 4;
+                if (d.HasAccel) caps |= 8;
+                if (d.HasTouchpad) caps |= 16;
+                if (d.HasHaptic) caps |= 32;
+                if (d.Online) caps |= 64;
+                // Bit 128 (issue #199) EXHAUSTS this byte: the next capability
+                // needs a wire-format extension, not another bit.
+                if (d.HasAccelAux) caps |= 128;
+                buf.Add(caps);
+                WriteU16(buf, (ushort)d.InputDeviceType);
+            }
+            return count;
+        }
+
+        /// <summary>The v1 records alone, for a peer older than 3.6.0: the
+        /// metadata extension and every tail came with or after the 64 KB
+        /// receive buffer, and such a peer parses none of them, so the list it
+        /// can read is the records.</summary>
+        internal static byte[] EncodeBasicDeviceList(IReadOnlyList<RemotePeerDeviceInfo> devices)
+        {
+            var buf = new List<byte>();
+            WriteBasicRecords(buf, devices);
+            return buf.ToArray();
+        }
+
+        /// <summary>The device-list tails v2 to v8, in order. Every one of
+        /// them follows the metadata extension, whose named objects are
+        /// budgeted around their size.</summary>
+        private static List<byte> EncodeTails(IReadOnlyList<RemotePeerDeviceInfo> devices, int count,
+            string localMachineName)
+        {
+            var tail = new List<byte>();
+            // v2 tail: raw HID button count per device (one byte, always fits
+            // the datagram budget). Lets the consumer offer the extra native
+            // buttons past the 22 standardized gamepad slots in its picker.
+            tail.Add(DeviceListExtV2Magic);
+            for (int i = 0; i < count; i++)
+                tail.Add((byte)Math.Clamp(devices[i].RawButtonCount, 0, 255));
+
+            // v3 tail: the post-exhaustion capability byte (one per device).
+            tail.Add(DeviceListExtV3Magic);
+            for (int i = 0; i < count; i++)
+            {
+                byte caps2 = 0;
+                if (devices[i].HasNfcReader) caps2 |= 1;
+                // Bit 1 (issue #252): the aux gyro. Without it a remote
+                // Joy-Con pair's left-half gyro sources stay hidden, the
+                // same discoverability hole bit 0 closed for the reader.
+                if (devices[i].HasGyroAux) caps2 |= 2;
+                // Bit 2 (#193 over the wire): the generic-extra-axes flag. Its
+                // count rides the v4 tail; this is the half a consumer cannot
+                // compute, since the flag excludes sensor-surfaced extras.
+                if (devices[i].HasExtraGenericAxes) caps2 |= 4;
+                if (devices[i].TouchpadPressureSupported.HasValue) caps2 |= 8;
+                if (devices[i].TouchpadPressureSupported == true) caps2 |= 16;
+                if (devices[i].TouchpadClickSupported.HasValue) caps2 |= 32;
+                if (devices[i].TouchpadClickSupported == true) caps2 |= 64;
+                tail.Add(caps2);
+            }
+
+            // v4 tail: raw HID axis count per device. Twin of the v2 tail.
+            tail.Add(DeviceListExtV4Magic);
+            for (int i = 0; i < count; i++)
+                tail.Add((byte)Math.Clamp(devices[i].RawAxisCount, 0, 255));
+
+            // v5 tail: this machine's name, so the peer can label our devices
+            // no matter how it found us.
+            tail.Add(DeviceListExtV5Magic);
+            WriteString(tail, localMachineName ?? SafeMachineName());
+
+            // v6 tail: the real supported-button set per device.
+            tail.Add(DeviceListExtV6Magic);
+            for (int i = 0; i < count; i++)
+                WriteButtonMask(tail, devices[i]);
+
+            // v7 tail: supported axes + SDL GUID.
+            tail.Add(DeviceListExtV7Magic);
+            for (int i = 0; i < count; i++)
+            {
+                WriteIndexMask(tail, devices[i].SupportedAxisIndices,
+                    Math.Max(devices[i].RawAxisCount, devices[i].NumAxes));
+                WriteString(tail, devices[i].SdlGuid ?? "");
+            }
+
+            // v8 tail: which of those sets were empty on purpose.
+            tail.Add(DeviceListExtV8Magic);
+            for (int i = 0; i < count; i++)
+            {
+                byte empties = 0;
+                if (IsExplicitlyEmpty(devices[i].SupportedButtonIndices,
+                        Math.Max(devices[i].RawButtonCount, devices[i].NumButtons)))
+                    empties |= 1;
+                if (IsExplicitlyEmpty(devices[i].SupportedAxisIndices,
+                        Math.Max(devices[i].RawAxisCount, devices[i].NumAxes)))
+                    empties |= 2;
+                tail.Add(empties);
+            }
+
+            return tail;
+        }
+
+        /// <summary>The v9 tail, the owner's analog key order for the rows
+        /// that carry one, or nothing when none does.</summary>
+        private static List<byte> EncodeKeyOrderTail(IReadOnlyList<RemotePeerDeviceInfo> devices, int count)
+        {
+            var tail = new List<byte>();
+            int orders = 0;
+            for (int i = 0; i < count; i++)
+                if (devices[i].AnalogKeyOrder != null) orders++;
+            if (orders == 0) return tail;
+            tail.Add(DeviceListExtV9Magic);
+            tail.Add((byte)orders);
+            for (int i = 0; i < count; i++)
+            {
+                if (devices[i].AnalogKeyOrder == null) continue;
+                var codes = WireKeyOrder(devices[i].AnalogKeyOrder);
+                tail.Add((byte)i);
+                WriteU16(tail, (ushort)codes.Count);
+                foreach (int code in codes) WriteU16(tail, (ushort)code);
+            }
+            return tail;
+        }
+
+        /// <summary>The v10 tail, the rest mask of each Bliss-Box port read
+        /// raw, or nothing when no row carries one.</summary>
+        private static List<byte> EncodeRestMaskTail(IReadOnlyList<RemotePeerDeviceInfo> devices, int count)
+        {
+            var tail = new List<byte>();
+            int masks = 0;
+            for (int i = 0; i < count; i++)
+                if (devices[i].BlissBoxRestMask.HasValue) masks++;
+            if (masks == 0) return tail;
+            tail.Add(DeviceListExtV10Magic);
+            tail.Add((byte)masks);
+            for (int i = 0; i < count; i++)
+            {
+                if (devices[i].BlissBoxRestMask is not byte mask) continue;
+                tail.Add((byte)i);
+                tail.Add(mask);
+            }
+            return tail;
+        }
+
+        /// <summary>The v11 tail, the owner's DualShock 3 identities, or
+        /// nothing when no row carries one.</summary>
+        /// <summary>Which of the v10, v11 and v9 tails fit in
+        /// <paramref name="budget"/> after <paramref name="required"/> bytes,
+        /// taken in that order, and the bytes they add.</summary>
+        private static (bool Masks, bool Identities, bool KeyOrders, int Bytes) FitOptionalTails(
+            int required, int budget, int masks, int identities, int keyOrders)
+        {
+            bool m = masks > 0 && required + masks <= budget;
+            if (m) required += masks;
+            bool id = identities > 0 && required + identities <= budget;
+            if (id) required += identities;
+            bool k = keyOrders > 0 && required + keyOrders <= budget;
+            return (m, id, k, (m ? masks : 0) + (id ? identities : 0) + (k ? keyOrders : 0));
+        }
+
+        private static List<byte> EncodeDs3IdentityTail(IReadOnlyList<RemotePeerDeviceInfo> devices, int count)
+        {
+            var tail = new List<byte>();
+            int ids = 0;
+            for (int i = 0; i < count; i++)
+                if (IsWireIdentity(devices[i].Ds3Identity)) ids++;
+            if (ids == 0) return tail;
+            tail.Add(DeviceListExtV11Magic);
+            tail.Add((byte)ids);
+            for (int i = 0; i < count; i++)
+            {
+                if (!IsWireIdentity(devices[i].Ds3Identity)) continue;
+                tail.Add((byte)i);
+                WriteString(tail, devices[i].Ds3Identity);
+            }
+            return tail;
+        }
+
+        private static bool IsWireIdentity(string identity)
+            => !string.IsNullOrEmpty(identity) && identity.Length <= MaxDs3IdentityLength;
+
+        /// <summary>A device's metadata section without its objects: the
+        /// serial string, the touchpad count, one finger count per touchpad,
+        /// and the object count.</summary>
+        private static int MandatoryMetadataBytes(RemotePeerDeviceInfo d)
+            => 2 + Math.Min(Encoding.UTF8.GetByteCount(d.SerialNumber ?? ""), ushort.MaxValue)
+               + 1 + Math.Clamp(d.NumTouchpads, 0, 255) + 2;
+
+        /// <summary>An analog key order as the v9 tail carries it: the codes
+        /// an AnalogKeyInputState can hold, each once, in the owner's order.
+        /// The decoder refuses the whole tail over one code outside that range
+        /// or one repeated.</summary>
+        private static List<int> WireKeyOrder(int[] order)
+        {
+            var codes = new List<int>(order.Length);
+            var seen = new HashSet<int>();
+            foreach (int code in order)
+                if (code > 0 && code < AnalogKeyInputState.CodeCount && seen.Add(code))
+                    codes.Add(code);
+            return codes;
+        }
+
+        internal static List<RemotePeerDeviceInfo> DecodeDeviceList(byte[] data)
+            => DecodeDeviceList(data, out _);
+
+        /// <summary>This PC's name for the v5 tail. Never throws.</summary>
+        internal static string SafeMachineName()
+        {
+            try { return Environment.MachineName ?? ""; } catch { return ""; }
+        }
+
+        internal static List<RemotePeerDeviceInfo> DecodeDeviceList(byte[] data, out string peerMachineName)
+            => DecodeDeviceList(data, out peerMachineName, out _);
+
+        /// <summary>Also reports whether the metadata extension followed the
+        /// v1 records. It and the 64 KB receive buffer both first shipped in
+        /// 3.6.0 (e6ed7b0e, 872a92a7), so a sender that writes it reads a full
+        /// list, and one that does not reads 4 KB and the records alone.</summary>
+        internal static List<RemotePeerDeviceInfo> DecodeDeviceList(byte[] data, out string peerMachineName,
+            out bool readsFullLists)
+        {
+            peerMachineName = null;
+            readsFullLists = false;
+            var list = new List<RemotePeerDeviceInfo>();
+            int o = 0;
+            int count = data[o++];
+            for (int i = 0; i < count; i++)
+            {
+                byte slot = data[o++];
+                var info = new RemotePeerDeviceInfo
+                {
+                    Slot = slot,
+                    PeerLocalDeviceId = ReadString(data, ref o),
+                    Name = ReadString(data, ref o),
+                    VendorId = ReadU16(data, ref o),
+                    ProductId = ReadU16(data, ref o),
+                    NumAxes = data[o++],
+                    NumButtons = data[o++],
+                    NumHats = data[o++],
+                };
+                byte caps = data[o++];
+                info.HasRumble = (caps & 1) != 0;
+                info.HasRumbleTriggers = (caps & 2) != 0;
+                info.HasGyro = (caps & 4) != 0;
+                info.HasAccel = (caps & 8) != 0;
+                info.HasTouchpad = (caps & 16) != 0;
+                info.HasHaptic = (caps & 32) != 0;
+                info.Online = (caps & 64) != 0;
+                info.HasAccelAux = (caps & 128) != 0;
+                info.InputDeviceType = ReadU16(data, ref o);
+                list.Add(info);
+            }
+
+            // Metadata extension: absent from an old sender's payload, and a
+            // malformed tail must not cost the already-decoded v1 records, so
+            // any parse failure falls back to the v1 result (the consumer then
+            // synthesizes generic objects exactly as it did before).
+            bool v1ExtOk = false;
+            readsFullLists = o < data.Length && data[o] == DeviceListExtMagic;
+            try
+            {
+                if (readsFullLists)
+                {
+                    o++;
+                    for (int i = 0; i < count; i++)
+                    {
+                        var info = list[i];
+                        info.SerialNumber = ReadString(data, ref o);
+                        int pads = data[o++];
+                        var fingers = pads > 0 ? new int[pads] : Array.Empty<int>();
+                        for (int p = 0; p < pads; p++) fingers[p] = data[o++];
+                        info.NumTouchpads = pads;
+                        info.TouchpadFingerCounts = fingers;
+                        int objCount = ReadU16(data, ref o);
+                        // Sanity-bound the allocation against what the payload
+                        // can actually hold (>= 26 bytes per object): a count
+                        // the bytes cannot back is malformed, fail to the
+                        // v1 fallback below rather than allocating for it.
+                        if (objCount > (data.Length - o) / 26 + 1)
+                            throw new InvalidOperationException("object count exceeds payload");
+                        if (objCount > 0)
+                        {
+                            var objs = new DeviceObjectItem[objCount];
+                            for (int j = 0; j < objCount; j++)
+                            {
+                                var obj = new DeviceObjectItem
+                                {
+                                    Name = ReadString(data, ref o),
+                                    InputIndex = ReadU16(data, ref o),
+                                    Offset = ReadU16(data, ref o),
+                                    ObjectType = (DeviceObjectTypeFlags)ReadU32(data, ref o),
+                                };
+                                obj.ObjectTypeGuid = new Guid(data.AsSpan(o, 16)); o += 16;
+                                objs[j] = obj;
+                            }
+                            info.DeviceObjects = objs;
+                        }
+                    }
+                    v1ExtOk = true;
+                }
+            }
+            catch
+            {
+                // The documented contract: a malformed extension tail costs
+                // nothing but the metadata. Reset EVERY extension-carried
+                // field on EVERY record, or a mid-record throw leaves garbage
+                // (a string byte read as a touchpad count) half-applied.
+                foreach (var info in list)
+                {
+                    info.SerialNumber = "";
+                    info.NumTouchpads = 0;
+                    info.TouchpadFingerCounts = null;
+                    info.DeviceObjects = null;
+                }
+            }
+
+            // v2 tail (raw button counts). Only reachable once the v1 tail
+            // parsed cleanly, since a v1 throw leaves the cursor unreliable.
+            // Its own try/catch so a malformed v2 tail costs only the counts.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV2Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                            list[i].RawButtonCount = data[o++];
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list)
+                        info.RawButtonCount = 0;
+                    v1ExtOk = false;   // cursor unreliable: do not read v3
+                }
+            }
+
+            // v3 tail (post-exhaustion capability byte). Same gating as v2:
+            // only after a clean v1 (and v2) parse, own try/catch, and an old
+            // peer that stops earlier simply leaves these flags false.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV3Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                        {
+                            byte caps2 = data[o++];
+                            list[i].HasNfcReader = (caps2 & 1) != 0;
+                            list[i].HasGyroAux = (caps2 & 2) != 0;
+                            list[i].HasExtraGenericAxes = (caps2 & 4) != 0;
+                            list[i].TouchpadPressureSupported = (caps2 & 8) != 0 ? (caps2 & 16) != 0 : null;
+                            list[i].TouchpadClickSupported = (caps2 & 32) != 0 ? (caps2 & 64) != 0 : null;
+                        }
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list)
+                    {
+                        info.HasNfcReader = false;
+                        info.HasGyroAux = false;
+                        info.HasExtraGenericAxes = false;
+                        info.TouchpadPressureSupported = null;
+                        info.TouchpadClickSupported = null;
+                    }
+                    // Cursor unreliable: do not read v4. The v2 catch has
+                    // always done this; v3's did not need to until a tail was
+                    // appended after it.
+                    v1ExtOk = false;
+                }
+            }
+
+            // v4 tail (raw axis counts). Same gating and same guarantees as
+            // v2: only after a clean parse of everything before it, its own
+            // try/catch, and an old peer that stops earlier simply leaves the
+            // counts at 0, which the field documents as "same as NumAxes".
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV4Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                            list[i].RawAxisCount = data[o++];
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list)
+                        info.RawAxisCount = 0;
+                    v1ExtOk = false; // cursor unreliable: do not read v5
+                }
+            }
+
+            // v5 tail: the sender's machine name. Its own guard; absence just
+            // means an older peer and the label falls back to whatever LAN
+            // discovery may have recorded.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV5Magic)
+                    {
+                        o++;
+                        var nm = ReadString(data, ref o);
+                        if (!string.IsNullOrWhiteSpace(nm)) peerMachineName = nm.Trim();
+                    }
+                }
+                catch { peerMachineName = null; v1ExtOk = false; }
+            }
+
+            // v6 tail: the owner's real supported-button set. Its own guard.
+            // Absence (an older peer) leaves the field null and the consumer
+            // falls back to the dense range it always used.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV6Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                            list[i].SupportedButtonIndices = ReadButtonMask(data, ref o);
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list) info.SupportedButtonIndices = null;
+                    v1ExtOk = false; // cursor unreliable: do not read v7
+                }
+            }
+
+            // v7 tail: supported axes + SDL GUID. Its own guard, same as every
+            // tail before it; an older peer leaves both at their defaults.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV7Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                        {
+                            list[i].SupportedAxisIndices = ReadIndexMask(data, ref o);
+                            list[i].SdlGuid = ReadString(data, ref o);
+                        }
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list)
+                    {
+                        info.SupportedAxisIndices = null;
+                        info.SdlGuid = null;
+                    }
+                    v1ExtOk = false; // cursor unreliable: do not read v8
+                }
+            }
+
+            // v8 tail: the explicit-empty flags for the two sets above. Its own
+            // guard. An older peer stops before it, which leaves both sets
+            // reading dense exactly as they did before the tail existed.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV8Magic)
+                    {
+                        o++;
+                        for (int i = 0; i < count; i++)
+                        {
+                            byte empties = data[o++];
+                            if ((empties & 1) != 0) list[i].SupportedButtonIndices = Array.Empty<int>();
+                            if ((empties & 2) != 0) list[i].SupportedAxisIndices = Array.Empty<int>();
+                        }
+                    }
+                }
+                catch
+                {
+                    // Undo a half-applied tail rather than leave a device
+                    // claiming it has no controls on the strength of a
+                    // truncated byte. Back to dense, which is what every peer
+                    // without this tail already gets.
+                    foreach (var info in list)
+                    {
+                        if (info.SupportedButtonIndices is { Length: 0 })
+                            info.SupportedButtonIndices = null;
+                        if (info.SupportedAxisIndices is { Length: 0 })
+                            info.SupportedAxisIndices = null;
+                    }
+                    v1ExtOk = false; // cursor unreliable: do not read v9
+                }
+            }
+
+            // v9 tail: analog key orders. Parsed whole before any row takes
+            // one, so a malformed record costs every order and nothing else,
+            // and a peer that stops earlier leaves them null (the catalog).
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV9Magic)
+                    {
+                        o++;
+                        int records = data[o++];
+                        var orders = new int[count][];
+                        for (int r = 0; r < records; r++)
+                        {
+                            int index = data[o++];
+                            if (index >= count || orders[index] != null)
+                                throw new InvalidOperationException("analog key order record");
+                            int keys = ReadU16(data, ref o);
+                            if (keys >= AnalogKeyInputState.CodeCount || keys * 2 > data.Length - o)
+                                throw new InvalidOperationException("analog key order length");
+                            var order = new int[keys];
+                            var seen = new HashSet<int>();
+                            for (int k = 0; k < keys; k++)
+                            {
+                                int code = ReadU16(data, ref o);
+                                if (code <= 0 || code >= AnalogKeyInputState.CodeCount || !seen.Add(code))
+                                    throw new InvalidOperationException("analog key code");
+                                order[k] = code;
+                            }
+                            orders[index] = order;
+                        }
+                        for (int i = 0; i < count; i++)
+                            if (orders[i] != null) list[i].AnalogKeyOrder = orders[i];
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list) info.AnalogKeyOrder = null;
+                    v1ExtOk = false; // cursor unreliable: do not read v10
+                }
+            }
+
+            // v10 tail: Bliss-Box rest masks. Same guarantees as v9.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV10Magic)
+                    {
+                        o++;
+                        int records = data[o++];
+                        var masks = new byte?[count];
+                        for (int r = 0; r < records; r++)
+                        {
+                            int index = data[o++];
+                            if (index >= count || masks[index] != null)
+                                throw new InvalidOperationException("rest mask record");
+                            masks[index] = data[o++];
+                        }
+                        for (int i = 0; i < count; i++)
+                            if (masks[i] != null) list[i].BlissBoxRestMask = masks[i];
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list) info.BlissBoxRestMask = null;
+                    v1ExtOk = false; // cursor unreliable: do not read v11
+                }
+            }
+
+            // v11 tail: DualShock 3 identities. Same guarantees as v9.
+            if (v1ExtOk)
+            {
+                try
+                {
+                    if (o < data.Length && data[o] == DeviceListExtV11Magic)
+                    {
+                        o++;
+                        int records = data[o++];
+                        var ids = new string[count];
+                        for (int r = 0; r < records; r++)
+                        {
+                            int index = data[o++];
+                            if (index >= count || ids[index] != null)
+                                throw new InvalidOperationException("ds3 identity record");
+                            string id = ReadString(data, ref o);
+                            if (!IsWireIdentity(id))
+                                throw new InvalidOperationException("ds3 identity");
+                            ids[index] = id;
+                        }
+                        for (int i = 0; i < count; i++)
+                            if (ids[i] != null) list[i].Ds3Identity = ids[i];
+                    }
+                }
+                catch
+                {
+                    foreach (var info in list) info.Ds3Identity = null;
+                }
+            }
+            return list;
+        }
+
+        /// <summary>Writes a device's supported-button set as a compact
+        /// bitmask, or a single 0 byte when the set is dense (which is the
+        /// common case for everything that is not an SDL gamepad).</summary>
+        private static void WriteButtonMask(List<byte> buf, RemotePeerDeviceInfo d)
+            => WriteIndexMask(buf, d.SupportedButtonIndices, Math.Max(d.RawButtonCount, d.NumButtons));
+
+        /// <summary>Writes a sparse index set as a compact bitmask, or a single
+        /// 0 byte when the set is dense (the common case for anything that is
+        /// not an SDL gamepad, which keeps a 256-key keyboard at one byte
+        /// instead of thirty-two).</summary>
+        private static void WriteIndexMask(List<byte> buf, int[] idx, int dense)
+        {
+            if (idx == null || idx.Length == 0 || idx.Length == dense)
+            {
+                buf.Add(0); // dense
+                return;
+            }
+            int highest = 0;
+            foreach (int i in idx) if (i > highest) highest = i;
+            int maskLen = Math.Min((highest / 8) + 1, 255);
+            var mask = new byte[maskLen];
+            foreach (int i in idx)
+            {
+                int by = i / 8;
+                if (by < maskLen) mask[by] |= (byte)(1 << (i % 8));
+            }
+            buf.Add((byte)maskLen);
+            buf.AddRange(mask);
+        }
+
+        /// <summary>True when a supported-index set says the device has NONE
+        /// of that control, rather than saying nothing (null) or saying it has
+        /// them all. WriteIndexMask spells all three as one 0 byte, so the v8
+        /// tail carries this bit to tell the first case from the other two.
+        /// A device whose dense count is zero is not "explicitly empty": empty
+        /// and dense agree there, and the flag would cost a byte to say
+        /// nothing.</summary>
+        private static bool IsExplicitlyEmpty(int[] idx, int dense)
+            => idx != null && idx.Length == 0 && dense > 0;
+
+        private static int[] ReadIndexMask(byte[] data, ref int o) => ReadButtonMask(data, ref o);
+
+        private static int[] ReadButtonMask(byte[] data, ref int o)
+        {
+            int maskLen = data[o++];
+            if (maskLen == 0) return null; // dense: consumer keeps its fallback
+            var list = new List<int>();
+            for (int by = 0; by < maskLen; by++)
+            {
+                byte m = data[o++];
+                for (int bit = 0; bit < 8; bit++)
+                    if ((m & (1 << bit)) != 0) list.Add(by * 8 + bit);
+            }
+            return list.ToArray();
+        }
+
+        private static void WriteString(List<byte> buf, string s)
+        {
+            byte[] b = Encoding.UTF8.GetBytes(s ?? "");
+            // The payload must match the u16 prefix exactly: writing the full
+            // array past a clamped prefix desyncs every field after this string.
+            int len = Math.Min(b.Length, ushort.MaxValue);
+            WriteU16(buf, (ushort)len);
+            buf.AddRange(new ArraySegment<byte>(b, 0, len));
+        }
+
+        private static string ReadString(byte[] data, ref int o)
+        {
+            int len = ReadU16(data, ref o);
+            string s = Encoding.UTF8.GetString(data, o, len);
+            o += len;
+            return s;
+        }
+
+        private static void WriteU16(List<byte> buf, ushort v)
+        {
+            buf.Add((byte)(v & 0xFF));
+            buf.Add((byte)(v >> 8));
+        }
+
+        private static ushort ReadU16(byte[] data, ref int o)
+        {
+            ushort v = (ushort)(data[o] | (data[o + 1] << 8));
+            o += 2;
+            return v;
+        }
+
+        private static void WriteU32(List<byte> buf, uint v)
+        {
+            buf.Add((byte)(v & 0xFF));
+            buf.Add((byte)((v >> 8) & 0xFF));
+            buf.Add((byte)((v >> 16) & 0xFF));
+            buf.Add((byte)(v >> 24));
+        }
+
+        private static uint ReadU32(byte[] data, ref int o)
+        {
+            uint v = (uint)(data[o] | (data[o + 1] << 8) | (data[o + 2] << 16) | (data[o + 3] << 24));
+            o += 4;
+            return v;
+        }
+    }
+}

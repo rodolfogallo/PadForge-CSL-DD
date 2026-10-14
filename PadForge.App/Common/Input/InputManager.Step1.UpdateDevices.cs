@@ -1,0 +1,3974 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using PadForge.Engine;
+using PadForge.Engine.Data;
+using PadForge.Resources.Strings;
+using SDL3;
+using static SDL3.SDL;
+
+namespace PadForge.Common.Input
+{
+    public partial class InputManager
+    {
+        // ─────────────────────────────────────────────
+        //  Step 1: UpdateDevices
+        //  Enumerates SDL joystick, keyboard, and mouse devices,
+        //  opens newly connected devices, marks disconnected devices as offline.
+        //
+        //  All controllers (including Xbox/XInput) are handled via SDL3.
+        //  PadForge's own virtual controllers (HIDMaestro in v3, plus any
+        //  v2 ViGEm residue) are detected and filtered out.
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// SDL instance IDs that we have already opened (joysticks), each with
+        /// the wrapper opened for it. Used to detect new vs. already-known
+        /// devices. The wrapper reference lets the disconnect sweep dispose an
+        /// orphan whose UserDevice no longer points at it (UI Remove, or a
+        /// replug rebind that swapped ud.Device to a fresh wrapper) instead of
+        /// leaving its SDL handles to the GC finalizer racing the poll loop.
+        /// SDL3: instance IDs are uint (0 = invalid).
+        /// </summary>
+        private readonly Dictionary<uint, SdlDeviceWrapper> _openedSdlInstanceIds = new Dictionary<uint, SdlDeviceWrapper>();
+
+        // SDL instance IDs identified as OUR OWN HM virtuals and rejected
+        // by the self-readback guard. Kept so each enumeration pass skips
+        // them instead of re-opening and re-probing every 2 s. Cleared
+        // implicitly on process restart. SDL instance IDs are unique per
+        // connection so a REAL device never inherits a suppressed id.
+        private readonly HashSet<uint> _suppressedSelfVirtualIds = new();
+
+        /// <summary>
+        /// First-observed tick (UTC) per SDL instance ID for which the
+        /// device has either vanished from SDL_GetJoysticks or reported
+        /// IsAttached=false. Used by Phase 2 to debounce transient drops.
+        /// The xinputhid slot-assignment pass during virtual creation can
+        /// briefly make a physical controller look disconnected on one
+        /// poll cycle. Calling MarkDeviceOffline on that first cycle nulls
+        /// out ud.Device and freezes the Devices-page preview (S2 violation).
+        /// We only mark offline after the device has been missing for the
+        /// full debounce window.
+        /// </summary>
+        private readonly Dictionary<uint, DateTime> _sdlDisconnectCandidateSince = new();
+
+        /// <summary>Debounce window in ms before a transient SDL drop is treated
+        /// as a real disconnect. Chosen to be longer than the worst-case
+        /// xinputhid reshuffle that a HIDMaestro virtual creation can induce
+        /// on a coexisting physical Xbox (observed up to a few hundred ms on
+        /// a BT-paired Series controller), short enough that a real unplug
+        /// / pair-disconnect still surfaces to the UI quickly.</summary>
+        private const int SdlDisconnectDebounceMs = 2000;
+
+        // Keyboard/mouse tracking moved to _openedKeyboardHandles / _openedMouseHandles
+        // (Raw Input IntPtr handles instead of SDL uint IDs).
+
+        // ── Async Raw Input enumeration ──
+        // Raw Input keyboard/mouse enumeration is expensive (CreateFile +
+        // HidD_GetAttributes + registry per device). Running it off the
+        // polling thread eliminates the ~2-5ms spike every 2 seconds.
+        private volatile bool _rawInputEnumPending;
+        private volatile bool _rawInputEnumRunning;
+        private RawInputListener.DeviceInfo[] _cachedKeyboards;
+        private RawInputListener.DeviceInfo[] _cachedMice;
+        private RawInputListener.DeviceInfo[] _cachedConsumerControls;
+        private readonly object _rawInputCacheLock = new object();
+
+        /// <summary>
+        /// Step 1: Enumerate all connected SDL joystick devices.
+        ///
+        /// SDL3 change: uses SDL_GetJoysticks() returning an array of instance IDs
+        /// instead of SDL_NumJoysticks() + device-index-based enumeration.
+        ///
+        /// For each device found by SDL:
+        ///   - If not yet opened: open it, create/update a UserDevice record, mark online
+        ///   - If already opened: verify it's still attached
+        ///
+        /// For each previously opened device not found in current enumeration:
+        ///   - Mark offline, close SDL handle
+        ///
+        /// Fires <see cref="DevicesUpdated"/> if the device list changed.
+        /// </summary>
+        private void UpdateDevices()
+        {
+            if (!_sdlInitialized)
+                return;
+
+            // No wait for App.OrphanSweepTask. The SDL3 fork filters
+            // HIDMaestro HIDs out of enumeration whether or not the prior
+            // session's kernel cleanup has finished, so we can enumerate
+            // immediately. Blocking the polling thread on the sweep was
+            // what pinned startup at 90+ seconds when stale virtuals
+            // lingered from a force-killed previous session.
+
+            bool changed = false;
+
+            // SDL3: Get array of instance IDs for all connected joysticks.
+            uint[] joystickIds = SDL_GetJoysticks();
+
+            // Build a set of instance IDs currently visible to SDL.
+            var currentInstanceIds = new HashSet<uint>(joystickIds);
+
+            // --- Phase 1: Open newly connected devices ---
+            foreach (uint instanceId in joystickIds)
+            {
+                try
+                {
+                    // Skip devices we already have open (by SDL instance ID).
+                    // This is more reliable than GUID matching because serial-based
+                    // GUIDs aren't available until after the device is opened.
+                    if (_openedSdlInstanceIds.ContainsKey(instanceId))
+                        continue;
+
+                    // Previously rejected self-virtual: don't reopen it on
+                    // every enumeration pass.
+                    if (_suppressedSelfVirtualIds.Contains(instanceId))
+                        continue;
+
+                    // Open the device by instance ID. The SDL3 fork already
+                    // dropped HIDMaestro HIDs from hid_enumerate, and the
+                    // OpenXInput fork's xinput1_4.dll never gives a HIDMaestro
+                    // XUSB interface an XInput slot, so an instance ID that
+                    // reaches here should be a real device. The self-readback
+                    // guard below catches the ones that slip past both.
+                    var wrapper = new SdlDeviceWrapper();
+                    if (!wrapper.Open(instanceId))
+                    {
+                        wrapper.Dispose();
+                        continue;
+                    }
+
+                    // Self-readback guard (2026-07-20): PadForge must NEVER
+                    // open its own HM virtuals. The fork-side enumeration
+                    // filter and the cloak both exist, but a driver upgrade
+                    // recreates the virtual devnodes with fresh instance
+                    // paths and can slip past both (observed live: the SDL
+                    // switch driver then FIGHTS the virtual Switch Pro's
+                    // protocol responder, cyclically resetting its inputs
+                    // and interleaving rumble). Coverage is narrower than
+                    // it looks: SDL's HIDAPI drivers overwrite the hid-level
+                    // "HM-CTL-<n>" serial with the fabricated MAC during
+                    // their identity handshake, and non-Xbox virtuals'
+                    // interface paths carry no HIDMAESTRO marker (the fork
+                    // filter reads DEVPKEY hardware IDs for that reason).
+                    // So this guard catches failed-handshake and
+                    // serial-preserving cases only. The fork enumeration
+                    // filter remains the primary defense, and the XInput
+                    // backend leak (no serial, no path marker) is out of
+                    // scope here entirely.
+                    bool selfVirtual =
+                        (wrapper.SerialNumber != null
+                         && wrapper.SerialNumber.StartsWith("HM-CTL-", StringComparison.Ordinal))
+                        || (wrapper.DevicePath != null
+                            && wrapper.DevicePath.IndexOf("HIDMAESTRO", StringComparison.OrdinalIgnoreCase) >= 0)
+                        // Composite personas (HM v1.4.0) ride the real USB
+                        // stack and carry neither marker. Their one
+                        // discriminator is usbip2_ude ancestry. Sony VID
+                        // only, the sole composite vendor today.
+                        || (wrapper.VendorId == 0x054C && IsOnUsbipVhci(wrapper.DevicePath));
+                    if (selfVirtual)
+                    {
+                        Engine.SdlDiagLog.WriteLine(
+                            $"DEV self-virtual suppressed SDL#{instanceId} {wrapper.VendorId:X4}:{wrapper.ProductId:X4} serial={wrapper.SerialNumber}");
+                        _suppressedSelfVirtualIds.Add(instanceId);
+                        wrapper.Dispose();
+                        continue;
+                    }
+
+                    Debug.WriteLine($"[Step1] Accepted device: SDL#{instanceId} VID={wrapper.VendorId:X4} PID={wrapper.ProductId:X4} path={wrapper.DevicePath} name={wrapper.Name}");
+                    Engine.SdlDiagLog.WriteLine($"DEV + SDL#{instanceId} {wrapper.VendorId:X4}:{wrapper.ProductId:X4} {wrapper.Name} backend={wrapper.Backend} type={wrapper.JoystickType} path={wrapper.DevicePath}");
+                    if (FlydigiServiceWatch.IsFlydigiDevice(wrapper.VendorId, wrapper.ProductId))
+                    {
+                        // #395: the one party PadForge cannot see is Flydigi's
+                        // service, so every arrival records whether it runs and
+                        // whether it can reach this pad (hiding inactive, or
+                        // whitelisted), beside SDL's own driver-outcome line.
+                        FlydigiServiceWatch.Refresh();
+                        _flydigiWatchTick = Environment.TickCount64;
+                        Engine.SdlDiagLog.WriteLine(FlydigiServiceWatch.DescribeArrival(
+                            wrapper.VendorId, wrapper.ProductId, instanceId, wrapper.Backend, wrapper.DevicePath,
+                            FlydigiServiceWatch.Detail,
+                            HidHideController.DescribeReach("SpaceStationService.exe", "GameControllerService.exe")));
+                    }
+
+                    UserDevice ud = FindOrCreateUserDevice(wrapper.InstanceGuid, wrapper.ProductGuid,
+                        currentInstanceIds, wrapper.SerialNumber);
+
+                    // Same-serial twin (owner-approved 2026-07-25): the
+                    // resolver bound this connection to a row whose
+                    // identity differs from the wrapper's serial-derived
+                    // GUID (an adopted or rebound twin row keeping its
+                    // persisted identity, or a first-ever minted one).
+                    // The wrapper must carry that identity BEFORE
+                    // LoadFromSdlDevice, which stamps the row's
+                    // InstanceGuid from the wrapper.
+                    if (ud.InstanceGuid != wrapper.InstanceGuid)
+                        wrapper.OverrideInstanceGuid(ud.InstanceGuid);
+
+                    // Populate from the SDL device.
+                    ud.LoadFromSdlDevice(wrapper);
+                    ud.IsOnline = true;
+                    // A DualShock 3's gyro calibration names the pad (#474).
+                    Ds3UnitIdentity.Prime(ud);
+
+                    // Track the SDL instance ID with its wrapper.
+                    _openedSdlInstanceIds[wrapper.SdlInstanceId] = wrapper;
+
+                    MarkChanged(ref changed);
+                }
+                catch (Exception ex)
+                {
+                    RaiseError($"Error opening device (instance {instanceId})", ex);
+                }
+            }
+
+            // --- Phase 1b/1c: Consume cached keyboard/mouse results ---
+            // Raw Input enumeration runs on a background thread to avoid
+            // blocking the polling loop with expensive CreateFile/HID I/O.
+            // On the first cycle, run synchronously so devices are available
+            // immediately at startup.
+            if (_cachedKeyboards == null)
+            {
+                // First call runs synchronous so devices are ready before Step 2.
+                _cachedKeyboards = RawInputListener.EnumerateKeyboards();
+                _cachedMice = RawInputListener.EnumerateMice();
+                _cachedConsumerControls = RawInputListener.EnumerateConsumerControls();
+                _rawInputEnumPending = true;
+            }
+
+            if (_rawInputEnumPending)
+            {
+                RawInputListener.DeviceInfo[] keyboards, mice, consumers;
+                lock (_rawInputCacheLock)
+                {
+                    keyboards = _cachedKeyboards;
+                    mice = _cachedMice;
+                    consumers = _cachedConsumerControls;
+                    _rawInputEnumPending = false;
+                }
+
+                changed |= EnumerateKeyboards(keyboards);
+                changed |= EnumerateMice(mice);
+                changed |= EnumerateConsumerControls(consumers);
+                changed |= DetectDisconnectedHandles(_openedKeyboardHandles, keyboards);
+                changed |= DetectDisconnectedHandles(_openedMouseHandles, mice);
+                changed |= DetectDisconnectedHandles(_openedConsumerHandles, consumers);
+            }
+
+            // Kick off the next async enumeration so results are ready
+            // by the time the next 2-second UpdateDevices cycle runs.
+            if (!_rawInputEnumRunning)
+            {
+                _rawInputEnumRunning = true;
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var kb = RawInputListener.EnumerateKeyboards();
+                        var ms = RawInputListener.EnumerateMice();
+                        var cc = RawInputListener.EnumerateConsumerControls();
+                        lock (_rawInputCacheLock)
+                        {
+                            _cachedKeyboards = kb;
+                            _cachedMice = ms;
+                            _cachedConsumerControls = cc;
+                            _rawInputEnumPending = true;
+                        }
+                    }
+                    catch { /* best effort: the next cycle retries */ }
+                    finally { _rawInputEnumRunning = false; }
+                });
+            }
+
+            UpdateTabletDevices(ref changed);
+
+            // --- Phase 1d: Precision Touchpads (per-hardware device) ---
+            if (_ptpReader != null && _ptpReader.IsAvailable)
+            {
+                var ptpDevices = _ptpReader.GetDevices();
+                var currentPtpHandles = new HashSet<IntPtr>();
+
+                foreach (var (handle, name, path, vid, pid) in ptpDevices)
+                {
+                    currentPtpHandles.Add(handle);
+                    var guid = SdlDeviceWrapper.BuildInstanceGuid(path, vid, pid, 0);
+
+                    // If the user removed this device from the Devices page,
+                    // the handle is still tracked but the UserDevice is gone.
+                    // Reset tracking so it gets recreated.
+                    if (_openedPtpHandles.Contains(handle) &&
+                        FindOnlineDeviceByInstanceGuid(guid) == null)
+                    {
+                        _openedPtpHandles.Remove(handle);
+                    }
+
+                    if (!_openedPtpHandles.Contains(handle))
+                    {
+                        UserDevice ud = FindOrCreateUserDevice(guid);
+                        ud.LoadInstance(guid, name, guid, name);
+                        ud.LoadCapabilities(0, 0, 0, InputDeviceType.Touchpad);
+                        ud.DevicePath = path;
+                        ud.VendorId = vid;
+                        ud.ProdId = pid;
+                        ud.IsOnline = true;
+                        ud.HasTouchpad = true;
+                        _openedPtpHandles.Add(handle);
+                        _ptpHandleToGuid[handle] = guid;
+                        MarkChanged(ref changed, "ptp", $"+ {name} {vid:X4}:{pid:X4}");
+                    }
+                }
+
+                // Detect disconnected PTP devices.
+                var disconnected = new List<IntPtr>();
+                foreach (var h in _openedPtpHandles)
+                {
+                    if (!currentPtpHandles.Contains(h))
+                    {
+                        if (_ptpHandleToGuid.TryGetValue(h, out var guid))
+                        {
+                            var ud = FindOnlineDeviceByInstanceGuid(guid);
+                            if (ud != null)
+                            {
+                                ud.IsOnline = false;
+                                // Same neutralize the MIDI and NFC removal
+                                // paths perform. A click-bar press or a mapped
+                                // contact asserted when the touchpad vanished
+                                // stayed stamped on the slot's combined output,
+                                // because Step 3 keeps the last OutputState for
+                                // an offline device.
+                                NeutralizeMappedOutputsFor(ud);
+                            }
+                            _ptpHandleToGuid.Remove(h);
+                        }
+                        disconnected.Add(h);
+                        MarkChanged(ref changed, "ptp", $"- handle=0x{h.ToInt64():X}");
+                    }
+                }
+                foreach (var h in disconnected)
+                    _openedPtpHandles.Remove(h);
+
+                // "All Touchpads (Merged)" aggregate device. Always present when PTP is available.
+                // Reset flag if the user removed the merged device from the Devices page.
+                if (_ptpMergedCreated && FindOnlineDeviceByInstanceGuid(PtpMergedGuid) == null)
+                    _ptpMergedCreated = false;
+
+                if (!_ptpMergedCreated)
+                {
+                    UserDevice mergedUd = FindOrCreateUserDevice(PtpMergedGuid);
+                    mergedUd.LoadInstance(PtpMergedGuid,
+                        Strings.Instance.Devices_AllTouchpadsMerged,
+                        PtpMergedGuid,
+                        Strings.Instance.Devices_AllTouchpadsMerged);
+                    mergedUd.LoadCapabilities(0, 0, 0, InputDeviceType.Touchpad);
+                    mergedUd.DevicePath = "aggregate://touchpads";
+                    mergedUd.IsOnline = true;
+                    mergedUd.HasTouchpad = true;
+                    _ptpMergedCreated = true;
+                    MarkChanged(ref changed, "ptp", "+ merged touchpads");
+                }
+                // PTP claims the digitizer collection, which causes Windows to
+                // send synthetic mouse WM_INPUT with hDevice=0 instead of the
+                // original per-device handle. Redirect all mouse wrappers that
+                // share hardware with a PTP device to IntPtr.Zero.
+                // Only redirect mice that share hardware with a PTP device
+                // (same VID/PID = same physical chip, different HID collection).
+                // Retry each cycle until at least one redirect succeeds, since
+                // PTP device VID/PID isn't known until first touchpad contact.
+                if (!_ptpMouseRedirected && ptpDevices.Length > 0)
+                {
+                    var ptpVidPids = new HashSet<(ushort, ushort)>();
+                    foreach (var (_, _, _, vid, pid) in ptpDevices)
+                    {
+                        if (vid != 0 || pid != 0)
+                            ptpVidPids.Add((vid, pid));
+                    }
+
+                    if (ptpVidPids.Count > 0)
+                    {
+                        var devices = SettingsManager.UserDevices;
+                        if (devices != null)
+                        {
+                            lock (devices.SyncRoot)
+                            {
+                                foreach (var ud in devices.Items)
+                                {
+                                    if (ud.IsOnline && ud.Device is SdlMouseWrapper mw &&
+                                        mw.RawInputHandle != IntPtr.Zero &&
+                                        mw.RawInputHandle != RawInputListener.AggregateMouseHandle &&
+                                        ptpVidPids.Contains((ud.VendorId, ud.ProdId)))
+                                    {
+                                        mw.UpdateHandle(IntPtr.Zero);
+                                        _ptpMouseRedirected = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if (_ptpMergedCreated)
+            {
+                var mergedUd = FindOnlineDeviceByInstanceGuid(PtpMergedGuid);
+                if (mergedUd != null)
+                {
+                    mergedUd.IsOnline = false;
+                    // This one fires on a live config change (merging turned
+                    // off), not just at shutdown, so a held input on the merged
+                    // surface would latch on the slot exactly as above.
+                    NeutralizeMappedOutputsFor(mergedUd);
+                }
+                _ptpMergedCreated = false;
+                MarkChanged(ref changed, "ptp", "- merged touchpads");
+            }
+
+            // --- Phase 1e: MIDI input endpoints (issue #128) ---
+            changed |= UpdateMidiInputDevices();
+
+            // --- Phase 1f: NFC PC/SC readers (issue #150) ---
+            changed |= UpdateNfcReaderDevices();
+
+            // --- Phase 1f2: standalone microphones as input devices (issue #317) ---
+            changed |= UpdateMicrophoneDevices();
+
+            // --- Phase 1g: Sony headset head trackers (issue #188) ---
+            changed |= UpdateHeadsetMotionDevices();
+
+            // --- Phase 1h: handheld PC hidden buttons + system motion (issue #343) ---
+            changed |= UpdateHandheldDevices();
+
+            // --- Phase 1i: head tracker, OpenTrack UDP + FreeTrack (issue #355) ---
+            changed |= UpdateHeadTrackerDevice();
+            changed |= UpdateLogitechGKeysDevice();
+
+            // --- Phase 1k: analog keyboards (issue #468) ---
+            changed |= UpdateAnalogKeyboardDevices();
+
+            // --- Phase 1l: Bliss-Box ports beside their SDL rows (issue #469) ---
+            changed |= UpdateBlissBoxPorts();
+
+            // --- Phase 2: Detect disconnected SDL devices (debounced) ---
+            //
+            // Signals that indicate the device might be gone:
+            //   (a) The SdlDeviceWrapper handle is null.
+            //   (b) ud.Device.IsAttached returns false.
+            //   (c) sdlId is no longer in SDL_GetJoysticks().
+            //
+            // (c) is the belt-and-suspenders for "SDL keeps a stale
+            // JoystickID after the kernel device is gone" (HIDMaestro#11).
+            //
+            // S2 debounce: any one of these signals starts a countdown
+            // (SdlDisconnectDebounceMs). The device is only marked offline
+            // if the condition persists for the full window. This rides out
+            // the xinputhid transients that occur during a HIDMaestro
+            // virtual's kernel creation — those typically resolve within
+            // tens to low hundreds of ms, far under the debounce window —
+            // so a coexisting physical Xbox's SDL handle is preserved and
+            // its Devices-page preview keeps moving. A real disconnect
+            // (unplug, BT pair-drop) stays missing past the window and
+            // surfaces as an offline event with only the debounce latency
+            // of delay.
+            var disconnectedIds = new List<uint>();
+            var nowUtc = DateTime.UtcNow;
+
+            foreach (uint sdlId in _openedSdlInstanceIds.Keys)
+            {
+                UserDevice ud = FindOnlineDeviceBySdlInstanceId(sdlId);
+                if (ud == null)
+                {
+                    // Not found ONLINE. Two cases:
+                    //  - Step 2 already flipped the device offline (its
+                    //    GetCurrentState returned null when SDL reported the
+                    //    handle detached). The UserDevice still holds the dead
+                    //    SDL handle and none of the disconnect cleanup has run.
+                    //    Without this, MarkDeviceOffline became unreachable for
+                    //    real SDL unplugs the moment the detached-read guard
+                    //    shipped: the handle leaked, the wheel-replug writer
+                    //    resets never ran, and the per-slot output
+                    //    neutralization never happened. Finish the disconnect
+                    //    here. Detachment is permanent for a handle, so no
+                    //    debounce applies.
+                    //  - The UserDevice itself is gone. Nothing to clean.
+                    var offlineUd = FindDeviceBySdlInstanceIdAnyState(sdlId);
+                    if (offlineUd != null && offlineUd.Device != null)
+                    {
+                        MarkDeviceOffline(offlineUd);
+                        MarkChanged(ref changed);
+                    }
+                    // Orphaned wrapper: no UserDevice references it anymore
+                    // (UI Remove dropped the record, or a replug rebind
+                    // swapped ud.Device to a fresh wrapper). Dispose it here
+                    // on the poll thread, the same thread as MarkDeviceOffline's
+                    // dispose. Dispose is idempotent, so the handled case above
+                    // is safe to skip by reference.
+                    //
+                    // EXCEPT when the same physical device is live under a
+                    // rebound wrapper: HIDAPI drivers keep ONE context per
+                    // device, and closing a stale instance runs the driver's
+                    // CloseJoystick against it (the fork's Wii CloseJoystick
+                    // nulls ctx->joystick), clobbering the live instance's
+                    // registration. Disposing here after a Wii re-identify
+                    // put the driver into a 10 s re-identify churn (observed
+                    // 2026-07-11, diag.log). For the rebind case the stale
+                    // handle is deliberately left to the finalizer, the
+                    // long-standing behavior before the 2026-07-11 audit.
+                    if (_openedSdlInstanceIds.TryGetValue(sdlId, out var orphan)
+                        && orphan != null && !ReferenceEquals(orphan, offlineUd?.Device)
+                        && !DeviceLiveUnderNewWrapper(orphan))
+                    {
+                        try { orphan.Dispose(); } catch { }
+                    }
+                    disconnectedIds.Add(sdlId);
+                    _sdlDisconnectCandidateSince.Remove(sdlId);
+                    continue;
+                }
+
+                bool inCurrentEnum = currentInstanceIds.Contains(sdlId);
+                bool looksDisconnected =
+                    ud.Device == null
+                    || !ud.Device.IsAttached
+                    || !inCurrentEnum;
+
+                if (!looksDisconnected)
+                {
+                    // Healthy. Clear any pending debounce for this SDL ID.
+                    _sdlDisconnectCandidateSince.Remove(sdlId);
+                    continue;
+                }
+
+                // Start / continue the debounce window.
+                if (!_sdlDisconnectCandidateSince.TryGetValue(sdlId, out var firstSeen))
+                {
+                    _sdlDisconnectCandidateSince[sdlId] = nowUtc;
+                    continue;
+                }
+
+                if ((nowUtc - firstSeen).TotalMilliseconds < SdlDisconnectDebounceMs)
+                {
+                    continue;
+                }
+
+                // Debounce window elapsed. Real disconnect.
+                MarkDeviceOffline(ud);
+                disconnectedIds.Add(sdlId);
+                _sdlDisconnectCandidateSince.Remove(sdlId);
+                MarkChanged(ref changed);
+            }
+
+            // Clean up tracking for disconnected devices.
+            foreach (uint sdlId in disconnectedIds)
+            {
+                _openedSdlInstanceIds.Remove(sdlId);
+            }
+
+            // #395: keep the Flydigi Space Station notice on the Devices page
+            // current while the service starts and stops between arrivals.
+            // A start or stop of the service with no device change must still
+            // reach the rows, and DevicesUpdated is what re-populates them.
+            long flydigiNow = Environment.TickCount64;
+            if (flydigiNow - _flydigiWatchTick >= 10000)
+            {
+                _flydigiWatchTick = flydigiNow;
+                if (FlydigiServiceWatch.Refresh())
+                    MarkChanged(ref changed, "flydigi", $"service running=[{FlydigiServiceWatch.Running}]");
+            }
+
+
+            // --- Notify if anything changed ---
+            if (changed)
+            {
+                DevicesUpdated?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private long _flydigiWatchTick;
+        private readonly FlydigiReprobePolicy _flydigiReprobe = new FlydigiReprobePolicy();
+
+        private long _flydigiObserveTick;
+        private long _flydigiHidRetryDue;
+        private long _flydigiConfirmDue;
+        private uint _flydigiChangeCount;
+        private bool _flydigiChangeCountKnown;
+        private readonly System.Collections.Generic.HashSet<uint> _flydigiLastOrdinaryIds = new System.Collections.Generic.HashSet<uint>();
+
+        /// <summary>#395: a Flydigi pad whose vendor interface SDL did not claim
+        /// at arrival (the reporter's logs show two of three) has no enhanced
+        /// view, and a slot bound to that view stays offline. Ask SDL to probe
+        /// again, a bounded number of times, by changing the Flydigi hint's
+        /// string without changing its meaning. Runs every poll cycle on the
+        /// polling thread, after the enumeration gate, so the delay is the
+        /// policy's and not the 2 s or 5 s enumeration cadence. Only while the
+        /// switch is on: off means the user does not want the view, and the
+        /// write itself is refused under the switch's lock.
+        ///
+        /// <para>Which interface is unclaimed is observed, not guessed: SDL's
+        /// raw HID enumeration lists the vendor's 0xFFA0 interfaces by path,
+        /// and an attached enhanced wrapper carries the path of the interface
+        /// it claimed. That enumeration opens every HID interface on the
+        /// system to read its attributes, so it runs only when SDL's HID
+        /// device-change counter has moved since the last observation, or on
+        /// the policy's delay cadence while an unclaimed interface is being
+        /// retried. A healthy pad costs one enumeration at its arrival and
+        /// none after. A pad PadForge opened no joystick view of is still
+        /// found, since its arrival moves the counter. The counter decides
+        /// only WHEN to look: it moves for any device and on a timer when
+        /// notifications are unavailable, so the policy never resets state on
+        /// it. A change in the set of attached ordinary Flydigi wrappers also
+        /// opens the gate, so a replacement wrapper reaches the policy without
+        /// a counter move, and one confirmation pass follows every counter-move
+        /// observation a delay later, so a single enumeration that missed a
+        /// present device does not end discovery. Only the confirmation itself
+        /// or a new counter move touches that deadline: an observation the
+        /// wrapper set or the cadence opened leaves it pending. A healthy pad costs the
+        /// enumerations its own arrival and confirmation take, plus whatever
+        /// other device changes on the system trigger. A failed enumeration
+        /// is not an observation. The wrapper snapshot is taken AFTER the
+        /// enumeration, so a wrapper that detached during it is not read as a
+        /// claim. A detached Flydigi wrapper awaiting cleanup means the pad is
+        /// in flux, and the policy defers every deadline. The enumeration's
+        /// cost lands on the polling thread and is logged past 25 ms, the
+        /// same bar as the other stall lines.</para></summary>
+        private void FlydigiReprobeTick()
+        {
+            if (!FlydigiEnhancedProtocolDesired) return;
+            FlydigiReprobeTick(null, null, null, null);
+        }
+
+        internal void FlydigiReprobeTick(Func<long> clock, Func<uint?> readCount,
+            Func<System.Collections.Generic.List<string>> readPaths,
+            Func<(bool written, string value)> nudge)
+        {
+            // SDL can retry HID initialization in the counter read itself.
+            // A failed read changes only this retry deadline.
+            long now = clock == null ? Environment.TickCount64 : clock();
+            if (now < _flydigiHidRetryDue) return;
+            uint? count = readCount == null ? Engine.SdlHidEnumeration.DeviceChangeCount() : readCount();
+            // SDL skips zero on counter wrap. Zero means HIDAPI is unavailable.
+            if (count == null || count.Value == 0)
+            {
+                _flydigiHidRetryDue = (clock == null ? Environment.TickCount64 : clock()) + FlydigiReprobePolicy.DelayMs;
+                return;
+            }
+            _flydigiHidRetryDue = 0;
+            now = clock == null ? Environment.TickCount64 : clock();
+            bool changed = !_flydigiChangeCountKnown || count.Value != _flydigiChangeCount;
+            bool confirm = _flydigiConfirmDue != 0 && now >= _flydigiConfirmDue;
+            bool wrappersChanged = FlydigiOrdinaryWrappersChanged();
+            if (!changed && !confirm && !wrappersChanged && !_flydigiReprobe.Armed) return;
+            if (!changed && !confirm && !wrappersChanged && now - _flydigiObserveTick < FlydigiReprobePolicy.DelayMs) return;
+
+            long tsEnum = Stopwatch.GetTimestamp();
+            var present = readPaths == null ? Engine.SdlHidEnumeration.Paths(0x37D7, 0xFFA0) : readPaths();
+            long enumMs = (Stopwatch.GetTimestamp() - tsEnum) * 1000 / Stopwatch.Frequency;
+            if (enumMs >= 25) Engine.SdlDiagLog.WriteLine($"STALL flydigi hid-enumerate={enumMs}ms");
+            if (present == null)
+            {
+                _flydigiHidRetryDue = (clock == null ? Environment.TickCount64 : clock()) + FlydigiReprobePolicy.DelayMs;
+                return;
+            }
+
+            bool inFlux = false;
+            var claimed = new System.Collections.Generic.List<string>();
+            var ordinary = new System.Collections.Generic.List<uint>();
+            foreach (var w in _openedSdlInstanceIds.Values)
+            {
+                if (w == null || w.VendorId != 0x37D7) continue;
+                if (!w.IsAttached) { inFlux = true; continue; }
+                if (w.Backend == "hidapi") { if (!string.IsNullOrEmpty(w.DevicePath)) claimed.Add(w.DevicePath); }
+                else ordinary.Add(w.SdlInstanceId);
+            }
+            _flydigiLastOrdinaryIds.Clear();
+            foreach (var id in ordinary) _flydigiLastOrdinaryIds.Add(id);
+            _flydigiObserveTick = now;
+            _flydigiChangeCount = count.Value;
+            _flydigiChangeCountKnown = true;
+            if (changed) _flydigiConfirmDue = now + FlydigiReprobePolicy.DelayMs;
+            else if (confirm) _flydigiConfirmDue = 0;
+            var due = _flydigiReprobe.Observe(now, present, claimed, ordinary, inFlux, absencesAreReal: changed);
+            if (due.Count == 0) return;
+            var (written, value) = nudge == null ? TryFlydigiReprobeNudge() : nudge();
+            Engine.SdlDiagLog.WriteLine(
+                $"FLYDIGI reprobe attempt={_flydigiReprobe.LastAttempt}/{FlydigiReprobePolicy.MaxAttempts} unclaimed={due.Count} present={present.Count} claimed={claimed.Count} flux={inFlux} changed={changed} confirm={confirm} wrappers={wrappersChanged} hint={value ?? "-"} written={written} first={due[0]}");
+        }
+
+        /// <summary>Whether the set of attached, non-enhanced Flydigi wrappers
+        /// differs from the one the last observation saw. Cheap enough for
+        /// every tick: a handful of wrappers at most.</summary>
+        private bool FlydigiOrdinaryWrappersChanged()
+        {
+            int seen = 0;
+            foreach (var w in _openedSdlInstanceIds.Values)
+            {
+                if (w == null || w.VendorId != 0x37D7 || !w.IsAttached || w.Backend == "hidapi") continue;
+                seen++;
+                if (!_flydigiLastOrdinaryIds.Contains(w.SdlInstanceId)) return true;
+            }
+            return seen != _flydigiLastOrdinaryIds.Count;
+        }
+
+        // ─────────────────────────────────────────────
+        //  UserDevice lookup helpers
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Finds a UserDevice by its instance GUID.
+        /// Uses a manual loop to avoid LINQ closure allocations in the hot path.
+        /// </summary>
+        /// <summary>Capped memo for config Guid strings parsed on the
+        /// 1 kHz path (motion-source resolution). Same policy as the
+        /// tuning parse memos.</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Guid>
+            s_guidParseCache = new(System.StringComparer.Ordinal);
+
+        internal static bool TryParseGuidCached(string text, out Guid guid)
+        {
+            if (string.IsNullOrEmpty(text)) { guid = Guid.Empty; return false; }
+            if (s_guidParseCache.TryGetValue(text, out guid)) return guid != Guid.Empty;
+            bool ok = Guid.TryParse(text, out guid);
+            if (s_guidParseCache.Count < 4096)
+                s_guidParseCache[text] = ok ? guid : Guid.Empty;
+            return ok;
+        }
+
+        private UserDevice FindOnlineDeviceByInstanceGuid(Guid instanceGuid)
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return null;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    if (devices[i].InstanceGuid == instanceGuid)
+                        return devices[i];
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Finds an online UserDevice by its SDL instance ID.
+        /// Uses a manual loop to avoid LINQ closure allocations.
+        /// </summary>
+        private UserDevice FindOnlineDeviceBySdlInstanceId(uint sdlInstanceId)
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return null;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    var d = devices[i];
+                    if (d.IsOnline && d.Device != null && d.Device.SdlInstanceId == sdlInstanceId)
+                        return d;
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Like <see cref="FindOnlineDeviceBySdlInstanceId"/> but without the
+        /// IsOnline filter. Used by the disconnect sweep to finish cleanup for
+        /// a device Step 2 already flipped offline (detached-handle read): the
+        /// UserDevice still holds the dead SDL wrapper that MarkDeviceOffline
+        /// must dispose.
+        /// </summary>
+        private UserDevice FindDeviceBySdlInstanceIdAnyState(uint sdlInstanceId)
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return null;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    var d = devices[i];
+                    if (d.Device != null && d.Device.SdlInstanceId == sdlInstanceId)
+                        return d;
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Finds an existing UserDevice by instance GUID, with fallback matching
+        /// by ProductGuid for devices whose InstanceGuid changed (e.g. Bluetooth
+        /// controllers that get a different device path after reboot).
+        /// When a fallback match is found, migrates the old device and its
+        /// UserSetting to the new InstanceGuid.
+        /// </summary>
+        // Internal so the same-model adoption path is testable end to end.
+        // Pinning only the serial predicate left the CALL SITE unguarded:
+        // deleting the gate from the loop kept every predicate test green.
+        //
+        // livePresentSdlIds (same-serial twin gate, owner-approved
+        // 2026-07-25): the SDL sweep passes the instance IDs SDL reports
+        // present RIGHT NOW. Serial outranks device path in
+        // BuildInstanceGuid, so two units reporting the identical serial
+        // string (a real clone-pad shape) build the SAME InstanceGuid, and
+        // without this gate the second unit stole the first one's row and
+        // disposed its live wrapper, violating the process-time
+        // distinctness rule. An exact-GUID row is treated as a LIVE TWIN's
+        // row only when its claiming wrapper's SDL instance is still in
+        // the present set: a same-unit reconnect always arrives under a
+        // NEW instance id while the old one has left the set (one physical
+        // device cannot be two present instances), so the rebind flow the
+        // disconnect debounce relies on is untouched. Every non-SDL caller
+        // passes null and keeps today's semantics exactly.
+        internal UserDevice FindOrCreateUserDevice(Guid instanceGuid, Guid productGuid = default,
+            HashSet<uint> livePresentSdlIds = null, string serialNumber = null)
+        {
+
+            var devices = SettingsManager.UserDevices;
+            if (devices == null) return new UserDevice { InstanceGuid = instanceGuid };
+
+            lock (devices.SyncRoot)
+            {
+                // 1. Exact match by InstanceGuid.
+                UserDevice exact = null;
+                for (int i = 0; i < devices.Items.Count; i++)
+                {
+                    if (devices.Items[i].InstanceGuid == instanceGuid)
+                    { exact = devices.Items[i]; break; }
+                }
+                // The flapped-unit rebind, HOISTED above every other
+                // resolution (round eight, R11). A same-product,
+                // SAME-SERIAL row still marked online while its claiming
+                // wrapper's SDL instance has LEFT the present set is this
+                // same physical unit re-identifying inside the disconnect
+                // debounce: its old connection is gone, and one physical
+                // device is never two present instances. It outranks the
+                // exact-match return in BOTH directions: (1) when the
+                // exact row is a live sibling (the twin collision), the
+                // flapped twin must get its own row back; (2) when the
+                // exact row is OFFLINE, adopting it would move a LIVE
+                // unit onto different assignments mid-session, breaking
+                // in-process identity stability. The serial constraint is
+                // load-bearing (round eight): without it, a THIRD
+                // same-model unit sitting inside its own disconnect
+                // debounce was hijacked and the two units swapped
+                // identities. Rows with no serial (path/sdlguid derived
+                // identities) compare as empty == empty, which stays
+                // inside the drawer policy for indistinguishable shells.
+                //
+                // Dispose truth (round eight, R12, correcting round
+                // seven's claim): returning this row means
+                // LoadFromSdlDevice swaps the wrapper IN PLACE and
+                // disposes the stale one right there
+                // (UserDevice.LoadFromDevice), the same flow every
+                // exact-guid rebind has used since 54b572b9.
+                // DeviceLiveUnderNewWrapper does NOT shield that dispose.
+                // It is consulted only in the orphan sweep, which this
+                // precedes. The two 2026-07-11 commits embody opposing
+                // policies (dispose-at-rebind to keep handles off the
+                // finalizer thread vs leave-to-finalizer to protect
+                // shared fork HIDAPI contexts). Dispose-at-rebind is the
+                // long-established behavior, including the
+                // hardware-validated Wii re-identify, so it stands.
+                // WATCHED RESIDUAL: if fork-driver re-identify churn ever
+                // recurs, the in-place dispose at rebind time is the
+                // first suspect.
+                // The scan runs ANCHOR-FREE (round nine, R7): it used to
+                // require an exact-GUID row to read the incoming serial
+                // from, so deleting a twin's offline sibling row (the
+                // Devices page allows it, with no online gate) left a
+                // flapped LIVE twin with no anchor, no zombie match, and
+                // a freshly minted row that orphaned its own. The
+                // wrapper's serial is the quantity the constraint always
+                // meant, and exact.SerialNumber was only ever a proxy for it.
+                // Empty serials still compare equal to each other, which
+                // keeps path-derived identities inside the drawer policy
+                // for indistinguishable shells.
+                string incomingSerial = serialNumber ?? exact?.SerialNumber ?? "";
+                // A NON-EMPTY serial is required when there is no anchor
+                // (round ten). Empty == empty carries zero identity
+                // information, so anchor-free it matched ANY online
+                // same-product row whose claimant had lapsed: a
+                // genuinely new serialless pad, enumerated in the same
+                // sweep as a momentarily-absent sibling, adopted that
+                // sibling's row, mappings and calibration, and the two
+                // pads swapped when the first returned. Round nine's
+                // deleted-sibling fix is untouched by this: a twin
+                // COLLISION only exists when the serial is non-empty,
+                // because BuildInstanceGuid falls through to the
+                // per-unit device path when it is empty, so two
+                // serialless units never derive the same identity.
+                // OPEN (round 37): the "exact != null" disjunct admits this
+                // scan for SERIALLESS units, where the row test below
+                // degenerates to "" == "". That is load-bearing for the case
+                // FlappedTwin_InsideTheDebounce_RebindsToItsOwnRow pins (one
+                // unit re-identifying inside the debounce must find its OWN
+                // row, not mint a new one), and it is also what lets two
+                // same-model serialless pads cross-bind when one is inside its
+                // debounce while the other enumerates. Removing the disjunct
+                // fixes the second and breaks the first, so the two cases need
+                // separating on whether `exact` is a live-twin collision
+                // rather than on the serial. Owner call, not a mechanical fix.
+                // Is the row we would otherwise return already CLAIMED by a
+                // live, present device? Computed here rather than after the
+                // scan because the scan needs it: it is what separates the two
+                // serialless cases, which the serial cannot.
+                bool liveTwinCollision = exact != null
+                    && livePresentSdlIds != null
+                    && exact.IsOnline
+                    && exact.Device != null
+                    && livePresentSdlIds.Contains(exact.Device.SdlInstanceId);
+
+                // With an EMPTY serial the row test below degenerates to
+                // "" == "", so admitting this scan on "exact != null" alone let
+                // any online same-product row whose SDL instance had lapsed
+                // match. Two same-model serialless pads, one inside its 2 s
+                // disconnect debounce while the other re-identified, cross-bound:
+                // the returning unit was stamped with the absent unit's identity
+                // and inherited its slot, mappings and calibration.
+                //
+                // The serial cannot separate that from the case round seven
+                // pins (ONE unit re-identifying inside its own debounce must
+                // find its own row), because both arrive with an empty serial.
+                // liveTwinCollision can. Re-identifying, the exact row is held
+                // by the live sibling, so returning it is impossible and the
+                // scan is the only way home. Cross-binding, the exact row is
+                // the arriving pad's OWN row with nobody on it, so there is
+                // nothing to search for and the scan can only do harm.
+                if (livePresentSdlIds != null && productGuid != Guid.Empty
+                    && (liveTwinCollision || !string.IsNullOrEmpty(incomingSerial)))
+                {
+                    for (int i = 0; i < devices.Items.Count; i++)
+                    {
+                        var d = devices.Items[i];
+                        if (d.IsOnline && d.ProductGuid == productGuid
+                            && d.InstanceGuid != Guid.Empty
+                            && d.InstanceGuid != instanceGuid
+                            && d.Device != null
+                            && !livePresentSdlIds.Contains(d.Device.SdlInstanceId)
+                            && string.Equals(d.SerialNumber ?? "", incomingSerial,
+                                StringComparison.Ordinal))
+                            return d;
+                    }
+                }
+
+                if (exact != null && !liveTwinCollision)
+                    return exact;
+
+                if (liveTwinCollision)
+                {
+                    // TWIN RESOLUTION (round seven R4/R5, zombie rebind
+                    // hoisted above in round eight).
+                    if (productGuid != Guid.Empty)
+                    {
+                        // (b) The drawer adoption, KEEPING the row's own
+                        // identity (round seven, R5). The incoming
+                        // serial-derived GUID is unusable here (it collides
+                        // with the live sibling), and minting a fresh one
+                        // per resolve re-keyed the twin EVERY LAUNCH: its
+                        // per-device slot configs (lighting, triggers,
+                        // audio) could never persist and grew a dead saved
+                        // entry per launch, device-pinned mapping rows died
+                        // on every reconnect, and Remote Link's
+                        // PeerLocalDeviceId broke its documented stability
+                        // contract. The adopted row's existing GUID is what
+                        // its UserSettings and every other GUID-keyed store
+                        // already reference, so identity is NOT restamped
+                        // and nothing is migrated. The caller pushes the
+                        // row's GUID onto the wrapper instead. Ordinary
+                        // non-collision adoption keeps restamping, because
+                        // there the incoming GUID is the device's true
+                        // stable identity. The asymmetry is deliberate.
+                        for (int i = 0; i < devices.Items.Count; i++)
+                        {
+                            var d = devices.Items[i];
+                            // Empty-guid rows (corrupt persisted data) are
+                            // never adopted as a twin identity (round
+                            // eight, R11): the caller's wrapper override
+                            // no-ops on Guid.Empty and the row would then
+                            // be restamped with the COLLIDING serial GUID.
+                            if (!d.IsOnline && d.ProductGuid == productGuid
+                                && d.InstanceGuid != Guid.Empty)
+                                return d;
+                        }
+                    }
+
+                    // (c) First-ever twin: a session-minted identity,
+                    // stable from the next launch on via (b). Same-serial
+                    // hardware with NO usable product identity (VID/PID
+                    // 0000) cannot take (a)/(b), because an Empty-product
+                    // scan would match across device classes, so it
+                    // re-mints per launch. Accepted degenerate-hardware
+                    // limitation. WATCHED RESIDUAL: if SDL ever listed a
+                    // re-identifying device's old and new instance ids in
+                    // ONE snapshot, the collision predicate above would
+                    // read it as a live sibling and (a) would not match.
+                    // No evidence SDL produces that shape. If
+                    // single-device duplicate rows ever appear, this gate
+                    // is the first suspect.
+                    // ProductGuid stamped at creation (round eight, R11):
+                    // LoadFromSdlDevice normally stamps it right after,
+                    // but a failed load used to leave the row
+                    // product-less and therefore invisible to every
+                    // adoption scan forever.
+                    var twin = new UserDevice
+                    { InstanceGuid = Guid.NewGuid(), ProductGuid = productGuid };
+                    devices.Items.Add(twin);
+                    return twin;
+                }
+
+                // 2. Fallback: find an offline device with the same ProductGuid.
+                //    This handles BT controllers that reconnect with a new device path.
+                //    ProductGuid is VID+PID only, so it cannot tell two units of
+                //    the same model apart, and that is DELIBERATE (owner decision,
+                //    2026-07-25). Identical controllers are physically
+                //    indistinguishable to their owner: you cannot tell which unit
+                //    you pulled out of the drawer without labeling the shell. So
+                //    identity here follows CONNECTION ORDER, not hardware. The
+                //    first unit powered on claims the stored entry and its
+                //    mappings, whichever unit it happens to be.
+                //    A serial gate was tried here and REVERTED: it blocked the
+                //    adoption when the serials differed, which is exactly the
+                //    drawer case, and the second controller came up blank instead
+                //    of inheriting the config the user had already built.
+                //    Serial-pinned identity is right only where the user has a
+                //    mental model of a specific pairing (DualShock 3, Wii), which
+                //    is a separate, per-device-class decision and is NOT this
+                //    generic path.
+                if (productGuid != Guid.Empty)
+                {
+                    // No Guid.Empty exclusion here, unlike the twin lane
+                    // above: on this ordinary path the row is RESTAMPED
+                    // with the incoming identity, so adopting a corrupt
+                    // empty-guid row repairs it instead of creating the
+                    // duplicate the twin lane must avoid (where the
+                    // wrapper override no-ops on Empty). The asymmetry is
+                    // deliberate.
+                    UserDevice fallback = null;
+                    for (int i = 0; i < devices.Items.Count; i++)
+                    {
+                        var d = devices.Items[i];
+                        if (!d.IsOnline && d.ProductGuid == productGuid)
+                        {
+                            fallback = d;
+                            break;
+                        }
+                    }
+
+                    if (fallback != null)
+                    {
+                        // Migrate the device to its new InstanceGuid.
+                        Guid oldGuid = fallback.InstanceGuid;
+                        fallback.InstanceGuid = instanceGuid;
+
+                        // Also migrate the linked UserSettings so slot
+                        // assignments and PadSettings are preserved.
+                        MigrateUserSettingGuid(oldGuid, instanceGuid);
+
+                        // Device-PINNED references (mapping-row sources,
+                        // activator legs, menu entries, per-pad slot
+                        // configs) live in UI-owned structures this poll
+                        // thread must not touch, so the re-key is queued
+                        // and UpdatePadDeviceInfo drains it on the UI
+                        // thread through the same remap helper
+                        // ApplyProfile's rebind lane uses (round eight,
+                        // R13: without this, a re-keyed device's pinned
+                        // rows produced no output and its lighting reset).
+                        lock (PendingDeviceGuidMigrationsLock)
+                            PendingDeviceGuidMigrations.Add((oldGuid, instanceGuid));
+
+                        return fallback;
+                    }
+                }
+
+                // 3. No match: create a new device.
+                var ud = new UserDevice { InstanceGuid = instanceGuid };
+                devices.Items.Add(ud);
+                return ud;
+            }
+        }
+
+        /// <summary>Adoption re-keys queued by the poll thread for the UI
+        /// thread to drain (round eight, R13). InputService's
+        /// UpdatePadDeviceInfo rewrites the device-pinned mapping-row /
+        /// activator / menu guids and moves the per-pad slot configs.
+        /// Those structures are UI-owned and must never be walked from
+        /// here.</summary>
+        internal static readonly System.Collections.Generic.List<(Guid Old, Guid New)>
+            PendingDeviceGuidMigrations = new();
+        internal static readonly object PendingDeviceGuidMigrationsLock = new();
+
+        /// <summary>
+        /// Updates a UserSetting's InstanceGuid when the physical device's
+        /// identity changes (e.g. Bluetooth reconnect with different path).
+        /// </summary>
+        private static void MigrateUserSettingGuid(Guid oldGuid, Guid newGuid)
+        {
+            var settings = SettingsManager.UserSettings;
+            if (settings == null) return;
+
+            lock (settings.SyncRoot)
+            {
+                // A device may be assigned to several slots at once (one
+                // UserSetting per slot, same InstanceGuid, different
+                // MapTo), so EVERY matching row follows the device. The
+                // old first-match break silently orphaned slots 2..N on
+                // any adoption (round seven, R6; pre-existing since
+                // v2.0.0-beta, its comment claimed one row per device).
+                // When a (newGuid, MapTo) row ALREADY exists (an orphaned
+                // setting colliding with the adoption target), the
+                // existing destination row is the live truth and the old
+                // row is dropped instead of rewritten, so the migration
+                // can never manufacture duplicate (guid, slot) rows
+                // (round eight, R5).
+                var items = settings.Items;
+                for (int i = items.Count - 1; i >= 0; i--)
+                {
+                    if (items[i].InstanceGuid != oldGuid) continue;
+                    int mapTo = items[i].MapTo;
+                    bool twinExists = false;
+                    for (int j = 0; j < items.Count; j++)
+                    {
+                        if (j != i && items[j].InstanceGuid == newGuid && items[j].MapTo == mapTo)
+                        { twinExists = true; break; }
+                    }
+                    if (twinExists) items.RemoveAt(i);
+                    else items[i].InstanceGuid = newGuid;
+                }
+            }
+        }
+
+        /// <summary>True when the physical device behind <paramref name="orphan"/>
+        /// is still online through a DIFFERENT wrapper (the driver re-identify
+        /// rebind: same InstanceGuid, new SDL instance id). Disposing the stale
+        /// wrapper in that state closes SDL handles whose driver context is
+        /// SHARED with the live instance.</summary>
+        private static bool DeviceLiveUnderNewWrapper(SdlDeviceWrapper orphan)
+        {
+            var devs = SettingsManager.UserDevices?.Items;
+            if (devs == null) return false;
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devs.Count; i++)
+                {
+                    var d = devs[i];
+                    if (d == null || !d.IsOnline || d.Device == null) continue;
+                    if (ReferenceEquals(d.Device, orphan)) continue;
+                    if (d.InstanceGuid == orphan.InstanceGuid) return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Marks a device as offline, disposes its SDL handle, and clears runtime state.
+        /// </summary>
+        private void MarkDeviceOffline(UserDevice ud)
+        {
+            if (ud == null) return;
+            DisconnectGyroTiltGravity(ud.InstanceGuid);
+            DisconnectGyroSimulation(ud.InstanceGuid);
+
+            Engine.SdlDiagLog.WriteLine($"DEV - {ud.InstanceName}");
+
+            // Stop rumble before closing.
+            if (ud.ForceFeedbackState != null && ud.Device != null)
+            {
+                try { ud.ForceFeedbackState.StopDeviceForces(ud.Device); }
+                catch { /* best effort */ }
+            }
+            // A Bliss-Box port's motors take the adapter's commands, which the
+            // SDL stop above never reaches (#469). Its port drops the levels
+            // now, so an adapter back on the same path before the next device
+            // pass retires the port is not handed them again.
+            if (PadForge.Engine.Common.BlissBox.BlissBoxProtocol.IsPort(ud.VendorId, ud.ProdId))
+            {
+                try { BlissBoxRuntime.StopRumble(ud.DevicePath); }
+                catch { /* best effort */ }
+            }
+
+            // Dispose SDL handle.
+            if (ud.Device != null)
+            {
+                try { ud.Device.Dispose(); }
+                catch { /* best effort */ }
+            }
+
+            // THE RE-ARM REGISTRY. On a confirmed disconnect, every per-device
+            // write-gating cache is cleared here so a replug re-establishes
+            // device state instead of trusting a latch the firmware no longer
+            // remembers: the wheel firmware power-cycles to its default
+            // centering spring and forgets uploaded effects, so the rotation
+            // range, auto-center and FFB state machines must re-apply.
+            //
+            // A new per-device cache that gates writes has exactly two legal
+            // designs: enroll its reset HERE, or self-heal by asserting its
+            // state on every packet (Fanatec's writer is stateless and the
+            // DS4 encoder sends its full flag byte each frame, so neither
+            // needs an entry). Those are deliberate N/As, not omissions.
+            // A per-process latch over per-connection firmware state is how
+            // a DualSense on Bluetooth sat on firmware-default blue from
+            // v4.2.0 until 4.3.1 (#334 second half): connect-time device
+            // init keyed to the process survives the reconnect that resets
+            // the device. "Works until a power-cycle, fixed by an app
+            // restart" is that defect's field signature.
+            if (!string.IsNullOrEmpty(ud.DevicePath))
+            {
+                _appliedWheelSettings.TryRemove(ud.DevicePath, out _);
+                _appliedLeds.TryRemove(ud.DevicePath, out _);
+                _appliedWheelFfb.TryRemove(ud.DevicePath, out _);
+                LogitechRawHidWriter.ResetDevice(ud.DevicePath);
+                ThrustmasterRawHidWriter.ResetDevice(ud.DevicePath);
+                RawHidOutput.ResetDevice(ud.DevicePath);
+            }
+
+            NeutralizeMappedOutputsFor(ud);
+
+            // Any confirmed disconnect can reshuffle the synthetic "XInput#N"
+            // paths the impulse writer caches its handles under, and a stale
+            // entry whose handle is still valid writes to the wrong pad
+            // without ever failing into the self-heal path.
+            XboxImpulseHidWriter.InvalidateCachedTargets();
+        }
+
+        /// <summary>Clears runtime state and neutralizes the device's per-slot
+        /// mapped outputs. Step 3 skips offline devices and "keeps the last
+        /// OutputState" (a guard against transient read glitches), so whatever
+        /// was stamped on the final frames before a confirmed disconnect would
+        /// otherwise persist for as long as the slot stays active: a detached
+        /// pedal's recentered read (inverted trigger -> ~32767 = 50% engaged),
+        /// or a button the user was holding at unplug. Step 4 copies
+        /// OutputState into the slot's combined output and the per-device
+        /// Triggers/Sticks preview reads RawMappedState, so both must go
+        /// neutral (Gamepad default: triggers released, sticks centered).
+        ///
+        /// <para>Split out of MarkDeviceOffline so the MIDI and NFC teardown
+        /// lanes can share it. Those two dispose their own endpoint object and
+        /// so cannot call MarkDeviceOffline (it would double-dispose), which is
+        /// exactly why they were silently skipping this step and freezing a
+        /// held note or CC into the slot after the endpoint vanished.</para></summary>
+        private void NeutralizeMappedOutputsFor(UserDevice ud)
+        {
+            if (ud == null) return;
+            ud.ClearRuntimeState();
+
+            // The trackball's per-device state (#291). Both momentum tables key
+            // on the device guid, so an unplugged pad's balls stayed in them for
+            // the life of the process. This is the third of the three reset
+            // sites the issue named, after the profile switch and the per-slot
+            // eviction, and it rides the teardown every removal path already
+            // funnels through (unplug, MIDI endpoint loss, NFC reader loss).
+            PadForge.Engine.Common.Mapping.SourceCoercion.ResetTouchMomentumForDevice(
+                ud.InstanceGuid.ToString());
+
+            // The IR pointer's held aim (#485) keys on the device guid the same
+            // way, so a remote that reconnects starts from center.
+            PadForge.Engine.Common.Mapping.SourceCoercion.ForgetIrPointerForDevice(
+                ud.InstanceGuid.ToString());
+
+            // Voice pulse arrays key on the pad guid the same way (#317):
+            // a removed device's pulses ride the same teardown funnel.
+            PadForge.Common.Input.VoicePulse.Forget(ud.InstanceGuid);
+
+            var allSettings = SettingsManager.UserSettings;
+            if (allSettings != null)
+            {
+                lock (allSettings.SyncRoot)
+                {
+                    foreach (var us in allSettings.Items)
+                    {
+                        if (us == null || us.InstanceGuid != ud.InstanceGuid) continue;
+                        NeutralizeOutputStates(us);
+                    }
+                }
+            }
+        }
+
+        /// <summary>Publishes the released state of all nine outputs a
+        /// setting's device feeds its slot. Step 4 merges every setting on a
+        /// slot with no online check, so an output left out kept a dropped
+        /// device's last frame in the slot for as long as another device
+        /// kept the slot active: a mouse button held at the drop stayed
+        /// down, a gyro kept turning the cursor on every poll, a finger
+        /// stayed on the touchpad, an Extended button or a MIDI note stayed
+        /// held.
+        ///
+        /// <para>The raw HID and MIDI states keep their shape and go to rest
+        /// in fresh arrays. Published arrays are never written after publish
+        /// (Step 3's contract), the MIDI controller sends a note off only for
+        /// a note its state still indexes, and a trigger rests at
+        /// short.MinValue rather than zero (RawHidState.ClearToRest). A state
+        /// already at rest publishes nothing, so Step 3's per-frame call for
+        /// a removed device allocates once.</para></summary>
+        private void NeutralizeOutputStates(UserSetting us)
+        {
+            us.OutputState = default;
+            us.RawMappedState = default; // the preview must not freeze on a removed device
+            us.MotionRowsOutputState = default;
+            us.PressureOutputState = default;
+            us.KbmRawOutputState = default;
+            us.VrRawOutputState = default;
+            us.TouchpadOutputState = default;
+
+            int slot = us.MapTo;
+            CustomControllerLayout layout = slot >= 0 && slot < MaxPads ? SlotCustomLayouts[slot] : default;
+            var raw = us.RawHidOutputState;
+            if (!RawAtRest(in raw, in layout))
+            {
+                var rest = new RawHidState
+                {
+                    Axes = raw.Axes == null ? null : new short[raw.Axes.Length],
+                    Buttons = raw.Buttons == null ? null : new uint[raw.Buttons.Length],
+                    Povs = raw.Povs == null ? null : new int[raw.Povs.Length],
+                    HardwareAxes = raw.HardwareAxes == null ? null : new short[raw.HardwareAxes.Length],
+                };
+                rest.ClearToRest(in layout);
+                us.RawHidOutputState = rest;
+            }
+
+            var midi = us.MidiRawOutputState;
+            if (!MidiAtRest(in midi))
+            {
+                var rest = new MidiRawState
+                {
+                    CcValues = midi.CcValues == null ? null : new byte[midi.CcValues.Length],
+                    Notes = midi.Notes == null ? null : new bool[midi.Notes.Length],
+                };
+                rest.Clear();
+                us.MidiRawOutputState = rest;
+            }
+        }
+
+        /// <summary>True when <paramref name="s"/> holds what
+        /// RawHidState.ClearToRest leaves for <paramref name="layout"/>: sticks
+        /// at zero, triggers at short.MinValue, buttons up, hats centered. A
+        /// never-populated state (null arrays) is at rest.</summary>
+        private static bool RawAtRest(in RawHidState s, in CustomControllerLayout layout)
+        {
+            int axes = s.Axes?.Length ?? 0;
+            for (int i = 0; i < axes; i++)
+                if (s.Axes[i] != (layout.IsTriggerSlot(i) ? short.MinValue : (short)0)) return false;
+            if (s.HardwareAxes != null)
+                for (int i = 0; i < s.HardwareAxes.Length; i++)
+                    if (s.HardwareAxes[i] != (i < axes && layout.IsTriggerSlot(i) ? short.MinValue : (short)0)) return false;
+            if (s.Buttons != null)
+                for (int i = 0; i < s.Buttons.Length; i++)
+                    if (s.Buttons[i] != 0) return false;
+            if (s.Povs != null)
+                for (int i = 0; i < s.Povs.Length; i++)
+                    if (s.Povs[i] != -1) return false;
+            return true;
+        }
+
+        /// <summary>True when <paramref name="s"/> holds what
+        /// MidiRawState.Clear leaves: every CC at center (64), every note
+        /// off.</summary>
+        private static bool MidiAtRest(in MidiRawState s)
+        {
+            if (s.CcValues != null)
+                for (int i = 0; i < s.CcValues.Length; i++)
+                    if (s.CcValues[i] != 64) return false;
+            if (s.Notes != null)
+                for (int i = 0; i < s.Notes.Length; i++)
+                    if (s.Notes[i]) return false;
+            return true;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Keyboard / Mouse enumeration
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Tracked Raw Input keyboard device handles.
+        /// </summary>
+        private readonly HashSet<IntPtr> _openedKeyboardHandles = new HashSet<IntPtr>();
+
+        /// <summary>Tracked PTP device handles.</summary>
+        private readonly HashSet<IntPtr> _openedPtpHandles = new();
+        private readonly Dictionary<IntPtr, Guid> _ptpHandleToGuid = new();
+
+        /// <summary>Fixed GUID for the merged touchpad aggregate device.</summary>
+        private static readonly Guid PtpMergedGuid = new("50545000-ffff-ffff-5054-505450505450");
+        private bool _ptpMergedCreated;
+        private bool _ptpMouseRedirected;
+
+        /// <summary>
+        /// Tracked Raw Input mouse device handles.
+        /// </summary>
+        private readonly HashSet<IntPtr> _openedMouseHandles = new HashSet<IntPtr>();
+
+        /// <summary>
+        /// Processes pre-fetched keyboard device info and creates UserDevice
+        /// records for any new keyboards. Returns true if a new keyboard was found.
+        /// </summary>
+        private bool EnumerateKeyboards(RawInputListener.DeviceInfo[] keyboards)
+        {
+            // Prune tracked handles whose UserDevice was removed (e.g. via UI "Remove").
+            PruneOrphanedHandles(_openedKeyboardHandles, "keyboard");
+
+            bool changed = false;
+
+            foreach (var kb in keyboards)
+            {
+                if (_openedKeyboardHandles.Contains(kb.Handle))
+                    continue;
+
+                SdlKeyboardWrapper wrapper = null;
+                try
+                {
+                    wrapper = new SdlKeyboardWrapper();
+                    if (!wrapper.Open(kb))
+                        continue;
+
+                    UserDevice ud = FindOrCreateUserDevice(wrapper.InstanceGuid);
+                    ud.LoadFromKeyboardDevice(wrapper);
+                    ud.IsOnline = true;
+
+                    _openedKeyboardHandles.Add(kb.Handle);
+                    wrapper = null; // ownership transferred to UserDevice
+                    MarkChanged(ref changed, "keyboard", $"+ {kb.Name} handle=0x{kb.Handle.ToInt64():X}");
+                }
+                catch (Exception ex)
+                {
+                    RaiseError($"Error opening keyboard ({kb.Name})", ex);
+                }
+                finally
+                {
+                    wrapper?.Dispose();
+                }
+            }
+
+            return changed;
+        }
+
+        private readonly HashSet<IntPtr> _openedConsumerHandles = new HashSet<IntPtr>();
+
+        /// <summary>
+        /// Processes pre-fetched Consumer Control device info (issue #168) and
+        /// creates UserDevice records for any new collections. Mirrors
+        /// <see cref="EnumerateKeyboards"/>. Returns true if a new device was found.
+        /// </summary>
+        private bool EnumerateConsumerControls(RawInputListener.DeviceInfo[] consumers)
+        {
+            // Prune tracked handles whose UserDevice was removed (e.g. via UI "Remove").
+            PruneOrphanedHandles(_openedConsumerHandles, "consumer");
+
+            bool changed = false;
+
+            foreach (var cc in consumers)
+            {
+                if (_openedConsumerHandles.Contains(cc.Handle))
+                    continue;
+
+                ConsumerControlWrapper wrapper = null;
+                try
+                {
+                    wrapper = new ConsumerControlWrapper();
+                    if (!wrapper.Open(cc))
+                        continue;
+
+                    UserDevice ud = FindOrCreateUserDevice(wrapper.InstanceGuid);
+                    ud.LoadFromConsumerDevice(wrapper);
+                    ud.IsOnline = true;
+
+                    _openedConsumerHandles.Add(cc.Handle);
+                    wrapper = null; // ownership transferred to UserDevice
+                    MarkChanged(ref changed, "consumer", $"+ {cc.Name} handle=0x{cc.Handle.ToInt64():X}");
+                }
+                catch (Exception ex)
+                {
+                    RaiseError($"Error opening consumer control ({cc.Name})", ex);
+                }
+                finally
+                {
+                    wrapper?.Dispose();
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Processes pre-fetched mouse device info and creates UserDevice
+        /// records for any new mice. Returns true if a new mouse was found.
+        /// </summary>
+        private bool EnumerateMice(RawInputListener.DeviceInfo[] mice)
+        {
+            // Prune tracked handles whose UserDevice was removed (e.g. via UI "Remove").
+            PruneOrphanedHandles(_openedMouseHandles, "mouse");
+
+            bool changed = false;
+
+            foreach (var mouse in mice)
+            {
+                if (_openedMouseHandles.Contains(mouse.Handle))
+                    continue;
+
+                // Skip if an existing device with the same path is already tracked
+                // (possibly redirected to IntPtr.Zero by PTP). Don't re-create it.
+                if (!string.IsNullOrEmpty(mouse.DevicePath))
+                {
+                    var existingUd = FindOnlineDeviceByDevicePath(mouse.DevicePath);
+                    if (existingUd != null)
+                        continue;
+                }
+
+                SdlMouseWrapper wrapper = null;
+                try
+                {
+                    wrapper = new SdlMouseWrapper();
+                    if (!wrapper.Open(mouse))
+                        continue;
+
+                    UserDevice ud = FindOrCreateUserDevice(wrapper.InstanceGuid);
+                    ud.LoadFromMouseDevice(wrapper);
+                    ud.IsOnline = true;
+
+                    _openedMouseHandles.Add(mouse.Handle);
+                    wrapper = null; // ownership transferred to UserDevice
+                    MarkChanged(ref changed, "mouse", $"+ {mouse.Name} handle=0x{mouse.Handle.ToInt64():X}");
+                }
+                catch (Exception ex)
+                {
+                    RaiseError($"Error opening mouse ({mouse.Name})", ex);
+                }
+                finally
+                {
+                    wrapper?.Dispose();
+                }
+            }
+
+            return changed;
+        }
+
+        // MIDI input endpoints (Phase 1e, issue #128). The WinRT device
+        // query runs on a background task. The polling thread consumes the
+        // latest cached snapshot, mirroring the Raw Input keyboard/mouse
+        // enumeration above.
+        private readonly Dictionary<string, MidiInputDevice> _openedMidiInputs =
+            new Dictionary<string, MidiInputDevice>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _midiInputsLock = new object();
+        private volatile List<(string Id, string Name)> _cachedMidiEndpoints;
+        private volatile bool _midiEnumRunning;
+        private volatile bool _midiInputsSuppressed;
+
+        // NFC PC/SC readers (Phase 1f, issue #150). The monitor service owns
+        // the PC/SC context + its own event thread. This sweep just mirrors
+        // the visible reader set into UserDevices, like the MIDI sweep above.
+        private readonly Dictionary<string, NfcReaderDevice> _openedNfcReaders =
+            new Dictionary<string, NfcReaderDevice>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _nfcReadersLock = new object();
+        // Retry throttle for starting the NFC monitor. Not a permanent latch:
+        // if the Smart Card service is down at launch, Start() fails, and we
+        // retry on a WALL-CLOCK interval so a service/reader that appears later
+        // in the session is still picked up (self-healing like the MIDI sweep).
+        // Wall-clock, not a poll counter: the device sweep runs at the
+        // enumeration cadence (~2 s), not the pipeline rate, so a poll-count
+        // throttle sized for 60 Hz would stretch a "5 s" retry to ~10 minutes.
+        private long _nfcNextStartTicks; // Environment.TickCount64 of the next allowed Start attempt
+        // Set true by ShutdownNfcReaders so a poll thread still inside Phase 1f
+        // after the engine stop (the InputManager.Stop join can time out) cannot
+        // re-Start a fresh monitor + context after teardown. Mirrors the MIDI
+        // _midiInputsSuppressed latch.
+        private volatile bool _nfcInputsSuppressed;
+        private const int _nfcStartRetryMs = 5000;
+
+        // Handheld PC hidden buttons and system motion (Phase 1h, issue
+        // #343). The button row itself opens without I/O. The vendor HID
+        // enumeration and opens, the sensor query, and the daemon scan are
+        // blocking, so a worker does them on the sweep cadence and the poll
+        // thread only registers and retires rows (the headset split).
+        private volatile HandheldButtonsDevice _handheldDevice;
+        private volatile SystemMotionDevice _systemMotionDevice;
+        private readonly object _handheldLock = new object();
+        private volatile bool _handheldSweepRunning;
+        private volatile bool _handheldInputsSuppressed;
+        private long _handheldNextSweepTicks;
+        private const int _handheldSweepIntervalMs = 4000;
+        // Worker's answer on the sensor stack: null until the first probe.
+        private volatile SystemMotionDevice _systemMotionPending;
+        private volatile bool _systemMotionProbed;
+        private volatile bool _systemMotionOpenFailed;
+
+        // Head tracker (Phase 1i, issue #355). The row opens without
+        // blocking I/O (a UDP bind, a file mapping), so the poll thread
+        // runs the whole lifecycle itself.
+        private volatile HeadTrackerDevice _headTrackerDevice;
+        private readonly object _headTrackerLock = new object();
+        private volatile bool _headTrackerInputsSuppressed;
+
+        // Logitech G-keys (issue #454). The row opens without blocking I/O
+        // beyond a registry read and a library load, so the poll thread runs
+        // the whole lifecycle itself, the head tracker's shape.
+        private volatile LogitechGKeysDevice _logitechGKeysDevice;
+        private readonly object _logitechGKeysLock = new object();
+        private volatile bool _logitechGKeysInputsSuppressed;
+        private int _logitechGKeysVersion;
+        // A row whose SDK never started is retried on this cadence, so a user
+        // who acts on the status line sees it take effect.
+        private const int _logitechGKeysRetryIntervalMs = 5000;
+        private long _logitechGKeysRetryTicks;
+
+        /// <summary>The live G-Keys row, null while the feature is off. Read
+        /// by the Dashboard status lane.</summary>
+        internal LogitechGKeysDevice LogitechGKeys => _logitechGKeysDevice;
+
+        // Analog keyboards (Phase 1k, issue #468). Discovery and the open are
+        // blocking HID I/O, so a worker performs them and the poll thread
+        // only registers finished rows and retires vanished or dead ones, the
+        // headset sweep's shape (Phase 1g), gated by the Settings switch like
+        // the G-keys row.
+        private readonly Dictionary<string, AnalogKeyboardDevice> _openedAnalogKeyboards =
+            new Dictionary<string, AnalogKeyboardDevice>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<AnalogKeyboardDevice> _analogPendingRegister = new List<AnalogKeyboardDevice>();
+        private readonly object _analogLock = new object();
+        private volatile bool _analogSweepRunning;
+        private volatile bool _analogInputsSuppressed;
+        // Rows open or waiting to register, so the switched-off steady state
+        // costs two volatile reads.
+        private volatile bool _analogAnyRows;
+        // Latest sweep's present paths. Null until the first sweep completes,
+        // so nothing is retired on a cold cache.
+        private volatile HashSet<string> _analogPresentPaths;
+        private long _analogNextSweepTicks;
+        // When each collection that failed to open, or whose reader gave up,
+        // may be tried again.
+        private readonly Dictionary<string, long> _analogRetryAt =
+            new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        // Collections every matching route talked to and none recognized.
+        // They are left alone while they stay plugged in, so a keyboard of
+        // another make never sees a route's handshake twice.
+        private readonly HashSet<string> _analogNotSupported =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // The route that opened each collection, or proved it its own, kept
+        // while the collection stays present. A reopen runs only that route,
+        // the way a reference reconnects to a keyboard it claimed.
+        private readonly Dictionary<string, string> _analogClaims =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // After a timed retry, the routes that asked for it. The retry runs
+        // only those, so a route that refused the keyboard does not hear it
+        // again.
+        private readonly Dictionary<string, string[]> _analogRetryRoutes =
+            new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        // Collections due for a reopen on a route's timer, with the candidate
+        // each was found as, so the reopen needs no enumeration: a route's
+        // timer can be shorter than the sweep's.
+        private readonly Dictionary<string, AnalogKeyboardCandidate> _analogReopen =
+            new Dictionary<string, AnalogKeyboardCandidate>(StringComparer.OrdinalIgnoreCase);
+        // Earliest due reopen, read by the poll thread without the lock.
+        private long _analogNextReopenTicks = long.MaxValue;
+        // Failed reopens in a row of a claimed collection, for a route whose
+        // reference stops retrying after a few (ReconnectTries).
+        private readonly Dictionary<string, int> _analogReopenFailures =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        // Rows being stopped on the thread pool. Their route may still be
+        // putting the keyboard back, so no new session opens that keyboard
+        // until the stop ends, and shutdown waits for every stop.
+        private readonly Dictionary<AnalogKeyboardDevice, Task> _analogDisposing =
+            new Dictionary<AnalogKeyboardDevice, Task>();
+        // The sweep or reopen worker, which shutdown lets finish an open in
+        // flight before the teardowns.
+        private volatile Task _analogWorker;
+        private const int _analogSweepIntervalMs = 3000;
+        // A collection that would not open, or whose reader gave up (a polled
+        // keyboard that never answers), waits this long before another try,
+        // unless its route reconnects on a timer of its own.
+        private const int _analogOpenRetryMs = 60000;
+
+        /// <summary>The open analog keyboard rows, a snapshot for the
+        /// Settings status line.</summary>
+        internal AnalogKeyboardDevice[] AnalogKeyboards
+        {
+            get
+            {
+                lock (_analogLock)
+                {
+                    var rows = new AnalogKeyboardDevice[_openedAnalogKeyboards.Count];
+                    _openedAnalogKeyboards.Values.CopyTo(rows, 0);
+                    return rows;
+                }
+            }
+        }
+
+        /// <summary>The live Head Tracker row, null while the feature is off
+        /// or the row is retired. Read by the Dashboard status lane
+        /// (InputService.UpdateHeadTrackingStatus), which keys its cache on
+        /// the instance plus <see cref="HeadTrackerDevice.StatusVersion"/>,
+        /// so a reopen (new instance, version back at 0) still rebuilds.</summary>
+        internal HeadTrackerDevice HeadTracker => _headTrackerDevice;
+
+        // Sony headset head trackers (Phase 1g, issue #188). Discovery,
+        // qualification (Bluetooth feature-report reads) and the enable
+        // sequence are all blocking device I/O, so the worker does the
+        // whole open and the poll thread only registers finished devices
+        // and retires vanished ones.
+        private readonly Dictionary<string, SonyHeadsetMotionDevice> _openedHeadsets =
+            new Dictionary<string, SonyHeadsetMotionDevice>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<SonyHeadsetMotionDevice> _headsetPendingRegister =
+            new List<SonyHeadsetMotionDevice>();
+        private readonly object _headsetLock = new object();
+        private volatile bool _headsetSweepRunning;
+        private volatile bool _headsetInputsSuppressed;
+        // Latest sweep's present qualified paths. Null until the first
+        // sweep completes so nothing is retired on a cold cache.
+        private volatile HashSet<string> _headsetPresentPaths;
+        private long _headsetNextSweepTicks;
+        private readonly Dictionary<string, long> _headsetOpenFailedAt =
+            new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        // Wall-clock cadence like the NFC retry throttle: the sweep opens
+        // handles across the HID tree, so it runs well below the ~2 s
+        // device-sweep rate.
+        private const int _headsetSweepIntervalMs = 3000;
+        private const int _headsetOpenRetryMs = 60000;
+        // Unattended rebind of a failed-start head-tracker node (worker
+        // thread). Detection runs EVERY sweep (one cheap SetupDi pass), so
+        // a node that appears right after a Bluetooth connect is fixed
+        // within one sweep interval. The backoff is per node instance, so
+        // only a node that refuses to start under the inbox driver is
+        // left alone between retries. A blanket 30 s cooldown here was
+        // the owner-reported 10-20 s connect-to-row latency.
+        private string _headsetLastRebindInstance;
+        private long _headsetLastRebindTicks;
+        private const int _headsetRebindRetryMs = 60000;
+        // One-shot PnP-tree identity mining (see the sweep comment).
+        private volatile bool _headsetMinedPnpTree;
+        // Trackers that qualified this session, by paired-device address.
+        // When one's HID node vanishes (the XM5 drops the sensor channel
+        // spontaneously: hardware-observed Win32 1167 + node removal,
+        // 2026-08-07) the sweep re-requests its HID service. The absence
+        // check and the connection probe are cheap cached reads, so they
+        // run EVERY sweep. Only an ISSUED service request carries a
+        // per-address cooldown. A blanket 20 s gate here made a headset
+        // that reconnected right after an attempt wait out the window
+        // (owner-measured 25-30 s to reappear).
+        private readonly HashSet<ulong> _headsetKnownAddresses = new HashSet<ulong>();
+        private readonly Dictionary<ulong, long> _headsetServiceRequestAt = new Dictionary<ulong, long>();
+        private const int _headsetServiceRequestIntervalMs = 20000;
+
+        /// <summary>
+        /// Tears down every open MIDI input connection and the shared input
+        /// session, and suppresses Phase 1e until app restart. Called before
+        /// uninstalling Windows MIDI Services so no in-process runtime
+        /// objects are alive during the uninstall.
+        /// </summary>
+        public void ShutdownMidiInputs()
+        {
+            _midiInputsSuppressed = true;
+            _cachedMidiEndpoints = null;
+            lock (_midiInputsLock)
+            {
+                foreach (var kvp in _openedMidiInputs)
+                {
+                    var ud = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        // Same neutralize the unplug path performs. This is not
+                        // only an app-shutdown path: it also runs before a
+                        // Windows MIDI Services uninstall, with the app still
+                        // live, and Step 3 keeps the last OutputState for an
+                        // offline device. A note or CC held at that moment
+                        // stayed stamped on the slot's combined output.
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    kvp.Value.Dispose();
+                }
+                _openedMidiInputs.Clear();
+            }
+            MidiInputRuntime.Shutdown();
+        }
+
+        /// <summary>
+        /// Phase 1e: registers MIDI input endpoints as input devices and
+        /// marks vanished ones offline. PadForge's own MIDI virtual
+        /// controller endpoints are deliberately included. Assigning one
+        /// as an input to another slot is the no-hardware loopback path.
+        /// </summary>
+        private readonly Dictionary<string, long> _midiOpenFailedAt = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Closes any open loopback input connections to the
+        /// given PadForge MIDI endpoint. MUST run before that endpoint's
+        /// device-side teardown: tearing down a virtual endpoint while
+        /// this process still holds a client connection to it is the
+        /// deterministic midisrv wedge (bench 2026-07-23: every switch
+        /// away from a working MIDI slot with the loopback open left the
+        /// service hung past SCM control). Callers demote the endpoint's
+        /// registry claim first (MidiVirtualController.MarkClosing) so
+        /// the scanner cannot reopen it in this window.</summary>
+        internal void CloseMidiInputsForEndpoint(string uniqueEndpointId)
+        {
+            if (string.IsNullOrEmpty(uniqueEndpointId)) return;
+            lock (_midiInputsLock)
+            {
+                List<string> matches = null;
+                foreach (var kvp in _openedMidiInputs)
+                    if (kvp.Key.IndexOf(uniqueEndpointId, StringComparison.OrdinalIgnoreCase) >= 0)
+                        (matches ??= new List<string>()).Add(kvp.Key);
+                if (matches == null) return;
+                foreach (var id in matches)
+                {
+                    var dev = _openedMidiInputs[id];
+                    var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        // Closing one endpoint while the app runs on. Same
+                        // neutralize the unplug path performs, for the same
+                        // reason: without it a held note or CC survives the
+                        // close on the slot's combined output.
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    dev.Dispose();
+                    _openedMidiInputs.Remove(id);
+                }
+            }
+        }
+
+        private bool UpdateMidiInputDevices()
+        {
+            if (_midiInputsSuppressed)
+                return false;
+
+            if (!_midiEnumRunning)
+            {
+                _midiEnumRunning = true;
+                Task.Run(() =>
+                {
+                    try { _cachedMidiEndpoints = MidiInputRuntime.EnumerateEndpoints(); }
+                    catch { }
+                    finally { _midiEnumRunning = false; }
+                });
+            }
+
+            var endpoints = _cachedMidiEndpoints;
+            if (endpoints == null)
+                return false;
+
+            bool changed = false;
+            var current = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // The lock guards against ShutdownMidiInputs (UI thread, MIDI
+            // services uninstall) racing this polling-thread sweep.
+            lock (_midiInputsLock)
+            {
+                // Re-check under the lock: ShutdownMidiInputs may have set
+                // the flag (and disposed the session) between the unlocked
+                // check above and acquiring the lock. Without this, a stale
+                // endpoint snapshot would dev.Open() and lazily recreate the
+                // MidiSession that uninstall is about to remove.
+                if (_midiInputsSuppressed)
+                    return false;
+
+                long midiNow = Environment.TickCount64;
+                foreach (var (id, name) in endpoints)
+                {
+                    current.Add(id);
+
+                    // PadForge's own virtual-controller endpoints (the
+                    // documented no-hardware loopback path) open ONLY while
+                    // the owning MidiVirtualController in this process
+                    // reports its device side fully connected. That is the
+                    // authoritative state, not a name-plus-settle-time
+                    // heuristic: a PadForge-shaped endpoint with no ready
+                    // owner is either mid-create (the owner will flag ready
+                    // when the service finishes) or a corpse stranded by a
+                    // failed service-side teardown, and opening a corpse
+                    // re-animates it inside the service (see
+                    // MidiEndpointJanitor, which removes them instead).
+                    if (MidiEndpointJanitor.IsPadForgeEndpointId(id)
+                        && !_openedMidiInputs.ContainsKey(id)
+                        && !MidiVirtualController.IsReadyEndpointInstance(id))
+                        continue;
+
+                    // A recent failed open backs off instead of re-poking a
+                    // sick service every sweep.
+                    if (_midiOpenFailedAt.TryGetValue(id, out long failedAt)
+                        && midiNow - failedAt < 60_000)
+                        continue;
+
+                    if (_openedMidiInputs.TryGetValue(id, out var existing))
+                    {
+                        // If the user removed this device from the Devices page,
+                        // the connection is still tracked but the UserDevice is
+                        // gone. Reset tracking so it gets recreated. (Same
+                        // pattern as the PTP phase above.)
+                        if (FindOnlineDeviceByInstanceGuid(existing.InstanceGuid) != null)
+                            continue;
+                        existing.Dispose();
+                        _openedMidiInputs.Remove(id);
+                    }
+
+                    try
+                    {
+                        var dev = new MidiInputDevice(id, name);
+                        if (!dev.Open())
+                        {
+                            dev.Dispose();
+                            _midiOpenFailedAt[id] = midiNow;
+                            continue;
+                        }
+                        _midiOpenFailedAt.Remove(id);
+
+                        UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                        ud.LoadFromExternalDevice(dev);
+                        ud.IsOnline = true;
+                        _openedMidiInputs[id] = dev;
+                        MarkChanged(ref changed, "midi", $"+ {name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError($"Error opening MIDI endpoint '{name}'", ex);
+                    }
+                }
+
+                // Endpoints that vanished since the last snapshot.
+                List<string> gone = null;
+                foreach (var kvp in _openedMidiInputs)
+                    if (!current.Contains(kvp.Key))
+                        (gone ??= new List<string>()).Add(kvp.Key);
+
+                // Forget cooldown tracking for vanished ids so a
+                // re-created endpoint starts fresh.
+                if (_midiOpenFailedAt.Count > 0)
+                {
+                    List<string> stale = null;
+                    foreach (var key in _midiOpenFailedAt.Keys)
+                        if (!current.Contains(key)) (stale ??= new List<string>()).Add(key);
+                    if (stale != null) foreach (var key in stale) _midiOpenFailedAt.Remove(key);
+                }
+
+                if (gone != null)
+                {
+                    foreach (var id in gone)
+                    {
+                        var dev = _openedMidiInputs[id];
+                        var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            // Same neutralize MarkDeviceOffline performs. Without
+                            // it a note or CC held when the endpoint vanished
+                            // stayed stamped on the slot's combined output.
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        dev.Dispose();
+                        _openedMidiInputs.Remove(id);
+                        MarkChanged(ref changed, "midi", $"- {id}");
+                    }
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Tears down every open NFC reader device and the shared monitor
+        /// service. Called on app shutdown alongside ShutdownMidiInputs.
+        /// </summary>
+        // ── Standalone microphones (issue #317) ──
+        private readonly object _micDevicesLock = new object();
+        private readonly Dictionary<string, MicrophoneInputDevice> _openedMicDevices =
+            new Dictionary<string, MicrophoneInputDevice>(StringComparer.Ordinal);
+        private long _micNextSweepTicks;
+        private volatile bool _micInputsSuppressed;
+        private volatile bool _micSweepRunning;
+        private volatile Dictionary<string, string> _micEndpointSnapshot;
+        private int _micSnapshotVersion;
+        private int _micConsumedVersion = -1;
+        private const int _micSweepIntervalMs = 4000;
+
+        /// <summary>
+        /// Phase 1f2: every active Windows capture endpoint is an input
+        /// device (issue #317). A microphone is real hardware, so it earns a
+        /// device row the way MIDI ports and PC/SC readers do, and its
+        /// buttons are the registered voice phrases. This includes a WIRED
+        /// DualSense's endpoint: phrases live wherever the microphone
+        /// surfaces, and wired, it surfaces here. The recognition service is
+        /// started lazily alongside, since Bluetooth pads need it even when
+        /// no endpoint rows exist.
+        /// </summary>
+        private bool UpdateMicrophoneDevices()
+        {
+            if (_micInputsSuppressed)
+                return false;
+
+            long now = Environment.TickCount64;
+            // The COM endpoint enumeration is NOT allowed on this thread: it
+            // costs 5-20 ms and this is the 1000 Hz poll loop, so running it
+            // inline read as periodic ~920 Hz dips (owner report,
+            // 2026-08-16). A worker enumerates on the sweep cadence and
+            // publishes a snapshot. This phase only consumes it, the same
+            // split the headset sweep uses for its Bluetooth I/O.
+            if (!_micSweepRunning && now >= _micNextSweepTicks)
+            {
+                _micSweepRunning = true;
+                _micNextSweepTicks = now + _micSweepIntervalMs;
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        // The recognizer service rides this cadence: absent
+                        // when no speech recognizer is installed, harmless
+                        // to re-call.
+                        PadForge.Services.VoiceMacroService.Start();
+                        var snap = new Dictionary<string, string>(StringComparer.Ordinal);
+                        using var en = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+                        foreach (var dev in en.EnumerateAudioEndPoints(
+                            NAudio.CoreAudioApi.DataFlow.Capture, NAudio.CoreAudioApi.DeviceState.Active))
+                        {
+                            try { snap[dev.ID] = dev.FriendlyName; } catch { }
+                        }
+                        _micEndpointSnapshot = snap;
+                        System.Threading.Interlocked.Increment(ref _micSnapshotVersion);
+                    }
+                    catch { /* audio stack unavailable: the next sweep retries */ }
+                    finally { _micSweepRunning = false; }
+                });
+            }
+
+            // Consume each snapshot ONCE. The reconcile below takes the
+            // mic lock and resolves every endpoint's row, which has no
+            // business running per poll on the 1000 Hz thread. Row changes
+            // between sweeps simply wait for the next publish (4 s), the
+            // sweep's own cadence.
+            int ver = System.Threading.Volatile.Read(ref _micSnapshotVersion);
+            if (ver == _micConsumedVersion) return false;
+            _micConsumedVersion = ver;
+            var current = _micEndpointSnapshot;
+            if (current == null)
+                return false; // no snapshot yet
+
+            bool changed = false;
+            lock (_micDevicesLock)
+            {
+                foreach (var kv in current)
+                {
+                    if (_openedMicDevices.TryGetValue(kv.Key, out var existing))
+                    {
+                        if (FindOnlineDeviceByInstanceGuid(existing.InstanceGuid) != null)
+                            continue;
+                        // Recreate if the user removed it from the Devices page.
+                        existing.Dispose();
+                        _openedMicDevices.Remove(kv.Key);
+                    }
+                    try
+                    {
+                        var dev = new MicrophoneInputDevice(kv.Key, kv.Value);
+                        if (!dev.Open()) { dev.Dispose(); continue; }
+                        UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                        ud.LoadFromExternalDevice(dev);
+                        ud.IsOnline = true;
+                        _openedMicDevices[kv.Key] = dev;
+                        MarkChanged(ref changed, "mic", $"+ {kv.Value}");
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError($"Error opening microphone '{kv.Value}'", ex);
+                    }
+                }
+
+                List<string> gone = null;
+                foreach (var kv in _openedMicDevices)
+                    if (!current.ContainsKey(kv.Key))
+                        (gone ??= new List<string>()).Add(kv.Key);
+                if (gone != null)
+                {
+                    foreach (var id in gone)
+                    {
+                        var dev = _openedMicDevices[id];
+                        var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        dev.Dispose();
+                        _openedMicDevices.Remove(id);
+                        MarkChanged(ref changed, "mic", $"- {id}");
+                    }
+                }
+            }
+            return changed;
+        }
+
+        /// <summary>Called on app shutdown alongside ShutdownNfcReaders.</summary>
+        public void ShutdownMicrophoneDevices()
+        {
+            _micInputsSuppressed = true;
+            PadForge.Services.VoiceMacroService.SuppressStart = true;
+            lock (_micDevicesLock)
+            {
+                foreach (var kv in _openedMicDevices)
+                {
+                    var ud = FindOnlineDeviceByInstanceGuid(kv.Value.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    kv.Value.Dispose();
+                }
+                _openedMicDevices.Clear();
+            }
+            try { PadForge.Services.VoiceMacroService.Shutdown(); } catch { }
+        }
+
+        public void ShutdownNfcReaders()
+        {
+            _nfcInputsSuppressed = true;
+            lock (_nfcReadersLock)
+            {
+                foreach (var kvp in _openedNfcReaders)
+                {
+                    var ud = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        // Same neutralize the reader-removed path performs.
+                        // Step 3 keeps the last OutputState for an offline
+                        // device, so a tag-presence input asserted at teardown
+                        // stayed stamped on the slot's combined output.
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    kvp.Value.Dispose();
+                }
+                _openedNfcReaders.Clear();
+            }
+            try { PadForge.Services.NfcReaderService.Active?.Dispose(); } catch { }
+        }
+
+        /// <summary>
+        /// Phase 1f: registers each visible PC/SC reader as an input device
+        /// and marks vanished ones offline, mirroring UpdateMidiInputDevices.
+        /// The shared monitor (NfcReaderService) is started once, lazily. When
+        /// the Smart Card service is unavailable Start() fails and the monitor
+        /// stays absent, but the start is retried periodically so a service or
+        /// reader that appears later in the session is still picked up (the MIDI
+        /// sweep self-heals the same way).
+        /// </summary>
+        private bool UpdateNfcReaderDevices()
+        {
+            // Suppressed after teardown so a late poll cannot resurrect the
+            // monitor + context once ShutdownNfcReaders has disposed Active.
+            if (_nfcInputsSuppressed)
+                return false;
+
+            var svc = PadForge.Services.NfcReaderService.Active;
+            if (svc == null)
+            {
+                // Throttle start attempts (wall-clock) so a missing Smart Card
+                // service does not trigger an SCardEstablishContext every sweep,
+                // while still retrying every ~5 s regardless of the sweep rate.
+                long now = Environment.TickCount64;
+                if (now < _nfcNextStartTicks)
+                    return false;
+                _nfcNextStartTicks = now + _nfcStartRetryMs;
+                svc = PadForge.Services.NfcReaderService.Start();
+                if (svc == null) return false; // no Smart Card service yet, so retry later
+            }
+
+            var readers = svc.GetReaders();
+
+            bool changed = false;
+            var current = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            lock (_nfcReadersLock)
+            {
+                foreach (var reader in readers)
+                {
+                    current.Add(reader);
+
+                    if (_openedNfcReaders.TryGetValue(reader, out var existing))
+                    {
+                        // Recreate if the user removed it from the Devices page.
+                        if (FindOnlineDeviceByInstanceGuid(existing.InstanceGuid) != null)
+                            continue;
+                        existing.Dispose();
+                        _openedNfcReaders.Remove(reader);
+                    }
+
+                    try
+                    {
+                        var dev = new NfcReaderDevice(reader);
+                        if (!dev.Open())
+                        {
+                            dev.Dispose();
+                            continue;
+                        }
+                        UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                        ud.LoadFromExternalDevice(dev);
+                        ud.IsOnline = true;
+                        _openedNfcReaders[reader] = dev;
+                        MarkChanged(ref changed, "nfc", $"+ {reader}");
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError($"Error opening NFC reader '{reader}'", ex);
+                    }
+                }
+
+                List<string> gone = null;
+                foreach (var kvp in _openedNfcReaders)
+                    if (!current.Contains(kvp.Key))
+                        (gone ??= new List<string>()).Add(kvp.Key);
+
+                if (gone != null)
+                {
+                    foreach (var reader in gone)
+                    {
+                        var dev = _openedNfcReaders[reader];
+                        var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            // Same neutralize MarkDeviceOffline performs. Without
+                            // it a note or CC held when the endpoint vanished
+                            // stayed stamped on the slot's combined output.
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        dev.Dispose();
+                        _openedNfcReaders.Remove(reader);
+                        MarkChanged(ref changed, "nfc", $"- {reader}");
+                    }
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Phase 1g: registers Sony headset head trackers (issue #188),
+        /// mirroring the MIDI sweep shape. Discovery, the marker probe and
+        /// the enable-sequence feature writes are Bluetooth I/O, so a
+        /// worker performs the entire enumerate-and-open. This poll-thread
+        /// phase only registers finished devices and retires ones whose
+        /// HID node vanished or whose reader thread died.
+        /// </summary>
+        private bool UpdateHeadsetMotionDevices()
+        {
+            if (_headsetInputsSuppressed)
+                return false;
+
+            long now = Environment.TickCount64;
+            if (!_headsetSweepRunning && now >= _headsetNextSweepTicks)
+            {
+                _headsetSweepRunning = true;
+                _headsetNextSweepTicks = now + _headsetSweepIntervalMs;
+                Task.Run(() =>
+                {
+                    try { HeadsetMotionSweep(); }
+                    catch { }
+                    finally { _headsetSweepRunning = false; }
+                });
+            }
+
+            bool changed = false;
+            var present = _headsetPresentPaths;
+            lock (_headsetLock)
+            {
+                // Re-check under the lock: shutdown may have latched while
+                // the worker was finishing (the MIDI suppress pattern).
+                if (_headsetInputsSuppressed)
+                    return false;
+
+                // Register devices the worker finished opening.
+                for (int i = 0; i < _headsetPendingRegister.Count; i++)
+                {
+                    var dev = _headsetPendingRegister[i];
+                    try
+                    {
+                        UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                        ud.LoadFromExternalDevice(dev);
+                        ud.IsOnline = true;
+                        _openedHeadsets[dev.DevicePath] = dev;
+                        MarkChanged(ref changed, "headset", $"+ {dev.Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        dev.Dispose();
+                        RaiseError($"Error registering headset tracker '{dev.Name}'", ex);
+                    }
+                }
+                _headsetPendingRegister.Clear();
+
+                // Retire vanished nodes, dead readers, and rows the user
+                // removed from the Devices page (the MIDI recreate pattern:
+                // dropping the tracking entry lets the next sweep re-open).
+                List<string> gone = null;
+                foreach (var kvp in _openedHeadsets)
+                {
+                    bool vanished = present != null && !present.Contains(kvp.Key);
+                    bool dead = !kvp.Value.IsAttached;
+                    bool removedByUser = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid) == null;
+                    if (vanished || dead || removedByUser)
+                        (gone ??= new List<string>()).Add(kvp.Key);
+                }
+                if (gone != null)
+                {
+                    foreach (var path in gone)
+                    {
+                        var dev = _openedHeadsets[path];
+                        var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            // Same neutralize the MIDI/NFC retire paths
+                            // perform: a gyro deflection held at vanish time
+                            // would stay stamped on the slot's output.
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        dev.Dispose();
+                        _openedHeadsets.Remove(path);
+                        MarkChanged(ref changed, "headset", $"- {path}");
+                    }
+                }
+
+                // Forget open-failure cooldowns for vanished paths so a
+                // re-created node starts fresh.
+                if (present != null && _headsetOpenFailedAt.Count > 0)
+                {
+                    List<string> stale = null;
+                    foreach (var key in _headsetOpenFailedAt.Keys)
+                        if (!present.Contains(key)) (stale ??= new List<string>()).Add(key);
+                    if (stale != null) foreach (var key in stale) _headsetOpenFailedAt.Remove(key);
+                }
+            }
+            return changed;
+        }
+
+        /// <summary>Worker half of Phase 1g: enumerate qualified trackers,
+        /// open and configure the new ones, queue them for poll-thread
+        /// registration. All blocking I/O lives here.</summary>
+        private void HeadsetMotionSweep()
+        {
+            // Self-heal BEFORE enumerating: Windows routinely parks the
+            // head-tracker child at CM_PROB_FAILED_START under its sensor
+            // class driver (hardware-confirmed 2026-08-07 on a WH-1000XM5),
+            // and a failed node never qualifies, so no row exists exactly
+            // when the repair is needed. Detection runs every sweep. The
+            // rebind acts only on exactly one matching node (the
+            // reference's own gate) with a per-node retry backoff.
+            long repairTick = Environment.TickCount64;
+            try
+            {
+                int matches = PadForge.Services.HeadsetTrackerRepair.FindFailedStartNode(
+                    out string failedInstance, out string failedHardwareId);
+                if (matches == 1
+                    && (!string.Equals(failedInstance, _headsetLastRebindInstance, StringComparison.OrdinalIgnoreCase)
+                        || repairTick - _headsetLastRebindTicks > _headsetRebindRetryMs))
+                {
+                    _headsetLastRebindInstance = failedInstance;
+                    _headsetLastRebindTicks = repairTick;
+                    PadForge.Engine.SdlDiagLog.WriteLine(
+                        $"Headset auto-repair: binding {failedInstance} to inbox input.inf");
+                    if (PadForge.Services.HeadsetTrackerRepair.RebindNode(failedHardwareId,
+                            line => PadForge.Engine.SdlDiagLog.WriteLine("Headset auto-repair: " + line)))
+                        SonyHeadsetMotionRuntime.InvalidateCache();
+                }
+                else if (matches > 1)
+                {
+                    PadForge.Engine.SdlDiagLog.WriteLine(
+                        $"Headset auto-repair: {matches} failed head-tracker nodes; not rebinding");
+                }
+            }
+            catch { }
+
+            var candidates = SonyHeadsetMotionRuntime.Enumerate();
+            if (candidates == null)
+                return; // enumeration failed, so keep the previous snapshot
+            var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in candidates) present.Add(c.Path);
+            _headsetPresentPaths = present;
+
+            // Known trackers (this session or persisted from earlier runs)
+            // whose node is absent: re-request the HID service so the
+            // stream comes back on its own. The rebind above then starts
+            // the recreated node, which routinely returns at failed-start.
+            long svcTick = Environment.TickCount64;
+
+            // With no candidates and no remembered addresses (fresh
+            // process after a force-kill, settings never saved), the
+            // PnP tree itself still records every tracker this machine
+            // has seen: the phantom node left behind by a channel drop
+            // resolves to its paired address (hardware-observed
+            // 2026-08-07, the exact state that stranded a connected
+            // headset with no recovery path).
+            if (candidates.Count == 0 && !_headsetMinedPnpTree)
+            {
+                bool haveAny;
+                lock (_headsetLock)
+                    haveAny = _headsetKnownAddresses.Count > 0
+                        || SonyHeadsetMotionRuntime.GetPersistedAddresses().Length > 0;
+                if (!haveAny)
+                {
+                    // Once per process: the scan walks every node's
+                    // hardware IDs, and its only job is recovering PAST
+                    // identity. A first-ever tracker arrives as a live
+                    // candidate through normal enumeration instead.
+                    _headsetMinedPnpTree = true;
+                    try
+                    {
+                        foreach (ulong mined in PadForge.Services.HeadsetTrackerRepair.FindKnownTrackerAddresses())
+                        {
+                            PadForge.Engine.SdlDiagLog.WriteLine(
+                                $"Headset: recovered tracker address {mined:X12} from a PnP node record");
+                            SonyHeadsetMotionRuntime.RememberAddress(mined);
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            List<ulong> absent = null;
+            lock (_headsetLock)
+            {
+                foreach (ulong persisted in SonyHeadsetMotionRuntime.GetPersistedAddresses())
+                    _headsetKnownAddresses.Add(persisted);
+                foreach (ulong address in _headsetKnownAddresses)
+                {
+                    bool covered = false;
+                    foreach (var c in candidates)
+                        if (c.BluetoothAddress == address) { covered = true; break; }
+                    if (covered) continue;
+                    // The per-address cooldown applies to ISSUED requests
+                    // only. A disconnected headset is probed again next
+                    // sweep so a reconnect is caught within ~3 s.
+                    if (_headsetServiceRequestAt.TryGetValue(address, out long at)
+                        && svcTick - at < _headsetServiceRequestIntervalMs)
+                        continue;
+                    (absent ??= new List<ulong>()).Add(address);
+                }
+            }
+            if (absent != null)
+            {
+                foreach (ulong address in absent)
+                {
+                    try
+                    {
+                        var outcome = PadForge.Services.HeadsetTrackerRepair.RequestHidServiceByAddress(
+                            address, line => PadForge.Engine.SdlDiagLog.WriteLine("Headset service: " + line));
+                        if (outcome == PadForge.Services.HeadsetTrackerRepair.Outcome.ServiceRequested
+                            || outcome == PadForge.Services.HeadsetTrackerRepair.Outcome.Failed)
+                        {
+                            // Both outcomes touched BluetoothSetServiceState.
+                            // Pace further attempts for this address.
+                            lock (_headsetLock)
+                                _headsetServiceRequestAt[address] = svcTick;
+                        }
+                        if (outcome == PadForge.Services.HeadsetTrackerRepair.Outcome.ServiceRequested)
+                            SonyHeadsetMotionRuntime.InvalidateCache();
+                    }
+                    catch { }
+                }
+            }
+
+            long now = Environment.TickCount64;
+            foreach (var candidate in candidates)
+            {
+                lock (_headsetLock)
+                {
+                    if (_headsetInputsSuppressed) return;
+                    if (_openedHeadsets.ContainsKey(candidate.Path)) continue;
+                    bool pending = false;
+                    for (int i = 0; i < _headsetPendingRegister.Count; i++)
+                        if (string.Equals(_headsetPendingRegister[i].DevicePath, candidate.Path,
+                                StringComparison.OrdinalIgnoreCase)) { pending = true; break; }
+                    if (pending) continue;
+                    if (_headsetOpenFailedAt.TryGetValue(candidate.Path, out long failedAt)
+                        && now - failedAt < _headsetOpenRetryMs)
+                        continue;
+                }
+
+                var dev = new SonyHeadsetMotionDevice(candidate);
+                bool ok = false;
+                try { ok = dev.Open(); }
+                catch { }
+                PadForge.Engine.SdlDiagLog.WriteLine(ok
+                    ? $"Headset: opened '{candidate.Name}' (accel={candidate.HasAccel})"
+                    : $"Headset: open/enable failed for '{candidate.Name}', retry in {_headsetOpenRetryMs / 1000} s");
+                lock (_headsetLock)
+                {
+                    if (_headsetInputsSuppressed) { dev.Dispose(); return; }
+                    if (!ok)
+                    {
+                        dev.Dispose();
+                        _headsetOpenFailedAt[candidate.Path] = now;
+                        continue;
+                    }
+                    _headsetOpenFailedAt.Remove(candidate.Path);
+                    _headsetPendingRegister.Add(dev);
+                    if (candidate.BluetoothAddress != 0)
+                    {
+                        _headsetKnownAddresses.Add(candidate.BluetoothAddress);
+                        // Persisted through AppSettings so an app restart
+                        // with the node absent can still re-request the
+                        // tracker's HID service.
+                        SonyHeadsetMotionRuntime.RememberAddress(candidate.BluetoothAddress);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Tears down every open headset tracker and suppresses Phase 1g.
+        /// Called on app shutdown alongside ShutdownNfcReaders.
+        /// </summary>
+        /// <summary>
+        /// Phase 1h: the handheld hidden-buttons row and the system motion
+        /// row (issue #343). Both exist only while the Settings toggle is
+        /// on. The button row registers at once (no I/O in Open). The
+        /// worker enumerates vendor collections and syncs the device's
+        /// readers, probes the sensor stack once and opens the motion row
+        /// off the poll thread, and refreshes the vendor daemon scan.
+        /// </summary>
+        private bool UpdateHandheldDevices()
+        {
+            if (_handheldInputsSuppressed)
+                return false;
+
+            bool enabled = HandheldButtonRegistry.FeatureEnabled;
+            // Off with nothing to retire: two volatile reads and out. The
+            // feature must cost a machine that never uses it nothing.
+            if (!enabled && _handheldDevice == null && _systemMotionDevice == null && _systemMotionPending == null)
+                return false;
+
+            bool changed = false;
+            bool stopChords = false;
+            lock (_handheldLock)
+            {
+                if (_handheldInputsSuppressed)
+                    return false;
+
+                if (!enabled)
+                {
+                    changed |= RetireHandheldRows();
+                    // Off means off (issue #353). Retiring the rows alone left
+                    // the chord worker thread parked and the hook manager
+                    // still holding the engine for the life of the process,
+                    // so the feature kept a thread and a hook-path branch on
+                    // a machine whose owner had turned it off.
+                    //
+                    // The stop itself happens OUTSIDE this lock, the way
+                    // ShutdownHandheldInputs already does it: Stop takes the
+                    // runtime's own lock, raises ButtonChanged through
+                    // SetChords(null), and joins its worker. This method runs
+                    // on the POLL thread, so holding _handheldLock across all
+                    // of that would nest two locks and put a join on the
+                    // thread that has to hold the rate.
+                    stopChords = true;
+                }
+            }
+            if (stopChords)
+            {
+                try { HandheldChordRuntime.Stop(); } catch { }
+                return changed;
+            }
+            lock (_handheldLock)
+            {
+                if (_handheldInputsSuppressed)
+                    return changed;
+
+                // Button row: recreate if the user removed it from the
+                // Devices page (the NFC recreate pattern).
+                if (_handheldDevice != null && FindOnlineDeviceByInstanceGuid(_handheldDevice.InstanceGuid) == null)
+                {
+                    _handheldDevice.Dispose();
+                    _handheldDevice = null;
+                }
+                if (_handheldDevice == null)
+                {
+                    try
+                    {
+                        var dev = new HandheldButtonsDevice(PadForge.Engine.Common.MachineIdentity.Current);
+                        if (dev.Open())
+                        {
+                            UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                            ud.LoadFromExternalDevice(dev);
+                            ud.IsOnline = true;
+                            _handheldDevice = dev;
+                            MarkChanged(ref changed, "handheld", "+ buttons");
+                        }
+                        else dev.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError("Error opening handheld buttons device", ex);
+                    }
+                }
+
+                // Motion row: register what the worker opened.
+                var pending = _systemMotionPending;
+                if (pending != null)
+                {
+                    _systemMotionPending = null;
+                    try
+                    {
+                        UserDevice ud = FindOrCreateUserDevice(pending.InstanceGuid, pending.ProductGuid);
+                        ud.LoadFromExternalDevice(pending);
+                        ud.IsOnline = true;
+                        _systemMotionDevice = pending;
+                        MarkChanged(ref changed, "handheld", "+ system motion");
+                    }
+                    catch (Exception ex)
+                    {
+                        pending.Dispose();
+                        RaiseError("Error registering system motion device", ex);
+                    }
+                }
+                if (_systemMotionDevice != null)
+                {
+                    bool dead = !_systemMotionDevice.IsAttached;
+                    bool removedByUser = FindOnlineDeviceByInstanceGuid(_systemMotionDevice.InstanceGuid) == null;
+                    if (dead || removedByUser)
+                    {
+                        var ud = FindOnlineDeviceByInstanceGuid(_systemMotionDevice.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        _systemMotionDevice.Dispose();
+                        _systemMotionDevice = null;
+                        _systemMotionProbed = false; // re-probe, the sensor may be back
+                        MarkChanged(ref changed, "handheld", dead ? "- system motion (dead)" : "- system motion (removed by user)");
+                    }
+                }
+            }
+
+            long now = Environment.TickCount64;
+            if (!_handheldSweepRunning && now >= _handheldNextSweepTicks)
+            {
+                _handheldSweepRunning = true;
+                _handheldNextSweepTicks = now + _handheldSweepIntervalMs;
+                Task.Run(() =>
+                {
+                    try { HandheldSweep(); }
+                    catch { }
+                    finally { _handheldSweepRunning = false; }
+                });
+            }
+            return changed;
+        }
+
+        /// <summary>Worker half of Phase 1h. All blocking calls live here.</summary>
+        private void HandheldSweep()
+        {
+            if (_handheldInputsSuppressed || !HandheldButtonRegistry.FeatureEnabled) return;
+
+            HandheldDaemonWatch.Refresh();
+
+            var dev = _handheldDevice;
+            if (dev != null)
+            {
+                var present = VendorHidRuntime.Enumerate();
+                if (present != null) dev.SyncReaders(present);
+                dev.SyncWmi();
+            }
+
+            bool probe;
+            lock (_handheldLock)
+            {
+                probe = !_systemMotionProbed && _systemMotionDevice == null && _systemMotionPending == null && !_systemMotionOpenFailed;
+                if (probe) _systemMotionProbed = true;
+            }
+            if (probe)
+            {
+                if (SystemMotionDevice.IsAvailable())
+                {
+                    var motion = new SystemMotionDevice(PadForge.Engine.Common.MachineIdentity.Current);
+                    if (motion.Open())
+                    {
+                        lock (_handheldLock)
+                        {
+                            if (_handheldInputsSuppressed || !HandheldButtonRegistry.FeatureEnabled)
+                            {
+                                // The toggle went off mid-probe. Forget the
+                                // probe too, or a re-enable never retries.
+                                motion.Dispose();
+                                _systemMotionProbed = false;
+                                return;
+                            }
+                            _systemMotionPending = motion;
+                        }
+                    }
+                    else
+                    {
+                        motion.Dispose();
+                        _systemMotionOpenFailed = true;
+                    }
+                }
+            }
+        }
+
+        // Caller holds _handheldLock.
+        private bool RetireHandheldRows()
+        {
+            bool changed = false;
+            if (_handheldDevice != null)
+            {
+                var ud = FindOnlineDeviceByInstanceGuid(_handheldDevice.InstanceGuid);
+                if (ud != null)
+                {
+                    ud.IsOnline = false;
+                    ud.Device = null;
+                    NeutralizeMappedOutputsFor(ud);
+                }
+                _handheldDevice.Dispose();
+                _handheldDevice = null;
+                MarkChanged(ref changed, "handheld", "- buttons (feature off)");
+            }
+            var pending = _systemMotionPending;
+            if (pending != null)
+            {
+                _systemMotionPending = null;
+                pending.Dispose();
+            }
+            if (_systemMotionDevice != null)
+            {
+                var ud = FindOnlineDeviceByInstanceGuid(_systemMotionDevice.InstanceGuid);
+                if (ud != null)
+                {
+                    ud.IsOnline = false;
+                    ud.Device = null;
+                    NeutralizeMappedOutputsFor(ud);
+                }
+                _systemMotionDevice.Dispose();
+                _systemMotionDevice = null;
+                MarkChanged(ref changed, "handheld", "- system motion (feature off)");
+            }
+            _systemMotionProbed = false;
+            _systemMotionOpenFailed = false;
+            return changed;
+        }
+
+        /// <summary>Called on app shutdown in the same window as the NFC,
+        /// microphone and headset teardowns: after Stop(), before
+        /// ShutdownSdl().</summary>
+        /// <summary>Phase 1i (issue #355). One row while either input is on,
+        /// recreated when the user removes it (the NFC recreate
+        /// pattern) and reopened when the port or the FreeTrack toggle
+        /// changes. Off with nothing to retire: two volatile reads and out.</summary>
+        private bool UpdateHeadTrackerDevice()
+        {
+            if (_headTrackerInputsSuppressed)
+                return false;
+
+            bool enabled = HeadTrackingRuntime.AnyEnabled;
+            if (!enabled && _headTrackerDevice == null)
+                return false;
+
+            bool changed = false;
+            lock (_headTrackerLock)
+            {
+                if (_headTrackerInputsSuppressed)
+                    return false;
+
+                var dev = _headTrackerDevice;
+                if (dev != null)
+                {
+                    // The hand rows count too. Checking only the headset row
+                    // meant deleting a controller on the Devices page left it
+                    // gone for the session, since the recreate is keyed on the
+                    // row that was still present.
+                    bool removedByUser = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid) == null;
+                    if (!removedByUser)
+                        foreach (var hand in new[] { dev.LeftHand, dev.RightHand })
+                        {
+                            if (hand == null) continue;
+                            if (FindOnlineDeviceByInstanceGuid(hand.InstanceGuid) != null) continue;
+                            removedByUser = true;
+                            break;
+                        }
+                    bool reconfigured = dev.ConfigVersion != HeadTrackingRuntime.Version;
+                    if (!enabled || removedByUser || reconfigured)
+                    {
+                        RetireHeadTrackerRow();
+                        MarkChanged(ref changed, "headtracker", !enabled ? "- (feature off)" : removedByUser ? "- (removed by user)" : "- (reconfigured)");
+                    }
+                }
+
+                if (enabled && _headTrackerDevice == null)
+                {
+                    try
+                    {
+                        var created = HeadTrackerDevice.FromCurrentSettings();
+                        if (created.Open())
+                        {
+                            UserDevice ud = FindOrCreateUserDevice(created.InstanceGuid, created.ProductGuid);
+                            ud.LoadFromExternalDevice(created);
+                            ud.IsOnline = true;
+                            _headTrackerDevice = created;
+                            MarkChanged(ref changed, "headtracker", "+ opened");
+                            // The controllers ride the same OpenXR session, so
+                            // they appear and retire with the headset row.
+                            foreach (var hand in new[] { created.LeftHand, created.RightHand })
+                            {
+                                if (hand == null) continue;
+                                UserDevice hud = FindOrCreateUserDevice(hand.InstanceGuid, hand.ProductGuid);
+                                hud.LoadFromExternalDevice(hand);
+                                hud.IsOnline = true;
+                                MarkChanged(ref changed, "openxrhand", "+ " + hand.Name);
+                            }
+                        }
+                        else created.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError("Error opening head tracker device", ex);
+                    }
+                }
+            }
+            return changed;
+        }
+
+        // Caller holds _headTrackerLock.
+        private void RetireHeadTrackerRow()
+        {
+            var dev = _headTrackerDevice;
+            if (dev == null) return;
+            var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+            if (ud != null)
+            {
+                ud.IsOnline = false;
+                ud.Device = null;
+                NeutralizeMappedOutputsFor(ud);
+            }
+            foreach (var hand in new[] { dev.LeftHand, dev.RightHand })
+            {
+                if (hand == null) continue;
+                var hud = FindOnlineDeviceByInstanceGuid(hand.InstanceGuid);
+                if (hud == null) continue;
+                hud.IsOnline = false;
+                hud.Device = null;
+                NeutralizeMappedOutputsFor(hud);
+            }
+            dev.Dispose();
+            _headTrackerDevice = null;
+        }
+
+        public void ShutdownHeadTrackerInputs()
+        {
+            _headTrackerInputsSuppressed = true;
+            lock (_headTrackerLock)
+            {
+                RetireHeadTrackerRow();
+            }
+        }
+
+        /// <summary>Phase 1j (issue #454). One row while the feature is on,
+        /// recreated when the user removes it from the Devices page (the NFC
+        /// recreate pattern). Off with nothing to retire: two volatile reads
+        /// and out.
+        ///
+        /// <para>The row opens even when the SDK is absent, so the Devices
+        /// list can carry the reason. A row that vanishes tells a user nothing
+        /// about why their G-keys are quiet.</para></summary>
+        private bool UpdateLogitechGKeysDevice()
+        {
+            if (_logitechGKeysInputsSuppressed)
+                return false;
+
+            bool enabled = LogitechGKeysRuntime.Enabled;
+            if (!enabled && _logitechGKeysDevice == null)
+                return false;
+            long now = Environment.TickCount64;
+
+            bool changed = false;
+            lock (_logitechGKeysLock)
+            {
+                if (_logitechGKeysInputsSuppressed)
+                    return false;
+
+                var dev = _logitechGKeysDevice;
+                if (dev != null)
+                {
+                    bool removedByUser = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid) == null;
+                    bool reconfigured = _logitechGKeysVersion != LogitechGKeysRuntime.Version;
+                    // The status line tells a user to start Logitech Gaming
+                    // Software, so starting it has to be enough. Without this
+                    // the row held its failure for the life of the session and
+                    // the only way through was to toggle the setting off and
+                    // on, which the message never mentions.
+                    bool retry = !removedByUser && !reconfigured
+                        && dev.SourceState != PadForge.Engine.Common.Logitech.LogitechGKeyState.Running
+                        && now >= _logitechGKeysRetryTicks;
+                    if (retry) _logitechGKeysRetryTicks = now + _logitechGKeysRetryIntervalMs;
+                    if (!enabled || removedByUser || reconfigured || retry)
+                    {
+                        RetireLogitechGKeysRow();
+                        MarkChanged(ref changed, "gkeys", !enabled ? "- (feature off)"
+                            : removedByUser ? "- (removed by user)"
+                            : reconfigured ? "- (reconfigured)" : "- (retrying the SDK)");
+                    }
+                }
+
+                if (enabled && _logitechGKeysDevice == null)
+                {
+                    try
+                    {
+                        var created = new LogitechGKeysDevice();
+                        if (created.Open())
+                        {
+                            UserDevice ud = FindOrCreateUserDevice(created.InstanceGuid, created.ProductGuid);
+                            ud.LoadFromExternalDevice(created);
+                            ud.IsOnline = true;
+                            _logitechGKeysDevice = created;
+                            _logitechGKeysVersion = LogitechGKeysRuntime.Version;
+                            MarkChanged(ref changed, "gkeys", "+ " + created.SourceState);
+                        }
+                        else created.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError("Error opening Logitech G-Keys device", ex);
+                    }
+                }
+            }
+            return changed;
+        }
+
+        // Caller holds _logitechGKeysLock.
+        private void RetireLogitechGKeysRow()
+        {
+            var dev = _logitechGKeysDevice;
+            if (dev == null) return;
+            var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+            if (ud != null)
+            {
+                ud.IsOnline = false;
+                ud.Device = null;
+                NeutralizeMappedOutputsFor(ud);
+            }
+            dev.Dispose();
+            _logitechGKeysDevice = null;
+        }
+
+        public void ShutdownLogitechGKeysInputs()
+        {
+            _logitechGKeysInputsSuppressed = true;
+            lock (_logitechGKeysLock)
+            {
+                RetireLogitechGKeysRow();
+            }
+        }
+
+        /// <summary>
+        /// Phase 1k (issue #468): one row per analog keyboard while the
+        /// Settings switch is on. A worker enumerates and opens, and this
+        /// poll-thread phase registers finished rows and retires rows whose
+        /// collection vanished, whose reader stopped, or that the user removed
+        /// from the Devices page (the headset sweep's legs). Switching the
+        /// setting off retires every row. Off with nothing to retire: two
+        /// volatile reads and out.
+        /// </summary>
+        private bool UpdateAnalogKeyboardDevices()
+        {
+            if (_analogInputsSuppressed)
+                return false;
+
+            bool enabled = AnalogKeyboardRuntime.Enabled;
+            if (!enabled && !_analogAnyRows)
+                return false;
+
+            long now = Environment.TickCount64;
+            if (enabled && !_analogSweepRunning)
+            {
+                // A full sweep every 3 s. Between sweeps, a reopen that a
+                // route's timer made due runs on its own, with the candidate
+                // it was found as.
+                bool full = now >= _analogNextSweepTicks;
+                if (full || now >= Volatile.Read(ref _analogNextReopenTicks))
+                {
+                    _analogSweepRunning = true;
+                    if (full) _analogNextSweepTicks = now + _analogSweepIntervalMs;
+                    _analogWorker = Task.Run(() =>
+                    {
+                        try
+                        {
+                            if (full) AnalogKeyboardSweep();
+                            else AnalogKeyboardReopenDue();
+                        }
+                        catch { }
+                        finally { _analogSweepRunning = false; }
+                    });
+                }
+            }
+
+            bool changed = false;
+            var present = _analogPresentPaths;
+            lock (_analogLock)
+            {
+                if (_analogInputsSuppressed)
+                    return false;
+
+                List<AnalogKeyboardDevice> listening = null;
+                for (int i = 0; i < _analogPendingRegister.Count; i++)
+                {
+                    var dev = _analogPendingRegister[i];
+                    if (!enabled)
+                    {
+                        DisposeAnalogKeyboardAsync(dev);
+                        continue;
+                    }
+                    // A route that recognizes its keyboards by their reports
+                    // registers the row at the first key set. Until then the
+                    // collection is only listened to, and it gives way as soon
+                    // as a route of its own reads the keyboard through another
+                    // collection: a listener never writes, so stopping it
+                    // costs nothing.
+                    if (dev.RegistersOnFirstReport && dev.ReportCount == 0)
+                    {
+                        bool vanished = present != null && !present.Contains(dev.HidPath);
+                        bool readElsewhere = false;
+                        foreach (var open in _openedAnalogKeyboards.Values)
+                            if (string.Equals(open.IdentityKey, dev.IdentityKey, StringComparison.OrdinalIgnoreCase))
+                            { readElsewhere = true; break; }
+                        for (int j = 0; j < _analogPendingRegister.Count && !readElsewhere; j++)
+                        {
+                            var other = _analogPendingRegister[j];
+                            if (other != dev && !(other.RegistersOnFirstReport && other.ReportCount == 0)
+                                && string.Equals(other.IdentityKey, dev.IdentityKey, StringComparison.OrdinalIgnoreCase))
+                                readElsewhere = true;
+                        }
+                        if (dev.IsAttached && !vanished && !readElsewhere)
+                        {
+                            (listening ??= new List<AnalogKeyboardDevice>()).Add(dev);
+                        }
+                        else
+                        {
+                            if (!vanished && !readElsewhere) _analogRetryAt[dev.HidPath] = now + _analogOpenRetryMs;
+                            DisposeAnalogKeyboardAsync(dev);
+                        }
+                        continue;
+                    }
+                    // Two collections of one keyboard, or two keyboards that
+                    // report one serial, would share a row. The first keeps it.
+                    bool duplicate = false;
+                    foreach (var open in _openedAnalogKeyboards.Values)
+                        if (open.InstanceGuid == dev.InstanceGuid) { duplicate = true; break; }
+                    if (duplicate)
+                    {
+                        // Wait out the cooldown, or the sweep reopens the
+                        // collection and starts its reader every pass.
+                        _analogRetryAt[dev.HidPath] = now + _analogOpenRetryMs;
+                        DisposeAnalogKeyboardAsync(dev);
+                        continue;
+                    }
+                    try
+                    {
+                        UserDevice ud = FindOrCreateUserDevice(dev.InstanceGuid, dev.ProductGuid);
+                        ud.LoadFromExternalDevice(dev);
+                        ud.IsOnline = true;
+                        dev.PublishKeyOrder();
+                        _openedAnalogKeyboards[dev.HidPath] = dev;
+                        MarkChanged(ref changed, "analogkb", $"+ {dev.Name} ({dev.Protocol})");
+                    }
+                    catch (Exception ex)
+                    {
+                        DisposeAnalogKeyboardAsync(dev);
+                        RaiseError($"Error registering analog keyboard '{dev.Name}'", ex);
+                    }
+                }
+                _analogPendingRegister.Clear();
+                if (listening != null) _analogPendingRegister.AddRange(listening);
+
+                List<string> gone = null;
+                foreach (var kvp in _openedAnalogKeyboards)
+                {
+                    bool vanished = present != null && !present.Contains(kvp.Key);
+                    bool dead = !kvp.Value.IsAttached;
+                    bool removedByUser = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid) == null;
+                    if (!enabled || vanished || dead || removedByUser)
+                        (gone ??= new List<string>()).Add(kvp.Key);
+                    // A reader that stopped on a collection that is still
+                    // there reopens on its route's reconnect timer, the wait
+                    // its reference takes after a session. A route without
+                    // one waits out the cooldown (a polled keyboard that never
+                    // answers) instead of reopening every sweep.
+                    if (enabled && dead && !vanished)
+                    {
+                        int reconnect = kvp.Value.ReconnectMs;
+                        if (reconnect > 0)
+                            ScheduleAnalogReopen(kvp.Value.Candidate, now + reconnect);
+                        else
+                            _analogRetryAt[kvp.Key] = now + _analogOpenRetryMs;
+                    }
+                }
+                if (gone != null)
+                {
+                    foreach (var path in gone)
+                    {
+                        var dev = _openedAnalogKeyboards[path];
+                        var ud = FindOnlineDeviceByInstanceGuid(dev.InstanceGuid);
+                        if (ud != null)
+                        {
+                            ud.IsOnline = false;
+                            ud.Device = null;
+                            // A key held at retire time would stay stamped on
+                            // the slot's output, the MIDI/NFC/headset reason.
+                            NeutralizeMappedOutputsFor(ud);
+                        }
+                        // A stop lets the route undo its keyboard mode, which
+                        // can take a pass, so it never runs on this thread.
+                        DisposeAnalogKeyboardAsync(dev);
+                        _openedAnalogKeyboards.Remove(path);
+                        MarkChanged(ref changed, "analogkb", $"- {path}");
+                    }
+                }
+
+                if (present != null && _analogRetryAt.Count > 0)
+                {
+                    List<string> stale = null;
+                    foreach (var key in _analogRetryAt.Keys)
+                        if (!present.Contains(key)) (stale ??= new List<string>()).Add(key);
+                    if (stale != null)
+                        foreach (var key in stale)
+                        {
+                            _analogRetryAt.Remove(key);
+                            _analogReopen.Remove(key);
+                            _analogRetryRoutes.Remove(key);
+                            _analogReopenFailures.Remove(key);
+                        }
+                }
+                if (present != null && _analogNotSupported.Count > 0)
+                    _analogNotSupported.RemoveWhere(key => !present.Contains(key));
+                // A claim lasts while its collection is plugged in.
+                if (present != null && _analogClaims.Count > 0)
+                {
+                    List<string> unplugged = null;
+                    foreach (var key in _analogClaims.Keys)
+                        if (!present.Contains(key)) (unplugged ??= new List<string>()).Add(key);
+                    if (unplugged != null)
+                        foreach (var key in unplugged)
+                        {
+                            _analogClaims.Remove(key);
+                            _analogReopenFailures.Remove(key);
+                        }
+                }
+
+                _analogAnyRows = _openedAnalogKeyboards.Count > 0 || _analogPendingRegister.Count > 0;
+            }
+            return changed;
+        }
+
+        /// <summary>Worker half of Phase 1k: enumerate analog keyboards, open
+        /// the new ones, queue them for poll-thread registration. All blocking
+        /// I/O lives here.</summary>
+        private void AnalogKeyboardSweep()
+        {
+            var candidates = AnalogKeyboardHidRuntime.Enumerate();
+            if (candidates == null)
+                return; // enumeration failed, so the previous snapshot stays
+            var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in candidates) present.Add(c.Path);
+            _analogPresentPaths = present;
+
+            try
+            {
+                foreach (var candidate in candidates)
+                    if (!TryOpenAnalogCandidate(candidate)) return;
+            }
+            finally
+            {
+                lock (_analogLock) RecomputeAnalogNextReopen();
+            }
+        }
+
+        /// <summary>Worker for the reopens a route's timer made due between
+        /// sweeps: each runs with the candidate it was found as, while the
+        /// last sweep still saw its collection.</summary>
+        private void AnalogKeyboardReopenDue()
+        {
+            List<AnalogKeyboardCandidate> due = null;
+            lock (_analogLock)
+            {
+                long now = Environment.TickCount64;
+                var present = _analogPresentPaths;
+                List<string> gone = null;
+                foreach (var kvp in _analogReopen)
+                {
+                    if (present != null && !present.Contains(kvp.Key))
+                    {
+                        (gone ??= new List<string>()).Add(kvp.Key);
+                        continue;
+                    }
+                    if (_analogRetryAt.TryGetValue(kvp.Key, out long at) && now < at) continue;
+                    (due ??= new List<AnalogKeyboardCandidate>()).Add(kvp.Value);
+                }
+                if (gone != null) foreach (var key in gone) _analogReopen.Remove(key);
+                RecomputeAnalogNextReopen();
+            }
+            if (due == null) return;
+            try
+            {
+                foreach (var candidate in due)
+                    if (!TryOpenAnalogCandidate(candidate)) return;
+            }
+            finally
+            {
+                lock (_analogLock) RecomputeAnalogNextReopen();
+            }
+        }
+
+        /// <summary>Opens one collection unless a row has it, a stop is still
+        /// putting its keyboard back, or its wait has not run out, and files
+        /// the result. False once the feature is off or the app is closing,
+        /// which ends the worker.</summary>
+        private bool TryOpenAnalogCandidate(AnalogKeyboardCandidate candidate)
+        {
+            string claimed;
+            string[] retryRoutes;
+            bool retrying;
+            lock (_analogLock)
+            {
+                if (_analogInputsSuppressed || !AnalogKeyboardRuntime.Enabled) return false;
+                string path = candidate.Path;
+                if (_openedAnalogKeyboards.ContainsKey(path) || _analogNotSupported.Contains(path)
+                    || AnalogCandidateTaken(candidate))
+                {
+                    _analogReopen.Remove(path);
+                    return true;
+                }
+                // A stop still running on this keyboard owns it until the
+                // route has put the keyboard back: a new session reading the
+                // keyboard's state now would record the old session's change
+                // as the keyboard's own. Try again shortly.
+                if (AnalogCandidateStopping(candidate))
+                {
+                    ScheduleAnalogReopen(candidate, Environment.TickCount64 + _analogStoppingRetryMs);
+                    return true;
+                }
+                if (_analogRetryAt.TryGetValue(path, out long retryAt) && Environment.TickCount64 < retryAt)
+                    return true;
+                _analogReopen.Remove(path);
+                _analogClaims.TryGetValue(path, out claimed);
+                _analogRetryRoutes.TryGetValue(path, out retryRoutes);
+                retrying = retryRoutes != null || _analogReopenFailures.ContainsKey(path);
+            }
+
+            var dev = new AnalogKeyboardDevice(candidate);
+            var result = AnalogKeyboardOpenResult.Busy;
+            try { result = dev.Open(claimed, claimed == null ? retryRoutes : null); }
+            catch { }
+            // The handshakes can take seconds, so the waits count from here.
+            long now = Environment.TickCount64;
+            // A route's timer can retry ten times a second, so a retry that
+            // fails like the last one is not logged again.
+            if (!(retrying && result == AnalogKeyboardOpenResult.RetryLater))
+            {
+                PadForge.Engine.SdlDiagLog.WriteLine(result switch
+                {
+                    AnalogKeyboardOpenResult.Opened =>
+                        $"Analog keyboard: opened '{dev.Name}' ({dev.Protocol}, {candidate.VendorId:X4}:{candidate.ProductId:X4})",
+                    AnalogKeyboardOpenResult.NotSupported =>
+                        $"Analog keyboard: no route recognized '{candidate.Name}' ({candidate.VendorId:X4}:{candidate.ProductId:X4}), left alone while plugged in",
+                    AnalogKeyboardOpenResult.RetryLater =>
+                        $"Analog keyboard: '{candidate.Name}' did not complete a handshake, retry in {dev.RetryAfterMs} ms",
+                    _ => $"Analog keyboard: open failed for '{candidate.Name}', retry in {_analogOpenRetryMs / 1000} s",
+                });
+            }
+            lock (_analogLock)
+            {
+                if (_analogInputsSuppressed || !AnalogKeyboardRuntime.Enabled)
+                {
+                    DisposeAnalogKeyboardAsync(dev);
+                    return false;
+                }
+                string path = candidate.Path;
+                _analogRetryRoutes.Remove(path);
+                if (dev.ClaimRouteId != null) _analogClaims[path] = dev.ClaimRouteId;
+                if (result == AnalogKeyboardOpenResult.Opened)
+                {
+                    _analogRetryAt.Remove(path);
+                    _analogReopenFailures.Remove(path);
+                    _analogPendingRegister.Add(dev);
+                    _analogAnyRows = true;
+                    return true;
+                }
+                dev.Dispose();
+                // A route whose reference gives up after a few reopens leaves
+                // the keyboard alone once they are spent.
+                if (claimed != null)
+                {
+                    _analogReopenFailures.TryGetValue(path, out int failures);
+                    _analogReopenFailures[path] = ++failures;
+                    int limit = PadForge.Engine.Common.AnalogKeyboard.AnalogKeyboardRoutes.Find(claimed)?.ReconnectTries ?? 0;
+                    if (limit > 0 && failures >= limit) result = AnalogKeyboardOpenResult.NotSupported;
+                }
+                if (result == AnalogKeyboardOpenResult.NotSupported)
+                {
+                    _analogNotSupported.Add(path);
+                }
+                else if (result == AnalogKeyboardOpenResult.RetryLater)
+                {
+                    if (dev.ClaimRouteId == null && claimed == null && dev.RetryRouteIds != null)
+                        _analogRetryRoutes[path] = dev.RetryRouteIds;
+                    ScheduleAnalogReopen(candidate, now + dev.RetryAfterMs);
+                }
+                else
+                {
+                    _analogRetryAt[path] = now + _analogOpenRetryMs;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>A row open or waiting to register already reads this
+        /// keyboard: the same collection, the collection a row reads as its
+        /// companion, or another collection of the same keyboard. A row that
+        /// only listens for its first report claims its own collection and
+        /// nothing else, so a route of the keyboard's own can still open it
+        /// through another collection. Caller holds <c>_analogLock</c>.</summary>
+        private bool AnalogCandidateTaken(AnalogKeyboardCandidate candidate)
+        {
+            foreach (var open in _openedAnalogKeyboards.Values)
+                if (string.Equals(open.IdentityKey, candidate.IdentityKey, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(open.CompanionPath, candidate.Path, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            foreach (var pending in _analogPendingRegister)
+            {
+                if (string.Equals(pending.HidPath, candidate.Path, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(pending.CompanionPath, candidate.Path, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                bool listening = pending.RegistersOnFirstReport && pending.ReportCount == 0;
+                if (!listening && string.Equals(pending.IdentityKey, candidate.IdentityKey, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>A row of this keyboard is still stopping. Caller holds
+        /// <c>_analogLock</c>.</summary>
+        private bool AnalogCandidateStopping(AnalogKeyboardCandidate candidate)
+        {
+            foreach (var stopping in _analogDisposing.Keys)
+                if (string.Equals(stopping.HidPath, candidate.Path, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(stopping.CompanionPath, candidate.Path, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(stopping.IdentityKey, candidate.IdentityKey, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        // How soon a collection whose keyboard is still stopping is tried again.
+        private const int _analogStoppingRetryMs = 100;
+
+        /// <summary>Reopens <paramref name="candidate"/> at
+        /// <paramref name="at"/>, from the candidate it was found as. Caller
+        /// holds <c>_analogLock</c>.</summary>
+        private void ScheduleAnalogReopen(AnalogKeyboardCandidate candidate, long at)
+        {
+            if (candidate == null) return;
+            _analogRetryAt[candidate.Path] = at;
+            _analogReopen[candidate.Path] = candidate;
+            if (at < Volatile.Read(ref _analogNextReopenTicks)) Volatile.Write(ref _analogNextReopenTicks, at);
+        }
+
+        /// <summary>The earliest reopen still waiting. Caller holds
+        /// <c>_analogLock</c>.</summary>
+        private void RecomputeAnalogNextReopen()
+        {
+            long next = long.MaxValue;
+            foreach (var key in _analogReopen.Keys)
+                if (_analogRetryAt.TryGetValue(key, out long at) && at < next) next = at;
+            Volatile.Write(ref _analogNextReopenTicks, next);
+        }
+
+        /// <summary>Tears down every analog keyboard row and suppresses Phase
+        /// 1k. Called on app shutdown beside the G-keys teardown. An open in
+        /// flight finishes first, and every stop already running, from the
+        /// switch turned off or a removed row, runs to its end: each is a
+        /// route putting its keyboard back.</summary>
+        public void ShutdownAnalogKeyboardInputs()
+        {
+            _analogInputsSuppressed = true;
+            int longestStop = AnalogKeyboardDevice.LongestStopMs;
+            // The worker sees the suppression when its open returns and hands
+            // that device to a stop of its own.
+            try { _analogWorker?.Wait(longestStop + 5000); } catch { }
+            var stopping = new List<AnalogKeyboardDevice>();
+            lock (_analogLock)
+            {
+                foreach (var kvp in _openedAnalogKeyboards)
+                {
+                    var ud = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    stopping.Add(kvp.Value);
+                }
+                _openedAnalogKeyboards.Clear();
+                stopping.AddRange(_analogPendingRegister);
+                _analogPendingRegister.Clear();
+                _analogReopen.Clear();
+                Volatile.Write(ref _analogNextReopenTicks, long.MaxValue);
+                _analogAnyRows = false;
+            }
+            // Every keyboard gets its route's teardown before the app exits,
+            // all at once rather than one wait after another.
+            if (stopping.Count > 0)
+                System.Threading.Tasks.Parallel.ForEach(stopping, dev =>
+                {
+                    try { dev.Dispose(); } catch { }
+                });
+            Task[] retiring;
+            lock (_analogLock)
+            {
+                retiring = new Task[_analogDisposing.Count];
+                _analogDisposing.Values.CopyTo(retiring, 0);
+            }
+            if (retiring.Length > 0)
+            {
+                try { Task.WaitAll(retiring, longestStop + 1000); } catch { }
+            }
+        }
+
+        /// <summary>Stops a retired analog keyboard on the thread pool: its
+        /// route may need a pass to finish and a few writes to put the
+        /// keyboard back, and neither belongs on the poll thread. The stop is
+        /// tracked until it ends, so the sweep leaves that keyboard alone
+        /// meanwhile and shutdown can wait for it.</summary>
+        private void DisposeAnalogKeyboardAsync(AnalogKeyboardDevice dev)
+        {
+            if (dev == null) return;
+            lock (_analogLock)
+            {
+                if (_analogDisposing.ContainsKey(dev)) return;
+                var stop = new Task(() =>
+                {
+                    try { dev.Dispose(); } catch { }
+                    lock (_analogLock) _analogDisposing.Remove(dev);
+                });
+                _analogDisposing[dev] = stop;
+                stop.Start(TaskScheduler.Default);
+            }
+        }
+
+        public void ShutdownHandheldInputs()
+        {
+            _handheldInputsSuppressed = true;
+            lock (_handheldLock)
+            {
+                RetireHandheldRows();
+            }
+            try { HandheldChordRuntime.Stop(); } catch { }
+        }
+
+        public void ShutdownHeadsetMotionInputs()
+        {
+            _headsetInputsSuppressed = true;
+            lock (_headsetLock)
+            {
+                foreach (var kvp in _openedHeadsets)
+                {
+                    var ud = FindOnlineDeviceByInstanceGuid(kvp.Value.InstanceGuid);
+                    if (ud != null)
+                    {
+                        ud.IsOnline = false;
+                        ud.Device = null;
+                        NeutralizeMappedOutputsFor(ud);
+                    }
+                    kvp.Value.Dispose();
+                }
+                _openedHeadsets.Clear();
+                foreach (var dev in _headsetPendingRegister)
+                    dev.Dispose();
+                _headsetPendingRegister.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Detects disconnected keyboards or mice by comparing tracked handles
+        /// to current Raw Input device handles. Marks disconnected devices offline
+        /// and removes their tracking entries so they can be re-opened on reconnect.
+        /// </summary>
+        private bool DetectDisconnectedHandles(
+            HashSet<IntPtr> trackedHandles, RawInputListener.DeviceInfo[] currentDevices)
+        {
+            if (trackedHandles.Count == 0)
+                return false;
+
+            var currentSet = new HashSet<IntPtr>();
+            for (int i = 0; i < currentDevices.Length; i++)
+                currentSet.Add(currentDevices[i].Handle);
+
+            var disconnected = new List<IntPtr>();
+            var redirected = new List<IntPtr>();
+            bool changed = false;
+
+            foreach (IntPtr handle in trackedHandles)
+            {
+                if (!currentSet.Contains(handle))
+                {
+                    UserDevice ud = FindOnlineDeviceByHandle(handle);
+                    if (ud != null)
+                    {
+                        // When PTP is active, the trackpad's mouse collection
+                        // disappears from GetRawInputDeviceList but synthetic
+                        // mouse WM_INPUT still arrives at hDevice=0. Keep the
+                        // device online and redirect its wrapper to IntPtr.Zero.
+                        if (_ptpReader != null && _ptpReader.IsAvailable &&
+                            ud.Device is SdlMouseWrapper mouseWrapper)
+                        {
+                            mouseWrapper.UpdateHandle(IntPtr.Zero);
+                            redirected.Add(handle);
+                        }
+                        else
+                        {
+                            MarkDeviceOffline(ud);
+                            MarkChanged(ref changed);
+                            disconnected.Add(handle);
+                        }
+                    }
+                    else
+                    {
+                        disconnected.Add(handle);
+                    }
+                }
+            }
+
+            foreach (IntPtr handle in disconnected)
+                trackedHandles.Remove(handle);
+
+            // Redirected devices: swap old handle for IntPtr.Zero in tracking.
+            foreach (IntPtr handle in redirected)
+            {
+                trackedHandles.Remove(handle);
+                trackedHandles.Add(IntPtr.Zero);
+            }
+
+            return changed;
+        }
+
+        /// <summary>Flags a device-list change that a DEV line already
+        /// named: the SDL open (DEV + above it) and every path through
+        /// MarkDeviceOffline (DEV -). The overload below is for every
+        /// other flip.</summary>
+        private static void MarkChanged(ref bool changed) => changed = true;
+
+        /// <summary>Flags a device-list change and names it, one line
+        /// "DEVCHG {lane} {what}". Every flip of the flag raises
+        /// DevicesUpdated, and that runs ApplyDeviceHiding (a CM
+        /// enumeration plus driver IOCTLs) and the registry signature. On
+        /// the owner's idle bench something flipped every enumeration
+        /// interval and nothing said what: the flips were silent
+        /// assignments, so the trace showed the consequence (215 of 305
+        /// lines were HIDHIDE apply) and never the cause. Every flip now
+        /// goes through here, so the next such trace names the lane and
+        /// the device that flapped.</summary>
+        private static void MarkChanged(ref bool changed, string lane, string what)
+        {
+            MarkChanged(ref changed);
+            Engine.SdlDiagLog.WriteLine($"DEVCHG {lane} {what}");
+        }
+
+        /// <summary>
+        /// Removes tracked handles that no longer have a corresponding UserDevice.
+        /// This handles the case where the user removes a device via the UI while
+        /// it's still physically connected. The tracking must be cleared so the
+        /// device can be re-detected on the next enumeration cycle.
+        ///
+        /// <para>Each prune logs, because a pruned handle is re-opened by the
+        /// caller on the same pass and that re-open is a device-list change.
+        /// A record that keeps going offline between enumerations (the
+        /// consumer-control lane was the suspect on the owner's idle bench)
+        /// shows here as a prune and a DEVCHG open every interval, with the
+        /// lane and the handle, instead of as an unexplained flap.</para>
+        /// </summary>
+        private void PruneOrphanedHandles(HashSet<IntPtr> trackedHandles, string lane)
+        {
+            if (trackedHandles.Count == 0)
+                return;
+
+            var toRemove = new List<IntPtr>();
+            foreach (IntPtr handle in trackedHandles)
+            {
+                if (FindOnlineDeviceByHandle(handle) == null)
+                    toRemove.Add(handle);
+            }
+
+            for (int i = 0; i < toRemove.Count; i++)
+            {
+                trackedHandles.Remove(toRemove[i]);
+                Engine.SdlDiagLog.WriteLine($"DEVCHG {lane} prune handle=0x{toRemove[i].ToInt64():X} (no online record)");
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  External device registration (web controllers)
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Registers the touchpad overlay as a virtual device in the device list.
+        /// </summary>
+        public void RegisterOverlayDevice(TouchpadOverlayDevice device)
+        {
+            if (device == null) return;
+
+            UserDevice ud = FindOrCreateUserDevice(device.InstanceGuid, device.ProductGuid);
+            ud.LoadFromOverlayDevice(device);
+            ud.IsOnline = true;
+
+            DevicesUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Registers an external (non-SDL) input device into the device list.
+        /// Called by WebControllerServer when a browser client connects.
+        /// Thread-safe via UserDevices.SyncRoot.
+        /// </summary>
+        public void RegisterExternalDevice(WebControllerDevice device)
+        {
+            if (device == null) return;
+
+            UserDevice ud = FindOrCreateUserDevice(device.InstanceGuid, device.ProductGuid);
+            ud.LoadFromWebDevice(device);
+            ud.IsOnline = true;
+
+            // A web pad's motion caps flip on the first motion message, AFTER
+            // this connect-time snapshot, so re-sync the UserDevice and refresh
+            // the UI when they do. Idempotent handler, unsubscribed on
+            // unregister below so a reconnect does not stack subscriptions.
+            device.CapabilitiesChanged -= OnWebDeviceCapabilitiesChanged;
+            device.CapabilitiesChanged += OnWebDeviceCapabilitiesChanged;
+
+            DevicesUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        private void OnWebDeviceCapabilitiesChanged()
+        {
+            // Fired on the WS receive thread. Re-load every web UserDevice's
+            // caps from its live device (cheap, a handful of pads) and raise
+            // DevicesUpdated. The App layer marshals the UI refresh.
+            try
+            {
+                // Under SyncRoot: this runs on the WS receive thread while the
+                // polling thread adds and removes rows, and an unsynchronized
+                // walk threw into the blanket catch below, which silently
+                // skipped the re-sync the caps flip exists to perform.
+                lock (SettingsManager.UserDevices.SyncRoot)
+                {
+                    foreach (var ud in SettingsManager.UserDevices.Items)
+                        if (ud?.Device is WebControllerDevice web)
+                            ud.LoadFromWebDevice(web);
+                }
+            }
+            catch { }
+            DevicesUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Registers a remote peer's device (issue #138) into the device list.
+        /// Called by LinkServer when a paired peer exposes a device. Same shape as
+        /// RegisterExternalDevice but uses the generic LoadFromExternalDevice, since
+        /// a RemotePeerDevice is just another ISdlInputDevice. Disconnect reuses
+        /// UnregisterExternalDevice(Guid) below.
+        /// </summary>
+        public void RegisterPeerDevice(PadForge.Engine.RemoteLink.RemotePeerDevice device)
+        {
+            if (device == null) return;
+
+            UserDevice ud = FindOrCreateUserDevice(device.InstanceGuid, device.ProductGuid);
+            ud.LoadFromExternalDevice(device);
+            ud.IsOnline = true;
+
+            DevicesUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        // ── Gamepad-only restriction (issue #138) ───────────────────────────
+        // A peer paired with the "gamepad only" option may drive gamepad output
+        // but never keyboard/mouse/scroll: neither via a KBM virtual controller
+        // nor via a macro. The set holds the InstanceGuids of restricted peer
+        // devices. The SendInput chokepoints consult IsSlotRestricted.
+        private readonly HashSet<Guid> _restrictedDevices = new();
+        private readonly object _restrictedLock = new();
+
+        /// <summary>Mark (or clear) a device as gamepad-only restricted.</summary>
+        public void SetDeviceRestricted(Guid instanceGuid, bool restricted)
+        {
+            lock (_restrictedLock)
+            {
+                bool changed = restricted
+                    ? _restrictedDevices.Add(instanceGuid)
+                    : _restrictedDevices.Remove(instanceGuid);
+                if (changed) _restrictedSnapshotCache = null;
+            }
+        }
+
+        // Rebuilt only when the set changes: while a Remote Link
+        // gamepad-only restriction was active, the old shape allocated a
+        // Guid[] per poll tick (menu walk + per-macro-slot checks).
+        private Guid[] _restrictedSnapshotCache;
+
+        /// <summary>Snapshot of restricted device GUIDs, or null when none (early-out).</summary>
+        private Guid[] RestrictedSnapshot()
+        {
+            lock (_restrictedLock)
+            {
+                if (_restrictedDevices.Count == 0) return null;
+                var cached = _restrictedSnapshotCache;
+                if (cached != null) return cached;
+                var a = new Guid[_restrictedDevices.Count];
+                _restrictedDevices.CopyTo(a);
+                _restrictedSnapshotCache = a;
+                return a;
+            }
+        }
+
+        /// <summary>True if any of these macros is triggered by a restricted device,
+        /// even when it lives on a slot the restricted device isn't mapped to.</summary>
+        internal bool AnyMacroTriggerRestricted(PadForge.ViewModels.MacroItem[] macros)
+        {
+            if (macros == null) return false;
+            var restricted = RestrictedSnapshot();
+            if (restricted == null) return false;
+            foreach (var m in macros)
+            {
+                if (m == null) continue;
+                if (Array.IndexOf(restricted, m.TriggerDeviceGuid) >= 0) return true;
+                var entries = m.GetTriggerInputEntries();
+                if (entries != null)
+                    foreach (var e in entries)
+                        if (Array.IndexOf(restricted, e.DeviceGuid) >= 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>True if any online restricted device is a source for this slot.
+        /// Free when no peer is restricted (the common case early-outs).</summary>
+        internal bool IsSlotRestricted(int slot)
+        {
+            Guid[] restricted = RestrictedSnapshot();
+            if (restricted == null) return false;
+            var settings = SettingsManager.UserSettings;
+            if (settings == null) return false;
+            lock (settings.SyncRoot)
+            {
+                foreach (var us in settings.Items)
+                    if (us.MapTo == slot && Array.IndexOf(restricted, us.InstanceGuid) >= 0)
+                        return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Marks an external device as offline when its connection is lost.
+        /// Called by WebControllerServer when a browser client disconnects.
+        /// </summary>
+        public void UnregisterExternalDevice(Guid instanceGuid)
+        {
+            // Drop the motion-cap subscription if this was a web pad.
+            try
+            {
+                var udev = SettingsManager.UserDevices.Items.FirstOrDefault(u => u.InstanceGuid == instanceGuid);
+                if (udev?.Device is WebControllerDevice web)
+                    web.CapabilitiesChanged -= OnWebDeviceCapabilitiesChanged;
+            }
+            catch { }
+            var devices = SettingsManager.UserDevices;
+            if (devices == null) return;
+
+            // Resolve under the devices lock, but mark offline OUTSIDE it.
+            // MarkDeviceOffline takes the UserSettings lock to neutralize
+            // the device's per-slot outputs. Nesting devices->settings here
+            // would be legal under the lock canon (devices before settings,
+            // never the reverse; no Settings-first nesting site exists in
+            // the repo as of the 2026-07-20 audit sweep), but the marking
+            // needs no collection lock, so keep it outside on principle.
+            UserDevice target = null;
+            lock (devices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Items.Count; i++)
+                {
+                    var d = devices.Items[i];
+                    if (d.IsOnline && d.InstanceGuid == instanceGuid)
+                    {
+                        target = d;
+                        break;
+                    }
+                }
+            }
+
+            if (target != null)
+                MarkDeviceOffline(target);
+
+            // Drop the device's menu runtime contexts NOW: a fired context
+            // stays credible for the staleness window, and a restricted
+            // peer's restriction is cleared at disconnect, so leaving the
+            // context alive allowed one last key injection after the gate
+            // was gone.
+            PurgeMenuContextsForDevice(instanceGuid);
+
+            DevicesUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Finds an online device that was opened from the given Raw Input handle.
+        /// Checks the RawInputHandle property on keyboard/mouse wrappers.
+        /// </summary>
+        private UserDevice FindOnlineDeviceByHandle(IntPtr handle)
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return null;
+
+            // The raw-input wrappers store _sdlId = (uint)devicePath.GetHashCode().
+            // We need to match on the device reference since we can't recover the path
+            // from just the handle. Check Device.RawInputHandle on every raw-input
+            // wrapper kind. The consumer-control wrapper was missing from this list,
+            // so PruneOrphanedHandles found no online record for any consumer handle,
+            // dropped all of them, and the lane re-opened them on the same pass every
+            // enumeration: three device flips every five seconds on an idle bench,
+            // each one raising DevicesUpdated and a full hiding apply. The DEVCHG
+            // trace named it.
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    var d = devices[i];
+                    if (!d.IsOnline || d.Device == null)
+                        continue;
+
+                    if (d.Device is SdlKeyboardWrapper kb && kb.RawInputHandle == handle)
+                        return d;
+                    if (d.Device is SdlMouseWrapper mouse && mouse.RawInputHandle == handle)
+                        return d;
+                    if (d.Device is ConsumerControlWrapper cc && cc.RawInputHandle == handle)
+                        return d;
+                }
+                return null;
+            }
+        }
+
+        private UserDevice FindOnlineDeviceByDevicePath(string path)
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null || string.IsNullOrEmpty(path)) return null;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    var d = devices[i];
+                    if (d.IsOnline && d.DevicePath == path)
+                        return d;
+                }
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Placeholder for the SettingsManager's UserDevices collection.
+    /// </summary>
+    public static partial class SettingsManager
+    {
+        public static DeviceCollection UserDevices { get; set; }
+        public static SettingsCollection UserSettings { get; set; }
+    }
+
+    /// <summary>
+    /// Thread-safe collection of UserDevice records with a sync root for locking.
+    /// </summary>
+    public class DeviceCollection
+    {
+        public List<UserDevice> Items { get; } = new List<UserDevice>();
+        public object SyncRoot { get; } = new object();
+    }
+
+    /// <summary>
+    /// Thread-safe collection of UserSetting records.
+    /// </summary>
+    public class SettingsCollection
+    {
+        public List<UserSetting> Items { get; } = new List<UserSetting>();
+        public object SyncRoot { get; } = new object();
+
+        /// <summary>Live record count under the lock. Used by hot-path callers
+        /// to size a reusable buffer for the non-allocating FindByPadIndex
+        /// overload: any single slot's settings are a subset of all records,
+        /// so a buffer this size can never truncate a per-slot query.</summary>
+        public int Count { get { lock (SyncRoot) return Items.Count; } }
+
+        /// <summary>
+        /// Finds the UserSetting that links a device (by InstanceGuid) to a pad slot.
+        /// Uses a manual loop to avoid LINQ closure allocations.
+        /// </summary>
+        public UserSetting FindByInstanceGuid(Guid instanceGuid)
+        {
+            lock (SyncRoot)
+            {
+                for (int i = 0; i < Items.Count; i++)
+                {
+                    if (Items[i].InstanceGuid == instanceGuid)
+                        return Items[i];
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Returns all UserSettings assigned to a specific pad slot (0–15).
+        /// Allocates a new List. Use <see cref="FindByPadIndex(int, UserSetting[], out int)"/>
+        /// in the hot path to avoid allocations.
+        /// </summary>
+        public List<UserSetting> FindByPadIndex(int padIndex)
+        {
+            var results = new List<UserSetting>();
+            lock (SyncRoot)
+            {
+                for (int i = 0; i < Items.Count; i++)
+                {
+                    if (Items[i].MapTo == padIndex)
+                        results.Add(Items[i]);
+                }
+            }
+            return results;
+        }
+
+        /// <summary>
+        /// Non-allocating overload: fills a pre-allocated buffer with all UserSettings
+        /// for a given device (by InstanceGuid) that have a valid MapTo (>= 0).
+        /// Returns the count of matches. Skips orphaned entries (MapTo == -1).
+        /// </summary>
+        public int FindByInstanceGuid(Guid instanceGuid, UserSetting[] buffer)
+        {
+            int count = 0;
+            lock (SyncRoot)
+            {
+                for (int i = 0; i < Items.Count && count < buffer.Length; i++)
+                {
+                    if (Items[i].InstanceGuid == instanceGuid && Items[i].MapTo >= 0)
+                        buffer[count++] = Items[i];
+                }
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Non-allocating overload: fills a pre-allocated buffer with UserSettings
+        /// assigned to the specified pad slot. Returns the count of matches.
+        /// </summary>
+        public int FindByPadIndex(int padIndex, UserSetting[] buffer)
+        {
+            int count = 0;
+            lock (SyncRoot)
+            {
+                for (int i = 0; i < Items.Count && count < buffer.Length; i++)
+                {
+                    if (Items[i].MapTo == padIndex)
+                        buffer[count++] = Items[i];
+                }
+            }
+            return count;
+        }
+    }
+}

@@ -1,0 +1,4113 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using PadForge.Engine;
+using PadForge.Engine.Common.Mapping;
+using PadForge.Engine.Data;
+using PadForge.Services;
+using SDL3;
+using static SDL3.SDL;
+
+namespace PadForge.Common.Input
+{
+    /// <summary>
+    /// Central input manager that runs the device polling pipeline on a background thread.
+    /// 
+    /// Pipeline (runs at ~1000Hz on a background thread):
+    ///   Step 1: Enumerate SDL devices, open new ones, close disconnected ones
+    ///   Step 2: Read input states from SDL
+    ///   Step 3: Map CustomInputState → OutputState via PadSetting rules
+    ///   Step 4: Combine multiple devices per virtual controller slot
+    ///   Step 5: Feed virtual controllers (HIDMaestro for Xbox / PlayStation / Extended, plus MIDI and KB+M)
+    ///   Step 6: Copy combined output states for UI display
+    /// 
+    /// Thread safety: the background thread writes UserDevice.InputState (atomic reference swap).
+    /// The UI thread reads it. Collection modifications to UserDevices use SyncRoot locking.
+    /// </summary>
+    public partial class InputManager : IDisposable
+    {
+        // ─────────────────────────────────────────────
+        //  Constants
+        // ─────────────────────────────────────────────
+
+        /// <summary>Target polling interval in milliseconds. Default 1ms (~1000Hz).
+        /// Higher values reduce CPU usage at the cost of input latency.</summary>
+        public int PollingIntervalMs { get; set; } = 1;
+
+        /// <summary>Seconds of all-mapped-devices-offline before an HM
+        /// virtual controller is destroyed and its slot removed.  0 disables
+        /// (HM VCs survive arbitrary offline windows).  Default 60.  When
+        /// the destroy fires, surviving HM VCs in the stack bubble down via
+        /// the bubble-up cascade so XInput indices stay contiguous.</summary>
+        public int HmInactivityTimeoutSeconds { get; set; } = 60;
+
+        /// <summary>Devices SDL's hidapi layer must never enumerate or probe
+        /// (SDL_HIDAPI_IGNORE_DEVICES format: comma-separated 0xVVVV/0xPPPP).
+        /// Each entry is a pad whose HID interface wedges the Sony
+        /// third-party detection FEATURE report forever on Windows, freezing
+        /// the UI thread that runs enumeration (issue #235). Ignored pads
+        /// ride SDL's XInput / DirectInput lanes instead.
+        ///   0x146b/0x0603: Nacon PS4 Compact (BB4469), XInput-mode PS4 pad.</summary>
+        internal const string HidapiIgnoreDevices = "0x146b/0x0603";
+
+        /// <summary>Devices no SDL joystick backend may enumerate
+        /// (SDL_JOYSTICK_BLACKLIST_DEVICES format: comma-separated
+        /// 0xVVVV/0xPPPP, SDL_hints.h:1401-1404). The PS Move family (#277):
+        /// a docked Move exposes three HID collections (the col01-col03
+        /// Windows quirk psmoveapi documents) and no SDL driver claims the
+        /// PIDs, so each collection surfaced through the generic Windows
+        /// backends as its own dead joystick row. PadForge drives these pads
+        /// itself (PsMoveDirectService / the DS3 service's navigation
+        /// profile) and feeds SDL VIRTUAL joysticks, which are exempt: the
+        /// virtual backend never calls SDL_ShouldIgnoreJoystick
+        /// (SDL_joystick.c:3845). On Windows its callers are the DirectInput,
+        /// RawInput, WGI, XInput, GameInput and HIDAPI backends and the
+        /// fork's Bluetooth LE, RFCOMM, serial, DJI network and iCade drivers
+        /// (hifihedgehog/SDL#33).
+        ///   0x054c/0x03d5: PS Move (ZCM1), 0x054c/0x0c5e: PS Move (ZCM2),
+        ///   0x054c/0x042f: Navigation controller.</summary>
+        internal const string JoystickBlacklistDevices =
+            "0x054c/0x03d5,0x054c/0x0c5e,0x054c/0x042f";
+
+        /// <summary>Raised on the polling thread when an HM VC has reached
+        /// its inactivity timeout. InputService marshals to the UI thread
+        /// and raises SlotInactivityTimedOut, and MainWindow's handler calls
+        /// InputService.OnSlotInactivityTimedOut, which runs
+        /// TryInactivityTeardown: the VC is destroyed and the bubble-down
+        /// cascade follows. The slot itself stays created. Argument is the
+        /// pad index that timed out.</summary>
+        public event System.EventHandler<int> HmVcInactivityDestroyed;
+
+        /// <summary>Raised on the polling thread when an HM-backed slot
+        /// (Xbox / PlayStation / Nintendo / Extended) has its live VC torn
+        /// down because the slot was disabled, deleted, or had every device
+        /// explicitly unassigned. The inactivity timeout raises
+        /// <see cref="HmVcInactivityDestroyed"/> instead. The slot stays in
+        /// its group's order list at the same position. Only the live VC is
+        /// gone. Listener (InputService) marshals to the UI thread, skips a
+        /// deleted slot, and runs the bubble-down cascade for surviving HM
+        /// VCs at higher positions in the same group so external observers
+        /// re-bind kernel slots in compact ascending order. Argument is the
+        /// pad index that went non-active.</summary>
+        public event System.EventHandler<int> HmVcWentNonActive;
+
+        /// <summary>Device re-enumeration interval in milliseconds (every 2 seconds).</summary>
+        private const int EnumerationIntervalMs = 2000;
+
+
+        /// <summary>Maximum number of virtual controller slots.</summary>
+        public const int MaxPads = 16;
+
+        // ─────────────────────────────────────────────
+        //  State
+        // ─────────────────────────────────────────────
+
+        private Thread _pollingThread;
+
+        // Last tick the unconditional poll heartbeat was written. See the
+        // HEARTBEAT write in the poll loop for why an always-on line exists
+        // in a log where everything else is edge-gated.
+        private long _pollHeartbeatTick;
+        // Injects accumulated macro mouse-move delta with a single SendInput per
+        // tick, off the poll thread. See FlushPendingMouseMove: SendInput on the
+        // 1000 Hz poll thread let a mouse-move macro drop the poll rate to ~200 Hz.
+        private Thread _mouseInjectorThread;
+        private volatile bool _running;
+        // Stamped on every Start, bumped by every Stop. The running flag alone
+        // cannot retire a loop: Stop sets it false, a later Start sets it true
+        // again, and a loop that outlived the bounded join would resume against
+        // torn-down devices and race the new thread over the scratch buffers
+        // documented as poll-thread only. A loop runs only while its own stamp
+        // is current.
+        private int _runGeneration;
+
+        // Serializes a retiring loop's release of the macro latches against
+        // Start's new stamp, so the release runs before the next loop exists
+        // or sees the newer stamp and leaves the latches to it
+        // (ReleaseLatchesOnExit).
+        private readonly object _runHandoffLock = new();
+
+        /// <summary>Test seam: the current run stamp.</summary>
+        internal int RunGenerationForTest
+        {
+            get => System.Threading.Volatile.Read(ref _runGeneration);
+            set => System.Threading.Volatile.Write(ref _runGeneration, value);
+        }
+
+        /// <summary>The poll loop's exit release for the run stamped
+        /// <paramref name="generation"/>, only while no newer run has started.
+        /// Stop stamps generation + 1, and a higher stamp is Start's, whose
+        /// loop owns the latch sets (poll thread only) and releases what this
+        /// run left when it begins (<see cref="ReleaseInheritedLatches"/>). A
+        /// loop that outlived Stop's join released them anyway, racing the new
+        /// loop and sending ups for the keys it holds. The lock orders this
+        /// against Start's stamp.</summary>
+        internal void ReleaseLatchesOnExit(int generation)
+        {
+            lock (_runHandoffLock)
+            {
+                if (System.Threading.Volatile.Read(ref _runGeneration) <= generation + 1)
+                {
+                    ExitReleaseCheckedForTest?.Invoke();
+                    try { ReleaseAllLatchedMacroKeys(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>Test seam: runs inside the exit release, after its check.</summary>
+        internal Action ExitReleaseCheckedForTest;
+
+        /// <summary>Start's new run stamp, taken under the handoff lock so a
+        /// retiring loop's exit release finishes first or sees it.</summary>
+        internal int StampRun()
+        {
+            lock (_runHandoffLock)
+                return System.Threading.Interlocked.Increment(ref _runGeneration);
+        }
+
+        /// <summary>A new poll loop's first act: releases what a retired run's
+        /// skipped exit release left (<see cref="ReleaseLatchesOnExit"/>), as a
+        /// stop and start releases it, before the first reconcile presses the
+        /// latches still wanted again. Nothing held: nothing sent. Only while
+        /// the run stamped <paramref name="generation"/> is still the current
+        /// one, which also means no Stop has come since (Stop moves the stamp):
+        /// a thread that was slow to start after its run had already stopped,
+        /// and another had begun, would otherwise release that run's latches.</summary>
+        internal void ReleaseInheritedLatches(int generation)
+        {
+            lock (_runHandoffLock)
+            {
+                if (System.Threading.Volatile.Read(ref _runGeneration) == generation)
+                    try { ReleaseAllLatchedMacroKeys(); } catch { }
+            }
+        }
+
+        private volatile bool _idle;
+
+        /// <summary>The engine half of "Continue polling when window loses
+        /// focus" (EnablePollingOnFocusLoss). True when the box is UNCHECKED:
+        /// the user has asked the engine itself to stop while PadForge is not
+        /// the foreground process. Written by the UI tick, read by the poll
+        /// thread.</summary>
+        public volatile bool SuspendWhenBackground;
+
+        /// <summary>Whether PadForge owns the foreground window. Probed on
+        /// the UI thread (user32 calls stay off the poll thread) and pushed
+        /// here every UI tick. Defaults true so a stalled UI timer can never
+        /// suspend the engine by accident.</summary>
+        public volatile bool HostIsForeground = true;
+
+        private bool _focusSuspended;
+        private bool _sdlInitialized;
+        private bool _disposed;
+
+        /// <summary>Precision touchpad reader for laptop PTP input.</summary>
+        private PrecisionTouchpadReader _ptpReader;
+
+        /// <summary>Stopwatch for timing enumeration intervals.</summary>
+        private readonly Stopwatch _enumerationTimer = new Stopwatch();
+
+        /// <summary>Stopwatch for frequency measurement.</summary>
+        private readonly Stopwatch _frequencyTimer = new Stopwatch();
+        private int _frequencyCounter;
+
+        // ── Pre-allocated snapshot buffers for hot path (avoid LINQ allocations) ──
+        private UserDevice[] _deviceSnapshotBuffer = new UserDevice[16];
+        private UserSetting[] _settingSnapshotBuffer = new UserSetting[16];
+        // 64, not MaxPads: this buffer holds one SLOT's mappings, and
+        // FindByPadIndex silently truncates at the buffer's length, so a
+        // slot-count constant here capped per-slot device mappings at 16
+        // (round 33, S14). Poll thread only; the async create-failure
+        // validation passes its own buffer (see IsSlotActive's overload).
+        private UserSetting[] _padIndexBuffer = new UserSetting[64];
+        private readonly UserSetting[] _instanceGuidBuffer = new UserSetting[MaxPads];
+
+        /// <summary>
+        /// Combined output gamepad states for the virtual controller slots.
+        /// Written by Step 4 (background thread), read by UI (InputService).
+        /// </summary>
+        public Gamepad[] CombinedOutputStates { get; } = new Gamepad[MaxPads];
+
+        /// <summary>
+        /// Combined Extended raw output states for custom Extended slots.
+        /// Written by Step 4 (background thread), read by Step 5.
+        /// </summary>
+        public RawHidState[] CombinedRawHidStates { get; } = new RawHidState[MaxPads];
+
+        /// <summary>
+        /// Combined MIDI raw output states for MIDI slots.
+        /// Written by Step 4 (background thread), read by Step 5.
+        /// </summary>
+        public MidiRawState[] CombinedMidiRawStates { get; } = new MidiRawState[MaxPads];
+
+        /// <summary>
+        /// Combined KBM raw output states for KeyboardMouse slots.
+        /// Written by Step 4 (background thread), read by Step 5.
+        /// </summary>
+        public KbmRawState[] CombinedKbmRawStates { get; } = new KbmRawState[MaxPads];
+        public VrRawState[] CombinedVrRawStates { get; } = new VrRawState[MaxPads];
+
+        /// <summary>
+        /// Combined touchpad states for PlayStation slots.
+        /// Written by Step 4 (background thread), read by Step 5.
+        /// </summary>
+        public TouchpadState[] CombinedTouchpadStates { get; } = new TouchpadState[MaxPads];
+
+        /// <summary>Per-slot raw physical touchpad-click flag (any assigned device's
+        /// SDL_GAMEPAD_BUTTON_TOUCHPAD = InputState.Buttons[16]), OR'd across devices each
+        /// frame in Step 3 regardless of virtual-controller type or click mapping. The
+        /// InputReactive lightbar reads this so a touchpad press flashes even on a
+        /// non-PlayStation virtual (where TouchpadOutputState is never computed).</summary>
+        public bool[] SlotRawTouchpadClick { get; } = new bool[MaxPads];
+
+        /// <summary>True when the slot's virtual controller has a touch
+        /// surface Step 3 must produce and Step 4 must combine: every
+        /// PlayStation slot, and an Extended slot on a Valve profile, whose
+        /// native frame carries both trackpads.</summary>
+        internal bool SlotCarriesTouchpad(int slot)
+            => SlotControllerTypes[slot] == VirtualControllerType.PlayStation
+            || (SlotControllerTypes[slot] == VirtualControllerType.Extended
+                && SlotRawHidSurface[slot]
+                && Models2D.NintendoPreviewMap.IsValve(SlotProfileIds[slot]));
+
+        /// <summary>Per-(slot, device, touchpad-pad-index) gesture
+        /// recognizer state. Slot-keyed so two slots sharing one
+        /// physical touchpad each keep their own context and settings —
+        /// slot 1's "4-way OFF" toggle truly stops slot 1's mapping
+        /// rows from receiving 4-way swipes even when slot 0 has 4-way
+        /// ON. Lazily populated when a device with a touchpad is
+        /// assigned to a slot; read by <see cref="UpdateGestureContexts"/>
+        /// each tick and by the SourceCoercion gesture-fired /
+        /// gesture-axis providers during mapping evaluation. Cleared on
+        /// device disconnect and on profile switch so a stale partial
+        /// gesture doesn't carry across profiles.</summary>
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<(int Slot, System.Guid DeviceId, int PadIdx), Engine.Touchpad.TouchpadGestureContext> GestureContexts
+            = new System.Collections.Concurrent.ConcurrentDictionary<(int, System.Guid, int), Engine.Touchpad.TouchpadGestureContext>();
+
+        /// <summary>Per-(slot, device, touchpad-pad-index) swipe-haptic
+        /// travel accumulators (discussion #219), sibling of
+        /// <see cref="GestureContexts"/> with the same key and lifecycle:
+        /// lazily created on the polling thread inside
+        /// <see cref="UpdateGestureContexts"/>, dropped wholesale by
+        /// <see cref="ResetGestureContexts"/>, and dropped per key the
+        /// moment the pad's settings disable the feature so a re-enable
+        /// starts from a fresh seed. Polling thread only.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Slot, System.Guid DeviceId, int PadIdx), Engine.Touchpad.SwipeHapticsState> SwipePulseStates
+            = new System.Collections.Concurrent.ConcurrentDictionary<(int, System.Guid, int), Engine.Touchpad.SwipeHapticsState>();
+
+        /// <summary>Active shape templates ready for the gesture
+        /// engine's point-cloud matcher (<see cref="Engine.Touchpad.ShapeRecognizer"/>).
+        /// Built at startup from the in-box catalog; profile load can
+        /// append the user's custom gestures via
+        /// <see cref="SetShapeTemplates"/>.</summary>
+        public System.Collections.Generic.IReadOnlyList<Engine.Touchpad.ShapeTemplate> ShapeTemplates
+        {
+            get => System.Threading.Volatile.Read(ref _shapeTemplates);
+        }
+        private System.Collections.Generic.IReadOnlyList<Engine.Touchpad.ShapeTemplate> _shapeTemplates
+            = Engine.Touchpad.InBoxShapeTemplates.Build();
+
+        /// <summary>Atomically swaps the active shape-template catalog.
+        /// Called on profile load when the per-profile custom gesture
+        /// library lands; passes in the in-box set merged with the
+        /// custom templates so the recognizer evaluates both.</summary>
+        public void SetShapeTemplates(System.Collections.Generic.IReadOnlyList<Engine.Touchpad.ShapeTemplate> templates)
+        {
+            System.Threading.Volatile.Write(ref _shapeTemplates, templates ?? Engine.Touchpad.InBoxShapeTemplates.Build());
+        }
+
+        /// <summary>Per-(slot, device, padIdx) gesture settings provider.
+        /// Wired by the App layer against the slot's
+        /// <c>PadSetting.TouchpadSettings</c> via a UserSettings walk
+        /// filtered by both <c>MapTo == slot</c> and
+        /// <c>InstanceGuid == device</c>. Returns
+        /// <see cref="Engine.Touchpad.TouchpadGestureSettings.Default"/>
+        /// when unwired or when no per-pad settings exist for the
+        /// requested slot + device + pad.</summary>
+        public System.Func<int, System.Guid, int, Engine.Touchpad.TouchpadGestureSettings> TouchpadGestureSettingsProvider { get; set; }
+
+        /// <summary>Per-(slot, device) mouse-gesture recognizer contexts
+        /// (issue #200), twin of <see cref="GestureContexts"/> minus the pad
+        /// index (a mouse has one motion surface). Same lifecycle: lazy
+        /// creation on the polling thread, cleared wholesale on profile
+        /// switch via <see cref="ResetGestureContexts"/>. Offline devices
+        /// leave frozen contexts; consumers that must not latch (the macro
+        /// trigger path) apply the same online guard the touchpad lane
+        /// uses.</summary>
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<(int Slot, System.Guid DeviceId), Engine.Mouse.MouseGestureContext> MouseGestureContexts
+            = new System.Collections.Concurrent.ConcurrentDictionary<(int, System.Guid), Engine.Mouse.MouseGestureContext>();
+
+        /// <summary>Per-(slot, device) mouse-gesture settings provider
+        /// (issue #200). Wired by the App layer against the slot's
+        /// <c>PadSetting.MouseGestureSettings</c> via a UserSettings walk
+        /// filtered by both <c>MapTo == slot</c> and
+        /// <c>InstanceGuid == device</c>. Returns
+        /// <see cref="Engine.Mouse.MouseGestureSettings.Default"/> when
+        /// unwired or when no per-device settings exist.</summary>
+        public System.Func<int, System.Guid, Engine.Mouse.MouseGestureSettings> MouseGestureSettingsProvider { get; set; }
+
+        /// <summary>Remote Link per-poll accumulation hook (issue #138), wired
+        /// by InputService. Invoked once per polling tick right after Step 2
+        /// publishes fresh InputState snapshots, so the stream tick can ship
+        /// snapshot frames with per-poll delta fields (mouse counts, Joy-Con 2
+        /// mouse) summed on the poll thread instead of calling the wrappers'
+        /// destructive GetCurrentState from a second thread. Null when Remote
+        /// Link is off or the engine is wired without it.</summary>
+        public System.Action RemoteLinkPollTick { get; set; }
+
+        // ─── Recording-mode hook (gesture recorder dialog) ───
+        //
+        // The recorder dialog sets RecordingTargetDeviceGuid +
+        // RecordingTargetPadIdx to the (device, pad) it's capturing.
+        // While set, UpdateGestureContexts skips recognition for that
+        // specific pad and instead invokes RecordingTick with the raw
+        // TouchpadInputState every poll. The dialog uses this to draw
+        // live finger paths from the real touchpad onto its canvas.
+        // Other pads on the same device — and every other device —
+        // continue normal gesture detection.
+        //
+        // Guid can't be volatile (CS0677). All writes go through
+        // SetRecordingTarget on the UI thread; reads happen on the
+        // polling thread. The 128-bit Guid read isn't strictly atomic
+        // on 64-bit Windows but the worst case is a one-tick mismatch
+        // where the engine evaluates the wrong pad once during a
+        // recording-target swap — visually invisible to the user.
+        public Guid RecordingTargetDeviceGuid;
+        public volatile int RecordingTargetPadIdx = -1;
+
+        /// <summary>Per-tick callback fired with the raw touchpad
+        /// state of whichever pad matches the recording target. The
+        /// recorder dialog subscribes; the engine clears the subscription
+        /// when the dialog closes via <see cref="ClearRecordingTarget"/>.
+        /// Always fires on the polling thread — marshal to the UI thread
+        /// before touching WPF visuals.</summary>
+        public event Action<PadForge.Engine.TouchpadInputState> RecordingTick;
+
+        /// <summary>Install (or replace) the recording target. Pass
+        /// <c>Guid.Empty</c> / <c>-1</c> + null callback to clear.
+        /// Idempotent.</summary>
+        public void SetRecordingTarget(Guid deviceGuid, int padIdx, Action<PadForge.Engine.TouchpadInputState> onTick)
+        {
+            RecordingTick = null;
+            RecordingTargetDeviceGuid = deviceGuid;
+            RecordingTargetPadIdx = padIdx;
+            if (onTick != null) RecordingTick += onTick;
+        }
+
+        public void ClearRecordingTarget()
+        {
+            RecordingTick = null;
+            RecordingTargetDeviceGuid = Guid.Empty;
+            RecordingTargetPadIdx = -1;
+        }
+
+        /// <summary>
+        /// Retrieved output states copied from Step 4 for UI display in Step 6.
+        /// </summary>
+        public Gamepad[] RetrievedOutputStates { get; } = new Gamepad[MaxPads];
+
+        /// <summary>
+        /// Retrieved KBM raw states for UI display (keyboard key + mouse state preview).
+        /// </summary>
+        public KbmRawState[] RetrievedKbmRawStates { get; } = new KbmRawState[MaxPads];
+
+        /// <summary>
+        /// Retrieved touchpad states for UI display.
+        /// </summary>
+        public TouchpadState[] RetrievedTouchpadStates { get; } = new TouchpadState[MaxPads];
+
+        /// <summary>
+        /// Pending profile switch ID queued by global macro evaluation.
+        /// "\0" = no pending switch. null = switch to default profile.
+        /// Consumed by InputService on the UI thread.
+        /// </summary>
+        public volatile string PendingProfileSwitchId = "\0";
+
+        /// <summary>Whether the pending profile switch was triggered manually (shortcut).</summary>
+        public volatile bool PendingProfileSwitchIsManual;
+
+        /// <summary>
+        /// Pending window toggle queued by global macro evaluation.
+        /// Consumed by InputService on the UI thread.
+        /// </summary>
+        public volatile bool PendingToggleWindow;
+
+        /// <summary>
+        /// Pending bulk VC disable/enable toggle queued by global macro
+        /// evaluation. Consumed by InputService on the UI thread.
+        /// </summary>
+        public volatile bool PendingToggleVCsDisabled;
+
+        /// <summary>
+        /// Set true while recording a shortcut combo. Suppresses global macro
+        /// evaluation so the recorded buttons don't immediately trigger a switch.
+        /// </summary>
+        public volatile bool SuppressGlobalMacros;
+
+        /// <summary>
+        /// Flag set by macro execution to request touchpad overlay toggle.
+        /// Cleared by InputService on the UI thread after processing.
+        /// </summary>
+        public volatile bool ToggleTouchpadOverlayRequested;
+
+        /// <summary>
+        /// Per-slot vibration states received from games via the active virtual-controller backend.
+        /// </summary>
+        public Vibration[] VibrationStates { get; } = new Vibration[MaxPads];
+
+        /// <summary>
+        /// Per-slot ephemeral macro rumble overrides driven by
+        /// <c>MacroActionType.Rumble</c> (set) and
+        /// <c>MacroActionType.RumbleStop</c> (clear). Read at the
+        /// three FFB injection points (Step 2 ApplyForceFeedback,
+        /// InputService's Sony dispatcher rumble pump, and
+        /// ComputeFinalVibrationStates for the FFB-tab meter) and
+        /// combined with raw game-driven rumble via <c>max()</c>.
+        /// </summary>
+        public MacroRumbleOverride[] MacroRumbleOverrides { get; }
+            = InitMacroRumbleOverrides();
+
+        /// <summary>
+        /// Per-slot ephemeral macro override for the TRIGGER channel, driven by
+        /// <c>MacroActionType.RumbleTrigger</c> (set) and
+        /// <c>MacroActionType.RumbleTriggerStop</c> (clear). Sibling to
+        /// <see cref="MacroRumbleOverrides"/> (issue #102): same hold / fade timer,
+        /// but its scalar output max-combines into the trigger channel
+        /// (<c>LeftTriggerMotorSpeed</c> / <c>RightTriggerMotorSpeed</c>) alongside
+        /// the game-driven impulse output and the main-motor → trigger routing pass,
+        /// at the same three injection points.
+        /// </summary>
+        public MacroRumbleOverride[] MacroTriggerRumbleOverrides { get; }
+            = InitMacroRumbleOverrides();
+
+        /// <summary>Per-slot trigger-actuator pulse for the steering at-lock feedback
+        /// (#94, channel 2). Reuses <see cref="MacroRumbleOverride"/> purely as a
+        /// hold+fade timer; its scalar output is routed to the trigger actuators (Xbox
+        /// impulse triggers in ApplyForceFeedback, DualSense trigger haptics via
+        /// <c>UserEffectsDispatcher</c>) rather than the grip motors, so trigger vibration
+        /// stays distinct from channel 1's rumble.</summary>
+        public MacroRumbleOverride[] SteeringTrigVibOverrides { get; }
+            = InitMacroRumbleOverrides();
+
+        private static MacroRumbleOverride[] InitMacroRumbleOverrides()
+        {
+            var arr = new MacroRumbleOverride[MaxPads];
+            for (int i = 0; i < arr.Length; i++) arr[i] = new MacroRumbleOverride();
+            return arr;
+        }
+
+        /// <summary>
+        /// Per-slot post-processed vibration. Each motor is the max
+        /// across every device mapped to the slot, with each device's
+        /// own PadSetting applied (gain/balance/swap, audio rumble,
+        /// constant force). Drives the Controller-preview-tab motor
+        /// meter — that meter answers "is anything rumbling right now?"
+        /// so it is intentionally device-filter-independent. The SDL
+        /// physical-rumble path and the DS5/DS4 dispatcher each compute
+        /// their own per-device scaled rumble from each device's own
+        /// PadSetting, so they do NOT read this array.
+        /// </summary>
+        public Vibration[] FinalVibrationStates { get; } = new Vibration[MaxPads];
+
+        /// <summary>
+        /// Per-slot vibration scaled by the FFB-tab dropdown's currently-
+        /// selected device's PadSetting (gain/balance/swap, audio rumble,
+        /// constant force). Drives the FFB tab's Motor Activity meter —
+        /// that meter MUST be device-specific so users editing one
+        /// device's settings see the effective output for THAT device,
+        /// not the slot-wide max. Falls back to zero when no device is
+        /// selected. Populated in the same loop as
+        /// <see cref="FinalVibrationStates"/> by
+        /// <c>ComputeFinalVibrationStates</c>.
+        /// </summary>
+        public Vibration[] SelectedDeviceVibrationStates { get; } = new Vibration[MaxPads];
+
+        /// <summary>
+        /// Per-slot InstanceGuid of the device the user has selected on
+        /// the slot's FFB tab. Drives (a) the audio-bass detector's
+        /// per-tick Sensitivity / CutoffHz settings via
+        /// <c>ApplyDetectorSettingsForTick</c> and (b) which device's
+        /// scaled vibration lands in
+        /// <see cref="SelectedDeviceVibrationStates"/> for the FFB-tab
+        /// meter. Updated by <c>InputService.SyncViewModelToPadSettings</c>
+        /// at 30 Hz. <see cref="Guid.Empty"/> when no device is selected.
+        /// </summary>
+        public Guid[] SelectedDeviceGuids { get; } = new Guid[MaxPads];
+
+        /// <summary>
+        /// Per-slot reconciled motion snapshots for mapped native output.
+        /// Written by the polling thread after Step 2.
+        /// </summary>
+        public MotionSnapshot[] MotionSnapshots { get; } = new MotionSnapshot[MaxPads];
+
+        /// <summary>DSU receives the same reconciled slot motion. Without
+        /// motion mappings, it uses the default combine over assigned sensors.</summary>
+        internal MotionSnapshot[] DsuMotionSnapshots { get; } = new MotionSnapshot[DsuMotionServer.MaxSlots];
+
+        /// <summary>
+        /// Per-slot battery percentage (0..100, or -1 if no assigned device
+        /// reports battery). Aggregated alongside MotionSnapshots from the
+        /// first online assigned device whose SDL3 power info is known.
+        /// Read by the Sony Report 0x01 packer.
+        /// </summary>
+        public int[] BatteryPercents { get; } = new int[MaxPads];
+
+        /// <summary>Per-slot battery charging flag, paired with <see cref="BatteryPercents"/>.</summary>
+        public bool[] BatteryCharging { get; } = new bool[MaxPads];
+
+        /// <summary>Per slot, the assigned physical DualSense's payload bytes
+        /// 40..47 (trigger feedback, host timestamp echo, effect modes) packed
+        /// little-endian, refreshed beside the battery each tick (#433). Zero
+        /// when no DualSense is assigned or the SDL fork has not published
+        /// them. See <see cref="DualSenseStatusBytes"/>.</summary>
+        public ulong[] Ds5StatusBytes { get; } = new ulong[MaxPads];
+
+        /// <summary>Per-slot hash of every assigned device's (percent, charging)
+        /// so the Battery lightbar repaint kick fires on ANY device's change,
+        /// not just the slot-collapsed first-match. Init -1 (never a real hash)
+        /// so the first scan always kicks. Polling thread only.</summary>
+        private readonly int[] _batterySignature = InitBatterySignature();
+        private static int[] InitBatterySignature()
+        {
+            var a = new int[MaxPads];
+            for (int i = 0; i < a.Length; i++) a[i] = -1;
+            return a;
+        }
+
+        /// <summary>Per-slot gyro engage state contributed by the
+        /// dedicated <c>GyroAimEngageButton</c> field. Settled once per
+        /// tick by <see cref="UpdateGyroEngageStates"/>: Hold mode tracks
+        /// the button state directly, Toggle mode flips on each rising
+        /// edge. Reads OR-combine with <see cref="GyroEngagedFromMacro"/>
+        /// in <see cref="SourceCoercion.AimEngageStateProvider"/>; either
+        /// source can engage and neither can disengage what the other
+        /// engaged.</summary>
+        public volatile bool[] GyroEngagedFromButton = new bool[MaxPads];
+
+        /// <summary>Per-slot gyro engage state contributed by the
+        /// <c>SetGyroEngaged</c> macro action. Written from the macro
+        /// evaluator (<c>Step4b.EvaluateMacros</c>), read alongside
+        /// <see cref="GyroEngagedFromButton"/> by the gyro evaluators.</summary>
+        public volatile bool[] GyroEngagedFromMacro = new bool[MaxPads];
+
+        /// <summary>Per-slot gyro ratchet clutch (translator v22, Steam's
+        /// gyro_ratchet_button_mask): true while any of the authoritative
+        /// set's stamped ratchet descriptors is held on any slot device.
+        /// Settled once per tick by <see cref="UpdateGyroEngageStates"/>
+        /// and ANDed-NOT into <see cref="SourceCoercion.AimEngageStateProvider"/>,
+        /// a separate lane the engage sources cannot fight: the OR of
+        /// button + macro engage decides "engaged", the ratchet alone
+        /// decides "clutched", so holding the ratchet always pauses gyro
+        /// and releasing it always restores whatever the engage sources
+        /// say.</summary>
+        public volatile bool[] GyroRatchetHeld = new bool[MaxPads];
+
+        /// <summary>Previous-tick button state for each slot's engage
+        /// button. Owned by <see cref="UpdateGyroEngageStates"/> as the
+        /// edge-detection input for Toggle mode.</summary>
+        private readonly bool[] _prevAimEngageButtonDown = new bool[MaxPads];
+
+        /// <summary>Reused scratch for the device-free gyro-engage walk
+        /// (P1): filled under the settings lock, read outside it, cleared
+        /// per use so the per-tick per-slot list allocation is gone. Poll
+        /// thread only.</summary>
+        private readonly List<string> _gyroEngageGuidScratch = new();
+
+        /// <summary>Whether ANY device on the slot has its left / right route
+        /// engaged (issue #102). A summary, not the gate: the route is settled
+        /// per (slot, device) on the cells below, because two devices on one
+        /// slot can each carry their own route. Kept because it is the public
+        /// surface, and because a caller with no device in hand (a slot-level
+        /// readout) still wants the one-bit answer.</summary>
+        public volatile bool[] TriggerRouteEngagedLeft = new bool[MaxPads];
+        public volatile bool[] TriggerRouteEngagedRight = new bool[MaxPads];
+
+        // Low-cadence config snapshot for the trigger-route settle (#102), mirroring
+        // _mirrorEngageCfg / UpdateHapticMirrorEngageStates (#185). Walking settings.Items
+        // under SyncRoot for every created slot every tick put a lock + O(Items) scan on
+        // the ~1 kHz loop; the route CONFIG changes only on user edit, so snapshot it at
+        // 250 ms and keep only the live per-tick work (the activator's ButtonHeldProvider
+        // read + edge/Toggle settle) hot. null slot = no active route.
+        /// <summary>One device's route on one slot (issue #102). The twelve
+        /// route fields live on that device's own PadSetting, so this is the
+        /// unit the runtime has to be keyed by. Before, the snapshot took the
+        /// FIRST device on the slot with an active route and every other device
+        /// inherited it, which routed pads that had no routing configured and,
+        /// under Redirect, silenced their main motors.
+        ///
+        /// <para>Config fields are rewritten by the 250 ms refresh. The engaged
+        /// and edge state is NOT, which is why the cell outlives the refresh:
+        /// a Toggle activator's sticky bit would reset four times a second on a
+        /// config object that is replaced. Same reason the haptic mirror's
+        /// snapshot holds an EngageCell reference rather than inlining the
+        /// state.</para>
+        ///
+        /// <para>Source: 0 None, 1 MainLeft, 2 MainRight, 3 MaxOfBoth,
+        /// 4 SumOfBoth. Scale is the 0-200% slider as 0.0-2.0. Redirect =
+        /// silence the main motor(s) the route drew from on the physical
+        /// write.</para></summary>
+        private sealed class TriggerRouteCell
+        {
+            public int Slot;
+            public Guid Device;
+            public byte SrcLeft, SrcRight;
+            public double ScaleLeft, ScaleRight;
+            public bool RedirectLeft, RedirectRight;
+            public string ActLeft, ActLeftGuid, ActLeftMode;
+            public string ActRight, ActRightGuid, ActRightMode;
+            /// <summary>Written by the poll thread, read by the Sony dispatcher
+            /// thread, hence volatile. The twin of the mirror's EngageCell
+            /// flag.</summary>
+            public volatile bool EngagedLeft;
+            public volatile bool EngagedRight;
+            /// <summary>Previous-tick button state for the Toggle edge. Poll
+            /// thread only.</summary>
+            public bool PrevLeftDown, PrevRightDown;
+        }
+
+        /// <summary>The cells each slot publishes, jagged because there is no
+        /// cap on devices per slot (a fixed per-slot width is the bug that
+        /// shipped at round 33, S14). A row exists only for a device whose
+        /// route is actually active, so the scan a consumer runs is length 0 or
+        /// 1 on any ordinary slot. Rebuilt at 250 ms; a whole-row reference
+        /// store is atomic, so a reader sees the old rows or the new ones and
+        /// never a torn set.</summary>
+        private readonly TriggerRouteCell[][] _triggerRouteCfg = new TriggerRouteCell[MaxPads][];
+
+        /// <summary>The cells themselves, keyed so the engaged and edge state
+        /// survives a refresh. Concurrent because the refresh runs on the poll
+        /// thread while the dispatcher may be walking a published row.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Slot, Guid Device), TriggerRouteCell>
+            _routeCells = new();
+
+        /// <summary>Previous and current cell sets, diffed each refresh so a
+        /// cell whose config disappeared (device unassigned, slot deleted,
+        /// routing switched off) is disengaged and dropped rather than left
+        /// holding a sticky Toggle for the next device to inherit. The mirror's
+        /// diff re-ASSERTS a retired cell, because an ungated sink must stay
+        /// audible. A retired route is the opposite: it must go quiet.</summary>
+        private readonly HashSet<TriggerRouteCell> _routeCellsPrev = new();
+        private readonly HashSet<TriggerRouteCell> _routeCellsNew = new();
+        private readonly List<TriggerRouteCell> _routeRowScratch = new();
+        private long _triggerRouteCfgRefreshTick;
+
+        /// <summary>Monotonic frame counter feeding the Sony Report 0x01
+        /// timestamp / packet-sequence fields. Game-side parsers (e.g. SDL3's
+        /// PS5 driver) reject duplicate packet-sequence values, so this MUST
+        /// advance every frame regardless of input state.</summary>
+        private long _sonyFrameCounter;
+
+        /// <summary>Neptune frame counter + scratch for the Deck persona
+        /// (#338). unPacketNum must increment: SDL's struct comment licenses
+        /// consumers to skip processing while it is unchanged.</summary>
+        private long _deckFrameCounter;
+        private readonly byte[] _deckReportScratch = new byte[ValveReportPackers.MaxReportSize];
+
+        /// <summary>Scratch for an Extended layout the fixed gamepad state
+        /// cannot carry (#C292). Poll thread only, like the Valve buffer beside
+        /// it.</summary>
+        private readonly byte[] _extendedReportScratch = new byte[ExtendedReportPacker.MaxReportSize];
+
+        /// <summary>
+        /// DSU motion server reference. When set, the polling thread broadcasts
+        /// motion data to subscribed clients after snapshotting sensor data.
+        /// </summary>
+        public DsuMotionServer DsuServer { get; set; }
+
+        /// <summary>
+        /// Audio bass detector. When set, the polling thread reads bass energy
+        /// and combines it with game rumble via max() in ApplyForceFeedback.
+        /// </summary>
+        public AudioBassDetector AudioBassDetector { get; set; }
+
+        /// <summary>
+        /// When set (non-empty), the test rumble for this slot targets only the
+        /// device with this GUID. ApplyForceFeedback skips other devices in the slot.
+        /// </summary>
+        public Guid[] TestRumbleTargetGuid { get; } = new Guid[MaxPads];
+
+        /// <summary>
+        /// Current measured polling frequency in Hz.
+        /// </summary>
+        public double CurrentFrequency { get; private set; }
+
+        /// <summary>
+        /// Whether the manager is currently running the polling loop.
+        /// </summary>
+        public bool IsRunning => _running;
+
+        /// <summary>
+        /// When true, the polling loop skips the expensive pipeline steps and sleeps
+        /// at a low rate (~20Hz) to minimize CPU usage. Device enumeration continues
+        /// at a reduced rate so new controllers still appear on the Devices page.
+        /// Set by InputService when no created+enabled slot has an ONLINE mapped
+        /// device (Step 5's own activity predicate). A slot whose every assigned
+        /// pad is asleep idles the engine instead of reading as "Forging".
+        /// </summary>
+        public bool IsIdle
+        {
+            get => _idle;
+            set => _idle = value;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Events
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Raised when the device list changes (device connected or disconnected).
+        /// Raised on the background thread — UI consumers must marshal to dispatcher.
+        /// </summary>
+        public event EventHandler DevicesUpdated;
+
+        /// <summary>
+        /// Raised when the polling frequency measurement is updated (~once per second).
+        /// </summary>
+        public event EventHandler FrequencyUpdated;
+
+        /// <summary>
+        /// Raised when an error occurs during polling that doesn't stop the loop.
+        /// </summary>
+        public event EventHandler<InputExceptionEventArgs> ErrorOccurred;
+
+        // ─────────────────────────────────────────────
+        //  Constructor
+        // ─────────────────────────────────────────────
+
+        public InputManager()
+        {
+            // Initialize vibration states.
+            for (int i = 0; i < MaxPads; i++)
+            {
+                VibrationStates[i] = new Vibration();
+                FinalVibrationStates[i] = new Vibration();
+                SelectedDeviceVibrationStates[i] = new Vibration();
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  SDL Initialization
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Initializes the SDL3 library for joystick and gamepad support.
+        /// Must be called before starting the polling loop.
+        /// </summary>
+        /// <returns>True if SDL initialized successfully.</returns>
+        private bool InitializeSdl()
+        {
+            if (_sdlInitialized)
+                return true;
+
+            try
+            {
+                // Set hints before initialization.
+                SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
+                // Allow SDL3 to enumerate XInput controllers (Xbox, etc.).
+                // SDL_XINPUT_ENABLED defaults to 1, and setting it keeps that
+                // intent explicit against a changed upstream default.
+                // Do NOT set SDL_HINT_JOYSTICK_RAWINPUT. It conflicts with
+                // XInput enumeration and prevents Xbox controllers from appearing.
+                SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "1");
+
+                // #395: replay the Flydigi driver switch. The previous SDL_Quit
+                // dropped every hint, and this manager is a new instance.
+                ApplyFlydigiEnhancedProtocol(_flydigiEnhancedDesired);
+
+                // Devices SDL's hidapi layer must never enumerate or probe
+                // (issue #235: connecting a Nacon PS4 Compact, 146B:0603,
+                // froze the app until unplug). Leading hypothesis, refined
+                // by the fork SDL#19 audit: the pad exposes a HID interface
+                // WITHOUT the xusb "&IG_" marker that swallows the Sony
+                // third-party capabilities FEATURE probe, and the Windows
+                // feature read waits forever (hid.c GetOverlappedResult
+                // wait=TRUE, no timeout) on the UI thread that runs
+                // enumeration (PumpSdlEvents). It cannot have been the xusb
+                // synthetic collection itself: hid_enumerate has skipped
+                // "&IG_" interfaces since upstream b6a88b0339 (2023-05-31),
+                // in every DLL PadForge ever shipped. If the freeze instead
+                // lives in another backend's arrival path (XInput / WGI /
+                // DirectInput detection shares the same UI-thread
+                // SDL_UpdateJoysticks), this hint does not cover it; a
+                // recurrence report is the discriminator, and the fork
+                // issue carries the bench protocol (interface-path capture
+                // + seatbelt-off repro) plus the bounded-read follow-up.
+                // The ignore cannot cost this PID anything: the Linux RFC
+                // for the BB4469 (linux-input msg83414) records a single
+                // vendor-class identity with no standard HID interfaces,
+                // and DS4Windows carries zero 146B entries. PID-scoped:
+                // other Nacon PIDs stay untouched until a report proves
+                // they share the wedge. The fork's xusb gates
+                // (60ed78a3ac + ae750868c8) are defense in depth beside
+                // this seatbelt; both stay.
+                SDL_SetHint(SDL_HINT_HIDAPI_IGNORE_DEVICES, HidapiIgnoreDevices);
+
+                // PS Move family junk-row suppression (#277); see the
+                // constant's doc for the mechanism and the virtual exemption.
+                SDL_SetHint(SDL_HINT_JOYSTICK_BLACKLIST_DEVICES, JoystickBlacklistDevices);
+
+                // Enable Switch 2 Pro Controller HIDAPI driver (requires libusb-1.0.dll).
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "1");
+
+                // Enable SDL's Wii HIDAPI driver (#116). SDL surfaces the
+                // Bluetooth-paired Wii Remote / Nunchuk / Classic / Wii U Pro and
+                // parses them, and lights the player LED (which stops the idle
+                // flashing). This relies on the SDL3 fork's hid_write fix
+                // (hifihedgehog/SDL#2): on Windows 8+ a Wii Remote's output
+                // reports must go via HidD_SetOutputReport, since the Microsoft
+                // Bluetooth stack rejects WriteFile for it. PadForge pairs the
+                // controller (WiiPairingService) and SDL drives it from there.
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_WII, "1");
+
+                // Enable the SDL3 fork's Bluetooth-LE Switch 2 driver (hifihedgehog/SDL#5).
+                // Switch 2 controllers (Pro Controller 2, Joy-Con 2 L/R, NSO GameCube) speak a
+                // custom BLE GATT service, not HID-over-Bluetooth, so SDL's hidapi can't see
+                // them. This new WinRT driver scans for the Nintendo advertisement, connects,
+                // and surfaces them as ordinary SDL gamepads (the existing fabricated Switch 2
+                // mappings fire via the 'h' GUID signature). When on, it runs a BLE
+                // advertisement scan while PadForge is open. Runtime is hypothesis-under-test
+                // (no Switch 2 hardware has validated it yet).
+                SDL_SetHint(SDL_HINT_JOYSTICK_BLE_SWITCH2, "1");
+
+                // The right Joy-Con NIR camera hint (issue #151, SDL#7) is NOT
+                // set here anymore. The camera and the NFC reader share the one
+                // MCU (camera = mode 5, NFC = mode 4, SDL_hidapi_switch.c
+                // UpdateNfc abandons while the camera streams), so a global
+                // always-on hint silently killed standalone right Joy-Con NFC
+                // (#248 audit). InputService.RefreshSwitchMcuArming now sets
+                // the hint only while an "IR Brightness" input is actually
+                // configured, mirroring the NFC hint's zero-cost-when-unused
+                // contract.
+
+                // Enable the SDL3 fork's Joy-Con 2 optical mouse axes (issue
+                // #154, hifihedgehog/SDL#8, fork commit 9b32ec13b8). With the
+                // hint on, the BLE driver enables the sensor via the feature
+                // init+enable frames at connect and posts the absolute 16-bit
+                // counters on joystick axes 6/7 (raw axis count 8 signals
+                // availability). SdlDeviceWrapper derives per-poll wraparound
+                // deltas for the "Mouse Motion X/Y" sources.
+                SDL_SetHint(SDL_HINT_JOYSTICK_BLE_SWITCH2_MOUSE, "1");
+
+                // Enable the fork's frequency-shaped Switch rumble (#271
+                // item 4, hifihedgehog/SDL#25, fork commit cfcdeb26e0).
+                // Upstream SDL drives the Switch LRAs at two fixed carrier
+                // frequencies with amplitude-only tables; with the hint on,
+                // each motor's intensity also sweeps its frequency band
+                // (low motor ~41-160 Hz, high 160-320 Hz, per dekuNukem's
+                // rumble_data_table.md) with attack/decay transients, which
+                // is where the native HD-rumble texture lives. Classic LRA
+                // packet only; the fork leaves Switch 2 encoding untouched.
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_SHAPED_RUMBLE, "1");
+
+                // Enable the fork's Switch 2 BLE magnetometer channel (#271
+                // item 5, same fork commit). Three raw int16 axes after the
+                // mouse counters; availability rides the raw axis count
+                // (9 = magnetometer, 11 = mouse + magnetometer), the mouse
+                // precedent. SdlDeviceWrapper.ReadSwitch2Magnetometer reads
+                // them, and the Gyro tab's Compass Yaw option uses them to
+                // correct gyro yaw (InputService's compass estimate feeds
+                // SourceCoercion.CompassYawCorrectionProvider).
+                SDL_SetHint(SDL_HINT_JOYSTICK_BLE_SWITCH2_MAGNETOMETER, "1");
+
+                // Enable SDL's Sony-sixaxis PS3 driver (discussion #194). It
+                // claims a DualShock 3 running DsHidMini's SixaxisCompatible
+                // (SXS) mode, the only DsHidMini mode that serves the DS3's
+                // motion data (GET_FEATURE report 0x00, HID.FeatureReport.c),
+                // and reads buttons, sticks, the 10 pressure axes (joystick
+                // axes 6-15, surfaced by the #193 generic-axis path), the
+                // 3-axis accelerometer, and the yaw gyro through the standard
+                // SDL sensor API that SdlDeviceWrapper already consumes.
+                // Windows-only driver, hint-gated off by default in SDL, and
+                // inert unless the user has put their DS3 in SXS mode. SDF /
+                // GPJ nodes are unaffected (wrong report shape for this
+                // driver's GET_FEATURE parse). Gyro and correct accel scaling
+                // over DsHidMini depend on the fork patch in
+                // sdl-patch-spec-ds3-sixaxis-motion.md; with a stock-driver
+                // DLL the accel reads wrong (big-endian parse of DsHidMini's
+                // little-endian serve) and no gyro is declared, so the fork
+                // patch must land before this feature is announced. Do NOT
+                // also set SDL_HINT_JOYSTICK_HIDAPI_PS3: the regular PS3
+                // driver outranks sixaxis in SDL's driver table and its init
+                // writes at the device.
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS3_SIXAXIS_DRIVER, "1");
+
+                // Of the fork's switches for the controllers Windows leaves
+                // unusable (hifihedgehog/SDL#33), PadForge moves these three
+                // off SDL's defaults.
+                //
+                // Bluetooth LE controllers that send their input over a vendor
+                // GATT service: the Poke Ball Plus, the Daydream, Gear VR and
+                // Oculus Go controllers, the iOS Guitar Hero Live guitar, the
+                // Zwift Play and Click, and the Myo. The fork leaves them off so
+                // no app scans unasked. PadForge scans for Switch 2 controllers
+                // already, and both drivers share the one advertisement
+                // watcher. The driver connects to every matching controller in
+                // range that advertises, not only to ones paired with this PC.
+                // SDL_JOYSTICK_BLE_PAIRING stays off: a Daydream or Oculus Go
+                // controller appears once the user pairs it in Windows
+                // Settings, and SDL never writes or removes a bond (pairing an
+                // Oculus Go controller with a PC can end its pairing with its
+                // headset). SDL_Quit waits up to 3 s for open links to close.
+                SDL_SetHint(SDL_HINT_JOYSTICK_BLE, "1");
+
+                // The Dream Cheeky roll-up drum kit, 1941:8021. A weather
+                // station and a missile launcher share that ID, which is why
+                // the fork leaves this driver off, and either one reads here as
+                // a drum kit with six pads. It reaches a game only if the user
+                // assigns it to a slot.
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_DREAMCHEEKY, "1");
+
+                // The iCade feed. RawInputListener's window holds the keyboard
+                // Raw Input class, and Windows gives a class to one window per
+                // process. With this hint off from the start SDL never
+                // registers for keyboards, and RawInputListener hands each
+                // keyboard record to SDL_ICadeProcessRawKeyboard.
+                SDL_SetHint(SDL_HINT_JOYSTICK_ICADE_RAWINPUT, "0");
+
+                // The Ring-Con hint stays off here, like the camera's. It powers
+                // a right Joy-Con's MCU, which the camera and NFC share, so
+                // InputService.RefreshSwitchNfcArming sets it only while a
+                // "Ring-Con Squeeze" or "Ring-Con Pull" source is read.
+
+                // The serial controllers the user added in the pairing
+                // dialog. SDL_Quit drops every hint, so each start replays
+                // the list, as the Flydigi switch is replayed above. Konami's
+                // ACIO boards run only while the list names one: otherwise
+                // the fork would open a plugged-in BIO2's port and hold it
+                // with no joystick (SerialControllers.AcioHintValue).
+                lock (_serialHintLock)
+                {
+                    SDL_SetHint(SDL_HINT_JOYSTICK_KONAMI_ACIO, SerialControllers.AcioHintValue(_serialHintValue));
+                    SDL_SetHint(SDL_HINT_JOYSTICK_SERIAL, _serialHintValue);
+                }
+
+                // The pads in iCade mode the user marked on the Devices page,
+                // replayed for the same reason.
+                lock (_iCadeHintLock)
+                    SDL_SetHint(SDL_HINT_JOYSTICK_ICADE_DEVICES, _iCadeHintValue);
+
+                // The DJI remotes the user added by address in the pairing
+                // dialog, replayed for the same reason.
+                lock (_djiHostsHintLock)
+                    SDL_SetHint(SDL_HINT_JOYSTICK_DJI_REMOTE_TCP_HOSTS, _djiHostsHintValue);
+
+                // The Namco USIO's layout, which the board reads when it
+                // opens, so it goes in before SDL_Init, and a reopen left over
+                // from the last engine ends here (ResetUsioReopenAtInit).
+                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_USIO_LAYOUT, _usioLayout);
+                ResetUsioReopenAtInit(value => SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_USIO, value));
+
+                // Allow screensaver/sleep even while SDL video is active.
+                SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+
+                // In-memory diagnostics ring: captures the SDL drivers' own
+                // debug narration plus the poll-loop stall watchdog as
+                // crash context (the crash handler appends the ring to
+                // crash.log). No file is written in normal operation.
+                // Installed before SDL_Init so init-time messages land
+                // too. Pre-v4 builds wrote these lines to diag.log beside
+                // the exe; remove the stale file those builds left behind.
+                try
+                {
+                    System.IO.File.Delete(System.IO.Path.Combine(
+                        AppDomain.CurrentDomain.BaseDirectory, "diag.log"));
+                }
+                catch { }
+                Engine.SdlDiagLog.Install();
+
+                // SDL3: SDL_Init returns bool (true = success), and
+                // SDL_INIT_GAMECONTROLLER is renamed to SDL_INIT_GAMEPAD.
+                // Keyboards and mice do not need SDL_INIT_VIDEO: RawInputListener enumerates and reads both.
+                if (!SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD | SDL_INIT_VIDEO | SDL_INIT_HAPTIC))
+                {
+                    string error = SDL_GetError();
+                    RaiseError($"SDL_Init failed: {error}", null);
+                    return false;
+                }
+
+                // Load PadForge community mappings (extends SDL's built-in
+                // gamecontrollerdb). Embedded in the exe; apply per-line via
+                // SDL_AddGamepadMapping rather than the file-path overload.
+                LoadEmbeddedGamepadMappings();
+
+                // SDL_INIT_VIDEO disables the screensaver and system sleep by
+                // default.  Re-enable both so the PC can sleep when idle.
+                SDL_EnableScreenSaver();
+                SetThreadExecutionState(ES_CONTINUOUS);
+
+                _sdlInitialized = true;
+
+                // Surface a Bluetooth DualShock 3 (behind BthPS3, no DsHidMini) to SDL
+                // as a virtual joystick so the normal pipeline consumes it. Cheap when
+                // absent (a periodic device-interface poll); attaches only on connect.
+                try
+                {
+                    _ds3Direct = new Ds3DirectService(msg => Engine.SdlDiagLog.WriteLine("DS3 " + msg));
+                    _ds3Direct.Start();
+
+                    // PlayStation Move family over the same BthPS3 stack (#277):
+                    // the Navigation controller is a half sixaxis and rides the
+                    // DS3 service's navigation profile; the Move motion
+                    // controller gets its own protocol lane.
+                    _navDirect = new Ds3DirectService(msg => Engine.SdlDiagLog.WriteLine("NAV " + msg), navigation: true);
+                    _navDirect.Start();
+                    _psMoveDirect = new PsMoveDirectService(msg => Engine.SdlDiagLog.WriteLine("MOVE " + msg));
+                    _psMoveDirect.Start();
+
+                    // Battery for the bridged pads (#167 lane): SDL has no power
+                    // channel for virtual joysticks, so the wrapper falls back to
+                    // these providers when SDL reports unknown. The DS3 provider
+                    // covers both its profiles (shared instance-id map).
+                    Engine.SdlDeviceWrapper.ExternalPowerInfoProvider =
+                        id => Ds3DirectService.GetPowerInfo(id) ?? PsMoveDirectService.GetPowerInfo(id);
+
+                    // Real transport path for the bridged pads (Dossier path + BT/USB
+                    // classification): the virtual joysticks have no SDL path of their own.
+                    Engine.SdlDeviceWrapper.ExternalDevicePathProvider =
+                        id => Ds3DirectService.GetDevicePath(id) ?? PsMoveDirectService.GetDevicePath(id);
+                }
+                catch (Exception ex) { Engine.SdlDiagLog.WriteLine("DS3 service start failed: " + ex.Message); }
+
+                // Surface 3Dconnexion SpaceMouse 6DoF pucks (HID usage 0x08
+                // Multi-axis Controller, invisible to SDL's raw-input backend)
+                // as virtual joysticks the same way (#288). Cheap when absent:
+                // a periodic device-interface sweep with per-path verdicts.
+                try
+                {
+                    _spaceMouse = new SpaceMouseService(msg => Engine.SdlDiagLog.WriteLine("SpaceMouse: " + msg));
+                    _spaceMouse.Start();
+                }
+                catch (Exception ex) { Engine.SdlDiagLog.WriteLine("SpaceMouse service start failed: " + ex.Message); }
+
+                // Bind WinUSB to the controllers Windows leaves unusable that
+                // SDL reads through libusb (hifihedgehog/SDL#33), as each one
+                // appears. Cheap when absent: a 3 s sweep of the present USB
+                // nodes.
+                try
+                {
+                    _vendorUsb = new VendorUsbBindingService(msg => Engine.SdlDiagLog.WriteLine("VendorUSB: " + msg));
+                    _vendorUsb.Start();
+                }
+                catch (Exception ex) { Engine.SdlDiagLog.WriteLine("Vendor USB binder start failed: " + ex.Message); }
+
+                // Real VR hardware as input sources (#287): headset pose and
+                // tracked controllers through a background OpenVR client.
+                // Cheap when absent: a 5 s registry-file poll until SteamVR
+                // exists and runs; never launches SteamVR itself.
+                try
+                {
+                    _openVrConsumer = new OpenVrConsumerService(msg => Engine.SdlDiagLog.WriteLine("VR " + msg));
+                    _openVrConsumer.Start();
+                }
+                catch (Exception ex) { Engine.SdlDiagLog.WriteLine("VR consumer start failed: " + ex.Message); }
+
+                return true;
+            }
+            catch (DllNotFoundException ex)
+            {
+                RaiseError("SDL3.dll not found. Place SDL3.dll next to the exe. " +
+                           "Download from https://github.com/libsdl-org/SDL/releases", ex);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                RaiseError("Failed to initialize SDL3.", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Shuts down the SDL3 library. Called during disposal.
+        /// </summary>
+        private void ShutdownSdl()
+        {
+            if (!_sdlInitialized)
+                return;
+
+            try { _ds3Direct?.Stop(); } catch { }
+            _ds3Direct = null;
+
+            try { _navDirect?.Stop(); } catch { }
+            _navDirect = null;
+
+            try { _psMoveDirect?.Stop(); } catch { }
+            _psMoveDirect = null;
+
+            try { _spaceMouse?.Stop(); } catch { }
+            _spaceMouse = null;
+
+            try { _vendorUsb?.Stop(); } catch { }
+            _vendorUsb = null;
+
+            try { _openVrConsumer?.Stop(); } catch { }
+            _openVrConsumer = null;
+
+            SDL_Quit();
+            _sdlInitialized = false;
+        }
+
+        /// <summary>Bluetooth DualShock 3 -> SDL virtual joystick bridge (BthPS3 raw PDO).</summary>
+        private Ds3DirectService _ds3Direct;
+
+        /// <summary>PS Move Navigation controller bridge: the DS3 service's navigation profile (#277).</summary>
+        private Ds3DirectService _navDirect;
+
+        /// <summary>PS Move motion controller bridge (BthPS3 MOTION raw PDO, #277).</summary>
+        private PsMoveDirectService _psMoveDirect;
+
+        /// <summary>3Dconnexion SpaceMouse -> SDL virtual joystick bridge (#288).</summary>
+        private SpaceMouseService _spaceMouse;
+
+        /// <summary>WinUSB binder for the controllers SDL reads through libusb (SDL#33).</summary>
+        private VendorUsbBindingService _vendorUsb;
+
+        /// <summary>Real VR devices -> SDL virtual joystick bridge (#287).</summary>
+        private OpenVrConsumerService _openVrConsumer;
+
+        private long _ds3PlayerNumberTick;
+
+        /// <summary>
+        /// Player LED idle floor for the bridged DS3 (#191 parity): of the
+        /// virtual controllers the pad feeds, the smallest displayed player
+        /// number picks its lit LED (SlotOrders.GetIdentityPlayerNumber),
+        /// wrapping past 4 like SDL's PS3 driver. Unmapped keeps LED 1.
+        /// Rate-limited to twice a second; SetPlayerNumber itself is
+        /// change-detected, so steady state costs two short lock walks and
+        /// no device I/O.
+        /// </summary>
+        private void UpdateDs3PlayerNumber()
+        {
+            var svc = _ds3Direct;
+            if (svc == null || !svc.IsConnected) return;
+
+            long now = Environment.TickCount64;
+            if (now - _ds3PlayerNumberTick < 500) return;
+            _ds3PlayerNumberTick = now;
+
+            var devices = SettingsManager.UserDevices;
+            var settings = SettingsManager.UserSettings;
+            if (devices == null || settings == null) return;
+
+            uint id = svc.InstanceId;
+            Guid guid = Guid.Empty;
+            lock (devices.SyncRoot)
+            {
+                foreach (var ud in devices.Items)
+                {
+                    if (ud?.Device is Engine.SdlDeviceWrapper w && w.SdlInstanceId == id)
+                    {
+                        guid = ud.InstanceGuid;
+                        break;
+                    }
+                }
+            }
+            if (guid == Guid.Empty) { svc.SetPlayerNumber(0); return; }
+
+            // Identity precedence: the shared fold over every slot the
+            // pad feeds (smallest displayed number wins), same winner
+            // every other identity writer computes.
+            svc.SetPlayerNumber(SettingsManager.SlotOrders.GetIdentityPlayerNumber(guid));
+        }
+
+        private long _movePlayerNumberTick;
+
+        /// <summary>The same idle floor for the bridged PS Move (#277): the
+        /// sphere shows the player's default color until an explicit LED write
+        /// claims it. Same 500 ms cadence and change-detected setter as the
+        /// DS3's walk.</summary>
+        private void UpdateMovePlayerNumber()
+        {
+            var svc = _psMoveDirect;
+            if (svc == null || !svc.IsConnected) return;
+
+            long now = Environment.TickCount64;
+            if (now - _movePlayerNumberTick < 500) return;
+            _movePlayerNumberTick = now;
+
+            var devices = SettingsManager.UserDevices;
+            if (devices == null) return;
+
+            uint id = svc.InstanceId;
+            Guid guid = Guid.Empty;
+            lock (devices.SyncRoot)
+            {
+                foreach (var ud in devices.Items)
+                {
+                    if (ud?.Device is Engine.SdlDeviceWrapper w && w.SdlInstanceId == id)
+                    {
+                        guid = ud.InstanceGuid;
+                        break;
+                    }
+                }
+            }
+            if (guid == Guid.Empty) { svc.SetPlayerNumber(0); return; }
+            svc.SetPlayerNumber(SettingsManager.SlotOrders.GetIdentityPlayerNumber(guid));
+        }
+
+        /// <summary>
+        /// Number of gamepad mappings successfully applied from the embedded
+        /// gamecontrollerdb_padforge.txt. Zero means either the resource is
+        /// missing (build misconfiguration) or every line was blank/comment.
+        /// Exposed as a diagnostic so Settings / About can surface whether
+        /// the embed is reaching SDL at runtime.
+        /// </summary>
+        public static int EmbeddedMappingsLoaded { get; private set; }
+
+        /// <summary>
+        /// Streams the embedded gamecontrollerdb_padforge.txt resource through
+        /// SDL_AddGamepadMapping one line at a time. The file-path overload
+        /// (SDL_AddGamepadMappingsFromFile) is unusable when the file ships
+        /// inside the single-file exe rather than as a loose resource next to
+        /// it. Per-line apply is cheap (one P/Invoke per mapping, a few dozen
+        /// total) and avoids touching the filesystem.
+        /// </summary>
+        private static void LoadEmbeddedGamepadMappings()
+        {
+            int applied = 0;
+            try
+            {
+                var asm = typeof(InputManager).Assembly;
+                // Resource name is the default manifest name: "<RootNamespace>.<filename>".
+                // PadForge's RootNamespace is "PadForge" (see csproj).
+                string resourceName = "PadForge.gamecontrollerdb_padforge.txt";
+                using var stream = asm.GetManifestResourceStream(resourceName);
+                if (stream == null)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[InputManager] Embedded resource '{resourceName}' not found. " +
+                        "Check <EmbeddedResource Include=\"gamecontrollerdb_padforge.txt\"/> in PadForge.App.csproj.");
+                    return;
+                }
+                using var reader = new System.IO.StreamReader(stream);
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed[0] == '#') continue;
+                    if (SDL_AddGamepadMapping(trimmed) >= 0)
+                        applied++;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Mapping load is best-effort — SDL's built-in gamecontrollerdb
+                // is still active and recognizes most common gamepads. Any
+                // failure here just means PadForge's community mappings aren't
+                // applied on top, which isn't fatal.
+                System.Diagnostics.Debug.WriteLine($"[InputManager] Embedded mappings load failed: {ex.Message}");
+            }
+            EmbeddedMappingsLoaded = applied;
+            System.Diagnostics.Debug.WriteLine($"[InputManager] Applied {applied} embedded PadForge gamepad mapping(s).");
+            // Also to the real diagnostics channel. The Debug.WriteLine above
+            // is compiled out of Release, so in the shipping build this count
+            // reached nothing: not a log, and not a reader, while the property's
+            // own doc offers it as the way to tell whether the embed is
+            // reaching SDL at runtime. A zero here means the resource is
+            // missing or every line was blank, which is a build
+            // misconfiguration worth seeing in a user's log rather than only
+            // under a debugger.
+            Engine.SdlDiagLog.WriteLine($"MAPPINGS embedded applied={applied}");
+        }
+
+        // ─────────────────────────────────────────────
+        //  Start / Stop
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Starts the background polling thread. Safe to call multiple times;
+        /// subsequent calls are ignored if already running.
+        /// </summary>
+        /// <summary>
+        /// Pumps SDL's event queue. MUST be called on the thread that ran
+        /// SDL_Init (the UI thread here), because SDL's hidapi creates its
+        /// device-change message window there and Windows posts WM_DEVICECHANGE
+        /// only to that thread. SDL's hidapi only re-scans for connected/removed
+        /// controllers when those messages are dispatched (SDL_hidapi.c relies on
+        /// the SDL_PumpEvents loop on the video thread). Without this, a device
+        /// that drops on a read hiccup never comes back and a freshly-plugged one
+        /// never appears until an app restart re-enumerates from scratch.
+        /// </summary>
+        private long _lastUiJoystickUpdateTicks;
+
+        public void PumpSdlEvents()
+        {
+            if (!_sdlInitialized)
+                return;
+
+            // Dispatch SDL's hidapi device-change messages (their hidden window
+            // lives on this, the SDL_Init thread), then run the joystick update
+            // HERE so the resulting hidapi re-scan / new-device enumeration runs
+            // on the thread that owns the joystick subsystem. The polling thread
+            // reads device STATE fine, but enumerating a newly-connected
+            // controller only produces joysticks on the init thread (a re-scan on
+            // the polling thread yields zero). This is what makes a hot-plugged
+            // controller (e.g. a DualSense) appear in-process without a restart.
+            // Stall watchdog (#210 follow-up): this UI-thread call enters the
+            // same hidapi UpdateDevice paths as the poll loop, so a driver
+            // stall here freezes the UI and must be attributable too.
+            long tsPump = Stopwatch.GetTimestamp();
+            SDL_PumpEvents();
+            long tsUpd = Stopwatch.GetTimestamp();
+            // The joystick update here exists ONLY for enumeration (new
+            // devices materialize on the init thread; state reads happen
+            // on the poll thread every tick). It shares SDL's joystick
+            // lock with that 1 kHz caller, and the diag harvest showed
+            // the two convoying (paired ~100 ms "STALL poll sdl=" /
+            // "STALL uipump" lines). 500 ms keeps hot-plug appearance
+            // sub-second while cutting the convoy exposure 5x. The pump
+            // above stays at the timer's 100 ms so WM_DEVICECHANGE
+            // dispatch stays prompt.
+            long updMs = 0;
+            long nowTicks = Stopwatch.GetTimestamp();
+            if (nowTicks - _lastUiJoystickUpdateTicks >= Stopwatch.Frequency / 2)
+            {
+                _lastUiJoystickUpdateTicks = nowTicks;
+                SDL_UpdateJoysticks();
+                updMs = (Stopwatch.GetTimestamp() - tsUpd) * 1000 / Stopwatch.Frequency;
+            }
+            long pumpMs = (tsUpd - tsPump) * 1000 / Stopwatch.Frequency;
+            if (pumpMs >= 25 || updMs >= 25)
+                Engine.SdlDiagLog.WriteLine($"STALL uipump pump={pumpMs}ms upd={updMs}ms");
+        }
+
+        /// <summary>
+        /// Forces SDL to cleanly re-open the Wii hidapi driver's devices after a
+        /// pairing (#116). During the Bluetooth pairing ceremony SDL grabs the
+        /// Wii Remote mid-pairing, then our BluetoothSetServiceState and the
+        /// pairing churn invalidate that handle, so the joystick drops and SDL
+        /// keeps a stale device that only a full app restart clears. Toggling the
+        /// Wii hidapi hint off then on replicates the restart for just this driver:
+        /// off runs SDL_HIDAPIDriverHintChanged which disables the driver (SDL
+        /// cleans up the stale device and closes the dead handle) and resets the
+        /// hidapi change count to force a re-enumerate; on re-opens and re-inits
+        /// the now-stable device. Repeated over ~11s to cover the post-pair
+        /// settling window. The UI-thread pump processes each toggle. Safe to call
+        /// from any thread (SDL_SetHint is thread-safe).
+        /// </summary>
+        public void RescanWiiControllers()
+        {
+            Task.Run(() =>
+            {
+                for (int i = 0; i < 8 && !_disposed; i++)
+                {
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_WII, "0");
+                    Thread.Sleep(200);
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_WII, "1");
+                    Thread.Sleep(1200);
+                }
+            });
+        }
+
+        /// <summary>The SDL Flydigi HIDAPI driver switch (#395). On, the
+        /// default, SDL drives a Flydigi pad's vendor interface for M1 to M4,
+        /// C, Z, LM, RM and motion. Off leaves the pad on its XInput view
+        /// only, which is the state a user needs while Flydigi Space Station
+        /// must keep sight of the pad: both drove that interface and one
+        /// Vader 5 Pro re-enumerated in a loop until the service lost access.
+        /// SDL_SetHint is thread-safe and a hint set before SDL_Init persists,
+        /// so this runs at settings load and again on every toggle. The
+        /// driver's hint callback re-enumerates live, the mechanism
+        /// RescanWiiControllers leans on.</summary>
+        public static void ApplyFlydigiEnhancedProtocol(bool enabled)
+        {
+            // SDL_Quit runs SDL_QuitHints, so an engine stop and start would
+            // silently revert the switch to the driver's default. The desired
+            // state lives here and InitializeSdl replays it before every
+            // SDL_Init. The hint's acceptance is logged because an environment
+            // variable can outrank a normal-priority hint without throwing.
+            // Under the same lock as the re-probe's write (#395), so the switch
+            // going off can never be overwritten by a nudge that read it on.
+            bool accepted;
+            lock (_flydigiHintLock)
+            {
+                _flydigiEnhancedDesired = enabled;
+                accepted = WriteFlydigiHintUnderJoystickLock(enabled ? "1" : "0");
+                if (accepted) _flydigiHintValue = enabled ? "1" : "0";
+            }
+            Engine.SdlDiagLog.WriteLine($"FLYDIGI hint {SDL_HINT_JOYSTICK_HIDAPI_FLYDIGI}={(enabled ? 1 : 0)} accepted={accepted}");
+        }
+
+        /// <summary>One write to the Flydigi hint for a re-probe (#395): the
+        /// switch is read, the alternated string written and recorded, all
+        /// under the lock the switch itself takes. Returns whether SDL took
+        /// the write and what was written. Nothing is written while the
+        /// switch is off.</summary>
+        internal static (bool written, string value) TryFlydigiReprobeNudge()
+        {
+            lock (_flydigiHintLock)
+            {
+                if (!_flydigiEnhancedDesired) return (false, null);
+                string next = FlydigiReprobePolicy.NextHintValue(_flydigiHintValue);
+                bool accepted = WriteFlydigiHintUnderJoystickLock(next);
+                if (accepted) _flydigiHintValue = next;
+                return (accepted, next);
+            }
+        }
+
+        /// <summary>The one place the Flydigi hint is written. SDL's HIDAPI
+        /// layer consumes its hints-changed flag inside its device update,
+        /// under the joystick lock, and clears the flag AFTER re-evaluating
+        /// drivers, so a write landing during a re-evaluation on another
+        /// thread (the UI pump also updates joysticks) could be cleared
+        /// unseen. Holding the joystick lock across the write serializes it
+        /// with that consumer. Before SDL_Init the lock is a no-op. Lock
+        /// order is the managed switch lock first, then SDL's, and nothing
+        /// takes them the other way around.</summary>
+        private static bool WriteFlydigiHintUnderJoystickLock(string value)
+        {
+            try
+            {
+                SDL_LockJoysticks();
+                try { return SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_FLYDIGI, value); }
+                finally { SDL_UnlockJoysticks(); }
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Hands SDL the serial controllers the user added
+        /// (hifihedgehog/SDL#33): SDL_JOYSTICK_SERIAL, which the fork's
+        /// serial driver reads at any time, opening the ports that join the
+        /// list and closing the ones that leave it. Written under the
+        /// joystick lock, as the Flydigi hint is.</summary>
+        public static void ApplySerialControllers(IEnumerable<SerialControllerEntry> entries)
+        {
+            string value = SerialControllers.HintValue(entries);
+            string acio = SerialControllers.AcioHintValue(value);
+            bool accepted;
+            lock (_serialHintLock)
+            {
+                _serialHintValue = value;
+                WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_KONAMI_ACIO, acio);
+                accepted = WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_SERIAL, value);
+            }
+            Engine.SdlDiagLog.WriteLine($"SERIAL hint {SDL_HINT_JOYSTICK_SERIAL}=\"{value}\" accepted={accepted} {SDL_HINT_JOYSTICK_KONAMI_ACIO}={acio}");
+        }
+
+        private static readonly object _serialHintLock = new object();
+        private static string _serialHintValue = string.Empty;
+
+        /// <summary>Hands SDL the pads in iCade mode the user marked
+        /// (hifihedgehog/SDL#33 Part 16): SDL_JOYSTICK_ICADE_DEVICES, which
+        /// the fork's iCade driver reads at any time. A keyboard that joins
+        /// the list becomes the pad's joystick, and one that leaves it turns
+        /// back into a keyboard. Written under the joystick lock, as the
+        /// serial hint is.</summary>
+        public static void ApplyICadePads(IEnumerable<string> entries)
+        {
+            string value = ICadePads.HintValue(entries);
+            bool accepted;
+            lock (_iCadeHintLock)
+            {
+                _iCadeHintValue = value;
+                accepted = WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_ICADE_DEVICES, value);
+            }
+            Engine.SdlDiagLog.WriteLine($"ICADE hint {SDL_HINT_JOYSTICK_ICADE_DEVICES}=\"{value}\" accepted={accepted}");
+        }
+
+        private static readonly object _iCadeHintLock = new object();
+        private static string _iCadeHintValue = string.Empty;
+
+        /// <summary>Hands SDL the DJI remotes the user added by address
+        /// (hifihedgehog/SDL#33 Part 6): SDL_JOYSTICK_DJI_REMOTE_TCP_HOSTS,
+        /// which the fork's network driver reads at any time, connecting to
+        /// the hosts that join the list and closing the links to the ones
+        /// that leave it. Written under the joystick lock, as the serial
+        /// hint is.</summary>
+        public static void ApplyDjiRemoteHosts(IEnumerable<string> entries)
+        {
+            string value = DjiRemoteHosts.HintValue(entries);
+            bool accepted;
+            lock (_djiHostsHintLock)
+            {
+                _djiHostsHintValue = value;
+                accepted = WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_DJI_REMOTE_TCP_HOSTS, value);
+            }
+            Engine.SdlDiagLog.WriteLine($"DJITCP hint {SDL_HINT_JOYSTICK_DJI_REMOTE_TCP_HOSTS}=\"{value}\" accepted={accepted}");
+        }
+
+        private static readonly object _djiHostsHintLock = new object();
+        private static string _djiHostsHintValue = string.Empty;
+
+        /// <summary>The Namco USIO's two layouts (hifihedgehog/SDL#33
+        /// Part 14): Taiko no Tatsujin's two drums, the fork's default, or
+        /// Tekken's four arcade sticks. One board ID serves both cabinets.</summary>
+        public const string UsioTaiko = "taiko";
+        public const string UsioTekken = "tekken";
+
+        private static volatile string _usioLayout = UsioTaiko;
+
+        /// <summary>The layout the setting names: Tekken for "tekken" in any
+        /// case, Taiko for anything else, as the fork reads the hint.</summary>
+        public static string NormalizeUsioLayout(string layout) =>
+            string.Equals(layout?.Trim(), UsioTekken, StringComparison.OrdinalIgnoreCase) ? UsioTekken : UsioTaiko;
+
+        /// <summary>Hands SDL the USIO layout. The board reads it when it
+        /// opens, so a change reaches a connected board only when it opens
+        /// again, and the fork opens it again when the USIO driver's hint
+        /// goes off and on (docs/README-arcade-io.md). reopen asks the poll
+        /// thread for that (<see cref="AdvanceUsioReopen"/>).</summary>
+        public static void ApplyUsioLayout(string layout, bool reopen)
+        {
+            string value = NormalizeUsioLayout(layout);
+            _usioLayout = value;
+            bool accepted = WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_HIDAPI_USIO_LAYOUT, value);
+            Engine.SdlDiagLog.WriteLine($"USIO hint {SDL_HINT_JOYSTICK_HIDAPI_USIO_LAYOUT}={value} accepted={accepted} reopen={reopen}");
+            if (reopen) RequestUsioReopen();
+        }
+
+        /// <summary>Where the USIO reopen stands: 0 nothing asked, 1 asked,
+        /// or the driver off and the token of the loop run that turned it off,
+        /// shifted left 2 bits with 2 in the low bits (<see cref="UsioOffBy"/>).</summary>
+        private static long _usioReopenState;
+
+        private const long UsioIdle = 0, UsioAsked = 1, UsioOff = 2;
+
+        /// <summary>The source of each poll loop run's USIO owner token. The
+        /// state is static and outlives an engine instance, and a new
+        /// InputManager counts its run stamps from 1 again, so a stamp alone
+        /// could name two loops at once: a retired loop of the last instance
+        /// and the first loop of the next.</summary>
+        private static long s_usioOwners;
+
+        internal static long NewUsioOwner() => System.Threading.Interlocked.Increment(ref s_usioOwners);
+
+        /// <summary>The state value for the driver turned off by the loop run
+        /// holding <paramref name="owner"/>.</summary>
+        internal static long UsioOffBy(long owner) => (owner << 2) | UsioOff;
+
+        internal static long UsioReopenStateForTest
+        {
+            get => System.Threading.Volatile.Read(ref _usioReopenState);
+            set => System.Threading.Volatile.Write(ref _usioReopenState, value);
+        }
+
+        internal static void RequestUsioReopen()
+            => System.Threading.Interlocked.Exchange(ref _usioReopenState, UsioAsked);
+
+        /// <summary>
+        /// Poll thread, right before each of its SDL updates: the USIO reopen's
+        /// next step, the driver's hint off on one call and on again on the
+        /// next. SDL's hint callback only marks the drivers for a change, and
+        /// the next HIDAPI detect applies it (the fork's
+        /// SDL_HIDAPIDriverHintChanged and HIDAPI_UpdateDeviceList), so an off
+        /// and an on with no update between them close nothing. The two used to
+        /// go out 200 ms apart from a worker, which the poll loop's own updates
+        /// covered, but not a stopped or background-suspended engine's: there
+        /// only the interface's joystick update runs, every 500 ms, and the
+        /// board kept its old layout. Here this thread's own update always runs
+        /// between the two writes: SDL takes HIDAPI's update gate only under
+        /// its joystick lock (SDL_UpdateJoysticks), so that update is never
+        /// skipped for another thread's. A request made in between runs another
+        /// cycle. One made while the engine is stopped or suspended finishes
+        /// when the loop runs again, and the board stays closed meanwhile,
+        /// which nothing reads then. SDL's own initialization clears it
+        /// (<see cref="InitializeSdl"/>): the layout goes in before the board
+        /// first opens.
+        ///
+        /// <para>The loop that turns the driver off is the one that turns it
+        /// back on, after its own update. A loop that outlived Stop's join can
+        /// still be finishing its last iteration beside the next run's loop,
+        /// and it passed its stamp check before the new run began: taking the
+        /// other loop's off for its own, it wrote the on before any update saw
+        /// the off. So a loop that finds the driver off under another loop's
+        /// token (<see cref="NewUsioOwner"/>) takes the cycle over and writes
+        /// nothing until its own update has run.</para>
+        ///
+        /// <para>An off that SDL refuses (an environment variable outranks
+        /// the hint) ends the cycle with nothing changed. An on it refuses is
+        /// written again before the next update, since the driver must not
+        /// stay off.</para>
+        /// </summary>
+        internal static void AdvanceUsioReopen(long owner) => AdvanceUsioReopen(owner,
+            value => WriteHintUnderJoystickLock(SDL_HINT_JOYSTICK_HIDAPI_USIO, value));
+
+        internal static void AdvanceUsioReopen(long owner, Func<string, bool> writeDriverHint)
+        {
+            if (System.Threading.Interlocked.Read(ref _usioReopenState) == UsioIdle) return;
+            // Held from reading the state through its hint write to the state
+            // that write leaves. A retired loop that read "asked" and then
+            // stalled before writing could otherwise land its off after the
+            // current loop had written the on, leaving the driver off with the
+            // state idle. The only lock taken inside is SDL's joystick lock,
+            // and nothing takes this one under that one. A request made
+            // meanwhile is kept: each state change is a compare-exchange.
+            lock (s_usioLock)
+            {
+                long state = System.Threading.Interlocked.Read(ref _usioReopenState);
+                if (state == UsioIdle) return;
+                if (state == UsioAsked)
+                {
+                    bool off = writeDriverHint("0");
+                    System.Threading.Interlocked.CompareExchange(ref _usioReopenState,
+                        off ? UsioOffBy(owner) : UsioIdle, UsioAsked);
+                    return;
+                }
+                if (state != UsioOffBy(owner))
+                {
+                    System.Threading.Interlocked.CompareExchange(ref _usioReopenState, UsioOffBy(owner), state);
+                    return;
+                }
+                if (writeDriverHint("1"))
+                    System.Threading.Interlocked.CompareExchange(ref _usioReopenState, UsioIdle, state);
+            }
+        }
+
+        private static readonly object s_usioLock = new();
+
+        /// <summary>SDL's initialization, before SDL_Init: a reopen still
+        /// pending is moot, since the board opens in the layout just set, and
+        /// a cycle left with the driver off gets it back on. SDL_Quit drops the
+        /// hints, but a loop that outlived its engine can write its off after
+        /// that, and a hint set before SDL_Init holds. Under the transition's
+        /// lock, so a step in the middle of its write finishes first and its
+        /// off is seen here, rather than landing after this reset with nothing
+        /// left to turn the driver back on.</summary>
+        internal static void ResetUsioReopenAtInit(Func<string, bool> writeDriverHint)
+        {
+            lock (s_usioLock)
+            {
+                long pending = System.Threading.Interlocked.Exchange(ref _usioReopenState, UsioIdle);
+                if ((pending & 3) == UsioOff) writeDriverHint("1");
+            }
+        }
+
+        private static bool WriteHintUnderJoystickLock(string name, string value)
+        {
+            try
+            {
+                SDL_LockJoysticks();
+                try { return SDL_SetHint(name, value); }
+                finally { SDL_UnlockJoysticks(); }
+            }
+            catch { return false; }
+        }
+
+        private static readonly object _flydigiHintLock = new object();
+        private static volatile bool _flydigiEnhancedDesired = true;
+        /// <summary>The string last written to the Flydigi hint (#395). The
+        /// re-probe alternates it between "1" and "true", which SDL reads as
+        /// the same boolean, so its callback fires and unclaimed devices are
+        /// probed again while claimed ones are left alone. Written only
+        /// under <see cref="_flydigiHintLock"/>.</summary>
+        private static string _flydigiHintValue = "1";
+
+        /// <summary>The switch's recorded state, replayed by InitializeSdl.</summary>
+        public static bool FlydigiEnhancedProtocolDesired => _flydigiEnhancedDesired;
+
+        public void Start()
+        {
+            if (_running || _disposed)
+                return;
+
+            if (!InitializeSdl())
+                return;
+            if (_personaAudioOwner.Closed)
+                _personaAudioOwner = new AudioPassthroughService.PersonaOwner();
+
+            // Virtual-controller filtering happens in the two forks PadForge
+            // ships. The SDL3 fork's HIDAPI, DirectInput and RawInput
+            // backends walk each HID's PnP ancestor chain for "HIDMaestro"
+            // and skip matches. XInput slots come from the OpenXInput fork's
+            // xinput1_4.dll, which SDL loads in place of the system one: its
+            // enumeration skips XUSB interfaces backed by a HIDMaestro virtual,
+            // so they never take a user index. No per-process slot tracking,
+            // no function-pointer hook.
+
+            RawInputListener.Start();
+
+            // Remove MIDI endpoint devnodes stranded by a previous run.
+            // Windows MIDI Services can leave them behind when its own
+            // teardown fails, and they otherwise sit in Device Manager
+            // forever and poison later MIDI slot creation.
+            MidiEndpointJanitor.ScheduleSweep(0);
+
+            // PTP reader always runs so Devices page can preview touchpad input.
+            // Note: on shared hardware (laptop trackpads), the digitizer registration
+            // stops Windows from synthesizing mouse reports for the same device.
+            _ptpReader = new PrecisionTouchpadReader();
+            _ptpReader.Start();
+            StartTabletReader();
+
+            // The last stop closed the Bliss-Box runtime (#469).
+            BlissBoxRuntime.Open();
+
+            Array.Clear(_steeringAngleFrames);
+            _running = true;
+            _enumerationTimer.Restart();
+            _frequencyTimer.Restart();
+            _frequencyCounter = 0;
+
+            int generation = StampRun();
+            // The run owns the evaluator's frame bookkeeping
+            // (SourceCoercion.BeginPollRun) from here, registered in Start's
+            // order before its thread exists. A loop that registered itself
+            // could do it late: one Stop retired before it reached its first
+            // frame registered after its replacement and locked it out.
+            int pollRun = Engine.Common.Mapping.SourceCoercion.BeginPollRun();
+            _pollingThread = new Thread(() => PollingLoop(generation, pollRun))
+            {
+                Name = "PadForge.InputManager",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal
+            };
+            _pollingThread.Start();
+
+            _mouseInjectorThread = new Thread(() => MouseInjectorLoop(generation))
+            {
+                Name = "PadForge.MouseInjector",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal
+            };
+            _mouseInjectorThread.Start();
+        }
+
+        /// <summary>
+        /// Flushes macro mouse-move deltas that the poll thread accumulated, one
+        /// SendInput per tick, so the SendInput syscall never runs on the 1000 Hz
+        /// poll thread. Injected mouse movement is processed synchronously (it
+        /// traverses every process's low-level mouse hook chain), which is why a
+        /// per-poll SendInput could collapse the poll rate to ~200 Hz. ~500 Hz cap
+        /// via a 2 ms sleep (timeBeginPeriod(1) from the poll loop keeps the sleep
+        /// near 2 ms); accumulated delta is never lost, only batched.
+        /// </summary>
+        private void MouseInjectorLoop(int generation)
+        {
+            while (_running && System.Threading.Volatile.Read(ref _runGeneration) == generation)
+            {
+                bool injected = FlushPendingMouseInput();
+                if (injected)
+                {
+                    // Active: keep the 2 ms batch cadence so SendInput
+                    // stays coalesced exactly as before.
+                    Thread.Sleep(2);
+                    continue;
+                }
+                // Idle: park until the first accumulated delta signals.
+                // Disarm-then-recheck prevents the lost-wakeup race; the
+                // timeout is a safety net only.
+                System.Threading.Interlocked.Exchange(ref MouseWorkArmed, 0);
+                if (HasPendingMouseInput())
+                    continue;
+                MouseWorkSignal.WaitOne(500);
+            }
+            FlushPendingMouseInput(); // drain any final delta on shutdown
+        }
+
+        /// <summary>
+        /// Stops the background polling thread and waits for it to exit.
+        /// </summary>
+        public void Stop()
+        {
+            if (!_running)
+                return;
+
+            _running = false;
+            Array.Clear(_steeringAngleFrames);
+            AudioPassthroughService.ClosePersonaOwner(_personaAudioOwner);
+
+            // Macro sounds die with the engine. Releases the WASAPI clients.
+            SoundMacroService.StopAll();
+            AudioPassthroughService.Shutdown();
+
+            // The Wii speaker and the Switch/Steam haptic-tone stream die
+            // with the ENGINE, not with a profile apply. StopAll no longer
+            // carries them (their _suppressed latch clears only in
+            // EnsureStarted, which runs at engine start), so engine stop
+            // tears them down here, mirroring RumbleAudioService below.
+            try { WiiSpeakerService.Shutdown(); } catch { }
+            try { HapticToneService.Shutdown(); } catch { }
+
+            // #236: engine stop is an explicit silence edge. _running is
+            // already false, so no in-flight poll can reassert a pack
+            // after this (and the per-slot generation discards a racing
+            // publish from the final tick). The renderer itself also dies
+            // with the engine HERE, not inside SoundMacroService.StopAll:
+            // that method runs on every profile apply via LoadMacros, and
+            // riding it silenced the shakers on every profile switch.
+            // EnsureStarted re-arms on the next engine start.
+            RumbleAudioService.SilenceAll();
+            RumbleAudioService.StopAll();
+
+            // Retire this run before the joins. The join stays bounded so the
+            // interface never hangs on shutdown, but a thread that outlives it
+            // must not be revivable: with only the running flag to test, the
+            // next Start would set it true again and the stalled loop would
+            // rejoin the pipeline beside the new one. A stale stamp ends it on
+            // its next iteration instead, and its finally still runs.
+            System.Threading.Interlocked.Increment(ref _runGeneration);
+
+            if (_pollingThread != null && _pollingThread.IsAlive)
+            {
+                if (!_pollingThread.Join(timeout: TimeSpan.FromSeconds(3)))
+                    Engine.SdlDiagLog.WriteLine(
+                        "STOP poll thread still running after a 3 s join; teardown continues, the loop is retired by generation");
+                _pollingThread = null;
+            }
+
+            if (_mouseInjectorThread != null && _mouseInjectorThread.IsAlive)
+            {
+                MouseWorkSignal.Set(); // unpark an idle injector for the join
+                if (!_mouseInjectorThread.Join(timeout: TimeSpan.FromSeconds(1)))
+                    Engine.SdlDiagLog.WriteLine(
+                        "STOP mouse injector still running after a 1 s join; teardown continues, the loop is retired by generation");
+                _mouseInjectorThread = null;
+            }
+
+            RawInputListener.Stop();
+
+            _ptpReader?.Stop();
+            _ptpReader?.Dispose();
+            _ptpReader = null;
+            StopTabletReader();
+
+            StopAllForceFeedback();
+            // The SDL rows close below, so their Bliss-Box ports close first,
+            // each stopping its motors (#469). The next start pairs them
+            // again, and until then no port opens, even from a poll pass that
+            // outlived the join.
+            BlissBoxRuntime.Close();
+
+            // Wait for any in-flight HM lifecycle tasks (Pass 2 connects
+            // and Pass 1 async-dispose teardowns) to complete before we
+            // tear everything down.  Without this wait, a connect task
+            // that's currently inside HMContext.CreateController would
+            // run to completion AFTER Stop returns, set
+            // _virtualControllers[i] to the just-built VC, and the new
+            // VC would never be disposed — an orphaned controller in
+            // the kernel device tree.  AwaitPendingLifecycleTasks is
+            // bounded so a hung HM call can't deadlock shutdown.
+            AwaitPendingLifecycleTasks();
+
+            DestroyAllVirtualControllers();
+
+            // Reset initializing flags so post-stop reads return false.
+            // The UI tick has already been stopped by InputService.Stop
+            // before getting here, but InputService also clears the same
+            // flags on the slot ViewModels for immediate visual update.
+            for (int i = 0; i < MaxPads; i++)
+                _slotInitializing[i] = false;
+            DisposeHMaestroContextOnShutdown();
+            CloseAllDevices();
+
+            _enumerationTimer.Stop();
+            _frequencyTimer.Stop();
+            CurrentFrequency = 0;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Main polling loop
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Background thread entry point. Runs the 6-step pipeline at ~1000Hz.
+        ///
+        /// Uses a Stopwatch-based spin-wait instead of Thread.Sleep(1) for precise
+        /// timing. Thread.Sleep(1) has ~1.5-2ms latency on Windows even with
+        /// timeBeginPeriod(1), capping the loop at ~500-600Hz. Spin-waiting on
+        /// Stopwatch ticks (backed by QueryPerformanceCounter) achieves true 1000Hz.
+        ///
+        /// CPU impact is minimal: spin-waiting burns one core at ~1-3% utilization
+        /// for sub-millisecond waits, and the thread priority is AboveNormal so it
+        /// doesn't starve other work.
+        ///
+        /// <paramref name="generation"/> retires the loop when Stop moves the
+        /// stamp. <paramref name="pollRun"/> is the frame bookkeeping run Start
+        /// registered for it (SourceCoercion.BeginPollRun).
+        /// </summary>
+        private void PollingLoop(int generation, int pollRun)
+        {
+            // Keep timeBeginPeriod(1). It still helps multimedia timers and
+            // other system timing used by SDL, HIDMaestro, and the UI dispatcher.
+            timeBeginPeriod(1);
+
+            // High-resolution waitable timer for sub-ms sleeps without
+            // burning CPU.  Available on Windows 10 1803+.
+            IntPtr hTimer = CreateWaitableTimerExW(
+                IntPtr.Zero, IntPtr.Zero,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+
+            // Fallback: x360ce-style multimedia timer + ManualResetEvent.
+            // timeSetEvent fires a periodic callback that signals the event,
+            // letting the polling thread block with zero CPU. Precision is
+            // ~1-2ms with timeBeginPeriod(1) — less accurate than the HR
+            // timer but much better than Thread.Sleep(1) alone.
+            ManualResetEvent mmTimerEvent = null;
+            TimerCallback mmTimerCb = null;
+            uint mmTimerId = 0;
+            if (hTimer == IntPtr.Zero)
+            {
+                mmTimerEvent = new ManualResetEvent(false);
+                var evt = mmTimerEvent; // capture for lambda
+                mmTimerCb = (id, msg, user, dw1, dw2) =>
+                {
+                    try { evt.Set(); } catch { /* disposed at shutdown */ }
+                };
+                mmTimerId = timeSetEvent((uint)Math.Max(1, PollingIntervalMs), 0,
+                    mmTimerCb, IntPtr.Zero, TIME_PERIODIC);
+                if (mmTimerId == 0)
+                {
+                    // Timer failed — dispose the event to avoid a resource leak.
+                    mmTimerEvent.Dispose();
+                    mmTimerEvent = null;
+                    mmTimerCb = null;
+                }
+            }
+
+            try
+            {
+                ReleaseInheritedLatches(generation);
+                long usioOwner = NewUsioOwner();
+
+                var cycleTimer = new Stopwatch();
+                cycleTimer.Start();
+
+                // Periodically clear any execution-state flags that SDL may
+                // re-assert during SDL_JoystickUpdate / event processing.
+                var sleepGuardTimer = new Stopwatch();
+                sleepGuardTimer.Start();
+
+                // Wall-clock drift compensation: track cumulative expected
+                // time vs actual elapsed time.  If we fall behind, shorten
+                // future cycles to catch up so the average rate converges.
+                var wallClock = new Stopwatch();
+                wallClock.Start();
+                long expectedTicks = 0;
+
+                // Run device enumeration immediately on the first cycle so that
+                // controllers are detected, virtual devices are created, and force
+                // feedback is wired without waiting for the 2-second interval.
+                bool firstCycle = true;
+
+                // The stamp retires a loop that outlived Stop's join: Stop
+                // bumps _runGeneration, so a stalled thread exits on its next
+                // check instead of running on (MouseInjectorLoop's rule).
+                while (_running && System.Threading.Volatile.Read(ref _runGeneration) == generation)
+                {
+                    // ── Idle mode: skip expensive pipeline, sleep at ~20Hz ──
+                    if (BeginIdlePoll())
+                    {
+                        try
+                        {
+                            // #236: the feedback lane below never runs in
+                            // idle, so idle entry is an explicit silence
+                            // edge. Every idle iteration republishes it
+                            // (16 volatile writes at 20 Hz); without this
+                            // the last nonzero pack would sound forever.
+                            RumbleAudioService.SilenceAll();
+                            if (System.Threading.Volatile.Read(ref _runGeneration) == generation) AdvanceUsioReopen(usioOwner);
+                            long tsIdleSdl = Stopwatch.GetTimestamp();
+                            SDL_UpdateJoysticks();
+                            long idleSdlMs = (Stopwatch.GetTimestamp() - tsIdleSdl) * 1000 / Stopwatch.Frequency;
+                            if (idleSdlMs >= 25)
+                                Engine.SdlDiagLog.WriteLine($"STALL idle sdl={idleSdlMs}ms");
+
+                            // Keep device enumeration at a reduced rate so the
+                            // Devices page still discovers newly connected controllers.
+                            // A change of the Bliss-Box switch runs it now (#469).
+                            if (_enumerationTimer.ElapsedMilliseconds >= 5000 || ConsumeBlissBoxSwitchChange())
+                            {
+                                _enumerationTimer.Restart();
+                                UpdateDevices();
+                            }
+                            RetryPendingBlissBoxRows();
+                            FlydigiReprobeTick();
+
+                            // Read input states even in idle mode so the Devices
+                            // page preview works for unassigned devices.
+                            using (EnterMenuPublication())
+                            {
+                                UpdateInputStates();
+                                // Remote Link accumulation runs in idle mode too:
+                                // shared devices keep streaming while no slot is
+                                // active on this end.
+                                RemoteLinkPollTick?.Invoke();
+
+                                // Evaluate global macros (profile shortcuts) even in idle
+                                // so the user can switch away from an empty profile.
+                                EvaluateGlobalMacros();
+
+                                // The slot macro evaluator (and its ToggleKey
+                                // reconcile) doesn't run in idle, so release any
+                                // latched macro key (issue #9 wave 1b) rather
+                                // than leave it stuck down while PadForge is
+                                // inactive. Latch bits stay set on the actions;
+                                // the desired-set rebuild re-asserts them when
+                                // the pipeline wakes. No-op when nothing is held.
+                                ReleaseAllLatchedMacroKeys();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            RaiseError("Idle polling error", ex);
+                        }
+
+                        CurrentFrequency = 0;
+                        _frequencyCounter = 0;
+                        _frequencyTimer.Restart();
+                        FrequencyUpdated?.Invoke(this, EventArgs.Empty);
+                        Thread.Sleep(50);
+                        firstCycle = true; // Ensure immediate enumeration on wake
+                        // Reset wall-clock drift tracker so stale drift from
+                        // before idle doesn't cause a burst of short cycles.
+                        wallClock.Restart();
+                        expectedTicks = 0;
+                        continue;
+                    }
+
+                    if (ApplyFocusSuspension())
+                    {
+                        CurrentFrequency = 0;
+                        _frequencyCounter = 0;
+                        _frequencyTimer.Restart();
+                        FrequencyUpdated?.Invoke(this, EventArgs.Empty);
+                        Thread.Sleep(100);
+                        firstCycle = true;
+                        wallClock.Restart();
+                        expectedTicks = 0;
+                        continue;
+                    }
+
+                    // Calculate target ticks each cycle so PollingIntervalMs can be
+                    // changed at runtime from the Settings UI.
+                    long targetTicks = Stopwatch.Frequency / 1000 * PollingIntervalMs;
+
+                    cycleTimer.Restart();
+
+                    try
+                    {
+                        // Stall watchdog (#210 follow-up): attribute any poll
+                        // hiccup to the segment that ate it. SDL_UpdateJoysticks
+                        // is where driver-side sync I/O would stall; the
+                        // enumeration sweep is where device opens would.
+                        if (System.Threading.Volatile.Read(ref _runGeneration) == generation) AdvanceUsioReopen(usioOwner);
+                        long tsSdl = Stopwatch.GetTimestamp();
+                        SDL_UpdateJoysticks();
+                        long sdlMs = (Stopwatch.GetTimestamp() - tsSdl) * 1000 / Stopwatch.Frequency;
+
+                        // Advance the evaluator's poll-frame gate exactly once
+                        // per cycle: SourceCoercion's smoothing/delta caches
+                        // step once per poll no matter how many mapping rows
+                        // read the same source (the Gyro tab's smoothing is
+                        // per-device-per-slot, not per-row).
+                        Engine.Common.Mapping.SourceCoercion.BeginPollFrame(pollRun);
+
+                        long enumMs = 0;
+                        // A change of the Bliss-Box switch runs the sweep now,
+                        // so its rows, ports and motors move together (#469).
+                        if (firstCycle || _enumerationTimer.ElapsedMilliseconds >= EnumerationIntervalMs || ConsumeBlissBoxSwitchChange())
+                        {
+                            firstCycle = false;
+                            _enumerationTimer.Restart();
+                            long tsEnum = Stopwatch.GetTimestamp();
+                            UpdateDevices();
+                            enumMs = (Stopwatch.GetTimestamp() - tsEnum) * 1000 / Stopwatch.Frequency;
+                        }
+                        RetryPendingBlissBoxRows();
+                        FlydigiReprobeTick();
+
+                        using (EnterMenuPublication())
+                        {
+                            UpdateInputStates();
+                            // Remote Link (#138): fold this tick's fresh snapshots
+                            // into the per-exposed-device delta accumulators. The
+                            // poll thread is the SOLE GetCurrentState caller; the
+                            // 125 Hz stream tick ships snapshots + drained deltas,
+                            // never reads the wrappers (destructive mouse / JC2
+                            // baseline reads split motion between two callers).
+                            RemoteLinkPollTick?.Invoke();
+                            UpdateGyroEngageStates();
+                            UpdateTriggerRouteEngageStates();
+                            UpdateHapticMirrorEngageStates();
+                            UpdateMotionSnapshots();
+                            UpdateOutputStates();
+                            CombineOutputStates();
+                            EvaluateMacros();
+                            // The Motion Pitch, Yaw and Roll rows (#475) are
+                            // evaluated in Step 3, so their motion composes
+                            // here, after the macro pass's Gyro Recenter, and
+                            // DSU sends the composed frame.
+                            ApplyMotionRows();
+                            BroadcastDsuMotion();
+                            UpdateVirtualDevices();
+                        }
+                        RetrieveOutputStates();
+                        UpdateDs3PlayerNumber();
+                        UpdateMovePlayerNumber();
+                        // #236: publish the per-slot inbound-feedback packs
+                        // for the rumble-to-audio renderer. Must follow
+                        // UpdateVirtualDevices so a slot destroyed this
+                        // tick publishes zeros the same tick.
+                        UpdateRumbleAudioLane();
+                        UpdateSensaLane();
+
+                        // Stall watchdog report: only outliers write anything.
+                        long cycleMs = cycleTimer.ElapsedMilliseconds;
+                        if (sdlMs >= 25 || enumMs >= 25 || cycleMs >= 50)
+                            Engine.SdlDiagLog.WriteLine(
+                                $"STALL poll sdl={sdlMs}ms enum={enumMs}ms cycle={cycleMs}ms");
+
+                        // Channel heartbeat, UNCONDITIONAL, every 10 s. Every
+                        // other line in this log is edge-gated or
+                        // threshold-gated, so an absence of lines has two
+                        // possible meanings: nothing happened, or the thing
+                        // that writes stopped. The 2026-07-26 VC
+                        // investigation could not tell those apart and drew
+                        // the wrong conclusion from silence. This line is
+                        // emitted from the poll loop itself, so if it is
+                        // present the loop AND the log are alive, and any
+                        // other silence is genuinely "no events". If it is
+                        // absent, the loop or the channel is dead. One line
+                        // per 10 s is ~8.6k lines a day, which the mirror
+                        // carries without trouble.
+                        if (Environment.TickCount64 - _pollHeartbeatTick > 10_000)
+                        {
+                            _pollHeartbeatTick = Environment.TickCount64;
+                            Engine.SdlDiagLog.WriteLine(
+                                $"HEARTBEAT poll hz={CurrentFrequency:F0} idle={(IsIdle ? 1 : 0)} cycle={cycleMs}ms");
+                        }
+
+                        // Frequency measurement.
+                        _frequencyCounter++;
+                        if (_frequencyTimer.ElapsedMilliseconds >= 1000)
+                        {
+                            CurrentFrequency = _frequencyCounter * 1000.0 / _frequencyTimer.ElapsedMilliseconds;
+                            _frequencyCounter = 0;
+                            _frequencyTimer.Restart();
+                            FrequencyUpdated?.Invoke(this, EventArgs.Empty);
+                        }
+
+                        // Clear any execution-state flags SDL may have re-set
+                        // during event processing so the PC can still sleep.
+                        if (sleepGuardTimer.ElapsedMilliseconds >= 5000)
+                        {
+                            sleepGuardTimer.Restart();
+                            SetThreadExecutionState(ES_CONTINUOUS);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError("Polling loop error", ex);
+                    }
+
+                    // Wall-clock drift-compensated precision wait.
+                    //
+                    // Instead of per-cycle overshoot tracking, we compare
+                    // cumulative expected time against the wall clock.  If
+                    // we're behind, we shorten this cycle; if ahead, we
+                    // lengthen it.  This converges the average rate exactly.
+                    expectedTicks += targetTicks;
+                    long drift = wallClock.ElapsedTicks - expectedTicks;
+
+                    // If drift exceeds 10 cycles (e.g. after system sleep/resume),
+                    // reset the wall clock instead of sprinting to catch up.
+                    if (drift > targetTicks * 10 || drift < -(targetTicks * 10))
+                    {
+                        wallClock.Restart();
+                        expectedTicks = targetTicks;
+                        drift = 0;
+                    }
+
+                    long adjustedTarget = targetTicks - drift;
+                    if (adjustedTarget < targetTicks / 4)
+                        adjustedTarget = targetTicks / 4; // safety floor
+
+                    long spinThresholdTicks = Stopwatch.Frequency / 10000; // 0.1ms
+                    long sleepThresholdTicks = Stopwatch.Frequency * 3 / 2000; // 1.5ms
+                    long remaining = adjustedTarget - cycleTimer.ElapsedTicks;
+
+                    if (remaining > spinThresholdTicks && hTimer != IntPtr.Zero)
+                    {
+                        // HR timer: precise sub-ms kernel sleep.
+                        long waitTicks = remaining - spinThresholdTicks;
+                        long dueTime = -(waitTicks * 10_000_000 / Stopwatch.Frequency);
+                        if (dueTime < -1)
+                        {
+                            if (SetWaitableTimerEx(hTimer, ref dueTime, 0,
+                                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0))
+                                WaitForSingleObject(hTimer, INFINITE);
+                            else
+                                // Arm failure would otherwise fall through
+                                // to a FULL-remaining busy spin (~a core).
+                                Thread.Sleep(1);
+                        }
+                    }
+                    else if (remaining > spinThresholdTicks && mmTimerEvent != null)
+                    {
+                        // x360ce-style: block until multimedia timer fires (~1ms).
+                        mmTimerEvent.WaitOne(50);
+                        mmTimerEvent.Reset();
+                    }
+                    else if (remaining > sleepThresholdTicks)
+                    {
+                        // Last resort: Thread.Sleep(1).
+                        Thread.Sleep(1);
+                    }
+                    else if (remaining <= 0)
+                    {
+                        // Overrun: the cycle's work exceeded the interval, so
+                        // no wait ran at all. On a CPU that cannot hold the
+                        // rate this loop otherwise free-runs at AboveNormal
+                        // priority with no scheduling gap, starving the UI
+                        // thread (#331: "every adjustment takes a minute").
+                        // SwitchToThread yields one quantum to ANY ready
+                        // thread on this processor, including lower-priority
+                        // ones, which Thread.Sleep(0) would not. On machines
+                        // that hold the rate this branch never runs.
+                        Thread.Yield();
+                    }
+
+                    // Spin for the final sub-ms portion.
+                    while (cycleTimer.ElapsedTicks < adjustedTarget)
+                        Thread.SpinWait(1);
+                }
+            }
+            finally
+            {
+                // A ToggleKey macro latch (issue #9 wave 1b) holds its key
+                // logically down between polls; the loop's exit must release
+                // whatever is still latched or the key stays pressed in the
+                // OS after the engine stops.
+                ReleaseLatchesOnExit(generation);
+
+                if (hTimer != IntPtr.Zero)
+                    CloseHandle(hTimer);
+                if (mmTimerId != 0)
+                    timeKillEvent(mmTimerId);
+                GC.KeepAlive(mmTimerCb); // prevent GC of native callback delegate
+                mmTimerEvent?.Dispose();
+                timeEndPeriod(1);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Device cleanup helpers
+        // ─────────────────────────────────────────────
+
+        /// <summary>Last-chance hardware quiet for abnormal exits
+        /// (crash handler, ProcessExit). The Steam Deck's 0xEB rumble
+        /// command has no duration field and no firmware timeout in any
+        /// reference, so a nonzero rumble left behind by a dying process
+        /// buzzes the trackpad LRAs until something zeroes it
+        /// (discussion #179). Best-effort by design.</summary>
+        /// <summary>True once an abnormal-exit quiesce ran. Sticky:
+        /// the polling thread keeps ticking through a crash dialog and
+        /// during ProcessExit (verified empirically on .NET 10), and one
+        /// StopAllForceFeedback sweep only clears the change-detection
+        /// caches, so the next tick would re-assert the game's still
+        /// nonzero VibrationStates within ~1 ms. ApplyForceFeedback and
+        /// the Sony effects provider gate on this flag.</summary>
+        public volatile bool OutputsQuiesced;
+
+        public void QuiesceOutputs()
+        {
+            OutputsQuiesced = true;
+            try { StopAllForceFeedback(); } catch { }
+            // A Bliss-Box port's stop is its worker's to send (#469), and a
+            // dying process may not outlive that, so wait a moment for it.
+            try { BlissBoxRuntime.StopMotorsNow(250); } catch { }
+        }
+
+        private void StopAllForceFeedback()
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                foreach (var ud in devices)
+                {
+                    if (ud?.ForceFeedbackState != null && ud.Device != null)
+                    {
+                        // Under the row's output gate when it comes free within
+                        // 50 ms: the poll thread, the relay and Identify's SDL
+                        // lane write under it, so a level one of them had
+                        // already decided lands before this stop, not after
+                        // it (#469). Bounded, so a writer stalled holding it
+                        // cannot hold up the stop.
+                        bool gated = false;
+                        try
+                        {
+                            System.Threading.Monitor.TryEnter(ud.OutputSync, 50, ref gated);
+                            // A Padix PSX/USB converter's SDL rumble is inert by
+                            // design (SdlDeviceWrapper.SetRumble), so its final zero
+                            // comes from the direct writer (#440).
+                            if (PadForge.Engine.PadixConverterIdentity.IsPlayStationConverter(ud.VendorId, ud.ProdId))
+                            {
+                                try { PadixConverterRawHidWriter.Write(ud.DevicePath, 0, 0); }
+                                catch { /* best effort */ }
+                            }
+                            // An Xbox One+ pad's motors take the raw report
+                            // (XboxImpulseHidWriter), never SDL's rumble, so SDL
+                            // holds no level for it and skips the stop below as
+                            // a repeat (SDL_joystick.c:2287-2290). The pad would
+                            // keep the last level for the long pulse the report
+                            // asks for, the 0xFF, 0x00, 0xEB tail that xpadneo's
+                            // rumble.c also sends. Like Step 2's final zero for an
+                            // unassigned pad, this goes only to a pad left at a
+                            // level.
+                            if (ud.ForceFeedbackState.IsActive
+                                && PadForge.Engine.XboxControllerIdentity.IsImpulseTriggerDevice(ud.VendorId, ud.ProdId))
+                            {
+                                try { XboxImpulseHidWriter.Write(ud, 0, 0, 0, 0); }
+                                catch { /* best effort */ }
+                            }
+                            // A Bliss-Box port's SDL rumble is inert while the
+                            // adapter's commands own its motors (#469). The port's
+                            // worker sends the stop with its next motor write, at
+                            // once on a GPA and at the next paced write on 3.x,
+                            // and a pulse asked for before is dropped rather than
+                            // sent ahead of it. QuiesceOutputs waits for it.
+                            if (PadForge.Engine.Common.BlissBox.BlissBoxApi.OwnsRumble(ud.VendorId, ud.ProdId))
+                            {
+                                try { BlissBoxRuntime.StopRumble(ud.DevicePath); }
+                                catch { /* best effort */ }
+                                // SDL's gate refuses the stop below on these rows,
+                                // and a level SDL took before the switch went on
+                                // runs until the hand-off stops it, which may not
+                                // have happened yet.
+                                if (ud.Device is SdlDeviceWrapper wrapper)
+                                {
+                                    try { wrapper.StopSdlRumble(); }
+                                    catch { /* best effort */ }
+                                    // As after the hand-off's stop.
+                                    BlissBoxRuntime.ResendMotors(ud.DevicePath);
+                                }
+                            }
+                            try { ud.ForceFeedbackState.StopDeviceForces(ud.Device); }
+                            catch { /* best effort */ }
+                        }
+                        finally { if (gated) System.Threading.Monitor.Exit(ud.OutputSync); }
+                    }
+                }
+            }
+        }
+
+        private void CloseAllDevices()
+        {
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return;
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                foreach (var ud in devices)
+                {
+                    if (ud?.Device != null)
+                    {
+                        try { ud.Device.Dispose(); }
+                        catch { /* best effort */ }
+                        ud.ClearRuntimeState();
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Gyro engage state (per-slot, per-tick)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Settles each slot's <see cref="GyroEngagedFromButton"/>
+        /// bit once per tick from the slot's configured
+        /// <c>GyroAimEngageButton</c> + <c>GyroAimEngageMode</c>. Hold mode
+        /// tracks the button state directly (empty descriptor = always-on);
+        /// Toggle mode flips the sticky bit on each rising edge (empty
+        /// descriptor = no-op, the bit stays whatever the macro last set).
+        /// Runs between Step 2 (UpdateInputStates) and Step 3
+        /// (UpdateOutputStates) so both gyro evaluators — mapping-row reads
+        /// and motion passthrough — see a single, consistent engaged
+        /// decision for the tick.
+        ///
+        /// <para>Picks the first device on the slot that has a non-empty
+        /// engage button configured. Multi-device slots with multiple
+        /// engage buttons configured pick the first per UserSettings
+        /// storage order; this is intentional — the engage button is a
+        /// per-slot ergonomic, not a per-device setting at the runtime
+        /// level. Configuring engage on two devices simultaneously is
+        /// supported by editing the second device's PadSetting but only
+        /// the first-listed wins at runtime.</para></summary>
+        /// <summary>Per-slot gyro-engage config snapshot, refreshed at 250 ms
+        /// like its two engage-family siblings (_triggerRouteCfg,
+        /// _mirrorEngageCfg): the SyncRoot lock + Items scan + GetPadSetting
+        /// string reads run at 4 Hz, not the ~1 kHz poll rate, while the
+        /// ENGAGE STATE itself still settles per tick for edge fidelity. A
+        /// config or device-list edit lands within a quarter second, which is
+        /// imperceptible and matches the siblings' contract.</summary>
+        private sealed class GyroEngageCfg
+        {
+            public string Descriptor = "";
+            public string DeviceGuid = "";
+            public string Mode = "Hold";
+            public string[] Ratchets;
+            public string[] SlotGuids = System.Array.Empty<string>();
+        }
+        private readonly GyroEngageCfg[] _gyroEngageCfg = new GyroEngageCfg[MaxPads];
+        private long _gyroEngageCfgRefreshTick;
+
+        private void RefreshGyroEngageCfg(SettingsCollection settings)
+        {
+            var wsSets = SettingsManager.SlotMappingSets;
+            for (int slot = 0; slot < MaxPads; slot++)
+            {
+                if (!SettingsManager.SlotCreated[slot]) { _gyroEngageCfg[slot] = null; continue; }
+
+                var wsSet = wsSets != null && slot < wsSets.Length ? wsSets[slot] : null;
+                if (wsSet != null && !wsSet.Authoritative) wsSet = null;
+
+                var cfg = new GyroEngageCfg();
+                // First device on the slot with a configured engage button
+                // wins (per-slot ergonomic, storage order, see the method
+                // doc above). Slot guids are captured for the device-free
+                // descriptor and ratchet walks.
+                _gyroEngageGuidScratch.Clear();
+                lock (settings.SyncRoot)
+                {
+                    for (int i = 0; i < settings.Items.Count; i++)
+                    {
+                        var us = settings.Items[i];
+                        if (us == null || us.MapTo != slot) continue;
+                        _gyroEngageGuidScratch.Add(us.InstanceGuidString);
+                        if (cfg.Descriptor.Length > 0) continue;
+                        var ps = us.GetPadSetting();
+                        if (ps == null) continue;
+                        if (string.IsNullOrEmpty(ps.GyroAimEngageButton)) continue;
+                        cfg.Descriptor = ps.GyroAimEngageButton;
+                        cfg.DeviceGuid = ps.GyroAimEngageDeviceGuid ?? "";
+                        cfg.Mode = string.IsNullOrEmpty(ps.GyroAimEngageMode) ? "Hold" : ps.GyroAimEngageMode;
+                    }
+                }
+                cfg.SlotGuids = _gyroEngageGuidScratch.ToArray();
+
+                // The Workshop gyro_button stamp is folded into the
+                // device's own GyroAimEngageButton when the device is
+                // assigned (WorkshopTuningApplier), so there is no
+                // runtime overlay left to consult and the Gyro card is
+                // the single source of truth.
+
+                // Workshop ratchet clutch (v22) descriptors, resolved
+                // per tick against SlotGuids.
+                var ratchets = wsSet?.WorkshopGyroRatchetList;
+                cfg.Ratchets = ratchets != null && ratchets.Length > 0 ? ratchets : null;
+
+                _gyroEngageCfg[slot] = cfg;
+            }
+        }
+
+        private void UpdateGyroEngageStates()
+        {
+            var settings = SettingsManager.UserSettings;
+            if (settings == null) return;
+
+            long nowCfg = Environment.TickCount64;
+            if (nowCfg - _gyroEngageCfgRefreshTick >= 250)
+            {
+                _gyroEngageCfgRefreshTick = nowCfg;
+                RefreshGyroEngageCfg(settings);
+            }
+
+            for (int slot = 0; slot < MaxPads; slot++)
+            {
+                var cfg = _gyroEngageCfg[slot];
+                if (!SettingsManager.SlotCreated[slot] || cfg == null)
+                {
+                    GyroEngagedFromButton[slot] = false;
+                    GyroRatchetHeld[slot] = false;
+                    _prevAimEngageButtonDown[slot] = false;
+                    continue;
+                }
+
+                string descriptor = cfg.Descriptor;
+                string deviceGuid = cfg.DeviceGuid;
+                string mode = cfg.Mode;
+                // "ReleaseToEngage": gyro fires while the button is NOT
+                // held. Steam spells this gyro_button_invert; it used to
+                // ride a hidden per-slot flag no card could reach.
+
+                bool buttonDown = false;
+                if (descriptor.Length > 0)
+                {
+                    if (deviceGuid.Length > 0)
+                    {
+                        buttonDown = SourceCoercion.ButtonHeldProvider?.Invoke(deviceGuid, descriptor, slot) ?? false;
+                    }
+                    else
+                    {
+                        // Device-free (workshop) descriptor: any slot device
+                        // holding it engages. The guid list comes from the
+                        // 250 ms snapshot; the provider reads device state
+                        // and must never nest inside UserSettings.SyncRoot
+                        // (lock-order discipline), which the snapshot walk
+                        // already honors.
+                        var guids = cfg.SlotGuids;
+                        for (int i = 0; i < guids.Length && !buttonDown; i++)
+                            buttonDown = SourceCoercion.ButtonHeldProvider?.Invoke(
+                                guids[i], descriptor, slot) ?? false;
+                    }
+                }
+
+                if (mode == "Toggle")
+                {
+                    // Rising edge → flip the sticky bit. Falling edge,
+                    // empty descriptor, and held state all leave the bit
+                    // alone. Toggle never auto-disengages.
+                    if (buttonDown && !_prevAimEngageButtonDown[slot])
+                        GyroEngagedFromButton[slot] = !GyroEngagedFromButton[slot];
+                }
+                else
+                {
+                    // Hold mode (default). Empty descriptor reads as
+                    // always-on to preserve the pre-v3.2.4 behavior where
+                    // no engage button = no gating from this source.
+                    GyroEngagedFromButton[slot] = string.IsNullOrEmpty(descriptor)
+                        ? true
+                        : (string.Equals(mode, "ReleaseToEngage", StringComparison.Ordinal)
+                            ? !buttonDown : buttonDown);
+                }
+                _prevAimEngageButtonDown[slot] = buttonDown;
+
+                // Workshop ratchet clutch (v22): any stamped descriptor
+                // held on any slot device pauses the slot's gyro. Guid
+                // list and descriptors come from the 250 ms snapshot; the
+                // provider runs outside any lock as before.
+                bool ratchetHeld = false;
+                var ratchets = cfg.Ratchets;
+                if (ratchets != null)
+                {
+                    var guids = cfg.SlotGuids;
+                    for (int g = 0; g < guids.Length && !ratchetHeld; g++)
+                        for (int r = 0; r < ratchets.Length && !ratchetHeld; r++)
+                            ratchetHeld = SourceCoercion.ButtonHeldProvider?.Invoke(
+                                guids[g], ratchets[r], slot) ?? false;
+                }
+                GyroRatchetHeld[slot] = ratchetHeld;
+            }
+        }
+
+        // ── Haptic mirror engage (#185): third member of the engage family ──
+
+        /// <summary>Engage configs for the haptic mirror, wired by InputService
+        /// from the per-device configs (the same source the
+        /// passthrough provider reads). Returns EVERY passthrough-enabled
+        /// config on the slot with its device GUID, including mode 0 (Always),
+        /// or null when none. The gate is per (slot, DEVICE): each device's
+        /// config gates only its own sink's cell, so a stale config on another
+        /// device GUID can never mute the selected device (the Steam
+        /// Controller Always-silent bug). Mode: 0 = Always, 1 = Input (held
+        /// descriptor), 2 = Rumble (game vibration active).</summary>
+        public Func<int, List<(Guid Device, int Mode, string EngageDeviceGuid, string Button, int ReleaseMs)>>
+            HapticMirrorEngageConfigProvider { get; set; }
+
+        // Config snapshot per slot, refreshed at low cadence: the ENGAGE STATE
+        // must settle per poll for edge fidelity, but the CONFIG (mode / button
+        // / delay) changing within a quarter second of a UI edit is
+        // imperceptible, and re-walking the ViewModel dictionaries through the
+        // provider at 1000 Hz x 16 slots would put LINQ on the hot loop
+        // (code-audit lens 1n). Each entry carries its device's EngageCell,
+        // resolved at refresh time, so the per-poll loop touches no dictionary.
+        private readonly (int Mode, string EngageDeviceGuid, string Button, int ReleaseMs, HapticToneService.EngageCell Cell)[][]
+            _mirrorEngageCfg = new (int, string, string, int, HapticToneService.EngageCell)[MaxPads][];
+        private long _mirrorEngageCfgRefreshTick;
+        // Cells gated by the PREVIOUS snapshot: any cell that disappears from
+        // the new snapshot (config removed, passthrough off, slot deleted) is
+        // re-asserted engaged so its sink can never stay muted by stale state.
+        private readonly HashSet<HapticToneService.EngageCell> _mirrorEngagePrevCells = new();
+        private readonly HashSet<HapticToneService.EngageCell> _mirrorEngageNewCells = new();
+
+        /// <summary>Settles each gated device's haptic-mirror engage cell once
+        /// per tick (issue #185). Mirrors <see cref="UpdateGyroEngageStates"/>:
+        /// Input mode holds while the chosen descriptor is down (empty
+        /// descriptor = always on, the family convention), Rumble mode holds
+        /// while any of the slot's four vibration motors is nonzero, and either
+        /// source keeps the cell up for its release delay after it drops so the
+        /// tone does not clip off instantly. Always entries re-assert engaged
+        /// each tick.</summary>
+        private void UpdateHapticMirrorEngageStates()
+        {
+            long now = Environment.TickCount64;
+
+            // Low-cadence config refresh (see field comment).
+            if (now - _mirrorEngageCfgRefreshTick >= 250)
+            {
+                _mirrorEngageCfgRefreshTick = now;
+                var provider = HapticMirrorEngageConfigProvider;
+                _mirrorEngageNewCells.Clear();
+                for (int slot = 0; slot < MaxPads; slot++)
+                {
+                    (int, string, string, int, HapticToneService.EngageCell)[] entries = null;
+                    if (provider != null && SettingsManager.SlotCreated[slot])
+                    {
+                        try
+                        {
+                            var cfgs = provider(slot);
+                            if (cfgs != null && cfgs.Count > 0)
+                            {
+                                entries = new (int, string, string, int, HapticToneService.EngageCell)[cfgs.Count];
+                                for (int i = 0; i < cfgs.Count; i++)
+                                {
+                                    var c = cfgs[i];
+                                    var cell = HapticToneService.GetOrCreateEngageCell(slot, c.Device);
+                                    entries[i] = (c.Mode, c.EngageDeviceGuid, c.Button, c.ReleaseMs, cell);
+                                    _mirrorEngageNewCells.Add(cell);
+                                }
+                            }
+                        }
+                        catch { entries = null; }
+                    }
+                    _mirrorEngageCfg[slot] = entries;
+                }
+                // Re-open any cell the new snapshot no longer gates.
+                foreach (var old in _mirrorEngagePrevCells)
+                    if (!_mirrorEngageNewCells.Contains(old))
+                        old.Engaged = true;
+                _mirrorEngagePrevCells.Clear();
+                foreach (var c in _mirrorEngageNewCells) _mirrorEngagePrevCells.Add(c);
+            }
+
+            for (int slot = 0; slot < MaxPads; slot++)
+            {
+                var entries = _mirrorEngageCfg[slot];
+                if (entries == null) continue;
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    var cfg = entries[i];
+                    if (cfg.Mode == 0)
+                    {
+                        // Always: assert open every tick, covering a cell left
+                        // closed by a previous non-Always mode on this device.
+                        cfg.Cell.Engaged = true;
+                        continue;
+                    }
+
+                    bool active;
+                    if (cfg.Mode == 2)
+                    {
+                        // Rumble: any motor the game drives, body or trigger.
+                        var v = VibrationStates[slot];
+                        active = v != null
+                            && (v.LeftMotorSpeed > 0 || v.RightMotorSpeed > 0
+                                || v.LeftTriggerMotorSpeed > 0 || v.RightTriggerMotorSpeed > 0);
+                    }
+                    else
+                    {
+                        // Input: empty descriptor reads as always-on, matching
+                        // the gyro-engage convention.
+                        active = string.IsNullOrEmpty(cfg.Button)
+                            || (SourceCoercion.ButtonHeldProvider?.Invoke(cfg.EngageDeviceGuid ?? "", cfg.Button, slot) ?? false);
+                    }
+
+                    cfg.Cell.Engaged = HapticToneService.HoldEngaged(
+                        active, now, ref cfg.Cell.LastActiveTick, cfg.ReleaseMs);
+                }
+            }
+        }
+
+        /// <summary>Settles each slot's left/right trigger-route engaged bits
+        /// once per tick (issue #102), from the first device on the slot that
+        /// has a non-None route source. Mirrors
+        /// <see cref="UpdateGyroEngageStates"/>: Hold tracks the activator
+        /// (empty descriptor = always on), Toggle flips the sticky bit on each
+        /// rising edge, AlwaysOn ignores the descriptor. The route source
+        /// itself being None leaves the side disengaged.</summary>
+        private void UpdateTriggerRouteEngageStates()
+        {
+            var settings = SettingsManager.UserSettings;
+            if (settings == null) return;
+
+            long now = Environment.TickCount64;
+            // Low-cadence config refresh (see _triggerRouteCfg). Mirrors
+            // UpdateHapticMirrorEngageStates' 250 ms snapshot: the SyncRoot lock +
+            // Items scan + GetPadSetting run at 4 Hz, not the ~1 kHz poll rate.
+            if (now - _triggerRouteCfgRefreshTick >= 250)
+            {
+                _triggerRouteCfgRefreshTick = now;
+                _routeCellsNew.Clear();
+                for (int slot = 0; slot < MaxPads; slot++)
+                {
+                    _routeRowScratch.Clear();
+                    if (SettingsManager.SlotCreated[slot])
+                    {
+                        lock (settings.SyncRoot)
+                        {
+                            for (int i = 0; i < settings.Items.Count; i++)
+                            {
+                                var us = settings.Items[i];
+                                if (us == null || us.MapTo != slot) continue;
+                                var p = us.GetPadSetting();
+                                if (p == null) continue;
+                                bool lActive = RouteSideActive(p.LeftTriggerRouteSource, p.LeftTriggerRouteMode);
+                                bool rActive = RouteSideActive(p.RightTriggerRouteSource, p.RightTriggerRouteMode);
+                                if (!lActive && !rActive) continue;
+                                // Every configured device gets a row. The old
+                                // loop stopped at the first one, which is what
+                                // made the slot carry a single route.
+                                var cell = _routeCells.GetOrAdd((slot, us.InstanceGuid),
+                                    static k => new TriggerRouteCell { Slot = k.Slot, Device = k.Device });
+                                cell.SrcLeft = lActive ? ParseRouteSource(p.LeftTriggerRouteSource) : (byte)0;
+                                cell.SrcRight = rActive ? ParseRouteSource(p.RightTriggerRouteSource) : (byte)0;
+                                cell.ScaleLeft = ParseRouteScale(p.LeftTriggerRouteScale);
+                                cell.ScaleRight = ParseRouteScale(p.RightTriggerRouteScale);
+                                cell.RedirectLeft = p.LeftTriggerRouteMode == "Redirect";
+                                cell.RedirectRight = p.RightTriggerRouteMode == "Redirect";
+                                cell.ActLeft = p.LeftTriggerRouteActivator;
+                                cell.ActLeftGuid = p.LeftTriggerRouteActivatorDeviceGuid;
+                                cell.ActLeftMode = p.LeftTriggerRouteActivatorMode;
+                                cell.ActRight = p.RightTriggerRouteActivator;
+                                cell.ActRightGuid = p.RightTriggerRouteActivatorDeviceGuid;
+                                cell.ActRightMode = p.RightTriggerRouteActivatorMode;
+                                _routeRowScratch.Add(cell);
+                                _routeCellsNew.Add(cell);
+                            }
+                        }
+                    }
+                    _triggerRouteCfg[slot] = _routeRowScratch.Count == 0
+                        ? null
+                        : _routeRowScratch.ToArray();
+                }
+
+                // Retire what the new snapshot no longer carries, so a device
+                // that stops routing (unassigned, slot deleted, mode switched
+                // to Off) cannot leave a sticky Toggle behind for whoever takes
+                // that (slot, device) pair next.
+                foreach (var old in _routeCellsPrev)
+                {
+                    if (_routeCellsNew.Contains(old)) continue;
+                    old.EngagedLeft = false;
+                    old.EngagedRight = false;
+                    old.PrevLeftDown = false;
+                    old.PrevRightDown = false;
+                    _routeCells.TryRemove((old.Slot, old.Device), out _);
+                }
+                _routeCellsPrev.Clear();
+                foreach (var c in _routeCellsNew) _routeCellsPrev.Add(c);
+            }
+
+            for (int slot = 0; slot < MaxPads; slot++)
+            {
+                var rows = _triggerRouteCfg[slot];
+                if (rows == null)
+                {
+                    TriggerRouteEngagedLeft[slot] = false;
+                    TriggerRouteEngagedRight[slot] = false;
+                    continue;
+                }
+
+                bool anyLeft = false, anyRight = false;
+                for (int r = 0; r < rows.Length; r++)
+                {
+                    var cell = rows[r];
+                    bool srcL = cell.SrcLeft != 0;
+                    bool srcR = cell.SrcRight != 0;
+
+                    // Settle unconditionally (the activator edge state must advance even
+                    // when the source is None) then AND with the source-active flag.
+                    bool leftSettled = SettleRouteActivator(
+                        slot, cell.ActLeft, cell.ActLeftGuid, cell.ActLeftMode,
+                        cell.PrevLeftDown, cell.EngagedLeft, out bool leftDown);
+                    cell.EngagedLeft = srcL && leftSettled;
+                    cell.PrevLeftDown = leftDown;
+
+                    bool rightSettled = SettleRouteActivator(
+                        slot, cell.ActRight, cell.ActRightGuid, cell.ActRightMode,
+                        cell.PrevRightDown, cell.EngagedRight, out bool rightDown);
+                    cell.EngagedRight = srcR && rightSettled;
+                    cell.PrevRightDown = rightDown;
+
+                    anyLeft |= cell.EngagedLeft;
+                    anyRight |= cell.EngagedRight;
+                }
+                TriggerRouteEngagedLeft[slot] = anyLeft;
+                TriggerRouteEngagedRight[slot] = anyRight;
+            }
+        }
+
+        /// <summary>This device's route on this slot, or null when it has
+        /// none. A linear walk of the slot's published rows: rows exist only
+        /// for devices with an active route, so the scan is length 0 or 1 on
+        /// any ordinary slot and beats hashing a tuple on a path that runs per
+        /// assigned device per tick.</summary>
+        private TriggerRouteCell FindRouteCell(int slot, Guid device)
+        {
+            if (slot < 0 || slot >= MaxPads || device == Guid.Empty) return null;
+            var rows = _triggerRouteCfg[slot];
+            if (rows == null) return null;
+            for (int i = 0; i < rows.Length; i++)
+                if (rows[i].Device == device) return rows[i];
+            return null;
+        }
+
+        /// <summary>Trigger-route source enum parse:
+        /// 0 None, 1 MainLeft, 2 MainRight, 3 MaxOfBoth, 4 SumOfBoth.</summary>
+        internal static byte ParseRouteSource(string s) => s switch
+        {
+            "MainLeft" => 1, "MainRight" => 2, "MaxOfBoth" => 3, "SumOfBoth" => 4, _ => 0,
+        };
+
+        /// <summary>True when one trigger's routing is live: a real source picked
+        /// (not None) and the Mode not explicitly Off. Source None and Mode Off are
+        /// both off switches (the recipe exposes both), so either one disables.</summary>
+        internal static bool RouteSideActive(string source, string mode)
+            => ParseRouteSource(source) != 0 && mode != "Off";
+
+        /// <summary>Parses the per-trigger route Scale slider (0-200%, stored as an
+        /// integer string) to a 0.0-2.0 multiplier. Out-of-range or unparseable
+        /// values clamp to the 0-200 band; default 100% maps to 1.0.</summary>
+        private static double ParseRouteScale(string s)
+            => System.Math.Clamp(int.TryParse(s, out int v) ? v : 100, 0, 200) / 100.0;
+
+        /// <summary>Trigger rumble routing (#102): given a slot's post-gain
+        /// main-motor amplitudes, computes the trigger-channel injection (routed
+        /// main-motor amplitude max-combined with the macro trigger override) and
+        /// flags which main motors to silence (Redirect mode), reading the per-slot
+        /// engaged bits plus resolved source/scale/mode captured by
+        /// <see cref="UpdateTriggerRouteEngageStates"/>. The routed value comes from
+        /// the pre-redirect main motor so Redirect moves the energy to the trigger
+        /// rather than dropping it. The macro override is independent of the route
+        /// activator, so it contributes even when both routing sides are disengaged.</summary>
+        private void ApplyTriggerRouting(int slot, Guid device, ushort mainL, ushort mainR,
+            out ushort routedLeft, out ushort routedRight, out bool zeroMainL, out bool zeroMainR)
+        {
+            routedLeft = 0; routedRight = 0; zeroMainL = false; zeroMainR = false;
+            // This device's own route, which is the only one that may touch its
+            // motors. The macro trigger override below is slot-level and still
+            // reaches every device.
+            var cell = FindRouteCell(slot, device);
+            if (cell != null && cell.EngagedLeft)
+            {
+                routedLeft = RouteMain(cell.SrcLeft, cell.ScaleLeft, mainL, mainR);
+                if (cell.RedirectLeft) MarkRedirect(cell.SrcLeft, ref zeroMainL, ref zeroMainR);
+            }
+            if (cell != null && cell.EngagedRight)
+            {
+                routedRight = RouteMain(cell.SrcRight, cell.ScaleRight, mainL, mainR);
+                if (cell.RedirectRight) MarkRedirect(cell.SrcRight, ref zeroMainL, ref zeroMainR);
+            }
+
+            // Macro trigger override (#102) max-combines with the routed value, the
+            // same way MacroRumbleOverride layers onto the main motors.
+            MacroTriggerRumbleOverrides[slot].ComputeMotors(out ushort macroLT, out ushort macroRT);
+            if (macroLT > routedLeft) routedLeft = macroLT;
+            if (macroRT > routedRight) routedRight = macroRT;
+        }
+
+        /// <summary>Selects the routed source amplitude per <paramref name="source"/>
+        /// (1 MainLeft, 2 MainRight, 3 MaxOfBoth, 4 SumOfBoth) and applies the
+        /// 0.0-2.0 scale, clamped to the ushort range.</summary>
+        private static ushort RouteMain(byte source, double scale, ushort mainL, ushort mainR)
+        {
+            int v = source switch
+            {
+                1 => mainL,
+                2 => mainR,
+                3 => System.Math.Max(mainL, mainR),
+                4 => System.Math.Min(mainL + mainR, 65535),
+                _ => 0,
+            };
+            if (v <= 0 || scale <= 0) return 0;
+            return (ushort)System.Math.Clamp((long)System.Math.Round(v * scale), 0, 65535);
+        }
+
+        /// <summary>Flags the main motor(s) a Redirect route draws from: MainLeft
+        /// silences left, MainRight silences right, Max / Sum silence both.</summary>
+        private static void MarkRedirect(byte source, ref bool zeroL, ref bool zeroR)
+        {
+            if (source == 1 || source >= 3) zeroL = true;
+            if (source == 2 || source >= 3) zeroR = true;
+        }
+
+        /// <summary>Sony dispatcher trigger path (#102): computes the trigger-channel
+        /// injection (routed main-motor amplitude + macro trigger override) for one
+        /// (slot, device) and max-combines it into the impulse-trigger amplitudes the
+        /// caller already scaled, so the DualSense AT Vibration auto-route picks up
+        /// routed rumble the same way Xbox impulse triggers do. The main-motor source
+        /// mirrors the Sony main-rumble provider (macro main rumble + constant force +
+        /// per-device gain). Runs on the dispatcher thread, so it takes caller-owned
+        /// scratch to stay off the input thread's buffers.</summary>
+        internal void ApplyTriggerRoutingForSony(int slot, Guid device, PadSetting devicePs, Vibration raw,
+            Vibration macroScratch, Vibration cfScratch, ref ushort triggerL, ref ushort triggerR)
+        {
+            if (slot < 0 || slot >= MaxPads || raw == null) return;
+            var withMacro = ResolveUserRumble(slot, devicePs, raw, macroScratch);
+            var eff = ConstantForceEvaluator.Resolve(withMacro, devicePs, cfScratch);
+            ScaleRumbleForDevice(eff.LeftMotorSpeed, eff.RightMotorSpeed, devicePs,
+                out ushort mainL, out ushort mainR);
+            ApplyTriggerRouting(slot, device, mainL, mainR,
+                out ushort routedLT, out ushort routedRT, out _, out _);
+            if (routedLT > triggerL) triggerL = routedLT;
+            if (routedRT > triggerR) triggerR = routedRT;
+        }
+
+        /// <summary>Sony dispatcher main-motor path (#102): reports whether the slot's
+        /// engaged Redirect routing should silence each main motor on the physical
+        /// DualSense, mirroring the Redirect zeroing the Xbox physical write applies in
+        /// ApplyForceFeedback. The game-facing virtual-controller state is unaffected.</summary>
+        internal void GetTriggerRouteMainRedirect(int slot, Guid device,
+            out bool zeroMainL, out bool zeroMainR)
+        {
+            zeroMainL = false; zeroMainR = false;
+            var cell = FindRouteCell(slot, device);
+            if (cell == null) return;
+            if (cell.EngagedLeft && cell.RedirectLeft)
+                MarkRedirect(cell.SrcLeft, ref zeroMainL, ref zeroMainR);
+            if (cell.EngagedRight && cell.RedirectRight)
+                MarkRedirect(cell.SrcRight, ref zeroMainL, ref zeroMainR);
+        }
+
+        /// <summary>Settles one trigger's route activator. Returns the engaged
+        /// state and outputs the raw button-down for next-tick edge detection.
+        /// Hold tracks the button (empty descriptor = always on), Toggle flips
+        /// on rising edge, ReleaseToEngage is Hold inverted (engaged while the
+        /// button is NOT held, the gyro engage's own rule at the
+        /// UpdateGyroEngageStates settle), and AlwaysOn ignores the
+        /// descriptor.
+        ///
+        /// <para>ReleaseToEngage was in the picker and not in this switch, so
+        /// it fell through to Hold and the option was inert (4.3.2 docs sweep,
+        /// the 1s shape: a control offered where its guard never fires). The
+        /// empty-descriptor rule stays "always on" for it too, because a
+        /// button that does not exist is never held.</para></summary>
+        internal static bool SettleRouteActivator(int slot, string descriptor, string deviceGuid,
+            string mode, bool prevDown, bool curEngaged, out bool buttonDown)
+        {
+            buttonDown = !string.IsNullOrEmpty(descriptor)
+                && (SourceCoercion.ButtonHeldProvider?.Invoke(deviceGuid ?? "", descriptor, slot) ?? false);
+            if (string.IsNullOrEmpty(mode)) mode = "Hold";
+            if (mode == "AlwaysOn") return true;
+            if (mode == "Toggle")
+                return (buttonDown && !prevDown) ? !curEngaged : curEngaged;
+            if (mode == "ReleaseToEngage")
+                return string.IsNullOrEmpty(descriptor) || !buttonDown;
+            return string.IsNullOrEmpty(descriptor) || buttonDown; // Hold: empty = always on
+        }
+
+        /// <summary>Clears both gyro-engage per-slot bits and the edge-
+        /// detection scratch. Called by the App layer after a profile
+        /// switch / settings reload so the new profile's engage state
+        /// doesn't carry the prior profile's Toggle stickiness.</summary>
+        public void ResetGyroEngageStates()
+        {
+            for (int i = 0; i < MaxPads; i++)
+            {
+                GyroEngagedFromButton[i] = false;
+                GyroEngagedFromMacro[i] = false;
+                GyroRatchetHeld[i] = false;
+                _prevAimEngageButtonDown[i] = false;
+            }
+            // Force an immediate re-snapshot on the next poll, the same
+            // reason ResetTriggerRouteEngageStates does: the engage config
+            // cache is 250 ms-cadenced, so without this the next tick would
+            // settle the NEW profile's engage state from the OLD profile's
+            // snapshot (descriptor, mode, ratchets) for up to a quarter
+            // second. A new profile that gates gyro behind an engage button
+            // would aim freely for that window, and a Toggle carried over
+            // from a profile with no button would re-stick immediately.
+            _gyroEngageCfgRefreshTick = 0;
+        }
+
+        /// <summary>Clears both trigger-route per-slot engaged bits and the
+        /// edge-detection scratch (issue #102). Called by the App layer after a
+        /// profile switch / settings reload so a new profile's Toggle activator
+        /// doesn't inherit the prior profile's sticky engaged state.</summary>
+        public void ResetTriggerRouteEngageStates()
+        {
+            for (int i = 0; i < MaxPads; i++)
+            {
+                TriggerRouteEngagedLeft[i] = false;
+                TriggerRouteEngagedRight[i] = false;
+                _triggerRouteCfg[i] = null;
+            }
+            _routeCells.Clear();
+            _routeCellsPrev.Clear();
+            // Force an immediate re-snapshot on the next poll: the config cache is
+            // 250 ms-cadenced, so without this the reset (dropping sticky Toggle state
+            // on a profile switch) would be re-applied from the STALE old-profile
+            // snapshot for up to 250 ms.
+            _triggerRouteCfgRefreshTick = 0;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Touchpad gesture per-tick driver
+        // ─────────────────────────────────────────────
+
+        /// <summary>250 ms snapshot of device → assigned slots for the two
+        /// gesture walks below, refreshed on the poll thread. Per-poll
+        /// UserSettings.SyncRoot walks per touchpad/mouse device shared the
+        /// UI thread's whole-save lock holds and allocated a fresh int[] per
+        /// poll (code-audit lens 1n); assignment changes only on user edit,
+        /// so the same 250 ms cadence as _triggerRouteCfg / _mirrorEngageCfg
+        /// applies. Poll thread only, no lock on the read path.</summary>
+        private readonly Dictionary<Guid, int[]> _assignedSlotsSnapshot = new();
+        private long _assignedSlotsRefreshTick;
+
+        private int[] GetAssignedSlotsSnapshot(Guid deviceGuid)
+        {
+            long now = System.Environment.TickCount64;
+            if (now - _assignedSlotsRefreshTick >= 250)
+            {
+                _assignedSlotsRefreshTick = now;
+                _assignedSlotsSnapshot.Clear();
+                var userSettings = SettingsManager.UserSettings;
+                if (userSettings != null)
+                {
+                    // Build per-device slot lists under one lock hold per
+                    // refresh. The 4 Hz allocation cost replaces a per-poll
+                    // stackalloc + int[] per device.
+                    lock (userSettings.SyncRoot)
+                    {
+                        for (int i = 0; i < userSettings.Items.Count; i++)
+                        {
+                            var us = userSettings.Items[i];
+                            if (us == null || us.MapTo < 0) continue;
+                            _assignedSlotsSnapshot.TryGetValue(us.InstanceGuid, out var slots);
+                            if (slots == null)
+                            {
+                                _assignedSlotsSnapshot[us.InstanceGuid] = new[] { us.MapTo };
+                                continue;
+                            }
+                            // Dedup. A device should only appear once per
+                            // slot, but defensively skip duplicates so the
+                            // recognizer doesn't tick twice for the same key.
+                            bool dup = false;
+                            for (int j = 0; j < slots.Length; j++) { if (slots[j] == us.MapTo) { dup = true; break; } }
+                            if (dup) continue;
+                            var grown = new int[slots.Length + 1];
+                            System.Array.Copy(slots, grown, slots.Length);
+                            grown[slots.Length] = us.MapTo;
+                            _assignedSlotsSnapshot[us.InstanceGuid] = grown;
+                        }
+                    }
+                }
+            }
+            return _assignedSlotsSnapshot.TryGetValue(deviceGuid, out var found)
+                ? found : System.Array.Empty<int>();
+        }
+
+        /// <summary>Drives the gesture recognizer for every touchpad
+        /// surface this device exposes, once per slot the device is
+        /// assigned to. One context per <c>(slot, device, pad)</c>
+        /// triple, lazily allocated. Called from Step 2 after the
+        /// device's <c>InputState</c> snapshot lands; recognizer fires
+        /// populate
+        /// <see cref="Engine.Touchpad.TouchpadGestureContext.FiredGesturesThisFrame"/>
+        /// which the SourceCoercion gesture-fired provider reads each
+        /// time a mapping row resolves a touchpad-gesture source.
+        ///
+        /// <para>Slot fan-out: the same physical (device, pad) can be
+        /// assigned to multiple slots with different Touchpad-tab
+        /// toggles. Each slot ticks the recognizer with its own
+        /// settings, so slot 1's "4-way OFF" truly stops slot 1's
+        /// mapping rows from firing even when slot 0 has it ON.
+        /// Recording-mode bypass is slot-agnostic (the recorder
+        /// captures finger paths per (device, pad), not per slot)
+        /// and runs once before any per-slot context update.</para></summary>
+        private void UpdateGestureContexts(Engine.Data.UserDevice ud, CustomInputState newState)
+        {
+            if (ud == null || newState == null) return;
+            if (newState.Touchpads == null || newState.Touchpads.Length == 0) return;
+
+            // Slots this device is currently assigned to, from the shared
+            // 250 ms snapshot (lock-free, allocation-free per poll). No
+            // assigned slots → no contexts to tick (gestures don't need to
+            // run for an unmapped device).
+            int[] assignedSlots = GetAssignedSlotsSnapshot(ud.InstanceGuid);
+            if (assignedSlots.Length == 0) return;
+
+            long nowMs = System.Environment.TickCount64;
+            for (int p = 0; p < newState.Touchpads.Length; p++)
+            {
+                var pad = newState.Touchpads[p];
+                if (pad == null) continue;
+
+                // Recording-mode bypass: while the recorder dialog is
+                // capturing this (device, pad), feed it the raw
+                // TouchpadInputState once (slot-agnostic) and skip
+                // every slot's recognizer evaluation for this pad.
+                // Drops any in-flight context for the pad so a stale
+                // path doesn't fire the moment recording stops.
+                if (RecordingTargetPadIdx == p &&
+                    RecordingTargetDeviceGuid == ud.InstanceGuid)
+                {
+                    foreach (int slot in assignedSlots)
+                    {
+                        if (GestureContexts.TryGetValue((slot, ud.InstanceGuid, p), out var ctxR))
+                            ctxR.Reset();
+                        // Drop the swipe-haptic accumulator too: it would
+                        // otherwise freeze across the recording and count
+                        // the position gap as travel on resume, firing a
+                        // spurious tick burst the moment recording stops.
+                        SwipePulseStates.TryRemove((slot, ud.InstanceGuid, p), out _);
+                    }
+                    var tickHandler = RecordingTick;
+                    if (tickHandler != null)
+                    {
+                        // Clone: the dialog marshals via Dispatcher.
+                        // BeginInvoke, so the reference sits in the queue
+                        // while the pooled buffer underneath keeps being
+                        // rewritten. Only allocates while the recorder
+                        // dialog is actively capturing.
+                        try { tickHandler(pad.Clone()); }
+                        catch { /* dialog teardown can race — ignore */ }
+                    }
+                    continue;
+                }
+
+                foreach (int slot in assignedSlots)
+                {
+                    var key = (slot, ud.InstanceGuid, p);
+                    if (!GestureContexts.TryGetValue(key, out var ctx))
+                    {
+                        ctx = new Engine.Touchpad.TouchpadGestureContext();
+                        GestureContexts[key] = ctx;
+                    }
+
+                    var settings = TouchpadGestureSettingsProvider?.Invoke(slot, ud.InstanceGuid, p)
+                        ?? Engine.Touchpad.TouchpadGestureSettings.Default();
+
+                    Engine.Touchpad.GestureRecognizer.Update(
+                        padIdx: p, ctx: ctx, pad: pad, settings: settings,
+                        nowMs: nowMs, shapeTemplates: _shapeTemplates);
+
+                    // Swipe-haptic ticks (#219): independent of the
+                    // gesture master switch. The pulse toggle stands
+                    // alone, like the joystick-output channel.
+                    UpdateSwipeHaptics(slot, ud, p, pad, settings);
+                }
+            }
+        }
+
+        /// <summary>Ticks the swipe-haptic travel accumulator for one
+        /// (slot, device, pad) and routes any earned detent to the
+        /// device's haptic lane (discussion #219). Steam Controller
+        /// family devices get a per-side actuator tick through
+        /// <see cref="HapticToneService.QueueTouchpadPulse"/> (pad 0 =
+        /// left actuator, pad 1 = right; the bundled SDL fork's Steam
+        /// drivers all send the left pad as touchpad index 0). Sony pads
+        /// raise a <see cref="TouchpadPulseService"/> burst that the
+        /// effects dispatcher mixes with game rumble, preserving the
+        /// sole-writer architecture. Ticks earned in one frame coalesce
+        /// into one pulse (the sink-side 40 ms cap would merge them
+        /// anyway). Amplitude is the fixed per-pad intensity setting;
+        /// both references fire fixed-strength ticks (SteamlessController
+        /// TRACKPAD_MOVE_GAIN_DB, DS4MapperTest hapticsIntensityRatio),
+        /// so no speed scaling.</summary>
+        private void UpdateSwipeHaptics(int slot, Engine.Data.UserDevice ud, int padIdx,
+            Engine.TouchpadInputState pad, Engine.Touchpad.TouchpadGestureSettings settings)
+        {
+            var key = (slot, ud.InstanceGuid, padIdx);
+            float amp = settings.SwipeHapticsIntensity;
+            if (!settings.EnableSwipeHaptics || amp <= 0f)
+            {
+                // Drop stale state so a later re-enable seeds fresh
+                // instead of ticking on the accumulated gap.
+                SwipePulseStates.TryRemove(key, out _);
+                return;
+            }
+            if (!SwipePulseStates.TryGetValue(key, out var st))
+            {
+                st = new Engine.Touchpad.SwipeHapticsState();
+                SwipePulseStates[key] = st;
+            }
+            if (Engine.Touchpad.SwipeHapticsEvaluator.Update(st, pad) <= 0) return;
+
+            if (amp > 1f) amp = 1f;
+            if (HapticToneService.DeviceHasHaptics(ud))
+                HapticToneService.QueueTouchpadPulse(ud.InstanceGuid, padIdx, amp);
+            else if (TouchpadPulseService.IsSonyRumblePad(ud))
+                TouchpadPulseService.Pulse(slot, ud.InstanceGuid, amp);
+        }
+
+        /// <summary>Drops every gesture context. Called on profile
+        /// switch and on engine stop so a stale partial gesture doesn't
+        /// carry across.</summary>
+        public void ResetGestureContexts()
+        {
+            GestureContexts.Clear();
+            MouseGestureContexts.Clear();
+            SwipePulseStates.Clear();
+            TouchpadPulseService.Clear();
+            // The gesture lanes route through the 250 ms device-to-slot
+            // snapshot, and a profile switch is exactly when that mapping
+            // changes. Same invalidation the trigger-route and gyro engage
+            // resets do: without it a gesture completed in the next quarter
+            // second fires on the OLD profile's slot assignment.
+            _assignedSlotsRefreshTick = 0;
+        }
+
+        /// <summary>Mouse-gesture recognizer walk (issue #200), sibling of
+        /// <see cref="UpdateGestureContexts"/> for mouse-class devices, which
+        /// never enter the touchpad walk (their state carries no Touchpads).
+        /// Reads the already-published MouseRawDX/DY counts rather than
+        /// consuming RawInput deltas again: the wrapper's consume-and-zero
+        /// read owns that source, and a second consumer would starve it.
+        /// Polling thread only.</summary>
+        private void UpdateMouseGestureContexts(Engine.Data.UserDevice ud, CustomInputState newState)
+        {
+            if (ud == null || newState == null) return;
+            if (!ud.IsMouse) return;
+
+            // Slots this device is currently assigned to, from the same
+            // 250 ms snapshot the touchpad lane reads.
+            int[] assignedSlots = GetAssignedSlotsSnapshot(ud.InstanceGuid);
+            if (assignedSlots.Length == 0) return;
+
+            // Raw unclamped counts, published by the wrapper from the same
+            // single RawInput consume that feeds the axes (#200). Recovery
+            // from the clamped Axis[0/1] capped at ±16 counts per poll, so a
+            // fast flick saturated both axes to a 1:1 ratio and the ax>=ay
+            // tie-break classified a mostly-vertical flick as horizontal.
+            double dxCounts = newState.MouseRawDX;
+            double dyCounts = newState.MouseRawDY;
+
+            long nowMs = System.Environment.TickCount64;
+            foreach (int slot in assignedSlots)
+            {
+                var key = (slot, ud.InstanceGuid);
+                if (!MouseGestureContexts.TryGetValue(key, out var ctx))
+                {
+                    ctx = new Engine.Mouse.MouseGestureContext();
+                    MouseGestureContexts[key] = ctx;
+                }
+
+                var settings = MouseGestureSettingsProvider?.Invoke(slot, ud.InstanceGuid)
+                    ?? Engine.Mouse.MouseGestureSettings.Default();
+
+                // Each selected gesture button runs its own session; hand
+                // the recognizer the raw pressed mask and let it fan out.
+                // Only the five PHYSICAL indices read from the mouse: a
+                // sixth-plus mouse button must not arm the Custom session.
+                int pressedMask = 0;
+                for (int b = 0; b < Engine.Mouse.MouseGestureContext.MouseButtonCount
+                    && b < newState.Buttons.Length; b++)
+                {
+                    if (newState.Buttons[b]) pressedMask |= 1 << b;
+                }
+
+                // Custom activation (discussion #216): the recognizer's
+                // composer ORs in bit 5 while the recorded cross-device
+                // input is held (ButtonHeldProvider, the same reader the
+                // gyro / trigger-route / haptic-mirror engage settles use).
+                pressedMask = Engine.Mouse.MouseGestureRecognizer.ComposePressedMask(
+                    pressedMask, settings, slot);
+
+                Engine.Mouse.MouseGestureRecognizer.Update(
+                    ctx, settings, pressedMask, dxCounts, dyCounts, nowMs);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Motion snapshots (for DSU server)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Unit conversion: SDL gyro rad/s → DSU deg/s.</summary>
+        private const float RadToDeg = 180f / MathF.PI;
+
+        /// <summary>Unit conversion: SDL accel m/s² → DSU g-force.</summary>
+        private const float MsToG = 1f / 9.80665f;
+
+        /// <summary>
+        /// Reconciles each slot's motion sources using its mapping rows'
+        /// combine modes. Gyro and acceleration are independent channels.
+        /// Called on the polling thread after Step 2 (UpdateInputStates).
+        ///
+        /// <para>Explicit motion rows select the sources for HID and DSU.
+        /// Without either row, DSU uses the default axis combine over all
+        /// enabled, assigned sensor devices. No separate source ranking.</para>
+        /// </summary>
+        // F5g gate state (poll thread only).
+        private readonly object[] _motionRowsSetRef = new object[MaxPads];
+        private readonly int[] _motionRowsCount = new int[MaxPads];
+        private readonly long[] _motionRowsCheckedTick = new long[MaxPads];
+        private readonly bool[] _motionHasGyroRow = new bool[MaxPads];
+        private readonly bool[] _motionHasAccelRow = new bool[MaxPads];
+        private readonly bool[] _motionHasAxisRows = new bool[MaxPads];
+
+        private readonly List<UserDevice> _motionAssignedDevices = new(8);
+        private readonly List<float> _motionRowX = new(8);
+        private readonly List<float> _motionRowY = new(8);
+        private readonly List<float> _motionRowZ = new(8);
+        private readonly List<float> _motionAssignedX = new(8);
+        private readonly List<float> _motionAssignedY = new(8);
+        private readonly List<float> _motionAssignedZ = new(8);
+
+        private static readonly MappingSource AutomaticAuxGyro = new()
+        {
+            Descriptor = MappingSetMigrator.MotionGyroAuxSourceDescriptor,
+        };
+        private static readonly MappingSource AutomaticAuxAccel = new()
+        {
+            Descriptor = MappingSetMigrator.MotionAccelAuxSourceDescriptor,
+        };
+
+        /// <summary>Permissive row-presence scan: true when ANY row names
+        /// the target, regardless of sources/online state, so the gate can
+        /// only skip walks that provably return null.</summary>
+        private static bool HasRowForTarget(PadForge.Engine.Data.MappingSet ms, string target)
+        {
+            var rows = ms?.Rows;
+            if (rows == null) return false;
+            int count = rows.Count;
+            for (int i = 0; i < count && i < rows.Count; i++)
+            {
+                var r = rows[i];
+                if (r != null && string.Equals(r.Target, target, System.StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
+
+        private void UpdateMotionSnapshots()
+        {
+            _motionAssignedDevices.Clear();
+            var settings = SettingsManager.UserSettings;
+            if (settings == null)
+            {
+                Array.Clear(MotionSnapshots);
+                Array.Clear(DsuMotionSnapshots);
+                return;
+            }
+
+            // Every assigned sensor must be reachable. Match Step 3's
+            // reusable settings buffer when a slot has more than 64 devices.
+            int settingsCount = settings.Count;
+            if (_padIndexBuffer.Length < settingsCount)
+                _padIndexBuffer = new UserSetting[settingsCount];
+
+            // Microseconds since an arbitrary epoch. Scale in double:
+            // GetTimestamp() * 1_000_000 overflows Int64 once the machine
+            // has been up long enough (~10 days at a 10 MHz QPC), which
+            // would make the relayed sensor timestamp wrap and jump.
+            long timestampUs = (long)(Stopwatch.GetTimestamp()
+                * (1_000_000.0 / Stopwatch.Frequency));
+            bool dsuEnabled = DsuServer != null;
+
+            for (int padIndex = 0; padIndex < MaxPads; padIndex++)
+            {
+                // Empty pad — nothing mapped means no motion data to snapshot
+                // and no battery to read. Skip the FindByPadIndex lock+scan
+                // that would otherwise run 14× per cycle on a 2-active-slot
+                // setup.
+                if (!SettingsManager.SlotCreated[padIndex])
+                {
+                    MotionSnapshots[padIndex] = default;
+                    if (padIndex < DsuMotionSnapshots.Length)
+                        DsuMotionSnapshots[padIndex] = default;
+                    _motionRowsActive[padIndex] = false;
+                    continue;
+                }
+
+                // Battery scan over the slot's assigned devices. Two values
+                // come out of one walk: the slot-collapsed first-online-with-
+                // data reading (BatteryPercents/Charging, which the virtual
+                // controller reports to the OS as the slot's single battery),
+                // and an all-device change signature so the Battery lightbar's
+                // per-device repaint kick fires when ANY device's battery
+                // changes, not just the first. Independent of motion.
+                int slotCount = settings.FindByPadIndex(padIndex, _padIndexBuffer);
+                int batteryPercent = -1;
+                bool batteryCharging = false;
+                int batterySignature = 17;
+                ulong ds5StatusBytes = 0;
+                bool dsuSlot = dsuEnabled && padIndex < DsuMotionSnapshots.Length;
+                _motionAssignedDevices.Clear();
+                for (int i = 0; i < slotCount; i++)
+                {
+                    var us = _padIndexBuffer[i];
+                    if (us == null) continue;
+                    var ud = FindOnlineDeviceByInstanceGuid(us.InstanceGuid);
+                    if (ud == null || !ud.IsOnline || ud.Device == null) continue;
+                    var state = ud.InputState;
+                    if (state == null) continue;
+                    if (us.IsEnabled)
+                        _motionAssignedDevices.Add(ud);
+                    if (batteryPercent < 0 && state.BatteryPercent >= 0)
+                    {
+                        batteryPercent = state.BatteryPercent;
+                        batteryCharging = state.BatteryCharging;
+                    }
+                    // (#433) The first assigned physical DualSense's trigger
+                    // feedback bytes ride to the virtual pad's report.
+                    if (ds5StatusBytes == 0
+                        && DualSenseStatusBytes.IsDualSense(ud.VendorId, ud.ProdId))
+                        ds5StatusBytes = DualSenseStatusBytes.Read(ud.Device.GamepadHandle);
+                    batterySignature = batterySignature * 31
+                        + state.BatteryPercent * 2 + (state.BatteryCharging ? 1 : 0);
+                }
+
+                BatteryPercents[padIndex] = batteryPercent;
+                BatteryCharging[padIndex] = batteryCharging;
+                Ds5StatusBytes[padIndex] = ds5StatusBytes;
+                if (_batterySignature[padIndex] != batterySignature)
+                {
+                    _batterySignature[padIndex] = batterySignature;
+                    UserEffectsDispatcher.NotifyBatteryPercentChanged(padIndex);
+                }
+
+                // HID motion is mapping-driven. DSU uses that same selection
+                // when either motion row exists, including an empty/offline
+                // row. With neither row, reconcile every assigned sensor
+                // through the same axis combine used by a default motion row.
+                var ms = (SettingsManager.SlotMappingSets != null
+                    && padIndex < SettingsManager.SlotMappingSets.Length)
+                    ? SettingsManager.SlotMappingSets[padIndex] : null;
+
+                // 250 ms row-presence gate (engage-lane cadence): slots
+                // whose MappingSet has no motion rows skip both per-tick
+                // source walks. Scan target names only, so an existing but
+                // offline keeps the per-tick failover walk it always had.
+                // Replacing the set or adding/removing a row re-scans immediately.
+                long nowMotionTick = Environment.TickCount64;
+                int rowCount = ms?.Rows?.Count ?? 0;
+                if (!ReferenceEquals(_motionRowsSetRef[padIndex], ms)
+                    || _motionRowsCount[padIndex] != rowCount
+                    || nowMotionTick - _motionRowsCheckedTick[padIndex] >= 250)
+                {
+                    _motionRowsSetRef[padIndex] = ms;
+                    _motionRowsCount[padIndex] = rowCount;
+                    _motionRowsCheckedTick[padIndex] = nowMotionTick;
+                    _motionHasGyroRow[padIndex] = HasRowForTarget(ms, MappingSetMigrator.MotionGyroTarget);
+                    _motionHasAccelRow[padIndex] = HasRowForTarget(ms, MappingSetMigrator.MotionAccelTarget);
+                    _motionHasAxisRows[padIndex] = HasSourcedMotionAxisRow(ms);
+                }
+
+                // The Motion Pitch, Yaw and Roll rows (#475) drive the slot
+                // when one carries a source on a slot family that has them.
+                bool rowsActive = _motionHasAxisRows[padIndex] && SlotCarriesMotion(padIndex);
+                _motionRowsActive[padIndex] = rowsActive;
+                _motionRowsHasDevice[padIndex] = _motionAssignedDevices.Count > 0;
+
+                try
+                {
+                    var gyro = _motionHasGyroRow[padIndex]
+                        ? ReconcileMappedMotion(ms, MappingSetMigrator.MotionGyroTarget,
+                            requireGyro: true, padIndex, timestampUs) : default;
+                    var accel = _motionHasAccelRow[padIndex]
+                        ? ReconcileMappedMotion(ms, MappingSetMigrator.MotionAccelTarget,
+                            requireGyro: false, padIndex, timestampUs) : default;
+                    var mapped = JoinMotionChannels(gyro, accel, timestampUs);
+                    if (rowsActive)
+                    {
+                        // The motion stage composes on top of this and
+                        // publishes once, so the grid never reads a frame
+                        // without the rows. DSU composes against the same
+                        // real sensors: no fallback to every assigned one.
+                        _motionRowsBase[padIndex] = mapped;
+                        _motionGyroLive[padIndex] = gyro.HasMotion;
+                        _motionAccelLive[padIndex] = accel.HasMotion;
+                        continue;
+                    }
+                    MotionSnapshots[padIndex] = mapped;
+                    if (padIndex < DsuMotionSnapshots.Length)
+                    {
+                        var dsu = mapped;
+                        if (dsuSlot && !_motionHasGyroRow[padIndex] && !_motionHasAccelRow[padIndex])
+                        {
+                            gyro = ReconcileAssignedMotion(null, true, padIndex, timestampUs);
+                            accel = ReconcileAssignedMotion(null, false, padIndex, timestampUs);
+                            dsu = JoinMotionChannels(gyro, accel, timestampUs);
+                        }
+                        DsuMotionSnapshots[padIndex] = dsu;
+                    }
+                }
+                finally
+                {
+                    _motionAssignedDevices.Clear();
+                }
+            }
+        }
+
+        private static MotionSnapshot JoinMotionChannels(
+            MotionSnapshot gyro, MotionSnapshot accel, long timestampUs)
+            => new()
+            {
+                GyroPitch = gyro.GyroPitch, GyroYaw = gyro.GyroYaw, GyroRoll = gyro.GyroRoll,
+                AccelX = accel.AccelX, AccelY = accel.AccelY, AccelZ = accel.AccelZ,
+                HasMotion = gyro.HasMotion || accel.HasMotion, TimestampUs = timestampUs,
+            };
+
+        private MotionSnapshot ReconcileAssignedMotion(MappingSource source, bool requireGyro,
+            int slotIndex, long timestampUs)
+        {
+            _motionAssignedX.Clear();
+            _motionAssignedY.Clear();
+            _motionAssignedZ.Clear();
+            foreach (var device in _motionAssignedDevices)
+            {
+                var sample = ReadMotionChannel(device, source, requireGyro, slotIndex, timestampUs);
+                // Default sources follow the device's primary channel. An
+                // auxiliary channel is used only if the primary is absent.
+                if (!sample.HasMotion && source == null)
+                    sample = ReadMotionChannel(device,
+                        requireGyro ? AutomaticAuxGyro : AutomaticAuxAccel,
+                        requireGyro, slotIndex, timestampUs);
+                if (!sample.HasMotion) continue;
+                AppendMotionValues(sample, requireGyro,
+                    _motionAssignedX, _motionAssignedY, _motionAssignedZ);
+            }
+            return CombineMotionValues(null, requireGyro, _motionAssignedX,
+                _motionAssignedY, _motionAssignedZ, _motionAssignedX.Count > 0, timestampUs);
+        }
+
+        private static MotionSnapshot ReadMotionChannel(UserDevice device, MappingSource source,
+            bool requireGyro, int slotIndex, long timestampUs)
+        {
+            var sample = requireGyro
+                ? CaptureMotionSnapshot((device, source), default, slotIndex, timestampUs)
+                : CaptureMotionSnapshot(default, (device, source), slotIndex, timestampUs);
+            bool finite = requireGyro
+                ? float.IsFinite(sample.GyroPitch) && float.IsFinite(sample.GyroYaw) && float.IsFinite(sample.GyroRoll)
+                : float.IsFinite(sample.AccelX) && float.IsFinite(sample.AccelY) && float.IsFinite(sample.AccelZ);
+            return finite ? sample : new MotionSnapshot { TimestampUs = timestampUs };
+        }
+
+        private static void AppendMotionValues(MotionSnapshot sample, bool gyro,
+            List<float> x, List<float> y, List<float> z)
+        {
+            x.Add(gyro ? sample.GyroPitch : sample.AccelX);
+            y.Add(gyro ? sample.GyroYaw : sample.AccelY);
+            z.Add(gyro ? sample.GyroRoll : sample.AccelZ);
+        }
+
+        private static MotionSnapshot CombineMotionValues(MappingRow row, bool gyro,
+            List<float> x, List<float> y, List<float> z, bool available, long timestampUs)
+        {
+            if (!available) return new MotionSnapshot { TimestampUs = timestampUs };
+            string mode = row?.CombineMode ?? "";
+            var expression = mode == "Custom" ? GetOrCompileExpression(row) : null;
+            // These are physical units, not normalized stick axes. Reuse the
+            // row combiner without the scalar target's [-1,1] output clamp.
+            float vx = expression != null ? expression.Evaluate(x) : CombineHelper.CombineAxis(mode, x);
+            float vy = expression != null ? expression.Evaluate(y) : CombineHelper.CombineAxis(mode, y);
+            float vz = expression != null ? expression.Evaluate(z) : CombineHelper.CombineAxis(mode, z);
+            if (!float.IsFinite(vx)) vx = 0f;
+            if (!float.IsFinite(vy)) vy = 0f;
+            if (!float.IsFinite(vz)) vz = 0f;
+            return gyro
+                ? new MotionSnapshot { GyroPitch = vx, GyroYaw = vy, GyroRoll = vz,
+                    HasMotion = true, TimestampUs = timestampUs }
+                : new MotionSnapshot { AccelX = vx, AccelY = vy, AccelZ = vz,
+                    HasMotion = true, TimestampUs = timestampUs };
+        }
+
+        private static MotionSnapshot CaptureMotionSnapshot(
+            (UserDevice Ud, MappingSource Src) gyroSrc,
+            (UserDevice Ud, MappingSource Src) accelSrc,
+            int padIndex, long timestampUs)
+        {
+            bool hasMotion = false;
+
+            // Acceleration is in g. The body follows the configured grip,
+            // while an auxiliary sensor keeps its own frame. A mapping
+            // source can invert all three axes.
+            float ax = 0f, ay = 0f, az = 0f;
+            if (accelSrc.Ud?.Device != null && accelSrc.Ud.InputState != null)
+            {
+                var s = accelSrc.Ud.InputState;
+                bool accelAux = accelSrc.Src != null
+                    && MappingSetMigrator.IsMotionAccelAuxDescriptor(accelSrc.Src.Descriptor);
+                var accel = accelAux ? s.AccelAux : s.Accel;
+                bool hasAccel = accelAux ? accelSrc.Ud.Device.HasAccelAux : accelSrc.Ud.Device.HasAccel;
+                if (hasAccel && accel != null && accel.Length >= 3)
+                {
+                    hasMotion = true;
+                    ax = accel[0] * MsToG;
+                    ay = accel[1] * MsToG;
+                    az = accel[2] * MsToG;
+                    if (!accelAux)
+                        SourceCoercion.ApplyMotionGrip(accelSrc.Ud.InstanceGuidString, padIndex, ref ax, ref ay, ref az);
+                    if (accelSrc.Src != null && accelSrc.Src.Invert)
+                    {
+                        ax = -ax; ay = -ay; az = -az;
+                    }
+                }
+            }
+
+            // Use the same calibration, body grip and optional tuning for
+            // mapped and automatic motion. Wire conversion belongs to the
+            // output encoder. A mapping's Invert follows the device tuning.
+            float gx = 0f, gy = 0f, gz = 0f;
+            if (gyroSrc.Ud?.Device != null && gyroSrc.Ud.InputState != null)
+            {
+                var s = gyroSrc.Ud.InputState;
+                bool gyroAux = MappingSetMigrator.IsMotionGyroAuxDescriptor(gyroSrc.Src?.Descriptor);
+                var gyroArr = gyroAux ? s.GyroAux : s.Gyro;
+                bool hasGyro = gyroAux ? gyroSrc.Ud.Device.HasGyroAux : gyroSrc.Ud.Device.HasGyro;
+                if (hasGyro && gyroArr != null && gyroArr.Length >= 3)
+                {
+                    hasMotion = true;
+                    SourceCoercion.GetPassthroughGyro(
+                        s, gyroSrc.Ud.InstanceGuidString, padIndex,
+                        out float tunedPitch, out float tunedYaw, out float tunedRoll, gyroAux);
+                    gx = tunedPitch * RadToDeg;
+                    gy = tunedYaw * RadToDeg;
+                    gz = tunedRoll * RadToDeg;
+                    if (gyroSrc.Src != null && gyroSrc.Src.Invert)
+                    {
+                        gx = -gx; gy = -gy; gz = -gz;
+                    }
+                }
+            }
+
+            return new MotionSnapshot
+            {
+                AccelX = ax,
+                AccelY = ay,
+                AccelZ = az,
+                GyroPitch = gx,
+                GyroYaw = gy,
+                GyroRoll = gz,
+                TimestampUs = timestampUs,
+                HasMotion = hasMotion
+            };
+        }
+
+        /// <summary>
+        /// Motion row candidates for the slot's engaged layer, in
+        /// preference order: the layer's own row, then Base, then any other
+        /// row naming the target.
+        ///
+        /// <para>Layer resolution is delegated ENTIRELY to the #221 resolver;
+        /// this only decides fallback ORDER, so there is no second
+        /// layer-resolution path to drift.</para>
+        ///
+        /// <para>The resolver's <c>suppressed</c> flag is deliberately
+        /// discarded here. Layers default to REPLACE semantics
+        /// (ShiftActivator.InheritUnmapped is false), so honoring suppression
+        /// would silence gyro and accel the moment a layer without a motion
+        /// row engaged. Motion never goes dark because of a layer: that is a
+        /// product decision, and it makes this change a strict preference
+        /// re-ordering, so nothing that resolves today stops resolving.</para></summary>
+        private static void BuildMotionRowCandidates(
+            MappingSet ms, string targetName, int slotIndex, ref MappingRow[] buf, out int count)
+        {
+            count = 0;
+            if (ms?.Rows == null) return;
+            // Grow the scratch to hold every row that could name this target.
+            // It was fixed at three, which after the active row and Base left
+            // room for exactly ONE other layer's row, so a slot with motion
+            // rows on Base plus three shift layers silently dropped the last
+            // two. Motion then went dark whenever the earlier candidates'
+            // devices were offline and a later one was live, which is the
+            // hand-off this walk exists to provide. Layers are open-ended, so
+            // the bound has to come from the row count, not a constant.
+            int needed = ms.Rows.Count + 2;
+            if (buf == null || buf.Length < needed) buf = new MappingRow[needed];
+
+            var activeRow = FindActiveRowForTarget(ms, targetName, slotIndex, out _);
+            if (activeRow != null) buf[count++] = activeRow;
+
+            var baseRow = FindBaseRowForTarget(ms, targetName);
+            if (baseRow != null && !ReferenceEquals(baseRow, activeRow)) buf[count++] = baseRow;
+
+            var rows = ms.Rows;
+            for (int r = 0; r < rows.Count && count < buf.Length; r++)
+            {
+                var row = rows[r];
+                if (row == null) continue;
+                if (!string.Equals(row.Target, targetName, StringComparison.Ordinal)) continue;
+                if (ReferenceEquals(row, activeRow) || ReferenceEquals(row, baseRow)) continue;
+                buf[count++] = row;
+            }
+        }
+
+        /// <summary>Checks the idle gate and publishes neutral DSU data before
+        /// idle maintenance. No input evaluation or native submission runs here.</summary>
+        /// <summary>True once the idle entry edge has neutralized the outputs.
+        /// Cleared when the engine leaves idle so the next entry neutralizes
+        /// again.</summary>
+        private bool _idleNeutralized;
+
+        internal bool BeginIdlePoll()
+        {
+            if (!_idle) { _idleNeutralized = false; return false; }
+            Array.Clear(_steeringAngleFrames);
+            // Idle skips steps 3 to 5, and step 3 deliberately KEEPS the last
+            // output for a device that went offline without leaving the list
+            // (its no-transient-zero rule). A pad that sleeps mid-hold therefore
+            // left that frame latched on the virtual controller, and with the
+            // inactivity timeout at zero the slot idles immediately with the
+            // controller still alive, so nothing ever cleared it. One neutral
+            // submit on the entry edge, the same pair the focus-suspend edge
+            // runs. Nothing writes the combined outputs in idle, so one pass is
+            // enough.
+            if (!_idleNeutralized)
+            {
+                _idleNeutralized = true;
+                try
+                {
+                    // The DSU motion cache survives the neutralize. It is a
+                    // READ cache the interface and the motion server compare
+                    // timestamps against, not an output surface, and idle
+                    // deliberately republishes nothing from it: clearing it
+                    // would make the next real poll read a fresh sample as
+                    // unchanged. The neutral DSU broadcast below is what the
+                    // subscribers get meanwhile.
+                    var keptDsu = new MotionSnapshot[DsuMotionSnapshots.Length];
+                    Array.Copy(DsuMotionSnapshots, keptDsu, keptDsu.Length);
+                    using (EnterMenuPublication())
+                    {
+                        NeutralizeCombinedOutputs();
+                        UpdateVirtualDevices();
+                    }
+                    Array.Copy(keptDsu, DsuMotionSnapshots, keptDsu.Length);
+                }
+                catch (Exception ex) { RaiseError("Idle neutral edge", ex); }
+            }
+            var server = DsuServer;
+            if (server == null) return true;
+
+            // The UI can enter idle before another normal motion poll.
+            // Use a local neutral value even if the cached sample is still moving.
+            var neutral = new MotionSnapshot
+            {
+                TimestampUs = (long)(Stopwatch.GetTimestamp()
+                    * (1_000_000.0 / Stopwatch.Frequency)),
+            };
+            try
+            {
+                for (int padIndex = 0; padIndex < DsuMotionSnapshots.Length; padIndex++)
+                    server.BroadcastMotion(padIndex, neutral, IsSlotActive(padIndex));
+            }
+            catch (Exception ex) { RaiseError("Idle DSU delivery", ex); }
+            return true;
+        }
+
+        /// <summary>Applies the focus policy before input evaluation. Optional callbacks
+        /// replace controller submission and key release in tests.</summary>
+        internal bool ApplyFocusSuspension(Action submitControllers = null, Action releaseKeys = null)
+        {
+            using var publication = EnterMenuPublication();
+            if (!SuspendWhenBackground || HostIsForeground)
+            {
+                if (_focusSuspended)
+                {
+                    _focusSuspended = false;
+                    Engine.SdlDiagLog.WriteLine("ENGINE resumed: foreground regained");
+                }
+                return false;
+            }
+
+            if (!_focusSuspended)
+            {
+                _focusSuspended = true;
+                try
+                {
+                    NeutralizeCombinedOutputs();
+                    if (submitControllers == null) UpdateVirtualDevices();
+                    else submitControllers();
+                }
+                catch (Exception ex) { RaiseError("Focus-suspend neutral edge", ex); }
+                finally
+                {
+                    try
+                    {
+                        if (releaseKeys == null) ReleaseAllLatchedMacroKeys();
+                        else releaseKeys();
+                    }
+                    catch (Exception ex) { RaiseError("Focus-suspend macro-key release", ex); }
+                }
+                Engine.SdlDiagLog.WriteLine("ENGINE suspended: unfocused and background polling disabled");
+            }
+
+            RumbleAudioService.SilenceAll();
+            try
+            {
+                if (submitControllers == null) UpdateVirtualDevices();
+                else submitControllers();
+            }
+            catch (Exception ex) { RaiseError("Focus-suspend VC upkeep", ex); }
+
+            // Repeat neutral packets at the suspended loop's 10 Hz cadence.
+            // A controller submission failure must not prevent network delivery.
+            try { BroadcastDsuMotion(); }
+            catch (Exception ex) { RaiseError("Focus-suspend DSU delivery", ex); }
+            return true;
+        }
+        /// <summary>Zeroes every combined output surface Step 5 submits.
+        ///
+        /// <para>The focus-suspend neutral edge: called once when the engine
+        /// stops because PadForge left the foreground with background polling
+        /// disabled, then Step 5 runs once more so the neutral state actually
+        /// reaches the virtual devices. Array-carrying structs are cleared in
+        /// place (RawHidState.Clear handles its own arrays, MidiRawState's
+        /// arrays are wiped per element) because a default-assign would null
+        /// the arrays and break Step 5's readers.</para></summary>
+        private void NeutralizeCombinedOutputs()
+        {
+            FlushSteeringAngleRumble();
+            for (int i = 0; i < MaxPads; i++)
+            {
+                CombinedOutputStates[i] = default;
+                CombinedRawHidStates[i].ClearToRest(SlotCustomLayouts[i]);
+                CombinedKbmRawStates[i] = default;
+                CombinedVrRawStates[i] = default;
+                CombinedTouchpadStates[i] = default;
+                // Button pressure (discussion #476). The neutral frame
+                // releases every button, so Step 5 sends none either way.
+                // Cleared so the grid's value column, which reads it, rests
+                // too for the length of the suspension.
+                CombinedPressureStates[i] = default;
+                // Motion rides beside the raw surface on every Step 5 submit
+                // (HasMotion=false submits zeroes), so leaving it out froze
+                // the LAST gyro/accel sample into the driver: tab away
+                // mid-motion and the virtual pad kept reporting that angular
+                // rate for the whole suspension.
+                MotionSnapshots[i] = default;
+                if (i < DsuMotionSnapshots.Length)
+                    DsuMotionSnapshots[i] = default;
+                // The Motion Pitch, Yaw and Roll rows (#475): no deflection
+                // while neutral, and the next live poll starts the model's
+                // clock over instead of turning through the pause.
+                CombinedMotionRows[i] = default;
+                Interlocked.Or(ref s_motionRowsRequests[i], MotionRowsRestartClock);
+                // MidiRawState.Clear(), not Array.Clear. The neutral CC value
+                // is 64 (center), and Array.Clear writes 0, which is the
+                // MINIMUM. Alt-tabbing with background polling off therefore
+                // slammed every mapped CC to zero instead of releasing it to
+                // center, while the other two neutralize sites for this same
+                // array produced 64. CcValues and Notes are arrays, so
+                // clearing through the local struct copy still reaches the
+                // shared buffers.
+                CombinedMidiRawStates[i].Clear();
+            }
+        }
+
+        /// <summary>Scratch for <see cref="BuildMotionRowCandidates"/>. Poll
+        /// thread only, so the candidate walk allocates nothing per tick.</summary>
+        private MappingRow[] _motionRowCandidateBuf = new MappingRow[8];
+
+        private MotionSnapshot ReconcileMappedMotion(
+            MappingSet ms, string targetName, bool requireGyro, int slotIndex, long timestampUs)
+        {
+            if (ms?.Rows == null) return new MotionSnapshot { TimestampUs = timestampUs };
+            BuildMotionRowCandidates(ms, targetName, slotIndex, ref _motionRowCandidateBuf, out int count);
+            var buf = _motionRowCandidateBuf;
+            try
+            {
+                for (int c = 0; c < count; c++)
+                {
+                    var sample = ReconcileMotionRow(buf[c], requireGyro, slotIndex, timestampUs);
+                    if (sample.HasMotion) return sample;
+                }
+                return new MotionSnapshot { TimestampUs = timestampUs };
+            }
+            finally
+            {
+                // Don't let the scratch pin rows (and through them devices)
+                // past the tick that used it.
+                for (int k = 0; k < count; k++) buf[k] = null;
+            }
+        }
+
+        private MotionSnapshot ReconcileMotionRow(
+            MappingRow row, bool requireGyro, int slotIndex, long timestampUs)
+        {
+            _motionRowX.Clear();
+            _motionRowY.Clear();
+            _motionRowZ.Clear();
+            bool available = false;
+            var sources = row?.Sources;
+            if (sources != null)
+            {
+                for (int i = 0; i < sources.Count; i++)
+                {
+                    var src = sources[i];
+                    if (IsRowModifierSource(src)) continue;
+                    MotionSnapshot sample = default;
+                    if (src != null && SourceCoercion.IsMotionDescriptor(src.Descriptor))
+                    {
+                        if (string.IsNullOrEmpty(src.DeviceGuid))
+                            sample = ReconcileAssignedMotion(src, requireGyro, slotIndex, timestampUs);
+                        else if (TryParseGuidCached(src.DeviceGuid, out var guid))
+                        {
+                            var device = FindOnlineDeviceByInstanceGuid(guid);
+                            if (device?.IsOnline == true)
+                                sample = ReadMotionChannel(device, src, requireGyro, slotIndex, timestampUs);
+                        }
+                    }
+                    // Keep source positions, including unavailable entries,
+                    // for Custom expressions and the usual Average semantics.
+                    AppendMotionValues(sample, requireGyro, _motionRowX, _motionRowY, _motionRowZ);
+                    available |= sample.HasMotion;
+                }
+            }
+            var combined = CombineMotionValues(row, requireGyro, _motionRowX,
+                _motionRowY, _motionRowZ, available, timestampUs);
+            // An InvertOnHold source is a ROW modifier: skipped above so it
+            // contributes no value, and it flips the row's sign while its
+            // modifier is held. Every scalar lane applies that flip after the
+            // combine. Motion rows skipped the source and then dropped the flip
+            // as well, so the modifier did nothing at all. Post-combine, like
+            // the scalar lanes, because a custom expression over negated inputs
+            // is not the negation of its result.
+            if (combined.HasMotion && MotionRowInversionHeld(row, slotIndex))
+            {
+                if (requireGyro)
+                {
+                    combined.GyroPitch = -combined.GyroPitch;
+                    combined.GyroYaw = -combined.GyroYaw;
+                    combined.GyroRoll = -combined.GyroRoll;
+                }
+                else
+                {
+                    combined.AccelX = -combined.AccelX;
+                    combined.AccelY = -combined.AccelY;
+                    combined.AccelZ = -combined.AccelZ;
+                }
+            }
+            return combined;
+        }
+
+        /// <summary>Row-level held inversion for a motion row. A pinned
+        /// modifier reads its own device's state. An empty-guid modifier has no
+        /// "device being processed" here, because the motion lane is slot-level
+        /// rather than per-device, so it reads against each device assigned to
+        /// the slot and any held one flips the row, which is the same OR the
+        /// scalar lane produces across its per-device passes.</summary>
+        private bool MotionRowInversionHeld(MappingRow row, int slotIndex)
+        {
+            if (IsInvertOnHoldActive(row, null, null, slotIndex)) return true;
+            for (int i = 0; i < _motionAssignedDevices.Count; i++)
+            {
+                var ud = _motionAssignedDevices[i];
+                if (ud?.InputState == null) continue;
+                if (IsInvertOnHoldActive(row, ud.InputState, ud.InstanceGuidString, slotIndex))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Broadcasts motion data to DSU clients if the server is active.
+        /// </summary>
+        private void BroadcastDsuMotion()
+        {
+            var server = DsuServer;
+            if (server == null) return;
+
+            bool refreshTimestamp = _focusSuspended;
+            long timestampUs = refreshTimestamp
+                ? (long)(Stopwatch.GetTimestamp()
+                    * (1_000_000.0 / Stopwatch.Frequency)) : 0;
+            for (int padIndex = 0; padIndex < DsuMotionSnapshots.Length; padIndex++)
+            {
+                bool connected = IsSlotActive(padIndex);
+                var snapshot = DsuMotionSnapshots[padIndex];
+                if (refreshTimestamp) snapshot.TimestampUs = timestampUs;
+                server.BroadcastMotion(padIndex, snapshot, connected);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Error helper
+        // ─────────────────────────────────────────────
+
+        private void RaiseError(string message, Exception ex)
+        {
+            // The status bar shows only the headline; without this line the
+            // exception's mechanism is invisible everywhere (the VR-create
+            // failure of 2026-08-08 surfaced as a bare "Failed to create Vr
+            // virtual controller" with the sharing-violation detail dropped).
+            PadForge.Engine.SdlDiagLog.WriteLine($"ERROR {message}: {ex}");
+            ErrorOccurred?.Invoke(this, new InputExceptionEventArgs(message, ex));
+        }
+
+        // ─────────────────────────────────────────────
+        //  Win32 timer resolution + power management
+        // ─────────────────────────────────────────────
+
+        [DllImport("winmm.dll", ExactSpelling = true)]
+        private static extern uint timeBeginPeriod(uint uPeriod);
+
+        [DllImport("winmm.dll", ExactSpelling = true)]
+        private static extern uint timeEndPeriod(uint uPeriod);
+
+        // Multimedia timer callback for x360ce-style fallback.
+        private delegate void TimerCallback(uint uTimerID, uint uMsg,
+            IntPtr dwUser, IntPtr dw1, IntPtr dw2);
+
+        [DllImport("winmm.dll", ExactSpelling = true)]
+        private static extern uint timeSetEvent(uint uDelay, uint uResolution,
+            TimerCallback lpTimeProc, IntPtr dwUser, uint fuEvent);
+
+        [DllImport("winmm.dll", ExactSpelling = true)]
+        private static extern uint timeKillEvent(uint uTimerID);
+
+        private const uint TIME_PERIODIC = 1;
+
+        [DllImport("kernel32.dll")]
+        private static extern uint SetThreadExecutionState(uint esFlags);
+
+        private const uint ES_CONTINUOUS = 0x80000000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateWaitableTimerExW(
+            IntPtr lpTimerAttributes, IntPtr lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+        [DllImport("kernel32.dll", SetLastError = false)]
+        private static extern bool SetWaitableTimerEx(
+            IntPtr hTimer, ref long lpDueTime, int lPeriod,
+            IntPtr pfnCompletionRoutine, IntPtr lpArgToCompletionRoutine,
+            IntPtr WakeContext, uint TolerableDelay);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+        private const uint TIMER_ALL_ACCESS = 0x1F0003;
+        private const uint INFINITE = 0xFFFFFFFF;
+
+        // ─────────────────────────────────────────────
+        //  IDisposable
+        // ─────────────────────────────────────────────
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            Stop();
+            // Tear down NFC here, after Stop() has halted the poll loop (so the
+            // suppression latch + a stopped sweep prevent a re-Start) but BEFORE
+            // ShutdownSdl() tears down the device list that ShutdownNfcReaders'
+            // FindOnlineDeviceByInstanceGuid walks. Calling it from
+            // InputService.Dispose after this object was already disposed risked
+            // a use-after-dispose whose swallowed throw would skip the actual
+            // NfcReaderService teardown (#150, round-4 finding).
+            ShutdownNfcReaders();
+            ShutdownMicrophoneDevices();
+            // Headset trackers ride the same teardown window: after Stop()
+            // so the suppress latch holds, before ShutdownSdl() tears down
+            // the device list the retire path walks.
+            ShutdownHeadsetMotionInputs();
+            ShutdownHandheldInputs();
+            ShutdownHeadTrackerInputs();
+            ShutdownLogitechGKeysInputs();
+            ShutdownAnalogKeyboardInputs();
+            ShutdownSdl();
+            _gyroTiltStates.Clear();
+            _gyroSimStates.Clear();
+            _disposed = true;
+
+            GC.SuppressFinalize(this);
+        }
+
+        ~InputManager()
+        {
+            Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Partial reference for SettingsManager — the actual implementation is in
+    /// Common/SettingsManager.cs. Properties are declared in Step1.
+    /// </summary>
+    public static partial class SettingsManager
+    {
+        // See SettingsManager.cs for methods.
+        // See InputManager.Step1.UpdateDevices.cs for UserDevices/UserSettings properties.
+    }
+}

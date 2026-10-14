@@ -1,0 +1,1448 @@
+﻿using System;
+using System.Runtime.InteropServices;
+
+namespace SDL3
+{
+    /// <summary>
+    /// Minimal SDL3 P/Invoke declarations for joystick and gamepad support.
+    /// Only the functions actually used by PadForge are declared here.
+    ///
+    /// Migrated from SDL2: key API changes include device-index enumeration
+    /// replaced by instance-ID enumeration, GameController renamed to Gamepad,
+    /// SDL_bool replaced with C bool, and consistent Verb-Noun function naming.
+    /// </summary>
+    public static class SDL
+    {
+        private const string lib = "SDL3";
+
+        // ─────────────────────────────────────────────
+        //  Init flags
+        // ─────────────────────────────────────────────
+
+        public const uint SDL_INIT_VIDEO = 0x00000020;
+        public const uint SDL_INIT_JOYSTICK = 0x00000200;
+        public const uint SDL_INIT_HAPTIC = 0x00001000;
+        public const uint SDL_INIT_GAMEPAD = 0x00002000; // was SDL_INIT_GAMECONTROLLER
+
+        // ─────────────────────────────────────────────
+        //  Hat constants (unchanged from SDL2)
+        // ─────────────────────────────────────────────
+
+        public const byte SDL_HAT_CENTERED = 0x00;
+        public const byte SDL_HAT_UP = 0x01;
+        public const byte SDL_HAT_RIGHT = 0x02;
+        public const byte SDL_HAT_DOWN = 0x04;
+        public const byte SDL_HAT_LEFT = 0x08;
+        public const byte SDL_HAT_RIGHTUP = SDL_HAT_RIGHT | SDL_HAT_UP;
+        public const byte SDL_HAT_RIGHTDOWN = SDL_HAT_RIGHT | SDL_HAT_DOWN;
+        public const byte SDL_HAT_LEFTUP = SDL_HAT_LEFT | SDL_HAT_UP;
+        public const byte SDL_HAT_LEFTDOWN = SDL_HAT_LEFT | SDL_HAT_DOWN;
+
+        // ─────────────────────────────────────────────
+        //  Hint strings
+        // ─────────────────────────────────────────────
+
+        public const string SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS = "SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS";
+        public const string SDL_HINT_JOYSTICK_RAWINPUT = "SDL_JOYSTICK_RAWINPUT";
+        public const string SDL_HINT_JOYSTICK_GAMEINPUT = "SDL_JOYSTICK_GAMEINPUT";
+        // SDL 3 kept SDL2's XInput switch name. SDL_JOYSTICK_XINPUT is SDL's
+        // build macro, not a hint, and setting it did nothing.
+        public const string SDL_HINT_XINPUT_ENABLED = "SDL_XINPUT_ENABLED";
+        public const string SDL_HINT_HIDAPI_IGNORE_DEVICES = "SDL_HIDAPI_IGNORE_DEVICES";
+        public const string SDL_HINT_JOYSTICK_BLACKLIST_DEVICES = "SDL_JOYSTICK_BLACKLIST_DEVICES";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_SWITCH2 = "SDL_JOYSTICK_HIDAPI_SWITCH2";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_WII = "SDL_JOYSTICK_HIDAPI_WII";
+        public const string SDL_HINT_JOYSTICK_BLE_SWITCH2 = "SDL_JOYSTICK_BLE_SWITCH2";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_JOYCON_IR_SENSOR = "SDL_JOYSTICK_HIDAPI_JOYCON_IR_SENSOR";
+        public const string SDL_HINT_JOYSTICK_BLE_SWITCH2_MOUSE = "SDL_JOYSTICK_BLE_SWITCH2_MOUSE";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_SWITCH_SHAPED_RUMBLE = "SDL_JOYSTICK_HIDAPI_SWITCH_SHAPED_RUMBLE";
+        public const string SDL_HINT_JOYSTICK_BLE_SWITCH2_MAGNETOMETER = "SDL_JOYSTICK_BLE_SWITCH2_MAGNETOMETER";
+        // Fork addition (SDL#15): drive the right Joy-Con / Pro Controller
+        // NFC MCU and surface tag UIDs via SDL_GetGamepadNfcTagUid. Opt-in
+        // (MCU costs battery + changes report cadence); runtime-toggleable.
+        public const string SDL_HINT_JOYSTICK_HIDAPI_SWITCH_NFC = "SDL_JOYSTICK_HIDAPI_SWITCH_NFC";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_PS3_SIXAXIS_DRIVER = "SDL_JOYSTICK_HIDAPI_PS3_SIXAXIS_DRIVER";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_FLYDIGI = "SDL_JOYSTICK_HIDAPI_FLYDIGI";
+        // Fork additions (hifihedgehog/SDL#33). InputManager.InitializeSdl
+        // says what each one turns on and why PadForge sets it.
+        public const string SDL_HINT_JOYSTICK_BLE = "SDL_JOYSTICK_BLE";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_DREAMCHEEKY = "SDL_JOYSTICK_HIDAPI_DREAMCHEEKY";
+        public const string SDL_HINT_JOYSTICK_ICADE_RAWINPUT = "SDL_JOYSTICK_ICADE_RAWINPUT";
+        public const string SDL_HINT_JOYSTICK_ICADE_DEVICES = "SDL_JOYSTICK_ICADE_DEVICES";
+        public const string SDL_HINT_JOYSTICK_DJI_REMOTE_TCP_HOSTS = "SDL_JOYSTICK_DJI_REMOTE_TCP_HOSTS";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_USIO = "SDL_JOYSTICK_HIDAPI_USIO";
+        public const string SDL_HINT_JOYSTICK_HIDAPI_USIO_LAYOUT = "SDL_JOYSTICK_HIDAPI_USIO_LAYOUT";
+        public const string SDL_HINT_JOYSTICK_SERIAL = "SDL_JOYSTICK_SERIAL";
+        // Konami's ACIO boards. InputManager.ApplySerialControllers sets it
+        // with the serial list.
+        public const string SDL_HINT_JOYSTICK_KONAMI_ACIO = "SDL_JOYSTICK_KONAMI_ACIO";
+        // The Ring-Con on a right Joy-Con's rail. InputService sets it only while
+        // a "Ring-Con Squeeze" or "Ring-Con Pull" source is read.
+        public const string SDL_HINT_JOYSTICK_HIDAPI_JOYCON_RINGCON = "SDL_JOYSTICK_HIDAPI_JOYCON_RINGCON";
+        public const string SDL_HINT_VIDEO_ALLOW_SCREENSAVER = "SDL_VIDEO_ALLOW_SCREENSAVER";
+
+        // ─────────────────────────────────────────────
+        //  Property constants
+        // ─────────────────────────────────────────────
+
+        public const string SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN = "SDL.joystick.cap.rumble";
+        public const string SDL_PROP_JOYSTICK_CAP_TRIGGER_RUMBLE_BOOLEAN = "SDL.joystick.cap.trigger_rumble";
+
+        // Set by the fork's Switch driver on a right Joy-Con: the Ring-Con's
+        // first nonzero strain after polling starts, 0 while none polls
+        // (docs/README-ringcon.md).
+        public const string SDL_PROP_JOYSTICK_SWITCH_RINGCON_REST_NUMBER = "SDL.joystick.switch.ringcon_rest";
+
+        // ─────────────────────────────────────────────
+        //  Enums
+        // ─────────────────────────────────────────────
+
+        public enum SDL_JoystickType : int
+        {
+            SDL_JOYSTICK_TYPE_UNKNOWN = 0,
+            SDL_JOYSTICK_TYPE_GAMEPAD = 1, // was SDL_JOYSTICK_TYPE_GAMECONTROLLER
+            SDL_JOYSTICK_TYPE_WHEEL = 2,
+            SDL_JOYSTICK_TYPE_ARCADE_STICK = 3,
+            SDL_JOYSTICK_TYPE_FLIGHT_STICK = 4,
+            SDL_JOYSTICK_TYPE_DANCE_PAD = 5,
+            SDL_JOYSTICK_TYPE_GUITAR = 6,
+            SDL_JOYSTICK_TYPE_DRUM_KIT = 7,
+            SDL_JOYSTICK_TYPE_ARCADE_PAD = 8,
+            SDL_JOYSTICK_TYPE_THROTTLE = 9,
+            SDL_JOYSTICK_TYPE_COUNT = 10
+        }
+
+        // ─────────────────────────────────────────────
+        //  Core lifecycle
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_Init")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_Init(uint flags);
+
+        /// <summary>
+        /// Initializes SDL subsystems. Returns true on success.
+        /// SDL3 change: returns bool instead of int.
+        /// </summary>
+        public static bool SDL_Init(uint flags) => _SDL_Init(flags);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_Quit();
+
+        // ─────────────────────────────────────────────
+        //  Logging (diagnostics capture)
+        // ─────────────────────────────────────────────
+
+        /// <summary>SDL_log.h:485: void (*)(void *userdata, int category,
+        /// SDL_LogPriority priority, const char *message). Priority enum at
+        /// SDL_log.h:130-140 (DEBUG = 3).</summary>
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate void SDL_LogOutputFunction(IntPtr userdata, int category, int priority, IntPtr message);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_SetLogPriorities(int priority);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_SetLogOutputFunction(SDL_LogOutputFunction callback, IntPtr userdata);
+
+        public const int SDL_LOG_PRIORITY_DEBUG = 3;
+
+        /// <summary>
+        /// Re-enables the screensaver and system sleep.  SDL disables both by
+        /// default when SDL_INIT_VIDEO is used.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool SDL_EnableScreenSaver();
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetError")]
+        private static extern IntPtr _SDL_GetError();
+
+        public static string SDL_GetError()
+        {
+            return Marshal.PtrToStringUTF8(_SDL_GetError()) ?? string.Empty;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetHint")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetHint(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string value);
+
+        public static bool SDL_SetHint(string name, string value) => _SDL_SetHint(name, value);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetHint")]
+        private static extern IntPtr _SDL_GetHint([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
+
+        public static string SDL_GetHint(string name)
+        {
+            IntPtr value = _SDL_GetHint(name);
+            return value == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(value);
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_free(IntPtr mem);
+
+        // ─────────────────────────────────────────────
+        //  Joystick enumeration (by instance ID)
+        //
+        //  SDL3 replaces SDL_NumJoysticks() + device-index-based
+        //  queries with SDL_GetJoysticks() returning an array of
+        //  SDL_JoystickID (uint) instance IDs.
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoysticks")]
+        private static extern IntPtr _SDL_GetJoysticks(out int count);
+
+        /// <summary>
+        /// Returns an array of instance IDs for all connected joysticks.
+        /// The caller does NOT need to free the array — this wrapper handles it.
+        /// </summary>
+        public static uint[] SDL_GetJoysticks()
+        {
+            IntPtr ptr = _SDL_GetJoysticks(out int count);
+            if (ptr == IntPtr.Zero)
+                return Array.Empty<uint>();
+
+            try
+            {
+                if (count <= 0) return Array.Empty<uint>();
+                var ids = new uint[count];
+                for (int i = 0; i < count; i++)
+                    ids[i] = unchecked((uint)Marshal.ReadInt32(ptr, i * 4));
+                return ids;
+            }
+            finally
+            {
+                SDL_free(ptr);
+            }
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickVendorForID(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickProductForID(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickProductVersionForID(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern SDL_JoystickType SDL_GetJoystickTypeForID(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickNameForID")]
+        private static extern IntPtr _SDL_GetJoystickNameForID(uint instance_id);
+
+        public static string SDL_GetJoystickNameForID(uint instance_id)
+        {
+            return Marshal.PtrToStringUTF8(_SDL_GetJoystickNameForID(instance_id)) ?? string.Empty;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickPathForID")]
+        private static extern IntPtr _SDL_GetJoystickPathForID(uint instance_id);
+
+        public static string SDL_GetJoystickPathForID(uint instance_id)
+        {
+            IntPtr ptr = _SDL_GetJoystickPathForID(instance_id);
+            return ptr != IntPtr.Zero ? (Marshal.PtrToStringUTF8(ptr) ?? string.Empty) : string.Empty;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_IsGamepad")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_IsGamepad(uint instance_id);
+
+        /// <summary>
+        /// Returns true if the joystick is recognized as a gamepad.
+        /// SDL3 change: renamed from SDL_IsGameController, takes instance ID.
+        /// </summary>
+        public static bool SDL_IsGamepad(uint instance_id) => _SDL_IsGamepad(instance_id);
+
+        // ─────────────────────────────────────────────
+        //  Custom gamepad mappings
+        // ─────────────────────────────────────────────
+
+        /// <summary>Load gamepad mappings from a file (SDL gamecontrollerdb.txt format). Returns number of mappings added, or -1 on error.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_AddGamepadMappingsFromFile([MarshalAs(UnmanagedType.LPUTF8Str)] string file);
+
+        /// <summary>Add a single gamepad mapping string. Returns 1 if new, 0 if updated, -1 on error.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_AddGamepadMapping([MarshalAs(UnmanagedType.LPUTF8Str)] string mapping);
+
+        /// <summary>Get the current mapping string for a gamepad. Returns null if no mapping. Caller must SDL_free the result.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr SDL_GetGamepadMapping(IntPtr gamepad);
+
+        /// <summary>Get the mapping string for an open gamepad as a managed string.</summary>
+        public static string GetGamepadMapping(IntPtr gamepad)
+        {
+            IntPtr ptr = SDL_GetGamepadMapping(gamepad);
+            if (ptr == IntPtr.Zero) return null;
+            string result = Marshal.PtrToStringUTF8(ptr);
+            SDL_free(ptr);
+            return result;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Joystick instance (opened device)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Opens a joystick by instance ID. SDL3 change: takes instance ID instead of device index.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr SDL_OpenJoystick(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_CloseJoystick(IntPtr joystick);
+
+        /// <summary>
+        /// Returns the instance ID of an opened joystick.
+        /// SDL3 change: returns uint (0 = error), was int (negative = error).
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint SDL_GetJoystickID(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_JoystickConnected")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_JoystickConnected(IntPtr joystick);
+
+        /// <summary>Returns true if the joystick is still connected.</summary>
+        public static bool SDL_JoystickConnected(IntPtr joystick) => _SDL_JoystickConnected(joystick);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad (was GameController)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Opens a gamepad by instance ID.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr SDL_OpenGamepad(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_CloseGamepad(IntPtr gamepad);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr SDL_GetGamepadJoystick(IntPtr gamepad);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad state polling (standardized layout)
+        //
+        //  SDL_GetGamepadAxis / SDL_GetGamepadButton read through SDL's
+        //  built-in gamecontrollerdb mapping layer. Any recognized device
+        //  (DualSense, DualShock, Switch Pro, etc.) is remapped to the
+        //  standardized Xbox-like layout automatically.
+        //
+        //  Axis enum (SDL_GamepadAxis):
+        //    LEFTX=0, LEFTY=1, RIGHTX=2, RIGHTY=3,
+        //    LEFT_TRIGGER=4, RIGHT_TRIGGER=5
+        //
+        //  Button enum (SDL_GamepadButton):
+        //    SOUTH/A=0, EAST/B=1, WEST/X=2, NORTH/Y=3,
+        //    BACK=4, GUIDE=5, START=6,
+        //    LEFT_STICK=7, RIGHT_STICK=8,
+        //    LEFT_SHOULDER=9, RIGHT_SHOULDER=10,
+        //    DPAD_UP=11, DPAD_DOWN=12, DPAD_LEFT=13, DPAD_RIGHT=14,
+        //    MISC1=15, RIGHT_PADDLE1=16, LEFT_PADDLE1=17,
+        //    RIGHT_PADDLE2=18, LEFT_PADDLE2=19, TOUCHPAD=20
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern short SDL_GetGamepadAxis(IntPtr gamepad, int axis);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadButton")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetGamepadButton(IntPtr gamepad, int button);
+
+        public static bool SDL_GetGamepadButton(IntPtr gamepad, int button) =>
+            _SDL_GetGamepadButton(gamepad, button);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GamepadHasButton")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GamepadHasButton(IntPtr gamepad, int button);
+
+        public static bool SDL_GamepadHasButton(IntPtr gamepad, int button) =>
+            _SDL_GamepadHasButton(gamepad, button);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GamepadHasAxis")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GamepadHasAxis(IntPtr gamepad, int axis);
+
+        public static bool SDL_GamepadHasAxis(IntPtr gamepad, int axis) =>
+            _SDL_GamepadHasAxis(gamepad, axis);
+
+        // Gamepad axis indices (SDL_GamepadAxis enum).
+        public const int SDL_GAMEPAD_AXIS_LEFTX = 0;
+        public const int SDL_GAMEPAD_AXIS_LEFTY = 1;
+        public const int SDL_GAMEPAD_AXIS_RIGHTX = 2;
+        public const int SDL_GAMEPAD_AXIS_RIGHTY = 3;
+        public const int SDL_GAMEPAD_AXIS_LEFT_TRIGGER = 4;
+        public const int SDL_GAMEPAD_AXIS_RIGHT_TRIGGER = 5;
+        public const int SDL_GAMEPAD_AXIS_COUNT = 6;
+
+        // Gamepad button indices (SDL_GamepadButton enum).
+        public const int SDL_GAMEPAD_BUTTON_SOUTH = 0;   // A
+        public const int SDL_GAMEPAD_BUTTON_EAST = 1;    // B
+        public const int SDL_GAMEPAD_BUTTON_WEST = 2;    // X
+        public const int SDL_GAMEPAD_BUTTON_NORTH = 3;   // Y
+        public const int SDL_GAMEPAD_BUTTON_BACK = 4;
+        public const int SDL_GAMEPAD_BUTTON_GUIDE = 5;
+        public const int SDL_GAMEPAD_BUTTON_START = 6;
+        public const int SDL_GAMEPAD_BUTTON_LEFT_STICK = 7;
+        public const int SDL_GAMEPAD_BUTTON_RIGHT_STICK = 8;
+        public const int SDL_GAMEPAD_BUTTON_LEFT_SHOULDER = 9;
+        public const int SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER = 10;
+        public const int SDL_GAMEPAD_BUTTON_DPAD_UP = 11;
+        public const int SDL_GAMEPAD_BUTTON_DPAD_DOWN = 12;
+        public const int SDL_GAMEPAD_BUTTON_DPAD_LEFT = 13;
+        public const int SDL_GAMEPAD_BUTTON_DPAD_RIGHT = 14;
+        public const int SDL_GAMEPAD_BUTTON_MISC1 = 15;
+        public const int SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1 = 16;
+        public const int SDL_GAMEPAD_BUTTON_LEFT_PADDLE1 = 17;
+        public const int SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2 = 18;
+        public const int SDL_GAMEPAD_BUTTON_LEFT_PADDLE2 = 19;
+        public const int SDL_GAMEPAD_BUTTON_TOUCHPAD = 20;
+        public const int SDL_GAMEPAD_BUTTON_MISC2 = 21;
+        public const int SDL_GAMEPAD_BUTTON_MISC3 = 22;
+        public const int SDL_GAMEPAD_BUTTON_MISC4 = 23;
+        public const int SDL_GAMEPAD_BUTTON_MISC5 = 24;
+        public const int SDL_GAMEPAD_BUTTON_MISC6 = 25;
+        public const int SDL_GAMEPAD_BUTTON_COUNT = 26;
+
+        // ─────────────────────────────────────────────
+        //  Joystick state polling
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_UpdateJoysticks();
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_PumpEvents();
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern short SDL_GetJoystickAxis(IntPtr joystick, int axis);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickButton")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetJoystickButton(IntPtr joystick, int button);
+
+        /// <summary>
+        /// Returns true if the button is pressed.
+        /// SDL3 change: returns bool instead of byte.
+        /// </summary>
+        public static bool SDL_GetJoystickButton(IntPtr joystick, int button) =>
+            _SDL_GetJoystickButton(joystick, button);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern byte SDL_GetJoystickHat(IntPtr joystick, int hat);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumJoystickAxes(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumJoystickButtons(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumJoystickHats(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumJoystickBalls(IntPtr joystick);
+
+        /// <summary>A trackball's relative motion since the previous call:
+        /// SDL sums each ball's motion and zeroes it on every read
+        /// (SDL_joystick.c).</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool SDL_GetJoystickBall(IntPtr joystick, int ball, out int dx, out int dy);
+
+        // ─────────────────────────────────────────────
+        //  Joystick properties (from opened instance)
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickName")]
+        private static extern IntPtr _SDL_GetJoystickName(IntPtr joystick);
+
+        public static string SDL_GetJoystickName(IntPtr joystick)
+        {
+            return Marshal.PtrToStringUTF8(_SDL_GetJoystickName(joystick)) ?? string.Empty;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickVendor(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickProduct(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern ushort SDL_GetJoystickProductVersion(IntPtr joystick);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_GUID
+        {
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+            public byte[] data;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern SDL_GUID SDL_GetJoystickGUID(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GUIDToString(SDL_GUID guid, byte[] pszGUID, int cbGUID);
+
+        public static string GetJoystickGUIDString(IntPtr joystick)
+        {
+            var guid = SDL_GetJoystickGUID(joystick);
+            byte[] buf = new byte[33];
+            SDL_GUIDToString(guid, buf, buf.Length);
+            return System.Text.Encoding.ASCII.GetString(buf).TrimEnd('\0');
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern SDL_JoystickType SDL_GetJoystickType(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickPath")]
+        private static extern IntPtr _SDL_GetJoystickPath(IntPtr joystick);
+
+        public static string SDL_GetJoystickPath(IntPtr joystick)
+        {
+            IntPtr ptr = _SDL_GetJoystickPath(joystick);
+            return ptr != IntPtr.Zero ? (Marshal.PtrToStringUTF8(ptr) ?? string.Empty) : string.Empty;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickSerial")]
+        private static extern IntPtr _SDL_GetJoystickSerial(IntPtr joystick);
+
+        public static string SDL_GetJoystickSerial(IntPtr joystick)
+        {
+            IntPtr ptr = _SDL_GetJoystickSerial(joystick);
+            return ptr != IntPtr.Zero ? Marshal.PtrToStringUTF8(ptr) : null;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Properties system (for capability queries)
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint SDL_GetJoystickProperties(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetBooleanProperty")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetBooleanProperty(
+            uint props,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            [MarshalAs(UnmanagedType.U1)] bool default_value);
+
+        public static bool SDL_GetBooleanProperty(uint props, string name, bool defaultValue) =>
+            _SDL_GetBooleanProperty(props, name, defaultValue);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern long SDL_GetNumberProperty(
+            uint props,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            long defaultValue);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetStringProperty")]
+        private static extern IntPtr _SDL_GetStringProperty(
+            uint props,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string default_value);
+
+        /// <summary>Reads a string property (e.g. the Wii Balance Board calibration
+        /// hex blob, "SDL.joystick.wii.balance_board_calibration", issue #146).
+        /// Returns <paramref name="defaultValue"/> when the property is unset.</summary>
+        public static string SDL_GetStringProperty(uint props, string name, string defaultValue)
+        {
+            // SDL can return its default argument. Keep that fallback in managed memory.
+            IntPtr ptr = _SDL_GetStringProperty(props, name, null);
+            return ptr != IntPtr.Zero ? (Marshal.PtrToStringUTF8(ptr) ?? defaultValue) : defaultValue;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Power info (replaces SDL_JoystickCurrentPowerLevel)
+        // ─────────────────────────────────────────────
+
+        // SDL_PowerState
+        public const int SDL_POWERSTATE_ERROR    = -1;
+        public const int SDL_POWERSTATE_UNKNOWN  =  0;
+        public const int SDL_POWERSTATE_ON_BATTERY = 1;
+        public const int SDL_POWERSTATE_NO_BATTERY = 2;
+        public const int SDL_POWERSTATE_CHARGING  = 3;
+        public const int SDL_POWERSTATE_CHARGED   = 4;
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadPowerInfo")]
+        private static extern int _SDL_GetGamepadPowerInfo(IntPtr gamepad, out int percent);
+
+        /// <summary>Returns the gamepad's power state and writes the battery percentage
+        /// (0-100, or -1 if unknown) to <paramref name="percent"/>.</summary>
+        public static int SDL_GetGamepadPowerInfo(IntPtr gamepad, out int percent) =>
+            _SDL_GetGamepadPowerInfo(gamepad, out percent);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad sensors (gyro / accelerometer)
+        // ─────────────────────────────────────────────
+
+        // SDL_SensorType enum values
+        public const int SDL_SENSOR_ACCEL = 1;
+        public const int SDL_SENSOR_GYRO = 2;
+        public const int SDL_SENSOR_ACCEL_L = 3;
+        public const int SDL_SENSOR_GYRO_L = 4;
+        public const int SDL_SENSOR_ACCEL_R = 5;
+        public const int SDL_SENSOR_GYRO_R = 6;
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GamepadHasSensor")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GamepadHasSensor(IntPtr gamepad, int type);
+
+        /// <summary>Returns true if the gamepad has the specified sensor type.</summary>
+        public static bool SDL_GamepadHasSensor(IntPtr gamepad, int type) =>
+            _SDL_GamepadHasSensor(gamepad, type);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetGamepadSensorEnabled")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetGamepadSensorEnabled(IntPtr gamepad, int type,
+            [MarshalAs(UnmanagedType.U1)] bool enabled);
+
+        /// <summary>Enables or disables data reporting for the specified sensor.</summary>
+        public static bool SDL_SetGamepadSensorEnabled(IntPtr gamepad, int type, bool enabled) =>
+            _SDL_SetGamepadSensorEnabled(gamepad, type, enabled);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadSensorData")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetGamepadSensorData(IntPtr gamepad, int type,
+            [Out] float[] data, int num_values);
+
+        /// <summary>
+        /// Reads sensor data. For gyro: 3 floats (X, Y, Z) in radians/second.
+        /// For accel: 3 floats (X, Y, Z) in m/s².
+        /// </summary>
+        public static bool SDL_GetGamepadSensorData(IntPtr gamepad, int type, float[] data, int num_values) =>
+            _SDL_GetGamepadSensorData(gamepad, type, data, num_values);
+
+        // ─────────────────────────────────────────────
+        //  Joystick sensors (SDL 3.6)
+        // ─────────────────────────────────────────────
+        //
+        // The same sensors on a device SDL opens as a joystick only, with no
+        // gamepad mapping. SDL_GetGamepadSensorData reads through
+        // SDL_GetJoystickSensorData on the gamepad's joystick (SDL_gamepad.c).
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_JoystickHasSensor")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_JoystickHasSensor(IntPtr joystick, int type);
+
+        /// <summary>Returns true if the joystick has the specified sensor type.</summary>
+        public static bool SDL_JoystickHasSensor(IntPtr joystick, int type) =>
+            _SDL_JoystickHasSensor(joystick, type);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickSensorEnabled")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetJoystickSensorEnabled(IntPtr joystick, int type,
+            [MarshalAs(UnmanagedType.U1)] bool enabled);
+
+        /// <summary>Enables or disables data reporting for the specified joystick sensor.</summary>
+        public static bool SDL_SetJoystickSensorEnabled(IntPtr joystick, int type, bool enabled) =>
+            _SDL_SetJoystickSensorEnabled(joystick, type, enabled);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetJoystickSensorData")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetJoystickSensorData(IntPtr joystick, int type,
+            [Out] float[] data, int num_values);
+
+        /// <summary>Reads joystick sensor data, in the units
+        /// <see cref="SDL_GetGamepadSensorData"/> uses.</summary>
+        public static bool SDL_GetJoystickSensorData(IntPtr joystick, int type, float[] data, int num_values) =>
+            _SDL_GetJoystickSensorData(joystick, type, data, num_values);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad capsense (stick-top / grip touch)
+        // ─────────────────────────────────────────────
+
+        // SDL_GamepadCapSenseType enum values (fork, SDL_gamepad.h since 3.6.0)
+        public const int SDL_GAMEPAD_CAPSENSE_LEFT_STICK = 0;
+        public const int SDL_GAMEPAD_CAPSENSE_RIGHT_STICK = 1;
+        public const int SDL_GAMEPAD_CAPSENSE_LEFT_GRIP = 2;
+        public const int SDL_GAMEPAD_CAPSENSE_RIGHT_GRIP = 3;
+        public const int SDL_GAMEPAD_CAPSENSE_COUNT = 4;
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GamepadHasCapSense")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GamepadHasCapSense(IntPtr gamepad, int type);
+
+        /// <summary>Returns true if the gamepad has the specified capsense channel.</summary>
+        public static bool SDL_GamepadHasCapSense(IntPtr gamepad, int type) =>
+            _SDL_GamepadHasCapSense(gamepad, type);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadCapSense")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetGamepadCapSense(IntPtr gamepad, int type);
+
+        /// <summary>Reads a capsense channel: true while touched.</summary>
+        public static bool SDL_GetGamepadCapSense(IntPtr gamepad, int type) =>
+            _SDL_GetGamepadCapSense(gamepad, type);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad touchpad
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumGamepadTouchpads(IntPtr gamepad);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumGamepadTouchpadFingers(IntPtr gamepad, int touchpad);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadTouchpadFinger")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetGamepadTouchpadFinger(
+            IntPtr gamepad, int touchpad, int finger,
+            [MarshalAs(UnmanagedType.U1)] out bool down,
+            out float x, out float y, out float pressure);
+
+        /// <summary>
+        /// Gets the state of a touchpad finger. x/y are normalized 0-1, pressure is 0-1.
+        /// Returns true on success.
+        /// </summary>
+        public static bool SDL_GetGamepadTouchpadFinger(
+            IntPtr gamepad, int touchpad, int finger,
+            out bool down, out float x, out float y, out float pressure) =>
+            _SDL_GetGamepadTouchpadFinger(gamepad, touchpad, finger,
+                out down, out x, out y, out pressure);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetGamepadNfcTagUid")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_GetGamepadNfcTagUid(IntPtr gamepad, byte[] uid, int len);
+
+        // 0 = unprobed, 1 = present, -1 = absent (stock SDL). Process-wide.
+        // PADFORGE_NO_SWITCH_NFC=1 disables the path at launch (bisect switch).
+        private static int s_nfcProbe =
+            Environment.GetEnvironmentVariable("PADFORGE_NO_SWITCH_NFC") == "1" ? -1 : 0;
+
+        /// <summary>Longest UID is 10 bytes of hex = 20 chars + NUL, per the
+        /// fork's documented buffer guarantee (SDL_GetGamepadNfcTagUid).</summary>
+        public const int NfcTagUidBufferLength = 21;
+
+        /// <summary>Reads the NFC tag UID currently held against a Switch
+        /// right Joy-Con / Pro Controller reader (fork export). Returns true
+        /// with <paramref name="uid"/> set to lowercase hex when a tag is
+        /// present, false (and empty) otherwise. On stock SDL the export is
+        /// absent: returns false permanently after the first probe, so the
+        /// caller simply never sees a controller tag.</summary>
+        public static bool SDL_TryGetGamepadNfcTagUid(IntPtr gamepad, out string uid)
+        {
+            uid = string.Empty;
+            if (s_nfcProbe < 0) return false;
+            var buf = new byte[NfcTagUidBufferLength];
+            try
+            {
+                bool present = _SDL_GetGamepadNfcTagUid(gamepad, buf, buf.Length);
+                s_nfcProbe = 1;
+                if (!present) return false;
+                int n = System.Array.IndexOf(buf, (byte)0);
+                if (n < 0) n = buf.Length;
+                // Reject a malformed native payload rather than register
+                // junk: a real UID is 1..20 lowercase-hex chars,
+                // even length. An ABI-skewed export filling the buffer with
+                // non-terminated data fails this and reads as "no tag".
+                if (n == 0 || n > 20 || (n & 1) != 0) return false;
+                for (int i = 0; i < n; i++)
+                {
+                    byte c = buf[i];
+                    bool hex = (c >= (byte)'0' && c <= (byte)'9')
+                            || (c >= (byte)'a' && c <= (byte)'f');
+                    if (!hex) return false;
+                }
+                uid = System.Text.Encoding.ASCII.GetString(buf, 0, n);
+                return true;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                s_nfcProbe = -1;
+                return false;
+            }
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_ICadeProcessRawKeyboard")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_ICadeProcessRawKeyboard(IntPtr device_handle, ushort make_code, ushort flags);
+
+        // Cleared by the first call into an SDL3.dll without the export, so
+        // an older DLL costs one exception rather than one per keystroke.
+        private static volatile bool s_icadeExport = true;
+
+        /// <summary>Hands one Raw Input keyboard record to the fork's iCade
+        /// driver (hifihedgehog/SDL#33 Part 16). True when the driver decodes
+        /// that keyboard as an iCade, which makes the record the iCade
+        /// joystick's. A record with make code 0 and RI_KEY_BREAK set only
+        /// asks whether the handle is an iCade and moves no control. False
+        /// before SDL_Init, after SDL_Quit, and on a DLL without the export.
+        /// The call takes only the driver's own lock, so any thread may make
+        /// it.</summary>
+        public static bool SDL_ICadeProcessRawKeyboard(IntPtr deviceHandle, ushort makeCode, ushort flags)
+        {
+            if (!s_icadeExport) return false;
+            try
+            {
+                return _SDL_ICadeProcessRawKeyboard(deviceHandle, makeCode, flags);
+            }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException)
+            {
+                s_icadeExport = false;
+                return false;
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Rumble / haptics
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Rumble a joystick for a specified duration.
+        /// SDL3 change: renamed from SDL_JoystickRumble, returns bool.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_RumbleJoystick")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_RumbleJoystick(
+            IntPtr joystick,
+            ushort low_frequency_rumble,
+            ushort high_frequency_rumble,
+            uint duration_ms);
+
+        public static bool SDL_RumbleJoystick(IntPtr joystick,
+            ushort low_frequency_rumble, ushort high_frequency_rumble, uint duration_ms) =>
+            _SDL_RumbleJoystick(joystick, low_frequency_rumble, high_frequency_rumble, duration_ms);
+
+        /// <summary>
+        /// Set a joystick's player index. Hidapi drivers with player
+        /// LEDs respond by lighting them (Switch subcommand 0x30, Wii
+        /// 4-LED map, Switch 2 bulk command); Windows backend stubs
+        /// (XInput / DInput / rawinput / WGI) are no-ops.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickPlayerIndex")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetJoystickPlayerIndex(IntPtr joystick, int player_index);
+
+        public static bool SDL_SetJoystickPlayerIndex(IntPtr joystick, int player_index) =>
+            _SDL_SetJoystickPlayerIndex(joystick, player_index);
+
+        /// <summary>
+        /// Set a joystick's LED color. The Switch HIDAPI driver treats
+        /// max(r, g, b), scaled 0-100, as HOME button LED brightness
+        /// (SDL_hidapi_switch.c HIDAPI_DriverSwitch_SetJoystickLED to
+        /// SetHomeLED, subcommand 0x38); the combined Joy-Con pair driver
+        /// forwards to both children and the right one acts
+        /// (SDL_hidapi_combined.c HIDAPI_DriverCombined_SetJoystickLED).
+        /// Drivers without an LED return false (SDL_Unsupported). SDL
+        /// core dedups same-value writes per joystick
+        /// (SDL_joystick.c SDL_SetJoystickLED led_red/green/blue cache).
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickLED")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetJoystickLED(IntPtr joystick, byte red, byte green, byte blue);
+
+        public static bool SDL_SetJoystickLED(IntPtr joystick, byte red, byte green, byte blue) =>
+            _SDL_SetJoystickLED(joystick, red, green, blue);
+
+        // True iff the joystick is an SDL virtual joystick (its driver is the virtual
+        // backend). Used to tell the two DS3 transports apart: they share VID/PID
+        // 054C/0268, but the BT bridge is a virtual joystick (owned by Ds3DirectService)
+        // while the USB SXS pad is a real hidapi device (owned by SDL's sixaxis driver).
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_IsJoystickVirtual")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_IsJoystickVirtual(uint instance_id);
+
+        public static bool SDL_IsJoystickVirtual(uint instance_id) =>
+            _SDL_IsJoystickVirtual(instance_id);
+
+        /// <summary>
+        /// Rumble a gamepad's impulse-trigger motors (Xbox One+ family).
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_RumbleGamepadTriggers")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_RumbleGamepadTriggers(
+            IntPtr gamepad,
+            ushort left_rumble,
+            ushort right_rumble,
+            uint duration_ms);
+
+        public static bool SDL_RumbleGamepadTriggers(IntPtr gamepad,
+            ushort left_rumble, ushort right_rumble, uint duration_ms) =>
+            _SDL_RumbleGamepadTriggers(gamepad, left_rumble, right_rumble, duration_ms);
+
+        // ─────────────────────────────────────────────
+        //  Gamepad effect (DualSense / DS4 vendor output reports)
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Sends a low-level vendor-specific effect packet to the gamepad's
+        /// underlying device.  For DualSense / DualSense Edge this carries
+        /// adaptive trigger commands, lightbar RGB, audio bytes, and rumble
+        /// in a single 47-byte (USB) / 63-byte (Edge USB) / 141-byte (BT)
+        /// effect message.  PadForge owns the byte layout per Sony's PS5
+        /// SDK conventions; SDL handles the wire transport (USB / BT
+        /// framing) for the target's connection type.
+        ///
+        /// <para>Slouken sanctioned this path for adaptive trigger output
+        /// in libsdl-org/SDL #5125 — explicitly outside the haptics API.</para>
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SendGamepadEffect")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SendGamepadEffect(IntPtr gamepad, IntPtr data, int size);
+
+        /// <summary>Wrapper around <c>SDL_SendGamepadEffect</c>.  Returns
+        /// true on success.  No-op when <paramref name="gamepad"/> is
+        /// IntPtr.Zero or <paramref name="data"/> is null/empty.  The
+        /// payload is pinned via GCHandle for the duration of the native
+        /// call so the engine project doesn't need <c>AllowUnsafeBlocks</c>.</summary>
+        public static bool SDL_SendGamepadEffect(IntPtr gamepad, byte[] data, int offset, int length)
+        {
+            if (gamepad == IntPtr.Zero) return false;
+            if (data == null || length <= 0) return false;
+            if (offset < 0 || offset + length > data.Length) return false;
+
+            var handle = System.Runtime.InteropServices.GCHandle.Alloc(
+                data, System.Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {
+                IntPtr ptr = System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(data, offset);
+                return _SDL_SendGamepadEffect(gamepad, ptr, length);
+            }
+            finally
+            {
+                handle.Free();
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Haptic (force feedback) — constants
+        // ─────────────────────────────────────────────
+
+        public const uint SDL_HAPTIC_CONSTANT     = 1u << 0;
+        public const uint SDL_HAPTIC_SINE         = 1u << 1;
+        public const uint SDL_HAPTIC_SQUARE       = 1u << 2;
+        public const uint SDL_HAPTIC_TRIANGLE     = 1u << 3;
+        public const uint SDL_HAPTIC_SAWTOOTHUP   = 1u << 4;
+        public const uint SDL_HAPTIC_SAWTOOTHDOWN = 1u << 5;
+        public const uint SDL_HAPTIC_RAMP         = 1u << 6;
+        public const uint SDL_HAPTIC_SPRING       = 1u << 7;
+        public const uint SDL_HAPTIC_DAMPER        = 1u << 8;
+        public const uint SDL_HAPTIC_INERTIA      = 1u << 9;
+        public const uint SDL_HAPTIC_FRICTION     = 1u << 10;
+        public const uint SDL_HAPTIC_LEFTRIGHT    = 1u << 11;
+        public const uint SDL_HAPTIC_CUSTOM       = 1u << 15;
+        public const uint SDL_HAPTIC_GAIN         = 1u << 16;
+        public const uint SDL_HAPTIC_AUTOCENTER   = 1u << 17;
+
+        public const uint SDL_HAPTIC_INFINITY = 0xFFFFFFFFu;
+
+        // Direction types (SDL_HapticDirectionType = Uint8)
+        public const byte SDL_HAPTIC_POLAR         = 0;
+        public const byte SDL_HAPTIC_CARTESIAN     = 1;
+        public const byte SDL_HAPTIC_SPHERICAL     = 2;
+        public const byte SDL_HAPTIC_STEERING_AXIS = 3;
+
+        // ─────────────────────────────────────────────
+        //  Haptic structs
+        // ─────────────────────────────────────────────
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticDirection
+        {
+            public byte type;       // SDL_HapticDirectionType (Uint8)
+            private byte _pad1;
+            private byte _pad2;
+            private byte _pad3;
+            public int dir0;        // dir[3] as individual fields (Sint32)
+            public int dir1;
+            public int dir2;
+        } // 16 bytes
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticLeftRight
+        {
+            public ushort type;              // SDL_HAPTIC_LEFTRIGHT
+            private ushort _pad;
+            public uint length;              // Duration in ms
+            public ushort large_magnitude;   // 0–65535
+            public ushort small_magnitude;   // 0–65535
+        } // 12 bytes
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticConstant
+        {
+            public ushort type;              // SDL_HAPTIC_CONSTANT
+            private ushort _pad;
+            public SDL_HapticDirection direction;
+            public uint length;              // Duration in ms
+            public ushort delay;
+            public ushort button;
+            public ushort interval;
+            public short level;              // -32768 to 32767
+            public ushort attack_length;
+            public ushort attack_level;
+            public ushort fade_length;
+            public ushort fade_level;
+        } // 40 bytes
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticPeriodic
+        {
+            public ushort type;              // SDL_HAPTIC_SINE, etc.
+            private ushort _pad;
+            public SDL_HapticDirection direction;
+            public uint length;              // Duration in ms
+            public ushort delay;
+            public ushort button;
+            public ushort interval;
+            public ushort period;            // Period in ms
+            public short magnitude;          // Peak value -32767 to 32767
+            public short offset;             // Mean value
+            public ushort phase;             // Phase shift 0–35999 (hundredths of degrees)
+            public ushort attack_length;
+            public ushort attack_level;
+            public ushort fade_length;
+            public ushort fade_level;
+        } // 44 bytes
+
+        /// <summary>
+        /// SDL_HapticCondition — used for Spring, Damper, Friction, Inertia effects.
+        /// Each axis has independent coefficients, saturation, center, and deadband.
+        /// SDL supports up to 3 axes; we expose them as individual fields.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticCondition
+        {
+            public ushort type;              // SDL_HAPTIC_SPRING / DAMPER / INERTIA / FRICTION
+            private ushort _pad;
+            public SDL_HapticDirection direction;
+            public uint length;              // Duration in ms
+            public ushort delay;
+            public ushort button;
+            public ushort interval;
+            // NO padding here. In the C ABI right_sat[0] follows `interval` directly at
+            // offset 30 (interval is a Uint16 at offset 28, already 2-aligned). A stray
+            // pad shifts every condition parameter 2 bytes, so SDL reads coeff/saturation
+            // as 0 and the effect (spring/damper/friction/inertia + the auto-center
+            // spring) applies no force. Verified vs SDL_haptic.h field order.
+            // Per-axis arrays (3 axes max) — flattened as individual fields
+            public ushort right_sat0, right_sat1, right_sat2;   // Positive saturation 0–65535
+            public ushort left_sat0, left_sat1, left_sat2;      // Negative saturation 0–65535
+            public short right_coeff0, right_coeff1, right_coeff2; // Positive coefficient
+            public short left_coeff0, left_coeff1, left_coeff2;   // Negative coefficient
+            public ushort deadband0, deadband1, deadband2;      // Dead band 0–65535
+            public short center0, center1, center2;             // Center point
+        } // 68 bytes
+
+        /// <summary>
+        /// SDL_HapticRamp — ramp force effect (linearly changing force).
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_HapticRamp
+        {
+            public ushort type;              // SDL_HAPTIC_RAMP
+            private ushort _pad;
+            public SDL_HapticDirection direction;
+            public uint length;              // Duration in ms
+            public ushort delay;
+            public ushort button;
+            public ushort interval;
+            public short start;              // Start level -32767 to 32767
+            public short end;                // End level -32767 to 32767
+            public ushort attack_length;
+            public ushort attack_level;
+            public ushort fade_length;
+            public ushort fade_level;
+        } // 44 bytes
+
+        /// <summary>
+        /// SDL_HapticEffect union. Uses explicit layout to overlay all effect types.
+        /// Size = largest member (SDL_HapticCondition at 68 bytes).
+        /// We use 72 bytes for safety margin across compilers/platforms.
+        /// </summary>
+        [StructLayout(LayoutKind.Explicit, Size = 72)]
+        public struct SDL_HapticEffect
+        {
+            [FieldOffset(0)] public ushort type;
+            [FieldOffset(0)] public SDL_HapticLeftRight leftright;
+            [FieldOffset(0)] public SDL_HapticConstant constant;
+            [FieldOffset(0)] public SDL_HapticPeriodic periodic;
+            [FieldOffset(0)] public SDL_HapticCondition condition;
+            [FieldOffset(0)] public SDL_HapticRamp ramp;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Haptic functions
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr SDL_OpenHapticFromJoystick(IntPtr joystick);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_CloseHaptic(IntPtr haptic);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint SDL_GetHapticFeatures(IntPtr haptic);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_CreateHapticEffect(IntPtr haptic, ref SDL_HapticEffect effect);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_UpdateHapticEffect")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_UpdateHapticEffect(IntPtr haptic, int effect, ref SDL_HapticEffect data);
+
+        public static bool SDL_UpdateHapticEffect(IntPtr haptic, int effect, ref SDL_HapticEffect data) =>
+            _SDL_UpdateHapticEffect(haptic, effect, ref data);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_RunHapticEffect")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_RunHapticEffect(IntPtr haptic, int effect, uint iterations);
+
+        public static bool SDL_RunHapticEffect(IntPtr haptic, int effect, uint iterations) =>
+            _SDL_RunHapticEffect(haptic, effect, iterations);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_StopHapticEffect")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_StopHapticEffect(IntPtr haptic, int effect);
+
+        public static bool SDL_StopHapticEffect(IntPtr haptic, int effect) =>
+            _SDL_StopHapticEffect(haptic, effect);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void SDL_DestroyHapticEffect(IntPtr haptic, int effect);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetHapticGain")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool _SDL_SetHapticGain(IntPtr haptic, int gain);
+
+        public static bool SDL_SetHapticGain(IntPtr haptic, int gain) =>
+            _SDL_SetHapticGain(haptic, gain);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetNumHapticAxes(IntPtr haptic);
+
+        // ─────────────────────────────────────────────
+        //  Keyboard enumeration and state
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetKeyboards")]
+        private static extern IntPtr _SDL_GetKeyboards(out int count);
+
+        /// <summary>
+        /// Returns an array of instance IDs for all connected keyboards.
+        /// </summary>
+        public static uint[] SDL_GetKeyboards()
+        {
+            IntPtr ptr = _SDL_GetKeyboards(out int count);
+            if (ptr == IntPtr.Zero)
+                return Array.Empty<uint>();
+
+            try
+            {
+                if (count <= 0) return Array.Empty<uint>();
+                var ids = new uint[count];
+                for (int i = 0; i < count; i++)
+                    ids[i] = unchecked((uint)Marshal.ReadInt32(ptr, i * 4));
+                return ids;
+            }
+            finally
+            {
+                SDL_free(ptr);
+            }
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetKeyboardNameForID")]
+        private static extern IntPtr _SDL_GetKeyboardNameForID(uint instance_id);
+
+        public static string SDL_GetKeyboardNameForID(uint instance_id)
+        {
+            return Marshal.PtrToStringUTF8(_SDL_GetKeyboardNameForID(instance_id)) ?? "Keyboard";
+        }
+
+        /// <summary>
+        /// Returns a pointer to an array of booleans (one per SDL_Scancode) representing key states.
+        /// The pointer is owned by SDL and valid until the next SDL_PumpEvents/SDL_PollEvent.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr SDL_GetKeyboardState(out int numkeys);
+
+        // ─────────────────────────────────────────────
+        //  Mouse enumeration and state
+        // ─────────────────────────────────────────────
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetMice")]
+        private static extern IntPtr _SDL_GetMice(out int count);
+
+        /// <summary>
+        /// Returns an array of instance IDs for all connected mice.
+        /// </summary>
+        public static uint[] SDL_GetMice()
+        {
+            IntPtr ptr = _SDL_GetMice(out int count);
+            if (ptr == IntPtr.Zero)
+                return Array.Empty<uint>();
+
+            try
+            {
+                if (count <= 0) return Array.Empty<uint>();
+                var ids = new uint[count];
+                for (int i = 0; i < count; i++)
+                    ids[i] = unchecked((uint)Marshal.ReadInt32(ptr, i * 4));
+                return ids;
+            }
+            finally
+            {
+                SDL_free(ptr);
+            }
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetMouseNameForID")]
+        private static extern IntPtr _SDL_GetMouseNameForID(uint instance_id);
+
+        public static string SDL_GetMouseNameForID(uint instance_id)
+        {
+            return Marshal.PtrToStringUTF8(_SDL_GetMouseNameForID(instance_id)) ?? "Mouse";
+        }
+
+        /// <summary>
+        /// Returns the current mouse button state and absolute position.
+        /// Button mask: bit 0 = left, bit 1 = middle, bit 2 = right, bit 3 = X1, bit 4 = X2.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint SDL_GetMouseState(out float x, out float y);
+
+        /// <summary>
+        /// Returns mouse relative motion since the last call.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint SDL_GetRelativeMouseState(out float x, out float y);
+
+        // SDL mouse button masks
+        public const uint SDL_BUTTON_LMASK = 1u << 0;
+        public const uint SDL_BUTTON_MMASK = 1u << 1;
+        public const uint SDL_BUTTON_RMASK = 1u << 2;
+        public const uint SDL_BUTTON_X1MASK = 1u << 3;
+        public const uint SDL_BUTTON_X2MASK = 1u << 4;
+
+        // ─────────────────────────────────────────────
+        //  SDL Scancode constants (common keys)
+        //  Full enum: SDL_Scancode in SDL3 headers.
+        //  We define only the subset needed for button naming.
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Human-readable names for Windows Virtual Key codes (0-255).
+        /// Used by SdlKeyboardWrapper.GetDeviceObjects() for button naming.
+        /// </summary>
+        public static readonly string[] VirtualKeyName = BuildVirtualKeyNames();
+
+        private static string[] BuildVirtualKeyNames()
+        {
+            var names = new string[256];
+            for (int i = 0; i < names.Length; i++)
+                names[i] = $"Key 0x{i:X2}";
+
+            names[0x08] = "Backspace";
+            names[0x09] = "Tab";
+            names[0x0D] = "Enter";
+            names[0x10] = "Shift";
+            names[0x11] = "Ctrl";
+            names[0x12] = "Alt";
+            names[0x13] = "Pause";
+            names[0x14] = "CapsLock";
+            names[0x1B] = "Escape";
+            names[0x20] = "Space";
+            names[0x21] = "PageUp";
+            names[0x22] = "PageDown";
+            names[0x23] = "End";
+            names[0x24] = "Home";
+            names[0x25] = "Left";
+            names[0x26] = "Up";
+            names[0x27] = "Right";
+            names[0x28] = "Down";
+            names[0x2C] = "PrintScreen";
+            names[0x2D] = "Insert";
+            names[0x2E] = "Delete";
+
+            // 0-9
+            for (int i = 0; i < 10; i++)
+                names[0x30 + i] = i.ToString();
+
+            // A-Z
+            for (int i = 0; i < 26; i++)
+                names[0x41 + i] = ((char)('A' + i)).ToString();
+
+            names[0x5B] = "LWin";
+            names[0x5C] = "RWin";
+            names[0x5D] = "Apps";
+
+            // Numpad 0-9
+            for (int i = 0; i < 10; i++)
+                names[0x60 + i] = $"Numpad {i}";
+
+            names[0x6A] = "Numpad *";
+            names[0x6B] = "Numpad +";
+            names[0x6D] = "Numpad -";
+            names[0x6E] = "Numpad .";
+            names[0x6F] = "Numpad /";
+
+            // Numpad Enter, which the keyboard state keeps apart from Enter at
+            // a code Windows leaves unassigned (RawInputListener.NumpadEnterKey).
+            names[0x88] = "Numpad Enter";
+
+            // F1-F24
+            for (int i = 0; i < 24; i++)
+                names[0x70 + i] = $"F{i + 1}";
+
+            names[0x90] = "NumLock";
+            names[0x91] = "ScrollLock";
+
+            names[0xA0] = "LShift";
+            names[0xA1] = "RShift";
+            names[0xA2] = "LCtrl";
+            names[0xA3] = "RCtrl";
+            names[0xA4] = "LAlt";
+            names[0xA5] = "RAlt";
+
+            // OEM keys (US layout)
+            names[0xBA] = "Semicolon";
+            names[0xBB] = "Equals";
+            names[0xBC] = "Comma";
+            names[0xBD] = "Minus";
+            names[0xBE] = "Period";
+            names[0xBF] = "Slash";
+            names[0xC0] = "Grave";
+            names[0xDB] = "LeftBracket";
+            names[0xDC] = "Backslash";
+            names[0xDD] = "RightBracket";
+            names[0xDE] = "Apostrophe";
+
+            return names;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Version
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Gets the version of the linked SDL3 library.
+        /// SDL3 change: returns a packed int (major*1000000 + minor*1000 + patch)
+        /// instead of filling an SDL_version struct.
+        /// </summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int SDL_GetVersion();
+
+        /// <summary>
+        /// Convenience: returns the linked SDL version as a (major, minor, patch) tuple.
+        /// </summary>
+        public static (int major, int minor, int patch) SDL_Linked_Version()
+        {
+            int v = SDL_GetVersion();
+            return (v / 1000000, (v / 1000) % 1000, v % 1000);
+        }
+
+        // ─────────────────────────────────────────────
+        //  Virtual joystick (SDL_JOYSTICK_VIRTUAL, enabled in the bundled build).
+        //  Used to surface a natively-read pad (e.g. a Bluetooth DualShock 3 behind
+        //  BthPS3) to SDL so the normal pipeline consumes it like any other device.
+        // ─────────────────────────────────────────────
+
+        /// <summary>Describes one virtual-joystick sensor (gyro/accel). 8 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_VirtualJoystickSensorDesc
+        {
+            public int type;    // SDL_SensorType
+            public float rate;
+        }
+
+        /// <summary>Describes one virtual-joystick touchpad. 8 bytes.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_VirtualJoystickTouchpadDesc
+        {
+            public ushort nfingers;
+            public ushort padding0;
+            public ushort padding1;
+            public ushort padding2;
+        }
+
+        // Callback delegate types (Cdecl). Keep the managed delegates alive for the
+        // lifetime of the attached joystick or the marshaled pointers dangle.
+        // SDL uses C `bool` (1 byte); marshal returns/params as I1, not the default 4-byte BOOL.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void VJUpdate(IntPtr userdata);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void VJSetPlayerIndex(IntPtr userdata, int playerIndex);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] public delegate bool VJRumble(IntPtr userdata, ushort lowFreq, ushort highFreq);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] public delegate bool VJRumbleTriggers(IntPtr userdata, ushort left, ushort right);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] public delegate bool VJSetLED(IntPtr userdata, byte r, byte g, byte b);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] public delegate bool VJSendEffect(IntPtr userdata, IntPtr data, int size);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] public delegate bool VJSetSensorsEnabled(IntPtr userdata, [MarshalAs(UnmanagedType.I1)] bool enabled);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void VJCleanup(IntPtr userdata);
+
+        /// <summary>
+        /// Mirror of SDL_VirtualJoystickDesc. Natural alignment yields the required
+        /// 136 bytes on x64 (4 bytes implicit padding before <c>name</c>). Set
+        /// <c>version</c> to Marshal.SizeOf of this struct; callbacks are function
+        /// pointers (IntPtr.Zero = unused).
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SDL_VirtualJoystickDesc
+        {
+            public uint version;
+            public ushort type;
+            public ushort padding;
+            public ushort vendor_id;
+            public ushort product_id;
+            public ushort naxes;
+            public ushort nbuttons;
+            public ushort nballs;
+            public ushort nhats;
+            public ushort ntouchpads;
+            public ushort nsensors;
+            public ushort padding2_0;
+            public ushort padding2_1;
+            public uint button_mask;
+            public uint axis_mask;
+            public IntPtr name;        // const char* (UTF-8)
+            public IntPtr touchpads;   // const SDL_VirtualJoystickTouchpadDesc*
+            public IntPtr sensors;     // const SDL_VirtualJoystickSensorDesc*
+            public IntPtr userdata;
+            public IntPtr Update;
+            public IntPtr SetPlayerIndex;
+            public IntPtr Rumble;
+            public IntPtr RumbleTriggers;
+            public IntPtr SetLED;
+            public IntPtr SendEffect;
+            public IntPtr SetSensorsEnabled;
+            public IntPtr Cleanup;
+        }
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_AttachVirtualJoystick")]
+        public static extern uint SDL_AttachVirtualJoystick(ref SDL_VirtualJoystickDesc desc);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_DetachVirtualJoystick")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SDL_DetachVirtualJoystick(uint instance_id);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickVirtualAxis")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SDL_SetJoystickVirtualAxis(IntPtr joystick, int axis, short value);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickVirtualButton")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SDL_SetJoystickVirtualButton(IntPtr joystick, int button, [MarshalAs(UnmanagedType.I1)] bool down);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetJoystickVirtualHat")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SDL_SetJoystickVirtualHat(IntPtr joystick, int hat, byte value);
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SendJoystickVirtualSensorData")]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool SDL_SendJoystickVirtualSensorData(IntPtr joystick, int type, ulong sensor_timestamp, float[] data, int num_values);
+
+        /// <summary>Global joystick lock. Recursive, so batching multiple Set*Virtual
+        /// calls under one acquisition publishes an atomic frame (the per-call locks
+        /// nest for free) and costs one contention instead of N.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_LockJoysticks")]
+        public static extern void SDL_LockJoysticks();
+
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_UnlockJoysticks")]
+        public static extern void SDL_UnlockJoysticks();
+
+        /// <summary>Nanoseconds since SDL init; the timestamp domain SDL sensor events use.</summary>
+        [DllImport(lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetTicksNS")]
+        public static extern ulong SDL_GetTicksNS();
+    }
+}

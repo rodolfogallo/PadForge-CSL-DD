@@ -1,0 +1,1415 @@
+﻿using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Reflection;
+using System.Threading.Tasks;
+using Microsoft.Win32;
+using PadForge.Common.Input;
+
+namespace PadForge.Common
+{
+    /// <summary>
+    /// An installer ran to the end and did not succeed, or never came back.
+    /// The facts ride on the properties so the caller can word the failure
+    /// in the user's language. Message is an English fallback for a log.
+    /// </summary>
+    public sealed class InstallerFailedException : Exception
+    {
+        /// <summary>The installer's exit code. Meaningless when
+        /// <see cref="TimedOut"/> is set.</summary>
+        public int ExitCode { get; }
+
+        /// <summary>The installer was still running when the wait ended, so
+        /// nothing is known about how it finished.</summary>
+        public bool TimedOut { get; }
+
+        /// <summary>ERROR_INSTALL_USEREXIT: the user pressed Cancel on the
+        /// installer's own progress window.</summary>
+        public bool UserCanceled => !TimedOut && ExitCode == 1602;
+
+        public InstallerFailedException(int exitCode)
+            : base("The installer exited with code " + exitCode + ".")
+        {
+            ExitCode = exitCode;
+        }
+
+        public InstallerFailedException()
+            : base("The installer did not finish in time.")
+        {
+            TimedOut = true;
+        }
+    }
+
+    /// <summary>
+    /// Handles HIDMaestro and HidHide install / uninstall in v3, plus legacy
+    /// uninstall paths for v2 ViGEmBus and vJoy residue. Uses embedded
+    /// bootstrapper executables that contain MSI packages.
+    /// </summary>
+    public static class DriverInstaller
+    {
+        // ─────────────────────────────────────────────
+        //  ViGEmBus
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Uninstall ViGEmBus driver by looking up the MSI ProductCode in the
+        /// Windows Uninstall registry and invoking <c>msiexec /x {ProductCode}</c>.
+        /// Retained in v3 only for the first-run cleanup wizard that removes
+        /// legacy v2 driver installs from upgrading users' systems — v3
+        /// uses HIDMaestro. Registry-based lookup means we don't need to
+        /// embed the 6 MB ViGEmBus installer any more; the MSI is already
+        /// on the user's machine if they have it installed.
+        /// </summary>
+        public static void UninstallViGEmBus()
+        {
+            string productCode = FindUninstallProductCode("ViGEm");
+            if (string.IsNullOrEmpty(productCode)) return;
+            RunMsiElevated($"/x {productCode} /qb /norestart", absentIsSuccess: true);
+        }
+
+        /// <summary>
+        /// Scans the Windows Uninstall registry (64- and 32-bit views) for a
+        /// product whose <c>DisplayName</c> contains <paramref name="displayNameSubstring"/>
+        /// and returns the matching subkey name (the MSI ProductCode GUID in
+        /// the form <c>{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}</c>), or null
+        /// when no match is found. Used for driver uninstalls that don't
+        /// bundle their own MSI.
+        /// </summary>
+        private static string FindUninstallProductCode(string displayNameSubstring)
+        {
+            var views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+            foreach (var view in views)
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+                    if (uninstallKey == null) continue;
+
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        var name = sub?.GetValue("DisplayName") as string;
+                        if (string.IsNullOrEmpty(name)) continue;
+                        if (name.IndexOf(displayNameSubstring, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                        // Only a Windows Installer product has a ProductCode
+                        // msiexec can act on. A bootstrapper registers its
+                        // own entry under a brace GUID too, and that GUID
+                        // names a bundle msiexec has never heard of, so the
+                        // shape of the key alone does not decide it.
+                        string code = MsiProductCodeOrNull(subName, sub.GetValue("WindowsInstaller"));
+                        if (code != null) return code;
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // ─────────────────────────────────────────────
+        //  HidHide
+        // ─────────────────────────────────────────────
+
+        private const string HidHideResourceName = "HidHide_1.5.230_x64.exe";
+
+        private static string HidHideTempRoot
+            => Path.Combine(Path.GetTempPath(), "PadForge_HidHide");
+
+        /// <summary>
+        /// A staging folder of this attempt's own.
+        ///
+        /// <para>There was one fixed folder, and every attempt began by
+        /// clearing it. An installer that outlives the three-minute wait
+        /// keeps reading its package from there, so a retry while it ran
+        /// deleted the package from under it. Each attempt now gets its own
+        /// folder and deletes that folder alone when it ends. A folder left
+        /// by an attempt that timed out is never cleared from here, because
+        /// nothing here can know that its installer has finished. It is a
+        /// few megabytes in the temp folder, which Windows clears.</para>
+        /// </summary>
+        private static string NewHidHideStagingDir()
+            => Path.Combine(HidHideTempRoot, Guid.NewGuid().ToString("N"));
+
+        /// <summary>
+        /// Install HidHide driver. Extracts the embedded bootstrapper,
+        /// unpacks the MSI, and runs msiexec /i with elevation.
+        /// </summary>
+        public static void InstallHidHide()
+        {
+            // A kernel driver cannot run emulated, so the MACHINE picks the
+            // package, whichever build this is. ARM64 Windows takes upstream's
+            // ARM64 driver package through HidHideArm64Installer. The MSI
+            // below is x64 only.
+            if (PadForge.Engine.PlatformSupport.IsArm64Machine)
+            {
+                HidHideArm64Installer.Install();
+                return;
+            }
+            if (!PadForge.Engine.PlatformSupport.HidHideAvailable)
+                throw new PlatformNotSupportedException(
+                    "HidHide ships for x64 and ARM64 Windows only.");
+            bool installerMayStillRun = false;
+            string staging = NewHidHideStagingDir();
+            try
+            {
+                var exePath = ExtractEmbeddedResource(HidHideResourceName, staging);
+                var extractDir = ExtractInstallerBundle(exePath, staging);
+                var msiPath = FindMsi(extractDir, "HidHide.msi", "HidHide*.msi");
+
+                RunMsiElevated($"/i \"{msiPath}\" /qb /norestart", absentIsSuccess: false);
+            }
+            catch (InstallerFailedException ex) when (ex.TimedOut)
+            {
+                installerMayStillRun = true;
+                throw;
+            }
+            finally
+            {
+                // An installer that outlived the wait is still reading the
+                // package it was handed, so the package stays where it is.
+                if (!installerMayStillRun) CleanupTempDir(staging);
+            }
+        }
+
+        /// <summary>
+        /// Uninstall the HidHide that is INSTALLED, by its registered
+        /// ProductCode, which is the command Windows itself records for the
+        /// product (<c>MsiExec.exe /X{ProductCode}</c>).
+        ///
+        /// <para>This used to hand msiexec the bundled package instead. A
+        /// package path names the product inside that package, so the
+        /// bundled 1.5.230 package removes an installed HidHide only when the
+        /// two share a ProductCode. Windows Installer requires a new
+        /// ProductCode for every major upgrade, msiexec answers 1605 for a
+        /// product that is not installed, and the exit code was not read, so
+        /// against an install with another ProductCode the button reported
+        /// success and removed nothing.</para>
+        ///
+        /// <para>The bundled package is kept as the fallback for a
+        /// registration that carries no usable ProductCode. There, 1605 stays
+        /// a failure, because it only says the BUNDLED product is absent
+        /// while something named HidHide is still registered.</para>
+        /// </summary>
+        public static void UninstallHidHide()
+        {
+            if (TryGetHidHideMsiInfo(out _, out string installedCode) && installedCode != null)
+            {
+                RunMsiElevated($"/x {installedCode} /qb /norestart", absentIsSuccess: true);
+                return;
+            }
+
+            // An ARM64 install was never registered with Windows Installer.
+            // It comes out the way it went in.
+            if (PadForge.Engine.PlatformSupport.IsArm64Machine)
+            {
+                HidHideArm64Installer.Uninstall();
+                return;
+            }
+
+            bool installerMayStillRun = false;
+            string staging = NewHidHideStagingDir();
+            try
+            {
+                var exePath = ExtractEmbeddedResource(HidHideResourceName, staging);
+                var extractDir = ExtractInstallerBundle(exePath, staging);
+                var msiPath = FindMsi(extractDir, "HidHide.msi", "HidHide*.msi");
+
+                RunMsiElevated($"/x \"{msiPath}\" /qb /norestart", absentIsSuccess: false);
+            }
+            catch (InstallerFailedException ex) when (ex.TimedOut)
+            {
+                installerMayStillRun = true;
+                throw;
+            }
+            finally
+            {
+                if (!installerMayStillRun) CleanupTempDir(staging);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  vJoy
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Uninstall vJoy driver. Removes device nodes first (so the driver
+        /// can unload cleanly), then removes the driver from the store,
+        /// deletes the service, and cleans up the install directory.
+        /// Retained in v3 only for the first-run cleanup wizard that removes
+        /// the legacy v2 vJoy install from upgrading users' systems —
+        /// PadForge owns this custom SetupAPI deployment so the standard
+        /// vJoy installer cannot remove it. Will be deleted after the
+        /// migration window closes.
+        /// </summary>
+        public static void UninstallVJoy()
+        {
+            string vjoyDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "vJoy");
+            var oemInfs = FindExtendedOemInfs();
+
+            string scriptPath = Path.Combine(Path.GetTempPath(), "PadForge_vjoy_uninstall.cmd");
+            using (var sw = new StreamWriter(scriptPath))
+            {
+                sw.WriteLine("@echo off");
+
+                // IMPORTANT: Remove device nodes FIRST so the driver can fully
+                // unload from the kernel. If we stop/delete the service while
+                // devices are still attached, it gets stuck in STOP_PENDING.
+                for (int i = 0; i <= 15; i++)
+                    sw.WriteLine($"pnputil /remove-device \"ROOT\\HIDCLASS\\{i:D4}\" /subtree >nul 2>&1");
+                sw.WriteLine("timeout /t 2 /nobreak >nul 2>&1");
+
+                // Now stop and delete the service (driver should be unloaded).
+                sw.WriteLine("sc stop vjoy >nul 2>&1");
+                sw.WriteLine("timeout /t 2 /nobreak >nul 2>&1");
+                sw.WriteLine("sc delete vjoy >nul 2>&1");
+                // Fallback: if sc delete failed (e.g. STOP_PENDING), remove the
+                // service registry keys from ALL ControlSets so it doesn't resurrect on reboot.
+                sw.WriteLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\vjoy\" /f >nul 2>&1");
+                sw.WriteLine("reg delete \"HKLM\\SYSTEM\\ControlSet001\\Services\\vjoy\" /f >nul 2>&1");
+                sw.WriteLine("reg delete \"HKLM\\SYSTEM\\ControlSet002\\Services\\vjoy\" /f >nul 2>&1");
+                sw.WriteLine("reg delete \"HKLM\\SYSTEM\\ControlSet003\\Services\\vjoy\" /f >nul 2>&1");
+
+                // Remove driver from driver store.
+                foreach (var inf in oemInfs)
+                    sw.WriteLine($"pnputil /delete-driver {inf} /uninstall /force >nul 2>&1");
+
+                // Delete the install directory and stale driver binary.
+                sw.WriteLine($"rmdir /s /q \"{vjoyDir}\" >nul 2>&1");
+                sw.WriteLine("del /f \"%SystemRoot%\\System32\\drivers\\vjoy.sys\" >nul 2>&1");
+
+                // Remove legacy Inno Setup uninstall registry entries (if present).
+                sw.WriteLine("powershell -NoProfile -Command \"Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall' -EA SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath -EA SilentlyContinue).DisplayName -like '*vJoy*' } | Remove-Item -Recurse -Force -EA SilentlyContinue\" >nul 2>&1");
+            }
+
+            RunElevated("cmd.exe", $"/c \"{scriptPath}\"");
+            try { File.Delete(scriptPath); } catch { }
+
+            CleanExtendedRegistryArtifacts();
+        }
+
+        /// <summary>
+        /// Light cleanup: removes only registry keys that can cause the vJoy installer
+        /// to hang on reinstall. Does NOT touch pnputil or files — those are needed
+        /// by the installer to register the driver via UpdateDriverForPlugAndPlayDevices.
+        /// </summary>
+        private static void CleanExtendedRegistryArtifacts()
+        {
+            try
+            {
+                string[] registryPaths =
+                {
+                    @"SYSTEM\CurrentControlSet\Services\vjoy",
+                    @"SYSTEM\ControlSet001\Services\vjoy",
+                    @"SYSTEM\ControlSet002\Services\vjoy",
+                    @"SYSTEM\ControlSet003\Services\vjoy",
+                    @"SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD",
+                    @"SYSTEM\ControlSet001\Services\EventLog\System\vjoy",
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\PnpLockdownFiles\%SystemRoot%/System32/drivers/hidkmdf.sys",
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\PnpLockdownFiles\%SystemRoot%/System32/drivers/vjoy.sys",
+                    @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Setup\PnpLockdownFiles\%SystemRoot%/System32/drivers/hidkmdf.sys",
+                    @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Setup\PnpLockdownFiles\%SystemRoot%/System32/drivers/vjoy.sys"
+                };
+
+                foreach (var path in registryPaths)
+                {
+                    try { Registry.LocalMachine.DeleteSubKeyTree(path, throwOnMissingSubKey: false); }
+                    catch { }
+                }
+
+                CleanExtendedDeviceClassEntries();
+
+                try
+                {
+                    Registry.CurrentUser.DeleteSubKeyTree(
+                        @"System\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_1234&PID_BEAD",
+                        throwOnMissingSubKey: false);
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Removes vJoy device entries from the shared device class key
+        /// {781ef630-72b2-11d2-b852-00c04fad5101} under ControlSet001\Control\Class.
+        /// Only deletes subkeys where the "Class" value equals "vjoy".
+        /// </summary>
+        private static void CleanExtendedDeviceClassEntries()
+        {
+            const string classPath = @"SYSTEM\ControlSet001\Control\Class\{781ef630-72b2-11d2-b852-00c04fad5101}";
+            try
+            {
+                using var classKey = Registry.LocalMachine.OpenSubKey(classPath, writable: false);
+                if (classKey == null) return;
+
+                foreach (var subName in classKey.GetSubKeyNames())
+                {
+                    try
+                    {
+                        using var sub = classKey.OpenSubKey(subName, writable: false);
+                        var classValue = sub?.GetValue("Class") as string;
+                        if (string.Equals(classValue, "vjoy", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Registry.LocalMachine.DeleteSubKeyTree(
+                                classPath + @"\" + subName, throwOnMissingSubKey: false);
+                        }
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+            catch { /* best effort */ }
+        }
+
+        /// <summary>
+        /// Runs pnputil /enum-drivers and finds OEM .inf names that belong to vJoy
+        /// (published by "Shaul" or containing "vjoy" in the driver package name).
+        /// </summary>
+        private static string[] FindExtendedOemInfs()
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "pnputil.exe",
+                    Arguments = "/enum-drivers",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi);
+                if (proc == null) return Array.Empty<string>();
+
+                string output = proc.StandardOutput.ReadToEnd();
+                proc.WaitForExit(30_000);
+
+                // Parse pnputil output. Format varies by Windows version, but each
+                // driver entry has "Published Name" and either "Driver Package Provider"
+                // or "Original Name" lines. We look for "shaul" or "vjoy" in the block
+                // and extract the oem*.inf name.
+                var results = new System.Collections.Generic.List<string>();
+                string[] lines = output.Split('\n');
+                string currentOem = null;
+                bool isExtendedBlock = false;
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+
+                    // Detect the block start by its VALUE, not its label. The
+                    // label is "Published Name" only on an English Windows;
+                    // pnputil localizes it, so keying on that word made this
+                    // whole parse return nothing on a German or Japanese
+                    // machine and legacy drivers went undetected rather than
+                    // reported. The value, "oemNN.inf", is locale-independent.
+                    var oemHit = System.Text.RegularExpressions.Regex.Match(
+                        // The word boundaries here were literal 0x08
+                        // BACKSPACE bytes: round 35's scripted edit wrote
+                        // the escape through a non-raw string, so the
+                        // pattern required backspace characters pnputil
+                        // never emits and matched NOTHING. The
+                        // legacy-driver detection that round shipped was
+                        // dead on arrival. Real word boundaries this time.
+                        line, OemInfPattern,
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (oemHit.Success)
+                    {
+                        // Save any previous match.
+                        if (isExtendedBlock && currentOem != null)
+                            results.Add(currentOem);
+
+                        currentOem = oemHit.Value;
+                        isExtendedBlock = false;
+                    }
+                    // Check if this block mentions Shaul or vjoy.
+                    else if (currentOem != null &&
+                             (line.IndexOf("shaul", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                              line.IndexOf("vjoy", StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        isExtendedBlock = true;
+                    }
+                }
+
+                // Don't forget the last block.
+                if (isExtendedBlock && currentOem != null)
+                    results.Add(currentOem);
+
+                return results.ToArray();
+            }
+            catch
+            {
+                return Array.Empty<string>();
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  vJoy detection
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Checks whether the vJoy driver is installed.
+        /// Detects both our minimal install (vjoy.sys in Program Files) and
+        /// legacy Inno Setup installs (registry uninstall entry).
+        /// </summary>
+        public static bool IsExtendedInstalled()
+        {
+            // Primary: check for our minimal driver install.
+            string vjoyDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "vJoy");
+            if (File.Exists(Path.Combine(vjoyDir, "vjoy.sys")))
+                return true;
+
+            // Fallback: check for legacy Inno Setup install via registry.
+            return !string.IsNullOrEmpty(GetVJoyVersionFromRegistry());
+        }
+
+        private static string GetVJoyVersionFromRegistry()
+        {
+            var views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var view in views)
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+
+                    if (uninstallKey == null) continue;
+
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        var name = sub?.GetValue("DisplayName") as string;
+                        if (string.IsNullOrEmpty(name)) continue;
+
+                        if (name.IndexOf("vJoy", StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+
+                        return sub.GetValue("DisplayVersion") as string ?? "Installed";
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Windows MIDI Services
+        // ─────────────────────────────────────────────
+
+        // Note: /releases/latest returns 404 because microsoft/MIDI only publishes
+        // pre-releases. Use /releases, which returns the newest releases
+        // first (one page of them), and take the first installer asset
+        // anywhere in it. A release that carries no installer for this
+        // machine is passed over that way.
+        private const string MidiServicesGitHubApi =
+            "https://api.github.com/repos/microsoft/MIDI/releases";
+
+        private static string GetMidiServicesTempDir()
+            => Path.Combine(Path.GetTempPath(), "PadForge_MidiServices");
+
+        /// <summary>
+        /// Downloads and runs the latest Windows MIDI Services SDK Runtime installer.
+        /// Uses the GitHub API to find the latest release asset dynamically.
+        /// The installer is ~210MB so it must be downloaded rather than embedded.
+        /// </summary>
+        public static async Task InstallMidiServicesAsync()
+        {
+            var tempDir = GetMidiServicesTempDir();
+            Directory.CreateDirectory(tempDir);
+
+            var installerPath = Path.Combine(tempDir, "MidiServicesSdkRuntime.exe");
+            try
+            {
+                using var http = new HttpClient();
+                http.DefaultRequestHeaders.UserAgent.ParseAdd("PadForge");
+                http.Timeout = TimeSpan.FromMinutes(10);
+
+                // Query GitHub API for the latest release and find the SDK Runtime installer asset.
+                var downloadUrl = await FindMidiServicesDownloadUrl(http);
+
+                using var response = await http.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var fs = new FileStream(installerPath, FileMode.Create, FileAccess.Write);
+                await stream.CopyToAsync(fs);
+
+                // Run the WiX Burn bootstrapper. PadForge is already elevated,
+                // so run directly (no runas) to avoid Win32Exception on some systems.
+                // Close the file stream before launching the installer.
+                fs.Close();
+                var psi = new ProcessStartInfo
+                {
+                    FileName = installerPath,
+                    Arguments = "/install /quiet /norestart",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit(300_000); // 5 minutes — Burn bundles can take a while
+
+                // Reset the cached availability check so IsAvailable() re-evaluates.
+                MidiVirtualController.ResetAvailability();
+            }
+            finally
+            {
+                CleanupTempDir(tempDir);
+            }
+        }
+
+        /// <summary>
+        /// Queries the GitHub API for microsoft/MIDI's releases and returns the
+        /// download URL of the newest SDK Runtime installer built for this
+        /// machine, x64 or arm64.
+        /// </summary>
+        private static async Task<string> FindMidiServicesDownloadUrl(HttpClient http)
+        {
+            var json = await http.GetStringAsync(MidiServicesGitHubApi);
+
+            // Find the browser_download_url for the SDK Runtime exe by scanning
+            // the release JSON for the key.
+            // Asset name pattern: "Windows.MIDI.Services.SDK.Runtime.and.Tools.*-<arch>.exe"
+            // Microsoft publishes an -arm64.exe beside every -x64.exe. This
+            // installs a Windows service, so the MACHINE picks the asset, not
+            // the architecture this process was built for.
+            string archToken = PadForge.Engine.PlatformSupport.IsArm64Machine ? "arm64" : "x64";
+            const string needle = "browser_download_url";
+            int pos = 0;
+            while ((pos = json.IndexOf(needle, pos, StringComparison.Ordinal)) >= 0)
+            {
+                // Find the URL value after the key.
+                int urlStart = json.IndexOf("\"http", pos, StringComparison.Ordinal);
+                if (urlStart < 0) break;
+                urlStart++; // skip opening quote
+                int urlEnd = json.IndexOf('"', urlStart);
+                if (urlEnd < 0) break;
+
+                string url = json.Substring(urlStart, urlEnd - urlStart);
+                if (url.Contains("SDK.Runtime", StringComparison.OrdinalIgnoreCase) &&
+                    url.Contains("-" + archToken + ".", StringComparison.OrdinalIgnoreCase) &&
+                    url.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    return url;
+                }
+
+                pos = urlEnd;
+            }
+
+            throw new InvalidOperationException(
+                "Could not find Windows MIDI Services SDK Runtime installer in the latest GitHub release.");
+        }
+
+        /// <summary>
+        /// Uninstalls Windows MIDI Services by finding the cached WiX Burn bootstrapper
+        /// via the registry UninstallString and launching it with /uninstall /quiet.
+        /// The uninstaller is launched fire-and-forget because the MIDI Services SDK
+        /// DLLs are loaded in-process — waiting for the uninstaller to finish would
+        /// cause a native crash when the backing service is removed mid-session.
+        /// </summary>
+        public static void UninstallMidiServices()
+        {
+            string uninstallCmd = FindMidiServicesUninstallString();
+            if (string.IsNullOrEmpty(uninstallCmd))
+                throw new InvalidOperationException("Could not find Windows MIDI Services uninstall entry in registry.");
+
+            // UninstallString is e.g.: "C:\...\Setup.exe"  /uninstall
+            // Parse the quoted exe path and any existing arguments, then append /quiet.
+            string exePath;
+            string existingArgs = "";
+            if (uninstallCmd.StartsWith('"'))
+            {
+                int closeQuote = uninstallCmd.IndexOf('"', 1);
+                exePath = uninstallCmd.Substring(1, closeQuote - 1);
+                existingArgs = uninstallCmd.Substring(closeQuote + 1).Trim();
+            }
+            else
+            {
+                int space = uninstallCmd.IndexOf(' ');
+                exePath = space > 0 ? uninstallCmd.Substring(0, space) : uninstallCmd;
+                if (space > 0) existingArgs = uninstallCmd.Substring(space + 1).Trim();
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = exePath,
+                // MSIRESTARTMANAGERCONTROL=Disable stops the packages asking
+                // Restart Manager to close processes holding their files, so
+                // files in use are scheduled for removal instead of PadForge
+                // being shut down to reach them. Best-effort: a Burn bundle
+                // only forwards properties its author declared, which is why
+                // the window itself also declines RM's request outright (see
+                // MainWindow.OnQueryEndSession).
+                Arguments = $"{existingArgs} /quiet /norestart MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress".Trim(),
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(300_000);
+        }
+
+        /// <summary>
+        /// Searches the registry Uninstall keys for the Windows MIDI Services entry
+        /// and returns its UninstallString value.
+        /// </summary>
+        /// <summary>The pnputil "Published Name" value, oemNN.inf,
+        /// locale-independent. A named constant so a test can pin it: the
+        /// shipped version of this pattern carried literal backspace bytes
+        /// where the word boundaries belong and matched nothing at all,
+        /// invisibly, for two months.</summary>
+        internal const string OemInfPattern = @"\boem\d+\.inf\b";
+
+        private static string FindMidiServicesUninstallString()
+        {
+            var views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var view in views)
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+                    if (uninstallKey == null) continue;
+
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        var name = sub?.GetValue("DisplayName") as string;
+                        if (string.IsNullOrEmpty(name)) continue;
+
+                        // Match the WiX Burn bootstrapper bundle entry, not the individual MSI components.
+                        if (name.Equals("Windows MIDI Services Runtime and Tools", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return sub.GetValue("UninstallString") as string;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Checks whether Windows MIDI Services is installed by looking for the
+        /// registry uninstall entry. Does NOT load the SDK runtime — that would
+        /// lock native DLLs in-process and prevent clean uninstallation.
+        /// </summary>
+        public static bool IsMidiServicesInstalled()
+        {
+            return FindMidiServicesUninstallString() != null;
+        }
+
+        /// <summary>The installed Windows MIDI Services version, or null.
+        /// Read from DisplayVersion on the same bundle entry the uninstall
+        /// string comes from, the way the HidHide and ViGEm cards read
+        /// theirs. The card's second line used to print the product name
+        /// again under a card already titled with it.</summary>
+        public static string GetMidiServicesVersion()
+        {
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+                    if (uninstallKey == null) continue;
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        if (sub?.GetValue("DisplayName") as string is string name
+                            && name.Equals("Windows MIDI Services Runtime and Tools",
+                                           StringComparison.OrdinalIgnoreCase))
+                            return sub.GetValue("DisplayVersion") as string;
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // ─────────────────────────────────────────────
+        //  SteamVR (Steam-free install, issue #49)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Default landing spot for the Steam-free SteamVR install
+        /// when the user picks nothing else. HIDMaestro's
+        /// discovery checks this conventional folder last, and the explicit
+        /// path hint below makes it authoritative regardless.</summary>
+        public const string SteamVrInstallDir = @"C:\SteamVR";
+
+        /// <summary>Valve's own steamcmd bootstrap. Needs no Steam client
+        /// and no account: SteamVR (app 250820) is anonymous-licensed, the
+        /// path HIDMaestro verified during v1.6.0 development.</summary>
+        private const string SteamCmdZipUrl =
+            "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip";
+
+        private static string GetSteamVrTempDir()
+            => Path.Combine(Path.GetTempPath(), "PadForge_SteamCmd");
+
+        /// <summary>Test seam for <see cref="InstallSteamVRAsync"/>: throw
+        /// after the argument guards, before any network or process work.
+        /// Set only by SteamVrInstallGuardTests.</summary>
+        internal static bool SteamVrInstallStopAfterGuards;
+
+        /// <summary>The HKLM key HIDMaestro's <c>FindSteamVR</c> consults
+        /// first. Mirrors VrDriverBuilder's constants; the value written by
+        /// <c>HMVR.SetSteamVRPathHint</c> is both the discovery mechanism and
+        /// PadForge's ownership marker for the Steam-free shape.</summary>
+        private const string HmRegKeyPath = @"SOFTWARE\HIDMaestro";
+        private const string SteamVrPathRegValue = "SteamVRPath";
+
+        /// <summary>Normalizes a user-chosen install dir: trims, drops
+        /// trailing separators (but keeps a drive root intact), and falls
+        /// back to <see cref="SteamVrInstallDir"/> for null/blank.</summary>
+        private static string NormalizeSteamVrDir(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir)) return SteamVrInstallDir;
+            dir = dir.Trim();
+            string trimmed = dir.TrimEnd('\\', '/');
+            // "C:\" trims to "C:", which means CWD-relative. Keep the root.
+            return trimmed.Length >= dir.Length - 1 && trimmed.EndsWith(":", StringComparison.Ordinal)
+                ? trimmed + Path.DirectorySeparatorChar
+                : trimmed;
+        }
+
+        private static bool SameDir(string a, string b) =>
+            !string.IsNullOrWhiteSpace(a) && !string.IsNullOrWhiteSpace(b)
+            && string.Equals(a.TrimEnd('\\', '/'), b.TrimEnd('\\', '/'),
+                             StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>True for a bare drive root ("C:\", "D:"). Both the
+        /// installer and the uninstaller refuse these: a payload at a drive
+        /// root is never a legitimate target, and the uninstall side would
+        /// otherwise be one hand-edited registry hint away from
+        /// Directory.Delete on an entire drive.</summary>
+        private static bool IsDriveRoot(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir)) return false;
+            string t = dir.Trim().TrimEnd('\\', '/');
+            return t.Length == 2 && t[1] == ':';
+        }
+
+        /// <summary>
+        /// The directory of the Steam-free SteamVR install PADFORGE owns, or
+        /// null. Owned means: the HIDMaestro path hint exists, the payload it
+        /// points at is real (vrpathreg.exe present), and neither Steam's own
+        /// "Steam App 250820" uninstall entry nor the default Steam library
+        /// resolves to the same directory. A Steam-client install therefore
+        /// never reads as owned, which is what gates the Uninstall button.
+        /// </summary>
+        public static string GetOwnedSteamVrDir()
+        {
+            try
+            {
+                string hinted;
+                using (var hm = Registry.LocalMachine.OpenSubKey(HmRegKeyPath))
+                    hinted = hm?.GetValue(SteamVrPathRegValue) as string;
+                if (string.IsNullOrWhiteSpace(hinted)) return null;
+                if (!File.Exists(Path.Combine(hinted, "bin", "win64", "vrpathreg.exe")))
+                    return null;
+
+                // Steam's 32-bit client writes its per-app uninstall entries
+                // under the WOW6432Node view; a default 64-bit read misses
+                // them entirely. Check both views so a custom-library
+                // Steam install (which the library check below cannot see)
+                // still disqualifies ownership.
+                foreach (var view in new[] { RegistryView.Registry32, RegistryView.Registry64 })
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var k = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 250820");
+                    if (k?.GetValue("InstallLocation") is string steamApp && SameDir(steamApp, hinted))
+                        return null;
+                }
+
+                using (var steam = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Valve\Steam"))
+                    if (steam?.GetValue("InstallPath") is string steamRoot
+                        && SameDir(Path.Combine(steamRoot, "steamapps", "common", "SteamVR"), hinted))
+                        return null;
+
+                return hinted;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// The decision behind <see cref="ContainOwnedSteamVrDataPaths"/>,
+        /// separated from the registry and the file so the refusals can be
+        /// tested. Answers true only for an install PadForge owns whose data
+        /// paths are not already inside it.
+        ///
+        /// <para>The refusals are the point. A SteamVR that PadForge did not
+        /// install, and a registry pointing at somebody else's runtime, are
+        /// both none of PadForge's business, and rewriting either would move
+        /// a stranger's log directory out from under them.</para>
+        /// </summary>
+        internal static bool ShouldContainDataPaths(
+            string ownedDir, string runtimeInRegistry,
+            string configInRegistry, string logInRegistry,
+            out string wantConfig, out string wantLog)
+        {
+            wantConfig = wantLog = null;
+            // No ownership marker: PadForge never installed this one.
+            if (string.IsNullOrWhiteSpace(ownedDir)) return false;
+            // The registry names a DIFFERENT runtime, so its data paths
+            // belong to that runtime rather than to ours.
+            if (!SameDir(runtimeInRegistry, ownedDir)) return false;
+
+            wantConfig = Path.Combine(ownedDir, "config");
+            wantLog = Path.Combine(ownedDir, "logs");
+            return !(SameDir(configInRegistry, wantConfig) && SameDir(logInRegistry, wantLog));
+        }
+
+        /// <summary>
+        /// Points a PadForge-owned SteamVR's config and log directories INSIDE
+        /// the install, in the path registry every OpenVR process reads.
+        ///
+        /// <para>Valve's tooling writes openvrpaths.vrpath with config and log
+        /// as SIBLINGS of the runtime, named by appending "-config" and
+        /// "-logs". At the default install that puts two folders at the root
+        /// of the system drive, and the consumer's own VR_LOG_PATH override
+        /// moves only PadForge's copy: vrserver, vrmonitor and vrcompositor
+        /// read this same file and would recreate both the moment SteamVR
+        /// actually ran. Fixing the file fixes it for every process.</para>
+        ///
+        /// <para>Only for an install PadForge owns, which means one whose path
+        /// PadForge itself recorded (HIDMaestro writes that hint nowhere, it
+        /// only reads it) and which resolves to neither Steam's app entry nor
+        /// its library. A preexisting or Steam-client SteamVR is left exactly
+        /// as it is. Rewrites nothing when the paths are already inside, so
+        /// this is safe on every launch.</para>
+        /// </summary>
+        /// <returns>True when the file was rewritten.</returns>
+        public static bool ContainOwnedSteamVrDataPaths()
+        {
+            try
+            {
+                string dir = GetOwnedSteamVrDir();
+                if (string.IsNullOrWhiteSpace(dir)) return false;
+
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string reg = Path.Combine(local, "openvr", "openvrpaths.vrpath");
+                if (!File.Exists(reg)) return false;
+
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(reg));
+                var root = doc.RootElement;
+                if (root.ValueKind != System.Text.Json.JsonValueKind.Object) return false;
+
+                static string First(System.Text.Json.JsonElement o, string name)
+                    => o.TryGetProperty(name, out var a)
+                       && a.ValueKind == System.Text.Json.JsonValueKind.Array
+                       && a.GetArrayLength() == 1
+                       ? a[0].GetString() : null;
+
+                bool rewrite = ShouldContainDataPaths(dir, First(root, "runtime"),
+                    First(root, "config"), First(root, "log"),
+                    out string wantConfig, out string wantLog);
+                // Nothing to point at is a real state, not a theoretical one.
+                // steamcmd finishes with "validate", which deletes anything in
+                // the install that is not in Valve's manifest, so the two
+                // directories created moments earlier by the install-time call
+                // are gone by the time the download settles while the registry
+                // entries, which live under LOCALAPPDATA, survive. Make them
+                // whenever this runs, including on the launch after, and not
+                // only on the launch that rewrites.
+                if (wantConfig != null)
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(wantConfig);
+                        Directory.CreateDirectory(wantLog);
+                    }
+                    catch { }
+                }
+                if (!rewrite) return false;
+
+                // Copy every other key through untouched: external_drivers
+                // carries HIDMaestro's own driver registration, and dropping
+                // it would unregister the VR slots.
+                var buffer = new System.IO.MemoryStream();
+                using (var w = new System.Text.Json.Utf8JsonWriter(buffer,
+                    new System.Text.Json.JsonWriterOptions { Indented = true }))
+                {
+                    w.WriteStartObject();
+                    foreach (var prop in root.EnumerateObject())
+                    {
+                        if (prop.NameEquals("config") || prop.NameEquals("log")) continue;
+                        prop.WriteTo(w);
+                    }
+                    w.WriteStartArray("config"); w.WriteStringValue(wantConfig); w.WriteEndArray();
+                    w.WriteStartArray("log"); w.WriteStringValue(wantLog); w.WriteEndArray();
+                    w.WriteEndObject();
+                }
+                File.WriteAllBytes(reg, buffer.ToArray());
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Removes the Steam-free SteamVR install PadForge owns: deletes the
+        /// payload directory, clears the HIDMaestro path hint, and resets the
+        /// availability cache so the VR slot gates drop immediately. Refuses
+        /// while vrserver runs (deleting a live runtime out from under
+        /// itself), and refuses when no owned install exists. A Steam-client
+        /// install is never touched, by design. The HM driver registration
+        /// needs no separate cleanup: vrpathreg's record lives inside the
+        /// SteamVR install's own config and dies with the directory.
+        /// </summary>
+        public static void UninstallSteamVR()
+        {
+            string dir = GetOwnedSteamVrDir()
+                ?? throw new InvalidOperationException(
+                    "No PadForge-owned SteamVR install to remove.");
+            if (Process.GetProcessesByName("vrserver").Length > 0)
+                throw new InvalidOperationException("SteamVR is running.");
+            // Independent of the install-side refusal: the hint is a plain
+            // registry value anyone can edit, and this is the line that
+            // recursively deletes whatever it names.
+            if (IsDriveRoot(dir))
+                throw new InvalidOperationException(
+                    "The recorded SteamVR path is a drive root; refusing to delete it.");
+
+            // PadForge is holding one of the files it is about to delete.
+            // The consumer loads SteamVR's own openvr_api.dll into this
+            // process and cached the handle forever, so the recursive delete
+            // below skipped that single file, the uninstall still reported
+            // success, and openvr_api.dll stayed on disk under a directory the
+            // user believed was gone. Unload first, then delete.
+            Input.OpenVrConsumerService.ReleaseRuntime();
+
+            // Windows drops a freed module's file lock asynchronously, so the
+            // first delete after an unload can still lose the race. Retry
+            // briefly rather than leaving a half-removed install behind.
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    Directory.Delete(dir, recursive: true);
+                    break;
+                }
+                catch (IOException) when (attempt < 10) { }
+                catch (UnauthorizedAccessException) when (attempt < 10) { }
+                System.Threading.Thread.Sleep(300);
+            }
+
+            // "Uninstalled" has to mean the directory is gone. Reporting
+            // success over a partial delete is what let a locked
+            // openvr_api.dll survive unnoticed in the first place.
+            if (Directory.Exists(dir))
+                throw new IOException(
+                    "SteamVR was not fully removed: " + dir + " still exists. "
+                    + "Close anything using SteamVR and try again.");
+
+            using (var k = Registry.LocalMachine.OpenSubKey(HmRegKeyPath, writable: true))
+                k?.DeleteValue(SteamVrPathRegValue, throwOnMissingValue: false);
+
+            HMaestroVRController.ResetAvailability();
+        }
+
+        /// <summary>
+        /// Installs SteamVR without Steam: downloads Valve's steamcmd,
+        /// runs the anonymous app_update for app 250820 into
+        /// <paramref name="installDir"/> (default
+        /// <see cref="SteamVrInstallDir"/>), then records the path hint so
+        /// HIDMaestro's discovery (which reads no Steam registry keys for
+        /// this shape) finds it from now on. The payload is several GB, so
+        /// this can run for many minutes on slow links; steamcmd prints
+        /// progress to its own console which stays hidden here.
+        /// </summary>
+        public static async Task InstallSteamVRAsync(string installDir = null)
+        {
+            string targetDir = NormalizeSteamVrDir(installDir);
+            // A relative path would land the payload relative to steamcmd's
+            // own working directory (the temp staging dir), then fail the
+            // vrpathreg verdict with a confusing message. Refuse up front.
+            if (!Path.IsPathRooted(targetDir))
+                throw new ArgumentException(
+                    "The SteamVR install location must be a full path, e.g. C:\\SteamVR.");
+            // A drive root is never a legitimate target, and allowing one
+            // would arm the uninstall side with Directory.Delete on the
+            // whole drive. Refuse it here too, symmetrically.
+            if (IsDriveRoot(targetDir))
+                throw new ArgumentException(
+                    "The SteamVR install location cannot be a drive root; pick a folder, e.g. C:\\SteamVR.");
+            // Test seam. Without it, the guard tests EXECUTE the real
+            // installer whenever a guard regresses: audit round 43's
+            // mutation run launched a live steamcmd toward C:\ while
+            // proving exactly that hazard. With the seam, a regressed
+            // guard still reddens the test (wrong exception type) and
+            // touches neither the network nor a process.
+            if (SteamVrInstallStopAfterGuards)
+                throw new InvalidOperationException("Test seam: guards passed.");
+            var tempDir = GetSteamVrTempDir();
+            Directory.CreateDirectory(tempDir);
+            try
+            {
+                var zipPath = Path.Combine(tempDir, "steamcmd.zip");
+                using (var http = new HttpClient())
+                {
+                    http.DefaultRequestHeaders.UserAgent.ParseAdd("PadForge");
+                    http.Timeout = TimeSpan.FromMinutes(10);
+                    using var response = await http.GetAsync(SteamCmdZipUrl,
+                        HttpCompletionOption.ResponseHeadersRead);
+                    response.EnsureSuccessStatusCode();
+                    using var stream = await response.Content.ReadAsStreamAsync();
+                    using var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write);
+                    await stream.CopyToAsync(fs);
+                }
+                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, tempDir, overwriteFiles: true);
+
+                // force_install_dir BEFORE login, per Valve's steamcmd
+                // contract; +quit so the process exits when done. The dir is
+                // quoted because it is user-chosen now and may carry spaces.
+                // Two quirks this loop absorbs, both reproduced on this
+                // machine (2026-08-08): the FIRST run self-updates, prints
+                // "Update complete, launching..." and EXITS with code 7
+                // without ever executing the + commands (the relaunch
+                // detaches), so the command line must be run again; and exit
+                // codes are not trustworthy in general. Presence of
+                // vrpathreg.exe is the only install verdict.
+                string vrpathreg = Path.Combine(targetDir, "bin", "win64", "vrpathreg.exe");
+                string lastTail = "";
+                for (int attempt = 1; attempt <= 3 && !File.Exists(vrpathreg); attempt++)
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(tempDir, "steamcmd.exe"),
+                        Arguments = $"+force_install_dir \"{targetDir}\" +login anonymous +app_update 250820 validate +quit",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        WorkingDirectory = tempDir
+                    };
+                    using var proc = Process.Start(psi);
+                    if (proc == null) continue;
+                    var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                    using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(60));
+                    try
+                    {
+                        await proc.WaitForExitAsync(cts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        try { proc.Kill(entireProcessTree: true); } catch { }
+                        throw new TimeoutException("steamcmd did not finish within 60 minutes.");
+                    }
+                    string outText = await stdoutTask;
+                    lastTail = outText.Length > 400 ? outText[^400..] : outText;
+                }
+
+                if (!File.Exists(vrpathreg))
+                    throw new InvalidOperationException(
+                        "steamcmd ran but SteamVR did not land in " + targetDir
+                        + ". steamcmd said: ..." + lastTail);
+
+                // Steam-free installs write no registry keys of their own;
+                // the hint makes discovery unconditional. Requires admin,
+                // which PadForge always has.
+                HIDMaestro.HMVR.SetSteamVRPathHint(targetDir);
+                // Valve's tooling has just written the registry with the
+                // root-level "-config"/"-logs" siblings. Move them inside.
+                ContainOwnedSteamVrDataPaths();
+                HMaestroVRController.ResetAvailability();
+            }
+            finally
+            {
+                CleanupTempDir(tempDir);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  ViGEmBus detection
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns the installed ViGEmBus version string, or null if not found in registry.
+        /// </summary>
+        public static string GetViGEmVersion()
+        {
+            var views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var view in views)
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+
+                    if (uninstallKey == null) continue;
+
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        var name = sub?.GetValue("DisplayName") as string;
+                        if (string.IsNullOrEmpty(name)) continue;
+
+                        if (name.IndexOf("ViGEm", StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+
+                        return sub.GetValue("DisplayVersion") as string;
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        // ─────────────────────────────────────────────
+        //  HidHide detection
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Whether HidHide is installed, and its version, from one look: a
+        /// Windows Installer registration on any machine, or on ARM64 the
+        /// service, class filter and device node that upstream's manual
+        /// install leaves, which registers nothing with Windows Installer.
+        /// The version is the MSI's where there is one, else the driver
+        /// file's own, and "Installed" when neither can be read.
+        ///
+        /// <para>This was two methods, one for each answer, and the status
+        /// timer called both every five seconds on the UI thread. Each made
+        /// the same look, so every tick walked the uninstall registry twice,
+        /// and on ARM64 enumerated the machine's devices twice.</para>
+        /// </summary>
+        public static bool TryGetHidHideStatus(out string version)
+        {
+            if (TryGetHidHideMsiInfo(out string msiVersion, out _))
+            {
+                version = string.IsNullOrEmpty(msiVersion) ? "Installed" : msiVersion;
+                return true;
+            }
+            if (PadForge.Engine.PlatformSupport.IsArm64Machine && HidHideArm64Installer.IsInstalled())
+            {
+                version = HidHideArm64Installer.InstalledDriverVersion() ?? "Installed";
+                return true;
+            }
+            version = null;
+            return false;
+        }
+
+        private static bool TryGetHidHideMsiInfo(out string displayVersion, out string productCode)
+        {
+            displayVersion = null;
+            productCode = null;
+            bool found = false;
+
+            var views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var view in views)
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var uninstallKey = baseKey.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", false);
+
+                    if (uninstallKey == null) continue;
+
+                    foreach (var subName in uninstallKey.GetSubKeyNames())
+                    {
+                        using var sub = uninstallKey.OpenSubKey(subName, false);
+                        var name = sub?.GetValue("DisplayName") as string;
+                        if (string.IsNullOrEmpty(name)) continue;
+
+                        if (name.IndexOf("HidHide", StringComparison.OrdinalIgnoreCase) < 0 &&
+                            name.IndexOf("HID Hide", StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+
+                        // "Installed" is any registration that names it, as
+                        // it always was. The ProductCode is narrower: only a
+                        // Windows Installer product has one msiexec can act
+                        // on, and a bootstrapper's own entry can sit in front
+                        // of it under a brace GUID that is not a ProductCode.
+                        // So the walk carries on past a match that has no
+                        // code, and stops at the first one that does.
+                        found = true;
+                        string code = MsiProductCodeOrNull(subName, sub.GetValue("WindowsInstaller"));
+                        if (displayVersion == null || code != null)
+                            displayVersion = sub.GetValue("DisplayVersion") as string ?? displayVersion;
+                        if (code != null)
+                        {
+                            productCode = code;
+                            return true;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore and try the other registry view.
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// The subkey name as an MSI ProductCode, or null when the entry is
+        /// not a Windows Installer product. Windows Installer marks its own
+        /// entries with a WindowsInstaller DWORD of 1 and names them by
+        /// ProductCode. Anything else under Uninstall is some other
+        /// installer's bookkeeping, whatever its key looks like.
+        /// </summary>
+        internal static string MsiProductCodeOrNull(string subKeyName, object windowsInstallerValue)
+        {
+            if (!(windowsInstallerValue is int flag) || flag != 1) return null;
+            return Guid.TryParseExact(subKeyName, "B", out _) ? subKeyName : null;
+        }
+
+        /// <summary>
+        /// Whether msiexec's exit code means the work is done. 3010 and 1641
+        /// are success with a restart owed or already started. 1605 means the
+        /// product named is not installed, which finishes an uninstall that
+        /// named an INSTALLED product and fails everything else.
+        /// </summary>
+        internal static bool IsMsiSuccess(int exitCode, bool absentIsSuccess)
+            => exitCode == 0
+            || exitCode == 3010
+            || exitCode == 1641
+            || (absentIsSuccess && exitCode == 1605);
+
+        // ─────────────────────────────────────────────
+        //  Shared helpers
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Extract an embedded resource to a temp directory.
+        /// Returns the full path to the extracted file.
+        /// </summary>
+        internal static string ExtractEmbeddedResource(string resourceFileName, string tempDir)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceNames = assembly.GetManifestResourceNames();
+
+            var resourceName = resourceNames.FirstOrDefault(
+                x => x.IndexOf(resourceFileName, StringComparison.OrdinalIgnoreCase) >= 0);
+
+            if (string.IsNullOrEmpty(resourceName))
+                throw new FileNotFoundException(
+                    $"Embedded resource '{resourceFileName}' not found. " +
+                    $"Available: {string.Join(", ", resourceNames)}");
+
+            Directory.CreateDirectory(tempDir);
+            var tempPath = Path.Combine(tempDir, resourceFileName);
+
+            using (var stream = assembly.GetManifestResourceStream(resourceName))
+            using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
+            {
+                stream.CopyTo(fs);
+            }
+
+            return tempPath;
+        }
+
+        /// <summary>
+        /// Run the bootstrapper's /extract to unpack the MSI and supporting files.
+        /// Returns the path to the extraction folder.
+        /// </summary>
+        private static string ExtractInstallerBundle(string exePath, string tempDir)
+        {
+            var extractDir = Path.Combine(tempDir, "Extracted");
+
+            if (Directory.Exists(extractDir))
+                Directory.Delete(extractDir, true);
+
+            Directory.CreateDirectory(extractDir);
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = exePath,
+                Arguments = $"/extract \"{extractDir}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (var proc = Process.Start(psi))
+            {
+                proc?.WaitForExit(60_000);
+            }
+
+            return extractDir;
+        }
+
+        /// <summary>
+        /// Find an MSI file in the extracted bundle contents.
+        /// </summary>
+        private static string FindMsi(string extractDir, string primaryName, string fallbackPattern)
+        {
+            var files = Directory.GetFiles(extractDir, primaryName, SearchOption.AllDirectories);
+            if (files.Length > 0)
+                return files[0];
+
+            files = Directory.GetFiles(extractDir, fallbackPattern, SearchOption.AllDirectories);
+            if (files.Length > 0)
+                return files[0];
+
+            throw new FileNotFoundException(
+                $"Could not find {primaryName} in extracted bundle at '{extractDir}'.");
+        }
+
+        /// <summary>
+        /// Run msiexec.exe with elevation (UAC prompt) and hold it to its
+        /// exit code. The wait's result and the code were both ignored once,
+        /// so a failed install, a canceled one and one still running after
+        /// three minutes all came back as success.
+        /// </summary>
+        /// <exception cref="InstallerFailedException">msiexec failed, was
+        /// canceled from its own window, or outlived the wait.</exception>
+        private static void RunMsiElevated(string arguments, bool absentIsSuccess)
+        {
+            int? exitCode = RunElevated("msiexec.exe", arguments);
+            if (exitCode == null) throw new InstallerFailedException();
+            if (!IsMsiSuccess(exitCode.Value, absentIsSuccess))
+                throw new InstallerFailedException(exitCode.Value);
+        }
+
+        /// <summary>
+        /// Run an executable with elevation (UAC prompt). Returns its exit
+        /// code, or null when it was still running after three minutes.
+        /// What an exit code means belongs to the caller: msiexec's are
+        /// documented, a cleanup script's are not.
+        /// </summary>
+        private static int? RunElevated(string fileName, string arguments)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                Verb = "runas",
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+
+            using var proc = Process.Start(psi);
+            // ShellExecute can start the work without handing a process back.
+            // Nothing can be waited on then, and nothing is known.
+            if (proc == null) return null;
+            return proc.WaitForExit(180_000) ? proc.ExitCode : (int?)null;
+        }
+
+        /// <summary>
+        /// Clean up a temp directory, ignoring errors.
+        /// </summary>
+        internal static void CleanupTempDir(string tempDir)
+        {
+            try
+            {
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, true);
+            }
+            catch { }
+        }
+    }
+}

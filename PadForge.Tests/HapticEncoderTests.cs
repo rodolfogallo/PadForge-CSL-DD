@@ -1,0 +1,460 @@
+using System;
+using PadForge.Engine.Haptics;
+using Xunit;
+
+namespace PadForge.Tests
+{
+    /// <summary>
+    /// Argues the issue #146/#147 encoder cores against their cloned references
+    /// (joycon-singer rumble.h, SteamControllerSinger main.cpp, dolphin
+    /// Speaker.cpp). These are the runtime positive controls the cite-verify
+    /// pass can cite as Confirmed: the logic runs here even though the device
+    /// hardware does not.
+    /// </summary>
+    public class HapticEncoderTests
+    {
+        // ─── Joy-Con HD rumble (joycon-singer rumble.h) ───
+
+        [Fact]
+        public void JoyConNeutral_IsTheReferenceSilencePacket()
+        {
+            // RUMBLE_NEUTRAL { 0x00, 0x01, 0x40, 0x40 } (rumble.h:10).
+            Assert.Equal(new byte[] { 0x00, 0x01, 0x40, 0x40 }, HapticToneEncoder.JoyConNeutral());
+        }
+
+        [Fact]
+        public void JoyConFold_KeepsPitchClassInBand()
+        {
+            // 1000 Hz folds down by an octave until <= 626; 20 Hz folds up past 41.
+            float high = HapticToneEncoder.FoldJoyConFrequency(1000f);
+            Assert.InRange(high, HapticToneEncoder.JoyConFreqMin, HapticToneEncoder.JoyConFreqMax);
+            float low = HapticToneEncoder.FoldJoyConFrequency(20f);
+            Assert.InRange(low, HapticToneEncoder.JoyConFreqMin, HapticToneEncoder.JoyConFreqMax);
+        }
+
+        [Fact]
+        public void JoyConFold_NonFiniteFoldsToFloor_NoHang()
+        {
+            // +Infinity must NOT spin the fold loop (Inf * 0.5f == Inf), and NaN
+            // (all comparisons unordered-false) must not slip through to a
+            // garbage byte. Both fold to the band floor. Run the +Inf case on a
+            // worker thread and bound it with Join(2000): a regression that
+            // removes the guard turns +Inf into an infinite loop, and this fails
+            // in 2s instead of hanging the whole run (xunit Timeout is async-only
+            // and would not interrupt a synchronous spin anyway).
+            float plusInf = float.NaN;
+            var worker = new System.Threading.Thread(
+                () => plusInf = HapticToneEncoder.FoldJoyConFrequency(float.PositiveInfinity))
+            { IsBackground = true };
+            worker.Start();
+            Assert.True(worker.Join(2000), "+Inf fold did not terminate within 2s (the NaN/Inf guard is missing).");
+            Assert.Equal(HapticToneEncoder.JoyConFreqMin, plusInf);
+
+            Assert.Equal(HapticToneEncoder.JoyConFreqMin, HapticToneEncoder.FoldJoyConFrequency(float.NegativeInfinity));
+            Assert.Equal(HapticToneEncoder.JoyConFreqMin, HapticToneEncoder.FoldJoyConFrequency(float.NaN));
+            // And the encoder itself must terminate and emit a defined packet.
+            byte[] bytes = HapticToneEncoder.EncodeJoyConRumble(float.PositiveInfinity, 0.5f);
+            Assert.Equal(4, bytes.Length);
+        }
+
+        [Fact]
+        public void JoyConEncode_MatchesReferenceFormulaByteForByte()
+        {
+            // Recompute encode_rumble (rumble.h:87-113) independently for a
+            // mid-band tone and assert the implementation agrees bit for bit.
+            // Float32 (MathF) + AwayFromZero mirrors the reference roundf(log2f).
+            float freq = 320f, amp = 0.5f;
+            byte encFreq = (byte)MathF.Round(MathF.Log2(freq / 10.0f) * 32.0f, MidpointRounding.AwayFromZero);
+            ushort hf = (ushort)((encFreq - 0x60) * 4);
+            byte lf = (byte)(encFreq - 0x40);
+            byte encAmp = (byte)MathF.Round(MathF.Log2(amp * 8.7f) * 32.0f, MidpointRounding.AwayFromZero); // amp > 0.23 segment
+            ushort hfAmp = (ushort)(encAmp * 2);
+            byte lfAmp = (byte)((encAmp >> 1) + 0x40);
+            var expected = new byte[]
+            {
+                (byte)(hf & 0xFF),
+                (byte)(((hf >> 8) & 0xFF) | (hfAmp & 0xFF)),
+                (byte)(lf | ((lfAmp << 7) & 0x80)),
+                (byte)(lfAmp >> 1),
+            };
+            Assert.Equal(expected, HapticToneEncoder.EncodeJoyConRumble(freq, amp));
+        }
+
+        [Fact]
+        public void JoyConEncode_UsesFloatAwayFromZero_NotDoubleNotBankers()
+        {
+            // rumble.h:95 computes enc_freq = roundf(log2f(freq/10) * 32) in
+            // float32, round-half-away-from-zero. The encoder must match THAT,
+            // not C# default double Math.Log2 and not banker's ToEven. Both a
+            // regression to double and to ToEven diverge from the float-away
+            // reference at the analytic tie frequencies f = 10*2^((k+0.5)/32),
+            // where float32 log2f lands exactly on k+0.5. Sweep those ties and
+            // assert the encoder equals the float-away reference everywhere, and
+            // confirm at least one tie actually discriminates (so this test has
+            // teeth, unlike a single-point check that may miss the midpoint).
+            bool discriminating = false;
+            for (int k = 66; k <= 180; k += 2) // even k: at a true .5, away != even
+            {
+                float freq = (float)(10.0 * Math.Pow(2.0, (k + 0.5) / 32.0));
+                if (freq < HapticToneEncoder.JoyConFreqMin || freq > HapticToneEncoder.JoyConFreqMax)
+                    continue;
+
+                byte refAway = (byte)MathF.Round(MathF.Log2(freq / 10.0f) * 32.0f, MidpointRounding.AwayFromZero);
+                byte refEven = (byte)MathF.Round(MathF.Log2(freq / 10.0f) * 32.0f, MidpointRounding.ToEven);
+                byte dblAway = (byte)Math.Round(Math.Log2(freq / 10.0) * 32.0, MidpointRounding.AwayFromZero);
+
+                int implLf = HapticToneEncoder.EncodeJoyConRumble(freq, 0.5f)[2] & 0x7F;
+
+                // Must equal the float away-from-zero reference. A regression to
+                // double or ToEven would diverge here at a discriminating tie.
+                Assert.Equal((refAway - 0x40) & 0x7F, implLf);
+
+                if (refAway != refEven) discriminating = true;   // catches ToEven regression
+                if (refAway != dblAway) discriminating = true;   // catches double regression
+            }
+            Assert.True(discriminating,
+                "no tie frequency exercised the float/away-from-zero divergence; the guard would be vacuous");
+        }
+
+        [Fact]
+        public void JoyConEncode_SilenceBelowDeadZone()
+        {
+            // amp <= 0.012 -> enc_amp 0 -> hf_amp 0, lf_amp 0x40 (the amplitude
+            // floor; pitch bytes still set). Confirms the dead-zone branch.
+            var bytes = HapticToneEncoder.EncodeJoyConRumble(320f, 0.0f);
+            // lf_amp = (0 >> 1) + 0x40 = 0x40; out[3] = 0x40 >> 1 = 0x20.
+            Assert.Equal(0x20, bytes[3]);
+        }
+
+        [Fact]
+        public void JoyConEncode_QuietBand_NoNegativeAmpWrap()
+        {
+            // The second amp segment log2(amp*17)*16 is negative below amp=1/17
+            // (~0.0588), so the threshold must sit above that. With the
+            // table-authoritative 0.12 threshold, a tone in the OLD (0.012,
+            // 0.0588) band now falls in the dead zone (enc_amp 0 -> out[3]=0x20)
+            // instead of wrapping a negative round to a near-max amplitude byte
+            // (the pre-fix garbage: amp=0.02 produced out[3]=0x59, loudest tone
+            // from the quietest input). out[3] = ((enc_amp>>1)+0x40)>>1.
+            Assert.Equal(0x20, HapticToneEncoder.EncodeJoyConRumble(320f, 0.02f)[3]);
+            Assert.Equal(0x20, HapticToneEncoder.EncodeJoyConRumble(320f, 0.05f)[3]);
+
+            // A tone just above the 0.12 threshold encodes a SMALL positive
+            // amplitude, neither silence nor garbage.
+            byte encAmp = (byte)Math.Max(0f, MathF.Round(MathF.Log2(0.15f * 17.0f) * 16.0f, MidpointRounding.AwayFromZero));
+            Assert.InRange((int)encAmp, 1, 63);
+            int expectedOut3 = ((encAmp >> 1) + 0x40) >> 1;
+            byte[] soft = HapticToneEncoder.EncodeJoyConRumble(320f, 0.15f);
+            Assert.Equal(expectedOut3, soft[3]);
+            Assert.NotEqual(0x20, soft[3]); // audible, not dead
+        }
+
+        [Fact]
+        public void MidiNote69_Is440Hz()
+        {
+            Assert.Equal(440f, HapticToneEncoder.MidiNoteToFrequency(69), 3);
+        }
+
+        // ─── Steam Controller 2015 (SteamControllerSinger main.cpp) ───
+
+        [Fact]
+        public void SteamClassic_HeaderAndPeriodMatchReference()
+        {
+            // A4 = 440 Hz, sustain. periodCommand = (1/440)*495483 (main.cpp:120-121).
+            byte[] blob = HapticToneEncoder.EncodeSteamClassic(440f, -1.0, haptic: 1);
+            Assert.Equal(64, blob.Length);
+            Assert.Equal(0x8F, blob[0]);
+            Assert.Equal(0x07, blob[1]);
+            Assert.Equal(0x01, blob[2]); // haptic = left
+
+            ushort periodCommand = (ushort)((1.0 / 440f) * HapticToneEncoder.SteamMagicPeriodRatio);
+            Assert.Equal((byte)(periodCommand % 0xFF), blob[3]);
+            Assert.Equal((byte)(periodCommand / 0xFF), blob[4]);
+            Assert.Equal(blob[3], blob[5]); // square wave: low duration == high
+            Assert.Equal(blob[4], blob[6]);
+            // Sustain -> repeat 0x7FFF -> LSB/MSB by the reference's 0xFF split.
+            Assert.Equal((byte)(0x7FFF % 0xFF), blob[7]);
+            Assert.Equal((byte)(0x7FFF / 0xFF), blob[8]);
+        }
+
+        [Fact]
+        public void SteamClassic_StopMatchesReferenceNote0RepeatZero()
+        {
+            // The reference NOTE_STOP is "note 0 (8.1758 Hz), duration 0", which
+            // falls through encode: the note-0 period stays in bytes 3-6 and only
+            // the repeat count (bytes 7-8) is zeroed (main.cpp:114-134). So a stop
+            // is not a blank packet.
+            byte[] blob = HapticToneEncoder.EncodeSteamClassic(0f, 0.0, haptic: 0);
+            Assert.Equal(0x8F, blob[0]);
+            Assert.Equal(0x07, blob[1]);
+            Assert.Equal(0x00, blob[2]);
+
+            ushort periodCommand = (ushort)((1.0 / 8.1758f) * HapticToneEncoder.SteamMagicPeriodRatio);
+            Assert.Equal((byte)(periodCommand % 0xFF), blob[3]); // note-0 period present
+            Assert.Equal((byte)(periodCommand / 0xFF), blob[4]);
+            Assert.Equal(0, blob[7]); // repeat count zeroed -> silent
+            Assert.Equal(0, blob[8]);
+        }
+
+        // ─── Steam Controller 2026 / Triton: 0x83 LFO-tone OUTPUT report ───
+        // Byte for byte against SteamHapticsSinger main.cpp:252-285:
+        // [0]=0x83, [1]=actuator index, [2]=signed velocity gain (amp*255-128),
+        // [3..4]=freq u16 LE, [5..6]=duration 0x7FFF (sustain). Drive all four LRAs
+        // (ids 0,1,3,4) with their own report.
+
+        [Fact]
+        public void TritonTone_LayoutMatchesSteamHapticsSinger()
+        {
+            byte[] r = HapticToneEncoder.EncodeTritonTone(haptic: 1, freqHz: 440f, amp: 1.0f);
+            Assert.Equal(10, r.Length);
+            Assert.Equal(0x83, r[0]);                    // ID_OUT_REPORT_HAPTIC_LFO_TONE
+            Assert.Equal(1, r[1]);                       // actuator index in byte 1 (trackpad)
+            Assert.Equal(0, unchecked((sbyte)r[2]));     // amp 1.0 -> 0 dB (unity, NOT +127)
+            Assert.Equal(440, r[3] | (r[4] << 8));       // trackpad: raw Hz, LE
+            Assert.Equal(0x7FFF, r[5] | (r[6] << 8));    // duration = sustain
+        }
+
+        [Fact]
+        public void TritonTone_GainIsDbNeverPositive_AndStopForm()
+        {
+            // gain_db: 0 dB at full amp (unity, the reference level), 20*log10(amp)
+            // below, never positive (positive dB clips the firmware limiter).
+            sbyte gFull = unchecked((sbyte)HapticToneEncoder.EncodeTritonTone(0, 440f, 1.0f)[2]);
+            sbyte gMid = unchecked((sbyte)HapticToneEncoder.EncodeTritonTone(0, 440f, 0.5f)[2]);
+            sbyte gLow = unchecked((sbyte)HapticToneEncoder.EncodeTritonTone(0, 440f, 0.1f)[2]);
+            Assert.Equal(0, gFull);                         // amp 1 -> 0 dB unity
+            Assert.Equal(-6, gMid);                         // 20*log10(0.5) = -6 dB
+            Assert.Equal(-20, gLow);                        // 20*log10(0.1) = -20 dB
+            Assert.True(gFull > gMid && gMid > gLow, "monotonic, never positive");
+
+            // Stop form: amp<=0 or freq<=0 -> byte2 0x80, byte6 0x80, actuator kept.
+            byte[] stop = HapticToneEncoder.EncodeTritonTone(4, 0f, 0f);
+            Assert.Equal(0x83, stop[0]);
+            Assert.Equal(4, stop[1]);
+            Assert.Equal(0x80, stop[2]);
+            Assert.Equal(0x80, stop[6]);
+        }
+
+        [Fact]
+        public void TritonActuators_AreTheFourLraIndices()
+        {
+            Assert.Equal(new[] { 0, 1, 3, 4 }, HapticToneEncoder.TritonActuators);
+            Assert.False(HapticToneEncoder.TritonIsGrip(0));  // trackpad
+            Assert.False(HapticToneEncoder.TritonIsGrip(1));  // trackpad
+            Assert.True(HapticToneEncoder.TritonIsGrip(3));   // grip
+            Assert.True(HapticToneEncoder.TritonIsGrip(4));   // grip
+        }
+
+        [Fact]
+        public void TritonGrip_GetsTwoPercentFreqCorrection_TrackpadDoesNot()
+        {
+            // Trackpad (0,1): raw note Hz. Grip (3,4): driven through the reference's
+            // per-note Tr->Rb map so it sounds the SAME pitch as the trackpad. At a
+            // TABULATED trackpad freq the grip drive equals Rb[n] exactly: Tr[69]=439 ->
+            // Rb[69]=449, Tr[81]=877 -> Rb[81]=898 (SteamHapticsSinger main.cpp:36-37).
+            byte[] pad = HapticToneEncoder.EncodeTritonTone(1, 439f, 1.0f);
+            byte[] grip = HapticToneEncoder.EncodeTritonTone(3, 439f, 1.0f);
+            Assert.Equal(439, pad[3] | (pad[4] << 8));            // trackpad: raw 439
+            Assert.Equal(449, grip[3] | (grip[4] << 8));          // grip: exact Rb[69]
+            byte[] gripHi = HapticToneEncoder.EncodeTritonTone(4, 877f, 1.0f);
+            Assert.Equal(898, gripHi[3] | (gripHi[4] << 8));      // grip: exact Rb[81]
+            // Grip drive is always above the trackpad drive (grip LRA needs more) and the
+            // ratio is per-note, not a fixed constant: higher at low freq than at high.
+            Assert.True(HapticToneEncoder.TritonGripDriveHz(110f) / 110f
+                      > HapticToneEncoder.TritonGripDriveHz(2093f) / 2093f);
+        }
+
+        // ─── Wii speaker Yamaha ADPCM (dolphin Speaker.cpp) ───
+
+        [Fact]
+        public void Adpcm_DecodeInitialState_FirstNibbleMatchesFormula()
+        {
+            // predictor 0, step 127. Nibble 0 -> predictor += 127*1/8 = 15.
+            var s = WiiSpeakerAdpcm.State.Initial;
+            short first = WiiSpeakerAdpcm.ExpandNibble(ref s, 0);
+            Assert.Equal(15, first);          // 127*1/8 = 15 (integer)
+            // step = (127*230)>>8 = 114, clamped up to the 127 floor
+            // (av_clip(step, 127, 24576), Speaker.cpp:53).
+            Assert.Equal(127, s.Step);
+
+            // A large nibble (7, indexscale 614) pushes step above the floor:
+            // (127*614)>>8 = 304, unclamped.
+            var s2 = WiiSpeakerAdpcm.State.Initial;
+            WiiSpeakerAdpcm.ExpandNibble(ref s2, 7);
+            Assert.Equal((127 * 614) >> 8, s2.Step);
+        }
+
+        [Fact]
+        public void Adpcm_RoundTrip_TracksASineWithinTolerance()
+        {
+            // Encode a low-rate sine, decode it back, assert the reconstruction
+            // follows the signal. ADPCM is lossy; assert mean abs error is a
+            // small fraction of full scale rather than exact equality.
+            int n = 512;
+            var pcm = new short[n];
+            for (int i = 0; i < n; i++)
+                pcm[i] = (short)(8000 * Math.Sin(2 * Math.PI * i / 32.0));
+
+            byte[] enc = WiiSpeakerAdpcm.Encode(pcm);
+            Assert.Equal((n + 1) / 2, enc.Length); // 2 samples per byte
+
+            short[] dec = WiiSpeakerAdpcm.Decode(enc);
+            Assert.Equal(n, dec.Length);
+
+            double sumErr = 0;
+            for (int i = 0; i < n; i++) sumErr += Math.Abs(dec[i] - pcm[i]);
+            double meanErr = sumErr / n;
+            // Yamaha ADPCM on a smooth tone tracks well; well under 10% FS.
+            Assert.True(meanErr < 3276, $"mean abs error {meanErr} too high");
+        }
+
+        [Fact]
+        public void Adpcm_ChunkedStreamMatchesWholeCue()
+        {
+            // A streaming sink encodes per report payload, not whole-cue. The
+            // state-carrying overloads must carry predictor/step across chunks
+            // so the chunked byte stream is IDENTICAL to a single-call encode
+            // (else the Wii decoder, which never resets mid-cue, hears a click
+            // at each report boundary). Reset-per-chunk would diverge after the
+            // first chunk.
+            int n = 256;
+            var pcm = new short[n];
+            for (int i = 0; i < n; i++)
+                pcm[i] = (short)(6000 * Math.Sin(2 * Math.PI * i / 24.0));
+
+            byte[] whole = WiiSpeakerAdpcm.Encode(pcm);
+
+            // Encode in even-length chunks carrying state forward.
+            var s = WiiSpeakerAdpcm.State.Initial;
+            var chunked = new System.Collections.Generic.List<byte>();
+            for (int off = 0; off < n; off += 40) // 40 = even chunk
+            {
+                int len = Math.Min(40, n - off);
+                var chunk = new short[len];
+                Array.Copy(pcm, off, chunk, 0, len);
+                chunked.AddRange(WiiSpeakerAdpcm.Encode(chunk, ref s));
+            }
+
+            Assert.Equal(whole, chunked.ToArray());
+
+            // And a reset-per-chunk encode must NOT match (proves the test has
+            // teeth: state continuity is what makes the streams equal).
+            var resetChunked = new System.Collections.Generic.List<byte>();
+            for (int off = 0; off < n; off += 40)
+            {
+                int len = Math.Min(40, n - off);
+                var chunk = new short[len];
+                Array.Copy(pcm, off, chunk, 0, len);
+                resetChunked.AddRange(WiiSpeakerAdpcm.Encode(chunk)); // fresh state each chunk
+            }
+            Assert.NotEqual(whole, resetChunked.ToArray());
+        }
+
+        [Fact]
+        public void Adpcm_StreamingEncode_RejectsOddChunk()
+        {
+            // An odd streaming chunk would ship a padding nibble the decoder
+            // consumes as a real sample, permanently desyncing the stream. The
+            // overload must throw rather than corrupt silently. The one-shot
+            // Encode stays lenient (self-contained, no following chunk).
+            var s = WiiSpeakerAdpcm.State.Initial;
+            Assert.Throws<System.ArgumentException>(() => WiiSpeakerAdpcm.Encode(new short[] { 1, 2, 3 }, ref s));
+            // One-shot odd input is allowed (no desync hazard).
+            Assert.Equal(2, WiiSpeakerAdpcm.Encode(new short[] { 1, 2, 3 }).Length);
+        }
+
+        [Fact]
+        public void Adpcm_LowNibbleDecodedFirst()
+        {
+            // Wire order is LOW nibble first (sample 2n in bits 0-3), confirmed on
+            // this exact hardware: Touchmote feeds ffmpeg adpcm_yamaha (low-first)
+            // bytes unchanged via WiimoteLib.StartPlayback and they play intelligibly
+            // on the user's own Wii Remote. One byte 0x0F: low nibble 15 (sample 0),
+            // high nibble 0 (sample 1). From Initial (predictor 0, step 127): nibble
+            // 15 -> 127*-15/8 = -238; nibble 0 from there steps back up, so sample 1
+            // > sample 0.
+            short[] dec = WiiSpeakerAdpcm.Decode(new byte[] { 0x0F });
+            Assert.Equal(2, dec.Length);
+            Assert.Equal(-238, dec[0]);        // low nibble 15 first (large negative step)
+            Assert.True(dec[1] > dec[0]);      // high nibble 0 second steps back up
+        }
+
+        // ─── PCM->tone reducer (issue #147, the hardware-independent half) ───
+        // The reducer is the one part of the haptic-tone sink that runs entirely
+        // in software, so it gets a runtime positive control: feed a synthetic
+        // sine and confirm it recovers the pitch and loudness the coil would play.
+
+        private const int ReduceRate = 8000;
+
+        // Streams `seconds` of a sine through the reducer in 80-sample (10 ms)
+        // ticks and returns the final (Hz, Amp) read, after the analysis ring has
+        // filled.
+        private static (float Hz, float Amp) ReduceSine(float freq, float amp, double seconds = 0.2)
+        {
+            var r = new HapticToneReducer(ReduceRate);
+            int tick = ReduceRate / 100; // 80
+            int total = (int)(ReduceRate * seconds);
+            var buf = new float[tick];
+            (float Hz, float Amp) last = (0f, 0f);
+            int phase = 0;
+            for (int produced = 0; produced < total; produced += tick)
+            {
+                for (int i = 0; i < tick; i++)
+                    buf[i] = amp * (float)Math.Sin(2.0 * Math.PI * freq * (phase + i) / ReduceRate);
+                phase += tick;
+                last = r.Push(buf, tick);
+            }
+            return last;
+        }
+
+        [Fact]
+        public void Reducer_RecoversPitchAndLoudness_Of220HzSine()
+        {
+            var (hz, amp) = ReduceSine(220f, 0.5f);
+            // Autocorrelation lag is integer, so 220 Hz lands on lag 36 (222 Hz)
+            // or 37 (216 Hz). Accept the quantization neighborhood.
+            Assert.InRange(hz, 210f, 232f);
+            // 0.5-amplitude sine -> RMS ~0.354 -> *1.4 ~0.495.
+            Assert.InRange(amp, 0.35f, 0.65f);
+        }
+
+        [Fact]
+        public void Reducer_RecoversPitch_Of440HzSine()
+        {
+            var (hz, _) = ReduceSine(440f, 0.6f);
+            // 440 Hz -> lag 18 (444 Hz) is the nearest integer lag.
+            Assert.InRange(hz, 420f, 460f);
+        }
+
+        [Fact]
+        public void Reducer_ReportsSilenceAsZeroAmplitude()
+        {
+            var (_, amp) = ReduceSine(330f, 0.0f);
+            Assert.Equal(0f, amp);
+        }
+
+        // ─── Steam Deck (Jupiter, SteamHapticsSinger) ───
+        // The SC2026 (Triton) plays through the 0x83 OUTPUT report on a direct raw
+        // handle (see the Triton tests above), NOT 0x8f. The Deck (0xEA) is the
+        // other gain-carrying feature path.
+
+        [Fact]
+        public void SteamDeck_UsesProven0x8FPath()
+        {
+            // The Deck's built-in controller is the Steam Controller 0x8F path
+            // (SteamControllerSinger opens 0x1205 and drives it via the same
+            // SteamController_PlayNote). There is no bespoke Deck encoder -- it reuses
+            // EncodeSteamClassic, so a Deck tone is a real period-based 0x8F square,
+            // not the old 0xEA Jupiter stub. Spot-check the shared encoder here.
+            var blob = HapticToneEncoder.EncodeSteamClassic(440f, durationSeconds: -1.0, haptic: 0);
+            Assert.Equal(0x8F, blob[0]);
+            Assert.Equal(0x07, blob[1]);
+            ushort period = (ushort)((1.0 / 440.0) * HapticToneEncoder.SteamMagicPeriodRatio);
+            Assert.Equal(period % 0xFF, blob[3]);   // real period frequency, not raw Hz
+            Assert.Equal(period / 0xFF, blob[4]);
+        }
+
+        // Switch 2 was dropped from the #147 tone scope (no reference plays a tone
+        // on a Switch 2 actuator), so its encoder + tests were removed.
+    }
+}

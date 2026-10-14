@@ -1,0 +1,854 @@
+﻿using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace PadForge.Engine
+{
+    /// <summary>
+    /// Virtual input device representing a browser-connected gamepad.
+    /// State is written by the WebSocket receive thread and read by the polling thread.
+    /// Implements <see cref="ISdlInputDevice"/> so it flows through the standard
+    /// 6-step input pipeline alongside physical devices.
+    /// </summary>
+    public class WebControllerDevice : ISdlInputDevice
+    {
+        // Standard gamepad layout: 6 axes, 11 buttons, 1 POV.
+        private const int NumGamepadAxes = 6;
+        private const int NumGamepadButtons = 11;
+        private const int NumGamepadPovs = 1;
+
+        // Distinctive VID/PID to avoid virtual-controller filter false positives.
+        private const ushort WebVendorId = 0xBEEF;
+        private const ushort WebProductId = 0xCA7E;
+
+        /// <summary>Base ProductGuid for web controllers. The instance
+        /// <see cref="ProductGuid"/> property mixes the layout key into
+        /// this so xbox360 / ds4 / touchpad clients each carry a distinct
+        /// product identity. Without per-layout differentiation, the
+        /// FindOrCreateUserDevice "BT reconnect" fallback in
+        /// InputManager.Step1 would migrate an offline xbox360 web
+        /// device's slot mapping onto a freshly-connecting ds4 web
+        /// device (and vice versa), since the fallback gates only on
+        /// ProductGuid + offline status. Real hardware distinct enough
+        /// to share a layout still shares a ProductGuid; web layouts are
+        /// software constructs and are deliberately treated as separate
+        /// products.</summary>
+        private static readonly Guid WebProductGuidBase =
+            new Guid("BEBC0000-0000-0000-0000-CAFEFACE0001");
+
+        // Axis names matching the standard gamepad layout (LX, LY, LT, RX, RY, RT).
+        private static readonly Guid[] AxisGuids =
+        {
+            ObjectGuid.XAxis,  ObjectGuid.YAxis,  ObjectGuid.ZAxis,
+            ObjectGuid.RxAxis, ObjectGuid.RyAxis, ObjectGuid.RzAxis
+        };
+
+        private static readonly string[] AxisNames =
+            { "Left X", "Left Y", "Left Trigger", "Right X", "Right Y", "Right Trigger" };
+
+        private static readonly string[] ButtonNames =
+            { "A", "B", "X", "Y", "Left Shoulder", "Right Shoulder", "Back", "Start", "Left Stick Button", "Right Stick Button", "Guide" };
+
+        // Thread-safe state: written by the WebSocket thread, read by the
+        // polling thread. Strict copy-on-write: every mutator clones under
+        // _stateLock and publishes with Volatile.Write, and the read path takes
+        // one Volatile.Read. The field is deliberately NOT declared volatile,
+        // because passing a volatile field to Volatile.Read by ref is CS0420
+        // (the ref takes its address and drops the volatile contract there).
+        private CustomInputState _currentState = new CustomInputState();
+        private readonly object _stateLock = new object();
+        private volatile bool _connected;
+
+        public uint SdlInstanceId { get; }
+        public string Name { get; }
+        public int NumAxes => _isTouchpadDevice || _isMenuSurface ? 0 : NumGamepadAxes;
+        // NumButtons describes the slot range, not the count of populated
+        // slots. The touchpad click rides Buttons[16] (SDL_GAMEPAD_BUTTON_TOUCHPAD's
+        // canonical slot), so touchpad-equipped layouts need NumButtons=17
+        // for dense-iter consumers (macro-trigger recorder, mapping picker's
+        // raw-button list) to actually reach slot 16. The sparse
+        // SupportedButtonIndices below is what the Devices preview reads
+        // to surface which slots are real, so its grid still shows 11
+        // circles for a ds4 gamepad client (plus the touchpad-click circle)
+        // and 1 for the touchpad-only client. GetDeviceObjects deliberately
+        // does NOT add slot 16 — the mapping picker keeps the canonical
+        // "Touchpad 0 Click" descriptor as the single source-of-truth.
+        public int NumButtons =>
+            _isMenuSurface ? 0
+            : _isTouchpadDevice ? 17
+            : _extendedMax >= 0 ? Math.Max(_extendedMax + 1, HasTouchpad ? 17 : 0)
+            : HasTouchpad ? 17
+            : NumGamepadButtons;
+        public int RawButtonCount => NumButtons;
+        // A built pad carries a D-pad only when its author placed one. The
+        // stock count was reported for every gamepad client, so a pad of one
+        // button showed a POV on the Devices page that nothing could move.
+        public int NumHats =>
+            _isTouchpadDevice || _isMenuSurface ? 0
+            : _hasCustomSurface ? (_customHasPov ? 1 : 0)
+            : NumGamepadPovs;
+
+        /// <summary>The axes a built pad actually carries, by their canonical
+        /// slot numbers, so a right stick alone is {3, 4} and stays there.
+        /// Null for every other client, which leaves the count to
+        /// <see cref="NumAxes"/>. An empty set is an answer too: a pad of
+        /// buttons has no axes, and the capability snapshot records zero for
+        /// it instead of the six slots every gamepad client reserves.
+        /// SupportedButtonIndices and GetDeviceObjects already spoke for the
+        /// built surface. This was the member that did not.</summary>
+        public int[] SupportedAxisIndices =>
+            _isMenuSurface ? Array.Empty<int>() : _hasCustomSurface ? _customAxes : null;
+        public int[] SupportedButtonIndices
+        {
+            get
+            {
+                if (_isMenuSurface)
+                    return Array.Empty<int>();
+                if (_isTouchpadDevice)
+                    return _touchpadOnlyButtons;
+                var list = new System.Collections.Generic.List<int>(NumGamepadButtons + 8);
+                if (_hasCustomSurface)
+                {
+                    list.AddRange(_customButtons);
+                    if (HasTouchpad) list.Add(16);
+                    list.Sort();
+                    return list.ToArray();
+                }
+                for (int i = 0; i < NumGamepadButtons; i++) list.Add(i);
+                // Extended slots this layout's surface actually offers
+                // (paddles, Misc, per-layout extras), in canonical order.
+                foreach (int c in _extendedButtons)
+                    if (c != 16) list.Add(c);
+                if (HasTouchpad) list.Add(16);
+                list.Sort();
+                return list.ToArray();
+            }
+        }
+
+        // Extended standardized slots (11-21) the ACTIVE LAYOUT offers:
+        // Misc 1 for Share/Mute/Capture/QAM, paddles 12-15, Misc 2+ for
+        // per-device extras. Set once by the server from the layout's
+        // overlay targets, so a Switch Pro web pad exposes its Capture
+        // button and a Steam Deck its four grips, while the plain Xbox 360
+        // layout stays at the standard 11.
+        private int[] _extendedButtons = Array.Empty<int>();
+        private int _extendedMax = -1;
+
+        /// <summary>Declares the extended button slots (11-21) present on the
+        /// active layout. Idempotent; slot 16 is carried by
+        /// <see cref="HasTouchpad"/> instead.</summary>
+        public void SetExtendedButtons(int[] codes)
+        {
+            var set = new System.Collections.Generic.SortedSet<int>();
+            if (codes != null)
+                foreach (int c in codes)
+                    if (c > 10 && c < 22 && c != 16) set.Add(c);
+            _extendedButtons = new int[set.Count];
+            set.CopyTo(_extendedButtons);
+            _extendedMax = _extendedButtons.Length > 0 ? _extendedButtons[_extendedButtons.Length - 1] : -1;
+        }
+        private static readonly int[] _touchpadOnlyButtons = { 16 };
+
+        // A BUILT pad's real surface: exactly the axes, buttons and hat its
+        // widgets provide. A stock layout mirrors real hardware and keeps the
+        // full standard shape, but a custom pad with one stick and two buttons
+        // was advertising six axes, eleven buttons and a D-pad, so the picker
+        // offered inputs that pad can never send and the Devices preview drew a
+        // controller that does not exist.
+        private int[] _customAxes;
+        private int[] _customButtons;
+        private bool _customHasPov;
+        private bool _hasCustomSurface;
+
+        /// <summary>Declares the exact surface a builder pad's widgets provide.
+        /// Axes are raw indices (0=LX .. 5=RT), buttons are slot numbers, and
+        /// the hat is present only when the pad has a D-pad widget.</summary>
+        public void SetCustomSurface(int[] axes, int[] buttons, bool hasPov)
+        {
+            var a = new System.Collections.Generic.SortedSet<int>();
+            if (axes != null)
+                foreach (int x in axes) if (x >= 0 && x < NumGamepadAxes) a.Add(x);
+            var b = new System.Collections.Generic.SortedSet<int>();
+            if (buttons != null)
+                foreach (int x in buttons) if (x >= 0 && x < CustomInputState.MaxButtons && x != 16) b.Add(x);
+            _customAxes = new int[a.Count]; a.CopyTo(_customAxes);
+            _customButtons = new int[b.Count]; b.CopyTo(_customButtons);
+            _customHasPov = hasPov;
+            _hasCustomSurface = true;
+        }
+        public IntPtr GamepadHandle => IntPtr.Zero;
+
+        /// <summary>Whether this client can actually play a rumble. It used to
+        /// be hardcoded true, which is a lie on any browser without the
+        /// Vibration API: iOS Safari has never shipped navigator.vibrate, so
+        /// every iPhone pad advertised rumble it could not produce, and the
+        /// Devices page and every mapping surface repeated the claim. The
+        /// client reports what it has on connect; until it does, assume yes,
+        /// because that is the common case and a late no costs only a
+        /// capability re-sync.</summary>
+        public bool HasRumble
+        {
+            // A Web Menus page (#471) has nothing to rumble.
+            get => _hasRumble && !_isMenuSurface;
+            set
+            {
+                if (_hasRumble == value) return;
+                _hasRumble = value;
+                CapabilitiesChanged?.Invoke();
+            }
+        }
+        private bool _hasRumble = true;
+        public bool HasRumbleTriggers => false;
+        public bool HasHaptic => false;
+        // Motion caps flip on the first motion message, the same pattern
+        // HasTouchpad uses for the first touch message (#296 phase 1). The
+        // phone's DeviceMotionEvent supplies both rates and gravity+linear
+        // acceleration, so both flip together.
+        public bool HasGyro { get; set; }
+        public bool HasAccel { get; set; }
+
+        /// <summary>True once this client has a touch surface. Set at connect
+        /// from the layout, or mid-session on the first touch message from a
+        /// client whose surface the query string did not declare. That
+        /// mid-session flip needs the same re-sync the motion caps get: the
+        /// UserDevice snapshot was taken at connect, so without the notify the
+        /// touchpad sources never appeared in the picker for that session.</summary>
+        public bool HasTouchpad
+        {
+            get => _hasTouchpad;
+            set
+            {
+                if (_hasTouchpad == value) return;
+                _hasTouchpad = value;
+                if (value) CapabilitiesChanged?.Invoke();
+            }
+        }
+        private bool _hasTouchpad;
+        public HapticEffectStrategy HapticStrategy => HapticEffectStrategy.None;
+        public IntPtr HapticHandle => IntPtr.Zero;
+        public uint HapticFeatures => 0;
+        public int NumHapticAxes => 0;
+        public ushort VendorId => WebVendorId;
+        public ushort ProductId => WebProductId;
+        public string DevicePath { get; }
+        public string SerialNumber => string.Empty;
+        public string SdlGuid => string.Empty;
+        public Guid InstanceGuid { get; }
+        public Guid ProductGuid { get; }
+
+        public bool IsAttached => _connected;
+
+        /// <summary>
+        /// Fired on the polling thread when SetRumble is called.
+        /// Parameters: (lowFrequency, highFrequency) in 0-65535 range.
+        /// </summary>
+        public event Action<ushort, ushort> RumbleRequested;
+
+        /// <summary>Raised the first time a capability flips on after connect
+        /// (currently gyro/accel on the first motion message). The device's
+        /// UserDevice snapshot was taken at connect, before the phone streamed
+        /// motion, so the Devices page and mapping picker need a re-sync to
+        /// show the motion sources (owner report 2026-08-12).</summary>
+        public event Action CapabilitiesChanged;
+
+        /// <summary>Lightbar feedback for the browser (#296): the phone
+        /// renders a glowing strip in this color, like a DualShock's bar.
+        /// Change-detected here so the identity pass can push every tick
+        /// without spamming the WebSocket.</summary>
+        public event Action<byte, byte, byte> LedChanged;
+
+        /// <summary>Player-number feedback for the browser (#296): the phone
+        /// shows Xbox-ring-style pips for the slot's displayed number.</summary>
+        public event Action<int> PlayerIndexChanged;
+
+        private int _lastLed = -1;
+        private int _lastPlayer = -1;
+
+        /// <summary>Sets the lightbar color shown on the browser client.</summary>
+        public void SetLed(byte r, byte g, byte b)
+        {
+            int packed = (r << 16) | (g << 8) | b;
+            if (packed == _lastLed) return;
+            _lastLed = packed;
+            LedChanged?.Invoke(r, g, b);
+        }
+
+        /// <summary>Sets the 1-based player number shown on the browser client.</summary>
+        public void SetPlayerNumber(int number)
+        {
+            if (number == _lastPlayer) return;
+            _lastPlayer = number;
+            PlayerIndexChanged?.Invoke(number);
+        }
+
+        /// <summary>Re-emits the current LED + player state, for a client that
+        /// reconnected after the last change was pushed.</summary>
+        public void ResendIdentity()
+        {
+            if (_lastPlayer > 0) PlayerIndexChanged?.Invoke(_lastPlayer);
+            if (_lastLed >= 0) LedChanged?.Invoke((byte)(_lastLed >> 16), (byte)(_lastLed >> 8), (byte)_lastLed);
+        }
+
+        /// <summary>
+        /// Creates a new web controller device.
+        /// </summary>
+        /// <param name="clientId">Unique client identifier (from browser localStorage).</param>
+        /// <param name="displayName">Human-readable name (e.g. "Web Controller 1").</param>
+        /// <param name="isTouchpad">When true, device reports as touchpad type with HasTouchpad=true.</param>
+        /// <param name="layoutKey">Layout discriminator ("xbox360" / "ds4" / "touchpad").
+        /// Mixed into <see cref="ProductGuid"/> so different layouts read as different products
+        /// and the BT-reconnect fallback in <c>FindOrCreateUserDevice</c> doesn't migrate one
+        /// layout's slot mapping onto another. Defaults to "xbox360" for back-compat with any
+        /// historical caller that didn't pass a layout (kept just so the constructor signature
+        /// is additive — every WebControllerServer call site passes the explicit value).</param>
+        public WebControllerDevice(string clientId, string displayName, bool isTouchpad = false, string layoutKey = "xbox360")
+        {
+            Name = displayName;
+            DevicePath = $"web://{clientId}";
+            InstanceGuid = BuildGuid(clientId);
+            ProductGuid = BuildProductGuid(layoutKey);
+            SdlInstanceId = SyntheticInstanceId.From(clientId);
+            HasTouchpad = isTouchpad;
+            _isTouchpadDevice = isTouchpad;
+            LayoutKey = layoutKey ?? "xbox360";
+            _isMenuSurface = string.Equals(LayoutKey, MenusLayoutKey, StringComparison.OrdinalIgnoreCase);
+
+            // Center stick axes at midpoint, triggers at 0 (full off).
+            var state = new CustomInputState();
+            if (!isTouchpad && !_isMenuSurface)
+            {
+                for (int i = 0; i < NumGamepadAxes; i++)
+                    state.Axis[i] = (i == 2 || i == 5) ? 0 : 32767;
+            }
+            Volatile.Write(ref _currentState, state);
+        }
+
+        private readonly bool _isTouchpadDevice;
+
+        /// <summary>The layout key of the Web Menus page (#471).</summary>
+        public const string MenusLayoutKey = "menus";
+        private readonly bool _isMenuSurface;
+
+        /// <summary>True for a Web Menus client (#471): a phone that shows a
+        /// slot's Touch Grid menus and fires their cells. It has no axes,
+        /// buttons or hat of its own.</summary>
+        public bool IsMenuSurface => _isMenuSurface;
+
+        /// <summary>The layout the browser is drawing, e.g. "dualsense".</summary>
+        public string LayoutKey { get; }
+
+        /// <summary>
+        /// Whether this client is drawing a pad that HAS a lightbar, and
+        /// whether that pad also carries the DualSense's indicator LEDs.
+        ///
+        /// <para>The device does not claim Sony's ids to earn these. It draws
+        /// a picture of a DualShock 4 and it is honest about that: a proxy
+        /// that reports somebody else's hardware id gets treated as that
+        /// hardware by every writer that keys on the id, which for a browser
+        /// on the far end of a socket is not survivable. The Lighting tab asks
+        /// these two questions directly instead.</para>
+        ///
+        /// <para>Same rule the tab applies to physical pads: a bar for the
+        /// DualSense family and the DualShock 4, indicator LEDs for the
+        /// DualSense family alone.</para>
+        /// </summary>
+        public bool HasLightbar =>
+            LayoutKey.Equals("ds4", StringComparison.OrdinalIgnoreCase)
+            || LayoutKey.Equals("dualsense", StringComparison.OrdinalIgnoreCase)
+            || LayoutKey.Equals("dualsenseedge", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>True when the drawn pad is a DualShock 4, whose bar the
+        /// Lighting tab previews with different art.</summary>
+        public bool LightbarIsDs4 =>
+            LayoutKey.Equals("ds4", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Player row plus mic LED. DualSense family only, exactly
+        /// as on hardware: the DualShock 4 has neither.</summary>
+        public bool HasIndicatorLeds =>
+            LayoutKey.Equals("dualsense", StringComparison.OrdinalIgnoreCase)
+            || LayoutKey.Equals("dualsenseedge", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Updates an axis value. Called from WebSocket receive thread.</summary>
+        /// <param name="code">Axis index (0=LX, 1=LY, 2=LT, 3=RX, 4=RY, 5=RT).</param>
+        /// <param name="value">Unsigned value 0-65535 (center = 32767).</param>
+        public void UpdateAxis(int code, int value)
+        {
+            if (code < 0 || code >= NumGamepadAxes) return;
+            // The value crosses the network from a page anyone on the LAN can
+            // edit: clamp to the declared range rather than letting an
+            // out-of-range number reach the mapping math.
+            if (value < 0) value = 0;
+            else if (value > 65535) value = 65535;
+            // A built pad's axes are read from its layout when it connects, and
+            // its page can send others later: a stick added and saved without
+            // reconnecting, or a page older than the saved layout. The axis
+            // joins the surface before its value lands, as touch and motion do
+            // on their first message, so an "(Any Device)" read that checks the
+            // device's axes takes the stick's 0 at full deflection as input.
+            if (_hasCustomSurface && Array.IndexOf(_customAxes, code) < 0)
+                AddCustomAxis(code);
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                s.Axis[code] = value;
+                Volatile.Write(ref _currentState, s);
+            }
+        }
+
+        private void AddCustomAxis(int code)
+        {
+            lock (_stateLock)
+            {
+                var axes = _customAxes;
+                if (Array.IndexOf(axes, code) >= 0) return;
+                var grown = new int[axes.Length + 1];
+                Array.Copy(axes, grown, axes.Length);
+                grown[axes.Length] = code;
+                Array.Sort(grown);
+                Volatile.Write(ref _customAxes, grown);
+            }
+            CapabilitiesChanged?.Invoke();
+        }
+
+        /// <summary>Updates a button state. Called from WebSocket receive thread.</summary>
+        /// <param name="code">Button index (0=A, 1=B, ..., 10=Guide, 20=Touchpad Click).</param>
+        /// <param name="pressed">True if pressed.</param>
+        public void UpdateButton(int code, bool pressed)
+        {
+            if (code < 0 || code >= CustomInputState.MaxButtons) return;
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                s.Buttons[code] = pressed;
+                Volatile.Write(ref _currentState, s);
+            }
+        }
+
+        /// <summary>True for a raw forwarded pad (#402), whose axes carry no
+        /// trigger meaning: each rests where <see cref="SetRawAxisRest"/> put it,
+        /// center until told otherwise. The stock shape and a built pad rest
+        /// their trigger and slider axes at zero.</summary>
+        public bool AxesCenterAtRest { get; set; }
+        private readonly int[] _rawAxisRest = { 32767, 32767, 32767, 32767, 32767, 32767 };
+
+        /// <summary>Where a raw pad's axis sits at rest, sampled by the page when
+        /// the pad connected (#402). Ignored on a stock shape, whose rest is
+        /// fixed. Clamped to the wire range.</summary>
+        public void SetRawAxisRest(int axis, int value)
+        {
+            if (!AxesCenterAtRest || axis < 0 || axis >= _rawAxisRest.Length) return;
+            _rawAxisRest[axis] = Math.Clamp(value, 0, 65535);
+        }
+
+        /// <summary>Everything at rest: buttons up, axes at rest, hat centered
+        /// (#402). The server calls this when a forwarded pad's session expires,
+        /// so a phone that slept mid-hold cannot leave a button latched on the
+        /// PC, and once at registration for a raw pad. Rest is sticks at center
+        /// and triggers at zero unless <see cref="AxesCenterAtRest"/> selects the
+        /// sampled raw rest values. Touch fingers and the accelerometer are left alone.
+        /// Gyro rates expire on their own. A Web Menus phone's held tiles
+        /// (#471) are let go as well.</summary>
+        public void NeutralizeAll()
+        {
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                for (int i = 0; i < s.Buttons.Length; i++) s.Buttons[i] = false;
+                for (int i = 0; i < NumGamepadAxes && i < s.Axis.Length; i++)
+                    s.Axis[i] = AxesCenterAtRest ? _rawAxisRest[i] : (i == 2 || i == 5) ? 0 : 32767;
+                if (s.Povs.Length > 0) s.Povs[0] = -1;
+                Volatile.Write(ref _currentState, s);
+            }
+            ReleaseAllMenuCells();
+        }
+
+        /// <summary>Updates POV hat value. Called from WebSocket receive thread.</summary>
+        /// <param name="value">Centidegrees (0=N, 9000=E, etc.) or -1 for centered.</param>
+        public void UpdatePov(int value)
+        {
+            // Centidegrees, or -1 centered. Anything else is centered rather
+            // than passed through: a hat angle outside 0-35999 lands in the
+            // POV-to-direction math as an unmapped quadrant.
+            if (value != -1 && (value < 0 || value >= 36000)) value = -1;
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                s.Povs[0] = value;
+                Volatile.Write(ref _currentState, s);
+            }
+        }
+
+        /// <summary>Updates a touchpad finger's position and contact state.
+        /// Phone clients drive a single-pad two-finger virtual touchpad
+        /// over WebSocket. Contact IDs are synthesized on rising / falling
+        /// edges so the gesture engine sees a stable input shape across
+        /// devices.</summary>
+        public void UpdateTouchpadFinger(int finger, float x, float y, bool down)
+        {
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                if (s.Touchpads == null || s.Touchpads.Length < 1
+                    || s.Touchpads[0] == null || s.Touchpads[0].MaxFingers < 2)
+                {
+                    s.Touchpads = new[] { new TouchpadInputState(2) };
+                }
+                var pad = s.Touchpads[0];
+                if (finger >= 0 && finger < pad.MaxFingers)
+                {
+                    pad.FingerX[finger] = x;
+                    pad.FingerY[finger] = y;
+                    pad.FingerPressure[finger] = down ? 1f : 0f;
+                    bool wasDown = pad.FingerDown[finger];
+                    pad.FingerDown[finger] = down;
+                    if (down && !wasDown) pad.FingerContactId[finger] = _webContactIdNext++;
+                    else if (!down && wasDown) pad.FingerContactId[finger] = -1;
+                }
+                Volatile.Write(ref _currentState, s);
+            }
+        }
+
+        // Monotonic contact-ID counter for the web phone-controller's
+        // virtual touchpad surface. Increments on each finger rising edge.
+        private int _webContactIdNext = 1;
+
+        /// <summary>Latest phone motion sample (#296 phase 1): gyro rad/s,
+        /// accel m/s², already rotated into the SDL controller frame by the
+        /// client. Stored copy-on-write like every other mutator so
+        /// GetCurrentState's lock-free copy stays valid.</summary>
+        public void UpdateMotion(float gx, float gy, float gz, float ax, float ay, float az)
+        {
+            lock (_stateLock)
+            {
+                var s = _currentState.Clone();
+                if (s.Gyro == null || s.Gyro.Length < 3) s.Gyro = new float[3];
+                if (s.Accel == null || s.Accel.Length < 3) s.Accel = new float[3];
+                s.Gyro[0] = gx; s.Gyro[1] = gy; s.Gyro[2] = gz;
+                s.Accel[0] = ax; s.Accel[1] = ay; s.Accel[2] = az;
+                Volatile.Write(ref _currentState, s);
+            }
+            Volatile.Write(ref _lastMotionTicks, Environment.TickCount64);
+        }
+
+        /// <summary>How long a motion sample keeps driving the pipeline. The
+        /// phone streams at ~60 Hz while Motion is on; nothing arriving for
+        /// this long means the stream stopped (screen locked, page hidden,
+        /// Wi-Fi dropped), and a LATCHED rate reads as a controller spinning
+        /// forever. Rates go to zero; the accelerometer keeps its last sample,
+        /// because gravity does not stop and zeroing it would tilt the lean
+        /// modes to a bogus free-fall orientation.</summary>
+        private const long MotionStaleMs = 500;
+        private long _lastMotionTicks;
+
+        /// <summary>Flips the motion caps on the first sample and notifies once,
+        /// so the UserDevice snapshot taken at connect gets re-synced.</summary>
+        public void EnableMotionCaps()
+        {
+            if (HasGyro && HasAccel) return;
+            HasGyro = true;
+            HasAccel = true;
+            CapabilitiesChanged?.Invoke();
+        }
+
+        /// <summary>Sets the connection state. A disconnect lets go of every
+        /// tile the phone held (#471), so a page that vanished mid-press
+        /// cannot keep a cell fired.</summary>
+        public void SetConnected(bool connected)
+        {
+            _connected = connected;
+            if (!connected) ReleaseAllMenuCells();
+        }
+
+        // ── Web Menus (#471) ─────────────────────────────────
+
+        /// <summary>The most tiles one phone can hold at once. A page cannot
+        /// grow the table past it.</summary>
+        public const int MaxHeldMenuCells = 32;
+
+        private struct MenuCellPress { public bool Down; public long DownAtMs; public long Seq; }
+        private readonly object _menuPressLock = new();
+
+        /// <summary>Numbers every press across all phones and reconnects, so
+        /// the engine can tell a press it voided from a later one.</summary>
+        private static long s_menuPressSeq;
+        private readonly System.Collections.Generic.Dictionary<(int Slot, int MenuId, int Cell), MenuCellPress>
+            _menuPresses = new();
+
+        /// <summary>A tile pressed or released on the phone. Called from the
+        /// socket's receive thread. The engine checks each press against the
+        /// slot's menus before it fires anything, so only the shape is
+        /// bounded here.</summary>
+        public void SetMenuCell(int slot, int menuId, int cell, bool down)
+        {
+            if (!_isMenuSurface || slot < 0 || slot >= 64 || cell < 0 || cell >= 64) return;
+            long now = Environment.TickCount64;
+            lock (_menuPressLock)
+            {
+                var key = (slot, menuId, cell);
+                if (down)
+                {
+                    bool known = _menuPresses.TryGetValue(key, out var current);
+                    // A repeated down on a held tile is the same press.
+                    if (known && current.Down) return;
+                    if (!known && _menuPresses.Count >= MaxHeldMenuCells) return;
+                    _menuPresses[key] = new MenuCellPress
+                    {
+                        Down = true,
+                        DownAtMs = now,
+                        Seq = System.Threading.Interlocked.Increment(ref s_menuPressSeq),
+                    };
+                }
+                else if (_menuPresses.TryGetValue(key, out var press))
+                {
+                    press.Down = false;
+                    _menuPresses[key] = press;
+                }
+            }
+        }
+
+        /// <summary>Adds to <paramref name="into"/> every cell to fire this
+        /// tick with its press's number: each held tile, and each released one
+        /// until <paramref name="minPulseMs"/> after its press, so a tap that
+        /// begins and ends between two polls still fires once. A released tile
+        /// past that is forgotten.</summary>
+        public void ReadMenuPresses(long nowMs, int minPulseMs,
+            System.Collections.Generic.List<(int Slot, int MenuId, int Cell, long Seq)> into)
+        {
+            lock (_menuPressLock)
+            {
+                if (_menuPresses.Count == 0) return;
+                System.Collections.Generic.List<(int, int, int)> done = null;
+                foreach (var kv in _menuPresses)
+                {
+                    if (kv.Value.Down || nowMs - kv.Value.DownAtMs < minPulseMs)
+                        into.Add((kv.Key.Slot, kv.Key.MenuId, kv.Key.Cell, kv.Value.Seq));
+                    else (done ??= new()).Add(kv.Key);
+                }
+                if (done != null)
+                    foreach (var key in done) _menuPresses.Remove(key);
+            }
+        }
+
+        /// <summary>Lets go of every held tile.</summary>
+        public void ReleaseAllMenuCells()
+        {
+            lock (_menuPressLock) _menuPresses.Clear();
+        }
+
+        /// <summary>The Web Menus page's content (#471): a JSON snapshot the
+        /// PC builds and the server sends. Change-detected here, so the
+        /// builder can hand it over on every pass without resending an
+        /// unchanged page.</summary>
+        public event Action<string> MenusFeedChanged;
+        private string _menusFeed;
+
+        public void SetMenusFeed(string json)
+        {
+            if (json == null || string.Equals(json, Volatile.Read(ref _menusFeed), StringComparison.Ordinal)) return;
+            Volatile.Write(ref _menusFeed, json);
+            MenusFeedChanged?.Invoke(json);
+        }
+
+        /// <summary>Forgets the last snapshot, so the next build sends a whole
+        /// one even when nothing changed. The builder on the UI timer stays the
+        /// only sender, so a snapshot sent this way cannot overtake a newer
+        /// one.</summary>
+        public void ResendMenusFeed() => Volatile.Write(ref _menusFeed, null);
+
+        /// <summary>The phone asked for a profile (#471). The PC checks the id
+        /// and switches through its manual-switch path.</summary>
+        public event Action<string> ProfileRequested;
+
+        public void RequestProfile(string profileId)
+        {
+            if (_isMenuSurface && profileId != null && profileId.Length <= 128)
+                ProfileRequested?.Invoke(profileId);
+        }
+
+        // Pooled per-tick output. The publisher is strict copy-on-write
+        // (every mutator clones, edits, swaps), so a single volatile grab
+        // plus CopyInto needs no lock.
+        private PadForge.Engine.PooledInputStatePair _statePool;
+
+        public CustomInputState GetCurrentState(bool forceRaw = false)
+        {
+            var src = Volatile.Read(ref _currentState);
+            var dst = _statePool.Next();
+            src.CopyInto(dst);
+            if (HasGyro && dst.Gyro != null && dst.Gyro.Length >= 3
+                && Environment.TickCount64 - Volatile.Read(ref _lastMotionTicks) > MotionStaleMs)
+            {
+                dst.Gyro[0] = 0f; dst.Gyro[1] = 0f; dst.Gyro[2] = 0f;
+            }
+            return dst;
+        }
+
+        public DeviceObjectItem[] GetDeviceObjects()
+        {
+            // Touchpad-only web layout has no axes / buttons / POVs —
+            // returning the gamepad shape here would surface 6 phantom
+            // axes + 11 phantom buttons + 1 phantom D-Pad in the source
+            // picker alongside the touchpad sources (since
+            // MappingDisplayResolver.BuildInputChoices walks DeviceObjects
+            // unconditionally). The touchpad-specific sources come from
+            // BuildInputChoices's HasTouchpad block on their own.
+            if (_isTouchpadDevice || _isMenuSurface)
+                return Array.Empty<DeviceObjectItem>();
+
+            // A builder pad lists only what it actually carries.
+            if (_hasCustomSurface)
+            {
+                // One read of each list: the socket thread can add an axis
+                // while this builds.
+                var customAxes = _customAxes;
+                var customButtons = _customButtons;
+                bool customPov = _customHasPov;
+                var custom = new DeviceObjectItem[
+                    customAxes.Length + customButtons.Length + (customPov ? 1 : 0)];
+                int ci = 0;
+                foreach (int a in customAxes)
+                    custom[ci++] = new DeviceObjectItem
+                    {
+                        InputIndex = a,
+                        ObjectTypeGuid = AxisGuids[a],
+                        Name = AxisNames[a],
+                        ObjectType = DeviceObjectTypeFlags.AbsoluteAxis,
+                        Offset = a * 4
+                    };
+                foreach (int b in customButtons)
+                    custom[ci++] = new DeviceObjectItem
+                    {
+                        InputIndex = b,
+                        ObjectTypeGuid = ObjectGuid.Button,
+                        Name = b < NumGamepadButtons ? ButtonNames[b] : GamepadObjectNames.Button(b),
+                        ObjectType = DeviceObjectTypeFlags.PushButton,
+                        Offset = (NumGamepadAxes + b) * 4
+                    };
+                if (customPov)
+                    custom[ci] = new DeviceObjectItem
+                    {
+                        InputIndex = 0,
+                        ObjectTypeGuid = ObjectGuid.PovController,
+                        Name = "D-Pad",
+                        ObjectType = DeviceObjectTypeFlags.PointOfViewController,
+                        Offset = (NumGamepadAxes + NumGamepadButtons) * 4
+                    };
+                return custom;
+            }
+
+            // Gamepad-shaped surface (6 axes + 11 buttons + extended
+            // layout buttons + 1 POV).
+            // Touchpad finger axes and the touchpad click button do NOT
+            // belong here — finger data lives in CustomInputState.Touchpad*
+            // and the click bit lives at Buttons[16]. Adding them here
+            // would double-list the mapping dropdown: BuildInputChoices
+            // walks DeviceObjects AND has its own canonical
+            // "Touchpad 0 Finger N X/Y/Down" + "Touchpad 0 Click" block
+            // for any HasTouchpad device, so the same inputs appeared
+            // twice. The touchpad descriptors are the right source for
+            // mappings; this surface stays gamepad-shaped.
+            var items = new DeviceObjectItem[NumGamepadAxes + NumGamepadButtons + _extendedButtons.Length + NumGamepadPovs];
+            int idx = 0;
+
+            // Axes.
+            for (int i = 0; i < NumGamepadAxes; i++)
+            {
+                items[idx++] = new DeviceObjectItem
+                {
+                    InputIndex = i,
+                    ObjectTypeGuid = AxisGuids[i],
+                    Name = AxisNames[i],
+                    ObjectType = DeviceObjectTypeFlags.AbsoluteAxis,
+                    Offset = i * 4
+                };
+            }
+
+            // Buttons.
+            for (int i = 0; i < NumGamepadButtons; i++)
+            {
+                items[idx++] = new DeviceObjectItem
+                {
+                    InputIndex = i,
+                    ObjectTypeGuid = ObjectGuid.Button,
+                    Name = ButtonNames[i],
+                    ObjectType = DeviceObjectTypeFlags.PushButton,
+                    Offset = (NumGamepadAxes + i) * 4
+                };
+            }
+
+            // Extended layout buttons (paddles / Misc), named canonically so
+            // the picker reads "Right Paddle 1", not "Button 12".
+            foreach (int c in _extendedButtons)
+            {
+                items[idx++] = new DeviceObjectItem
+                {
+                    InputIndex = c,
+                    ObjectTypeGuid = ObjectGuid.Button,
+                    Name = GamepadObjectNames.Button(c),
+                    ObjectType = DeviceObjectTypeFlags.PushButton,
+                    Offset = (NumGamepadAxes + c) * 4
+                };
+            }
+
+            // POV.
+            items[idx++] = new DeviceObjectItem
+            {
+                InputIndex = 0,
+                ObjectTypeGuid = ObjectGuid.PovController,
+                Name = "D-Pad",
+                ObjectType = DeviceObjectTypeFlags.PointOfViewController,
+                Offset = (NumGamepadAxes + NumGamepadButtons + _extendedButtons.Length) * 4
+            };
+
+            return items;
+        }
+
+        public int GetInputDeviceType() =>
+            _isMenuSurface ? InputDeviceType.WebMenus
+            : _isTouchpadDevice ? InputDeviceType.Touchpad
+            : InputDeviceType.Gamepad;
+
+        public bool SetRumble(ushort low, ushort high, uint durationMs = uint.MaxValue)
+        {
+            RumbleRequested?.Invoke(low, high);
+            return true;
+        }
+
+        public bool StopRumble()
+        {
+            RumbleRequested?.Invoke(0, 0);
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _connected = false;
+            GC.SuppressFinalize(this);
+        }
+
+        private static Guid BuildGuid(string identifier)
+        {
+            using var md5 = MD5.Create();
+            byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(identifier));
+            return new Guid(hash);
+        }
+
+        /// <summary>Mixes the layout key into <see cref="WebProductGuidBase"/>
+        /// so each web layout reports a distinct ProductGuid. Hashed
+        /// rather than indexed so adding a future layout (e.g. "joycon")
+        /// doesn't shift any existing product identity.</summary>
+        private static Guid BuildProductGuid(string layoutKey)
+        {
+            string normalized = (layoutKey ?? "xbox360").Trim().ToLowerInvariant();
+            if (normalized.Length == 0) normalized = "xbox360";
+            using var md5 = MD5.Create();
+            byte[] basebytes = WebProductGuidBase.ToByteArray();
+            byte[] saltbytes = Encoding.UTF8.GetBytes(":" + normalized);
+            byte[] combined = new byte[basebytes.Length + saltbytes.Length];
+            Buffer.BlockCopy(basebytes, 0, combined, 0, basebytes.Length);
+            Buffer.BlockCopy(saltbytes, 0, combined, basebytes.Length, saltbytes.Length);
+            byte[] hash = md5.ComputeHash(combined);
+            return new Guid(hash);
+        }
+    }
+}

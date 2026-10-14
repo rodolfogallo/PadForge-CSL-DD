@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PadForge - Web Controller</title>
+    <meta content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' name='viewport' />
+    <meta name="mobile-web-app-capable" content="yes">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            color: #fff;
+        }
+        p.subtitle {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 28px;
+        }
+        .cards {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            max-width: 1240px;
+        }
+        .card {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 280px;
+            background: #16213e;
+            border: 2px solid #0f3460;
+            border-radius: 16px;
+            padding: 14px 12px 12px;
+            color: #eee;
+            transition: transform 0.15s, border-color 0.15s;
+        }
+        .card:hover { transform: scale(1.03); border-color: #e94560; }
+        .card a.face {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-decoration: none;
+            color: #eee;
+            width: 100%;
+        }
+        .card img.preview {
+            width: 100%;
+            height: 120px;
+            object-fit: contain;
+            margin-bottom: 10px;
+            pointer-events: none;
+        }
+        .card .icon {
+            width: 100%;
+            height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 10px;
+        }
+        .card .icon svg { width: 64px; height: 64px; }
+        .card .label { font-size: 18px; font-weight: 600; }
+        .card .desc { font-size: 12px; color: #888; margin-top: 3px; }
+        .swatches {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .swatches a {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            border: 2px solid #444;
+            display: block;
+        }
+        .swatches a:hover { border-color: #fff; transform: scale(1.15); }
+        .swatches a.default { background: linear-gradient(135deg, #666 50%, #333 50%); }
+    </style>
+</head>
+<body>
+    <h1>PadForge</h1>
+    <p class="subtitle">Choose a controller layout. Tap a color to pick a finish.</p>
+    <div class="cards">
+        <div class="card">
+            <a class="face" href="/controller.html?layout=xbox360">
+                <img class="preview" src="/img/2DModels/XBOX360/XB360_base.png" alt="">
+                <div class="label">Xbox 360</div>
+                <div class="desc">Classic layout, dual analog sticks</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=xboxone">
+                <img class="preview" src="/img/2DModels/XBOXONE/XB1_S_base.png" alt="">
+                <div class="label">Xbox One</div>
+                <div class="desc">Xbox One S layout</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=xboxseries">
+                <img class="preview" src="/img/2DModels/XBOXSERIES/XBSeries_base.png" alt="">
+                <div class="label">Xbox Series X|S</div>
+                <div class="desc">Share button, hybrid D-pad</div>
+            </a>
+            <div class="swatches">
+                <a class="default" href="/controller.html?layout=xboxseries" title="Robot White"></a>
+                <a style="background:#2d2d2d" href="/controller.html?layout=xboxseries&finish=Carbon" title="Carbon Black"></a>
+                <a style="background:#e75480" href="/controller.html?layout=xboxseries&finish=DeepPink" title="Deep Pink"></a>
+                <a style="background:#cddc39" href="/controller.html?layout=xboxseries&finish=ElectricVolt" title="Electric Volt"></a>
+                <a style="background:#d32f2f" href="/controller.html?layout=xboxseries&finish=PulseRed" title="Pulse Red"></a>
+                <a style="background:#1976d2" href="/controller.html?layout=xboxseries&finish=ShockBlue" title="Shock Blue"></a>
+            </div>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=ds4">
+                <img class="preview" src="/img/2DModels/DS4/DS4_V2_base.png" alt="">
+                <div class="label">DualShock 4</div>
+                <div class="desc">Touchpad and lightbar</div>
+            </a>
+            <div class="swatches">
+                <a class="default" href="/controller.html?layout=ds4" title="Jet Black"></a>
+                <a style="background:#e8e8e8" href="/controller.html?layout=ds4&finish=GlacierWhite" title="Glacier White"></a>
+                <a style="background:#c9a227" href="/controller.html?layout=ds4&finish=Gold" title="Gold"></a>
+                <a style="background:#c0392b" href="/controller.html?layout=ds4&finish=MagmaRed" title="Magma Red"></a>
+                <a style="background:#1f3a93" href="/controller.html?layout=ds4&finish=MidnightBlue" title="Midnight Blue"></a>
+            </div>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=dualsense">
+                <img class="preview" src="/img/2DModels/DualSense/DualSense_base.png" alt="">
+                <div class="label">DualSense</div>
+                <div class="desc">PS5 layout with mute button</div>
+            </a>
+            <div class="swatches">
+                <a class="default" href="/controller.html?layout=dualsense" title="White"></a>
+                <a style="background:#b0233a" href="/controller.html?layout=dualsense&finish=CosmicRed" title="Cosmic Red"></a>
+                <a style="background:#7b6bb7" href="/controller.html?layout=dualsense&finish=GalacticPurple" title="Galactic Purple"></a>
+                <a style="background:#23272f" href="/controller.html?layout=dualsense&finish=Midnight" title="Midnight Black"></a>
+                <a style="background:#f7a8c4" href="/controller.html?layout=dualsense&finish=NovaPink" title="Nova Pink"></a>
+                <a style="background:#7fb2d9" href="/controller.html?layout=dualsense&finish=StarlightBlue" title="Starlight Blue"></a>
+            </div>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=dualsenseedge">
+                <img class="preview" src="/img/2DModels/DUALSENSEEDGE/DualSense_base.png" alt="">
+                <div class="label">DualSense Edge</div>
+                <div class="desc">Fn buttons and back paddles</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=switchpro">
+                <img class="preview" src="/img/2DModels/SWITCHPRO/NSwitchPro_base.png" alt="">
+                <div class="label">Switch Pro</div>
+                <div class="desc">Nintendo layout with Capture</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=switch2pro">
+                <img class="preview" src="/img/2DModels/SWITCH2PRO/NSwitchPro_base.png" alt="">
+                <div class="label">Switch 2 Pro</div>
+                <div class="desc">C button and back paddles</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=steamdeck">
+                <img class="preview" src="/img/2DModels/STEAMDECK/SD_base.png" alt="">
+                <div class="label">Steam Deck</div>
+                <div class="desc">Dual trackpads and four grips</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/controller.html?layout=steamcontroller">
+                <img class="preview" src="/img/2DModels/STEAMCONTROLLER/SC_base.png" alt="">
+                <div class="label">Steam Controller</div>
+                <div class="desc">Dual trackpads and paddles</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/gamepad.html">
+                <div class="icon"><svg viewBox="0 0 32 32" fill="none" stroke="#7CFC00" stroke-width="2"><rect x="9" y="3" width="14" height="26" rx="3"/><rect x="3" y="12" width="26" height="12" rx="6" fill="#1a1a2e"/><circle cx="9" cy="18" r="2.2" fill="#7CFC00"/><circle cx="23" cy="18" r="2.2" fill="#7CFC00"/></svg></div>
+                <div class="label">Browser Gamepad</div>
+                <div class="desc">Forward a controller paired to this phone, or built into this handheld</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/touchpad.html">
+                <div class="icon"><svg viewBox="0 0 32 32" fill="#e94560"><rect x="3" y="8" width="26" height="16" rx="3" ry="3" fill="none" stroke="#e94560" stroke-width="2"/><circle cx="12" cy="16" r="2" fill="#e94560" opacity="0.5"/><circle cx="20" cy="16" r="2" fill="#e94560" opacity="0.5"/></svg></div>
+                <div class="label">Touchpad</div>
+                <div class="desc">Multi-touch surface only</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/menus.html">
+                <div class="icon"><svg viewBox="0 0 32 32" fill="none" stroke="#FF6B2C" stroke-width="2"><rect x="4" y="4" width="10" height="10" rx="2"/><rect x="18" y="4" width="10" height="10" rx="2"/><rect x="4" y="18" width="10" height="10" rx="2"/><rect x="18" y="18" width="10" height="10" rx="2" fill="#FF6B2C" fill-opacity="0.35"/></svg></div>
+                <div class="label">Web Menus</div>
+                <div class="desc">A slot's Touch Grid menus as tiles</div>
+            </a>
+        </div>
+        <div class="card">
+            <a class="face" href="/custom.html?id=new">
+                <div class="icon"><svg viewBox="0 0 32 32" fill="none" stroke="#7CFC00" stroke-width="2"><rect x="4" y="7" width="24" height="18" rx="4"/><line x1="16" y1="12" x2="16" y2="20"/><line x1="12" y1="16" x2="20" y2="16"/></svg></div>
+                <div class="label">Build Your Own</div>
+                <div class="desc">Drag widgets onto a blank pad</div>
+            </a>
+        </div>
+    </div>
+    <div class="cards" id="customCards" style="margin-top:20px"></div>
+    <script>
+    // Custom pads built on this server (#296 phase 4), listed beside the
+    // stock cards.
+    (function () {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "/api/custom-layouts", true);
+        xhr.onload = function () {
+            if (xhr.status !== 200) return;
+            var list;
+            try { list = JSON.parse(xhr.responseText); } catch (e) { return; }
+            if (!list.length) return;
+            var host = document.getElementById("customCards");
+            list.forEach(function (l) {
+                var card = document.createElement("div");
+                card.className = "card";
+                card.innerHTML =
+                    '<a class="face" href="/custom.html?id=' + encodeURIComponent(l.id) + '">' +
+                    '<div class="icon"><svg viewBox="0 0 32 32" fill="none" stroke="#7CFC00" stroke-width="2">' +
+                    '<rect x="4" y="7" width="24" height="18" rx="4"/><circle cx="22" cy="14" r="2" fill="#7CFC00"/>' +
+                    '<circle cx="10" cy="18" r="3"/></svg></div>' +
+                    '<div class="label"></div>' +
+                    '<div class="desc">Custom pad (' + (l.widgets ? l.widgets.length : 0) + ' widgets)</div></a>';
+                card.querySelector(".label").textContent = l.name || "Custom Pad";
+                host.appendChild(card);
+            });
+        };
+        xhr.send();
+    })();
+    </script>
+</body>
+</html>

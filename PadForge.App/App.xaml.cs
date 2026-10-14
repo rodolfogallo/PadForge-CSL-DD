@@ -1,0 +1,827 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Windows;
+using System.Windows.Threading;
+using Microsoft.Win32;
+using Wpf.Ui.Appearance;
+using PadForge.Common.Input;
+using PadForge.Resources.Strings;
+
+namespace PadForge
+{
+    internal static class NativeMethods
+    {
+        [System.Runtime.InteropServices.DllImport("kernel32", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        internal static extern bool SetDllDirectory(string lpPathName);
+    }
+
+    public partial class App : Application
+    {
+        /// <summary>Best-effort "quiet all hardware outputs" hook,
+        /// assigned by MainWindow once services exist. Invoked from the
+        /// crash handler and ProcessExit.</summary>
+        public static Action PanicQuiesce;
+
+        /// <summary>The UI culture the process started with, captured
+        /// before the saved language override is applied. The
+        /// fresh-install language, used by Reset to Defaults.</summary>
+        public static System.Globalization.CultureInfo StartupUICulture { get; private set; }
+            = Thread.CurrentThread.CurrentUICulture;
+
+        private Mutex _singleInstanceMutex;
+
+        /// <summary>Timestamp of the last dispatcher error shown. Used to rate-limit popups.</summary>
+        private readonly Stopwatch _lastErrorTime = new Stopwatch();
+
+        /// <summary>Suppressed error count since last shown popup.</summary>
+        private int _suppressedErrorCount;
+
+        /// <summary>Occurrences per dispatcher-exception signature this
+        /// session. A storyboard that dies during template application is
+        /// retried and rethrown by every subsequent layout pass (the
+        /// 2026-07-13 workshop forge-bar storm logged 300k+ identical
+        /// entries and re-showed the same dialog every 3 seconds), so the
+        /// dialog shows once per signature per session and crash.log keeps
+        /// the first three full entries plus a periodic one-line counter.
+        /// Dispatcher-thread only.</summary>
+        private readonly Dictionary<string, int> _dispatcherErrorSignatures = new();
+
+        /// <summary>Set when GPU render thread is zombied. Suppresses all cascading exceptions.</summary>
+        private bool _gpuLost;
+
+        /// <summary>Set at the end of OnStartup, after the main window is
+        /// constructed and shown (or deliberately held for the tray). A
+        /// dispatcher exception before this point is a failed launch.
+        /// Application.MainWindow is NOT a usable signal for that: WPF
+        /// auto-assigns it inside the Window base constructor, so a window
+        /// that died mid-InitializeComponent still occupies it.</summary>
+        private bool _startupUiReady;
+
+        /// <summary>Window state before sleep for restore on wake.</summary>
+        private WindowState _windowStateBeforeSleep;
+        private bool _windowVisibleBeforeSleep;
+
+        /// <summary>
+        /// Background task sweeping HIDMaestro virtual controllers orphaned
+        /// by a prior session that didn't cleanly dispose (crash, force-kill,
+        /// power loss). Kicked off during OnStartup so the main window can
+        /// render immediately. Nothing awaits it for correctness anymore
+        /// (an earlier InitializeSdl await was removed when the SDL3 fork
+        /// grew its own HM filter; round 33, C3 retired the stale claim
+        /// here): the ordering property lives INSIDE the task, which ends
+        /// with a bounded wait (up to 5 s) for the HIDMAESTRO devnodes to
+        /// be genuinely ABSENT, so a same-session VC create cannot adopt a
+        /// dying node, and logs ORPHANSWEEP when one lingers past the
+        /// bound. MainWindow only watches it to show the startup overlay.
+        /// </summary>
+        public static System.Threading.Tasks.Task OrphanSweepTask { get; private set; }
+
+        /// <summary>Translator for <see cref="Engine.Common.Mapping.MappingExpression.ErrorFormatter"/>.
+        /// Maps each ParseError enum value to its Pad_Formula_Error_* resource
+        /// string with the supplied positional args. Wired in <see cref="OnStartup"/>.</summary>
+        private static string LocalizeMappingExpressionError(Engine.Common.Mapping.MappingExpression.ParseError code, object[] args)
+        {
+            args ??= System.Array.Empty<object>();
+            var s = Strings.Instance;
+            string tmpl = code switch
+            {
+                Engine.Common.Mapping.MappingExpression.ParseError.UnexpectedTokenAtEnd       => s.Pad_Formula_Error_UnexpectedTokenAtEnd,
+                Engine.Common.Mapping.MappingExpression.ParseError.InvalidNumber              => s.Pad_Formula_Error_InvalidNumber,
+                Engine.Common.Mapping.MappingExpression.ParseError.SingleEqualsNotSupported   => s.Pad_Formula_Error_SingleEqualsNotSupported,
+                Engine.Common.Mapping.MappingExpression.ParseError.UnexpectedCharacter        => s.Pad_Formula_Error_UnexpectedCharacter,
+                Engine.Common.Mapping.MappingExpression.ParseError.ExpectedColonInTernary     => s.Pad_Formula_Error_ExpectedColonInTernary,
+                Engine.Common.Mapping.MappingExpression.ParseError.ExpectedRParen             => s.Pad_Formula_Error_ExpectedRParen,
+                Engine.Common.Mapping.MappingExpression.ParseError.ExpectedRParenAfterArgs    => s.Pad_Formula_Error_ExpectedRParenAfterArgs,
+                Engine.Common.Mapping.MappingExpression.ParseError.ExpectedRBracketAfterIndex => s.Pad_Formula_Error_ExpectedRBracketAfterIndex,
+                Engine.Common.Mapping.MappingExpression.ParseError.ExpectedTokenSuffix        => s.Pad_Formula_Error_ExpectedTokenSuffix,
+                Engine.Common.Mapping.MappingExpression.ParseError.UnknownIdentifier          => s.Pad_Formula_Error_UnknownIdentifier,
+                Engine.Common.Mapping.MappingExpression.ParseError.UnexpectedToken            => s.Pad_Formula_Error_UnexpectedToken,
+                Engine.Common.Mapping.MappingExpression.ParseError.UnexpectedParseError       => s.Pad_Formula_Error_UnexpectedParseError,
+                _ => code.ToString(),
+            };
+            try { return string.Format(tmpl, args); }
+            catch { return tmpl; }
+        }
+
+        /// <summary>External-control command (#366) parsed from the command
+        /// line at startup, applied once the engine is running. Null when no
+        /// profile argument was passed. See <see cref="ParseProfileCommand"/>.</summary>
+        internal static string PendingProfileCommand { get; private set; }
+
+        /// <summary>Consumed once by InputService.Start so a later engine
+        /// restart does not re-apply the startup profile.</summary>
+        internal static void ClearPendingProfileCommand() => PendingProfileCommand = null;
+
+        /// <summary>Maps <c>--profile "Name"</c> / <c>--default-profile</c> to
+        /// the external-control command grammar (#366), or null if neither is
+        /// present. Shared by the first-instance (deferred apply) and
+        /// second-instance (pipe forward) paths so both read the args the
+        /// same way.</summary>
+        internal static string ParseProfileCommand(string[] args)
+        {
+            if (args == null) return null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (string.Equals(a, "--default-profile", StringComparison.OrdinalIgnoreCase))
+                    return "deactivate";
+                if (string.Equals(a, "--profile", StringComparison.OrdinalIgnoreCase)
+                    && i + 1 < args.Length)
+                    return "activate " + args[i + 1];
+            }
+            return null;
+        }
+
+        /// <summary>The update helper's two dialogs (#457). It runs before any
+        /// window exists and before settings load, so they follow the Windows
+        /// display language rather than PadForge's own.</summary>
+        private sealed class UpdateHelperUi : Services.UpdateService.IApplyUi
+        {
+            public void Report(string text) =>
+                MessageBox.Show(text, Strings.Instance.Common_PadForge, MessageBoxButton.OK, MessageBoxImage.Warning);
+
+            /// <summary>A window rather than a message box, so the question
+            /// closes itself once the old copy has exited instead of holding
+            /// the update until someone answers it.</summary>
+            public bool KeepWaiting(string text, Func<bool> exited)
+            {
+                // The helper says when it is done. Left at the default, closing
+                // this window, the helper's only one, would shut it down.
+                Current.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                return AskToKeepWaiting(text, exited, TimeSpan.FromMilliseconds(250));
+            }
+        }
+
+        /// <summary>The helper's wait question (#457): OK keeps waiting,
+        /// Cancel or closing the window skips the update. It answers itself
+        /// with OK once <paramref name="exited"/> turns true, checked every
+        /// <paramref name="poll"/>. <paramref name="place"/> positions the
+        /// window before it shows, for tests.</summary>
+        internal static bool AskToKeepWaiting(string text, Func<bool> exited, TimeSpan poll, Action<Window> place = null)
+        {
+            var ok = new System.Windows.Controls.Button
+            {
+                Content = Strings.Instance.Common_OK, IsDefault = true, MinWidth = 90, Margin = new Thickness(0, 0, 8, 0),
+            };
+            var cancel = new System.Windows.Controls.Button
+            {
+                Content = Strings.Instance.Common_Cancel, IsCancel = true, MinWidth = 90,
+            };
+            var buttons = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 18, 0, 0),
+            };
+            buttons.Children.Add(ok);
+            buttons.Children.Add(cancel);
+            var content = new System.Windows.Controls.StackPanel { Margin = new Thickness(20, 18, 20, 18) };
+            content.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = text, TextWrapping = TextWrapping.Wrap, MaxWidth = 400,
+            });
+            content.Children.Add(buttons);
+            var window = new Window
+            {
+                Title = Strings.Instance.Common_PadForge,
+                Content = content,
+                SizeToContent = SizeToContent.WidthAndHeight,
+                ResizeMode = ResizeMode.NoResize,
+                WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            };
+            // The theme's own ground and text, whatever the helper loaded.
+            window.SetResourceReference(System.Windows.Controls.Control.BackgroundProperty, "ApplicationBackgroundBrush");
+            window.SetResourceReference(System.Windows.Controls.Control.ForegroundProperty, "TextFillColorPrimaryBrush");
+            ok.Click += (s, e) => window.DialogResult = true;
+            var timer = new DispatcherTimer { Interval = poll };
+            timer.Tick += (s, e) =>
+            {
+                bool gone;
+                try { gone = exited(); }
+                catch
+                {
+                    // Whether the old copy exited cannot be seen, so the
+                    // question stays up for someone to answer.
+                    timer.Stop();
+                    return;
+                }
+                if (!gone) return;
+                timer.Stop();
+                window.DialogResult = true;
+            };
+            window.Closed += (s, e) => timer.Stop();
+            place?.Invoke(window);
+            // Its first tick comes after the window shows: ShowDialog runs it.
+            timer.Start();
+            return window.ShowDialog() == true;
+        }
+
+        /// <summary>The arguments this copy was started with. An update hands
+        /// them to the installer so PadForge comes back the way it was
+        /// launched, --profile included (#457).</summary>
+        internal static string[] StartupArgs { get; private set; } = Array.Empty<string>();
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            // Make the process's first known-folder lookup here, on the UI
+            // thread, before any other thread starts or any window renders.
+            // The first lookup resolves windows.storage's delay-loaded
+            // SHCreatePropertyBagOnRegKey while it holds the known-folder
+            // lock, and resolving it waits for the loader. When WPF renders
+            // its first frame on an NVIDIA GPU, the driver loads
+            // NvMemMapStoragex.dll, whose DllMain looks up a known folder
+            // while it holds the loader. If the HIDMaestro sweep below made
+            // the first lookup at that moment, each thread would wait on the
+            // other and the window would never paint. The test suite hung
+            // this way on 2026-09-23 (see FirstKnownFolderLookup in the tests).
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+
+            // In-app updates (#457). A copy started from the update folder with
+            // --apply-update is the installer, not PadForge: it replaces the
+            // copy that started it and exits. This runs before everything below,
+            // the single-instance check included, because the old copy still
+            // holds that lock while it closes.
+            if (Services.UpdateService.TryRunApplyMode(e.Args, new UpdateHelperUi()))
+            {
+                // The old copy reads the exit code when the helper leaves
+                // before reporting ready (UpdateService.WrongBuildExitCode).
+                Shutdown(Environment.ExitCode);
+                return;
+            }
+
+            // A committed update helper holds a lease on this exe until it
+            // starts PadForge again itself. A launch meanwhile, from the Start
+            // menu or a launcher, leaves quietly: it would hold the very file
+            // being replaced.
+            if (Services.UpdateService.IsUpdateInProgress(Environment.ProcessPath))
+            {
+                Shutdown();
+                return;
+            }
+
+            _singleInstanceMutex = new Mutex(true, "PadForge_SingleInstance", out bool isNewInstance);
+            if (!isNewInstance)
+            {
+                // A second instance carrying a profile argument is a launcher
+                // driving the running one (#366): forward the command over the
+                // pipe and exit silently, with no "already running" box.
+                string forward = ParseProfileCommand(e.Args);
+                if (forward != null)
+                {
+                    TryForwardExternalCommand(forward);
+                    Shutdown();
+                    return;
+                }
+
+                MessageBox.Show(Strings.Instance.App_AlreadyRunning, Strings.Instance.Common_PadForge,
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                Shutdown();
+                return;
+            }
+
+            StartupArgs = e.Args ?? Array.Empty<string>();
+
+            // An update Install Updates Automatically downloaded last session
+            // installs now, before the engine, the drivers or a window start.
+            if (Services.UpdateService.TryStartPendingInstall(StartupArgs))
+            {
+                Shutdown();
+                return;
+            }
+
+            // First instance: a profile argument applies once the engine is
+            // running (see InputService.Start's tail).
+            PendingProfileCommand = ParseProfileCommand(e.Args);
+
+            base.OnStartup(e);
+
+            // WPF data-binding failures are silent in production: they only
+            // reach the debugger trace channel, so a broken binding looks
+            // like a control that ignores clicks (the #155 Reset on Release
+            // checkbox produced no save and no event, indistinguishable
+            // from a wiring bug until traced). Forward binding ERRORS to
+            // the in-memory diagnostics ring so a dead binding names itself
+            // in a crash report. Nothing is written to disk.
+            System.Diagnostics.PresentationTraceSources.Refresh();
+            System.Diagnostics.PresentationTraceSources.DataBindingSource.Listeners.Add(
+                new DiagBindingTraceListener());
+            System.Diagnostics.PresentationTraceSources.DataBindingSource.Switch.Level =
+                System.Diagnostics.SourceLevels.Error;
+
+            // Wire the MappingExpression parse-error translator (Issue
+            // #61). The Engine project can't reference Strings.Instance
+            // (App-only), so the parser holds a delegate it calls per
+            // error site; we resolve to the active culture's resource
+            // string here at startup.
+            Engine.Common.Mapping.MappingExpression.ErrorFormatter = LocalizeMappingExpressionError;
+
+            // Put the single-file extraction directory on Win32's DLL
+            // search path so SDL3's native LoadLibrary("xinput1_4.dll")
+            // finds our OpenXInput-derived copy there instead of
+            // Microsoft's System32 xinput1_4.dll.  Uses SetDllDirectory
+            // (not NativeLibrary.Load) to avoid triggering OpenXInput's
+            // DllMain mid-process — that DllMain does work that's
+            // unsafe under loader lock and hangs if invoked when other
+            // threads are already active.  The OS loader will call it
+            // normally when SDL3 later resolves the DLL via the
+            // extended search path.
+            try
+            {
+                string extractionDir = null;
+                try
+                {
+                    foreach (System.Diagnostics.ProcessModule mod in System.Diagnostics.Process.GetCurrentProcess().Modules)
+                    {
+                        string p = null;
+                        try { p = mod?.FileName; } catch { continue; }
+                        if (!string.IsNullOrEmpty(p) && p.IndexOf(@"\.net\", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            extractionDir = Path.GetDirectoryName(p);
+                            if (!string.IsNullOrEmpty(extractionDir)) break;
+                        }
+                    }
+                }
+                catch { /* module enumeration failed — scan as fallback */ }
+
+                if (string.IsNullOrEmpty(extractionDir))
+                {
+                    try
+                    {
+                        var netRoot = Path.Combine(Path.GetTempPath(), ".net", "PadForge");
+                        if (Directory.Exists(netRoot))
+                        {
+                            extractionDir = Directory.EnumerateDirectories(netRoot)
+                                .Where(d => { try { return File.Exists(Path.Combine(d, "xinput1_4.dll")); } catch { return false; } })
+                                .OrderByDescending(d => { try { return Directory.GetLastWriteTimeUtc(d); } catch { return DateTime.MinValue; } })
+                                .FirstOrDefault();
+                        }
+                    }
+                    catch { /* scan failed — no filter this run */ }
+                }
+
+                if (!string.IsNullOrEmpty(extractionDir))
+                {
+                    NativeMethods.SetDllDirectory(extractionDir);
+                }
+            }
+            catch { /* outer catch — never allow this to take down startup */ }
+
+            // Replay any HIDMaestro OEM-name overrides left by a prior
+            // session that didn't get a clean Clear (crash, force-kill,
+            // power loss). Restores the DirectInput OEM table to its
+            // pre-override state before we create any virtuals or apply
+            // new overrides. Idempotent — no-op when no orphan records
+            // exist. Requires admin (HKLM write); PadForge auto-elevates.
+            try { HIDMaestro.HMOemNameOverride.RecoverOrphans(); }
+            catch { /* best effort — continue without recovery */ }
+
+            // Sweep any HIDMaestro virtual devices left over from a prior
+            // session that didn't cleanly dispose (crash, force-kill,
+            // power loss). Sweep runs on a background thread so startup returns
+            // immediately. Nothing waits on it before enumeration: the library
+            // filters the virtual devices out whether or not the prior session's
+            // kernel cleanup has finished, and blocking the polling thread on
+            // the sweep is what pinned startup at ninety seconds. The task is
+            // exposed only so the window can show the cleanup overlay while it
+            // runs.
+            //
+            // preserveInstall: TRUE. This is a launch sweep, and HM's own
+            // doc names that as the case for it. Devices and orphans are
+            // still evicted (the preserve flag guards only package removal
+            // and the HKLM\SOFTWARE\HIDMaestro delete), which is the whole
+            // reason this sweep exists. The uninstall-grade overload was
+            // the only one that existed when this was written (2026-04-20);
+            // HM added the preserving one in its 2026-07-21 perf audit and
+            // moved its own call site over. Staying on the nuking overload
+            // cost three things every single launch: the ~3 s full deploy
+            // pipeline (the same-version fast path could never fire), the
+            // SteamVRPath hint that lets a steamcmd SteamVR be found, and
+            // the VR driver's registration gate. Losing that gate made
+            // every launch re-extract driver_hidmaestro.dll into a running
+            // vrserver.exe and fail the VR slot with a sharing violation
+            // (owner report 2026-08-08).
+            OrphanSweepTask = System.Threading.Tasks.Task.Run(() =>
+            {
+                try { HIDMaestro.HMContext.RemoveAllVirtualControllers(preserveInstall: true); }
+                catch { /* best effort — continue without sweep */ }
+                // HM#38 consumer-side ordering hygiene: RemoveAll returns when
+                // the CALL completes, not when PnP removal completes, and a
+                // create racing an in-flight removal was one of the freeze's
+                // trigger windows. Wait (bounded) for the devnodes to actually
+                // be gone before the first enumeration proceeds. Purely an
+                // ordering barrier: with the v1.3.22 driver the freeze itself
+                // is structurally fixed, and if something genuinely cannot be
+                // removed we log and proceed rather than block startup.
+                for (int i = 0; i < 25; i++)
+                {
+                    if (!Common.SetupApiInterop.AnyPresentHidMaestroDevice()) return;
+                    System.Threading.Thread.Sleep(200);
+                }
+                PadForge.Engine.SdlDiagLog.WriteLine(
+                    "ORPHANSWEEP devnodes still present after 5 s; proceeding");
+            });
+
+            // Apply the normal PS3-family filter policy in the background.
+            // This preserves DsHidMini and externally paired devices. A Wii
+            // scan can defer enabling. PSM-off affects new connections only,
+            // so this is exposure reduction, not a kernel teardown guarantee.
+            // An older BthPS3 install is replaced first, while no PlayStation
+            // controller is connected over Bluetooth, and the reconcile then
+            // arms the filter for whichever drivers are in place.
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { PadForge.Services.Ds3PairingService.UpgradeDriversAtStartup(); }
+                catch { /* best effort. an update must never block launch */ }
+                try { PadForge.Services.Ds3PairingService.ReconcilePsmPatchForCrashSafety("startup"); }
+                catch { /* best effort. mitigation must never block launch */ }
+            });
+
+            // Capture the pre-override UI culture first: this is the
+            // Windows display language a fresh install runs under, and
+            // Reset to Defaults restores it. InstalledUICulture is the
+            // wrong stand-in (OS install language, which can differ from
+            // the user's display language).
+            StartupUICulture = Thread.CurrentThread.CurrentUICulture;
+
+            // Apply saved language preference before any UI is created.
+            var settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PadForge.xml");
+            if (File.Exists(settingsPath))
+            {
+                try
+                {
+                    var xml = File.ReadAllText(settingsPath);
+                    var langMatch = System.Text.RegularExpressions.Regex.Match(xml, @"<Language>([^<]+)</Language>");
+                    if (langMatch.Success && !string.IsNullOrEmpty(langMatch.Groups[1].Value))
+                    {
+                        var culture = new System.Globalization.CultureInfo(langMatch.Groups[1].Value);
+                        Thread.CurrentThread.CurrentUICulture = culture;
+                        System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = culture;
+                    }
+                }
+                catch { /* ignore parse errors, use system default */ }
+            }
+
+            // Elevation is guaranteed by app.manifest (requireAdministrator).
+            // Windows prompts on launch and shows the UAC shield on the icon.
+
+            // Migrate the legacy HKCU\Run launch-at-logon entry (which never
+            // worked once PadForge required elevation) to a Task Scheduler
+            // entry. Idempotent — no-op when no legacy entry exists. Runs
+            // before the UI shows the Settings toggle so the toggle's bound
+            // state always reflects the migrated reality.
+            PadForge.Common.StartupHelper.MigrateLegacyEntryIfNeeded();
+
+            // Apply system theme (follows OS light/dark setting), then pin
+            // the Ember accent over whatever the system accent was (#175).
+            ApplicationThemeManager.ApplySystemTheme();
+            PadForge.Common.EmberTheme.ApplyAccent();
+
+            // Wire up global unhandled exception handlers for diagnostics.
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            // Quiet hardware outputs on exit paths that bypass
+            // MainWindow.OnClosing (Environment.Exit, AppDomain unload).
+            // ProcessExit does NOT fire after an unhandled exception;
+            // the crash handler carries its own invoke for that path.
+            // Idempotent after a clean stop.
+            AppDomain.CurrentDomain.ProcessExit += (s2, e2) =>
+            { try { PanicQuiesce?.Invoke(); } catch { } };
+            DispatcherUnhandledException += App_DispatcherUnhandledException;
+            Dispatcher.UnhandledExceptionFilter += Dispatcher_UnhandledExceptionFilter;
+
+            // Proactively handle GPU device loss on sleep/wake by temporarily
+            // switching to software rendering before the render thread crashes.
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+
+            // Create main window manually (instead of StartupUri) so we can
+            // control whether Show() is called, required for start-minimized-to-tray.
+            var window = new MainWindow();
+            MainWindow = window;
+
+            if (window.ShouldStartMinimizedToTray)
+            {
+                // Don't call Show() at all. The tray icon handles restore.
+            }
+            else if (window.ShouldStartMinimized)
+            {
+                window.WindowState = WindowState.Minimized;
+                window.Show();
+            }
+            else
+            {
+                window.Show();
+            }
+
+            _startupUiReady = true;
+        }
+
+        /// <summary>Sends one command to the running instance's control pipe
+        /// (#366) and prints the response, so an elevated caller like a
+        /// launcher script sees the result. Best-effort: a closed pipe (the
+        /// user never enabled external control) fails quietly.</summary>
+        private static void TryForwardExternalCommand(string command)
+        {
+            try
+            {
+                using var client = new System.IO.Pipes.NamedPipeClientStream(
+                    ".", Services.ExternalControlService.PipeName,
+                    System.IO.Pipes.PipeDirection.InOut);
+                client.Connect(2000);
+                byte[] outBytes = System.Text.Encoding.UTF8.GetBytes(command + "\n");
+                client.Write(outBytes, 0, outBytes.Length);
+                client.Flush();
+
+                // The reply is one UTF-8 line, the framing the server writes.
+                using var reply = new System.IO.MemoryStream();
+                var one = new byte[1];
+                while (reply.Length < 1024)
+                {
+                    int n = client.Read(one, 0, 1);
+                    if (n == 0 || one[0] == (byte)'\n') break;
+                    if (one[0] == (byte)'\r') continue;
+                    reply.WriteByte(one[0]);
+                }
+                Console.WriteLine(System.Text.Encoding.UTF8.GetString(reply.GetBuffer(), 0, (int)reply.Length));
+            }
+            catch
+            {
+                Console.WriteLine("error not-connected");
+            }
+        }
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Suspend)
+            {
+                // Hide the window before sleep so WPF doesn't attempt to
+                // render when the GPU device is lost during wake. This
+                // prevents the render thread from touching D3D on resume.
+                Dispatcher.Invoke(() =>
+                {
+                    try
+                    {
+                        if (MainWindow is MainWindow mw)
+                        {
+                            _windowStateBeforeSleep = mw.WindowState;
+                            _windowVisibleBeforeSleep = mw.IsVisible;
+                            mw.Hide();
+                        }
+                    }
+                    catch { }
+                });
+            }
+            else if (e.Mode == PowerModes.Resume)
+            {
+                // Restore the window after a delay to let the GPU driver
+                // re-initialize before WPF tries to render.
+                Dispatcher.BeginInvoke(() =>
+                {
+                    var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+                    timer.Tick += (s, _) =>
+                    {
+                        timer.Stop();
+                        try
+                        {
+                            if (MainWindow is MainWindow mw && _windowVisibleBeforeSleep)
+                            {
+                                mw.Show();
+                                mw.WindowState = _windowStateBeforeSleep;
+                            }
+                        }
+                        catch { }
+                    };
+                    timer.Start();
+                });
+            }
+        }
+
+        /// <summary>One "Type: Message" line per exception in the inner
+        /// chain. Wrapper exceptions (XamlParseException rewraps, TIEs,
+        /// AggregateExceptions) carry a generic outer message; the real
+        /// cause lives at the bottom of the chain. A v4.0.0 Discord
+        /// crash report showed only "Set property
+        /// 'System.Windows.FrameworkElement.Style' threw an exception."
+        /// because both handlers printed the outer level alone.</summary>
+        private static string ExceptionMessageChain(Exception ex)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var e = ex; e != null && sb.Length < 4096; e = e.InnerException)
+            {
+                if (sb.Length > 0)
+                    sb.Append("\n--> ");
+                sb.Append(e.GetType().Name).Append(": ").Append(e.Message);
+                // BAML rewraps know which XAML file failed even when the
+                // release build has no line info.
+                if (e is System.Windows.Markup.XamlParseException xpe)
+                {
+                    if (xpe.BaseUri != null)
+                        sb.Append(" [").Append(xpe.BaseUri).Append(']');
+                    if (xpe.LineNumber > 0)
+                        sb.Append(" [line ").Append(xpe.LineNumber)
+                          .Append(", pos ").Append(xpe.LinePosition).Append(']');
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Every stack in the inner chain, outermost first.
+        /// Exception.ToString() carries the same data, but interleaves
+        /// messages and stacks; this keeps the dialog's message block
+        /// (ExceptionMessageChain) and stack block separable.</summary>
+        private static string ExceptionStackChain(Exception ex)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var e = ex; e != null && sb.Length < 16384; e = e.InnerException)
+            {
+                if (sb.Length > 0)
+                    sb.Append("\n-- inner (").Append(e.GetType().Name).Append(") --\n");
+                sb.Append(e.StackTrace ?? "(no stack)");
+            }
+            return sb.ToString();
+        }
+
+        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            try { System.IO.File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"),
+                $"[{DateTime.Now:HH:mm:ss}] DOMAIN: {(e.ExceptionObject is Exception ex2 ? $"{ExceptionMessageChain(ex2)}\n{ExceptionStackChain(ex2)}" : e.ExceptionObject?.ToString())}\n\n"
+                // The in-memory diagnostics ring (SDL narration, stall
+                // watchdog, binding errors) is this crash's recent context;
+                // a fatal crash is the one place it reaches disk.
+                + "-- recent diagnostics --\n" + Engine.SdlDiagLog.Snapshot() + "\n\n"); }
+            catch { }
+
+            // Stop any live rumble / sustained haptic tone BEFORE the
+            // fatal dialog blocks, and BEFORE the GPU-loss early return:
+            // ProcessExit does not fire after an unhandled exception, so
+            // this is the only quiesce a fatal crash gets. The Steam
+            // Deck's rumble command has no firmware timeout, so leaving
+            // it running would buzz the trackpads indefinitely.
+            try { PanicQuiesce?.Invoke(); } catch { }
+
+            // Suppress cascading render thread exceptions after GPU device loss.
+            if (_gpuLost)
+                return;
+
+            if (e.ExceptionObject is Exception ex)
+            {
+                MessageBox.Show(
+                    string.Format(Strings.Instance.App_UnexpectedError_Format,
+                        ExceptionMessageChain(ex), ExceptionStackChain(ex)),
+                    Strings.Instance.App_FatalError,
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        private void Dispatcher_UnhandledExceptionFilter(object sender,
+            System.Windows.Threading.DispatcherUnhandledExceptionFilterEventArgs e)
+        {
+            // Suppress cascading exceptions after GPU device loss.
+            if (_gpuLost)
+                e.RequestCatch = true;
+        }
+
+        private void App_DispatcherUnhandledException(object sender,
+            System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+        {
+            e.Handled = true;
+
+            string signature = ExceptionMessageChain(e.Exception);
+            _dispatcherErrorSignatures.TryGetValue(signature, out int priorHits);
+            int hits = priorHits + 1;
+            _dispatcherErrorSignatures[signature] = hits;
+
+            // Storm bound: full entries for the first three hits of a
+            // signature, then a one-line counter every 500th, nothing in
+            // between. A layout-retry storm otherwise appends the same
+            // multi-kilobyte stack thousands of times.
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log");
+                if (hits <= 3)
+                {
+                    System.IO.File.AppendAllText(logPath,
+                        $"[{DateTime.Now:HH:mm:ss}] DISPATCHER{(hits > 1 ? $" (hit {hits})" : string.Empty)}: {signature}\n{ExceptionStackChain(e.Exception)}\n\n"
+                        // Before startup completes, a dispatcher exception is a
+                        // failed launch (OnStartup aborted): flush the diagnostics
+                        // ring like the fatal DOMAIN path does. Steady-state
+                        // dispatcher errors skip the appendix so an exception storm
+                        // doesn't snowball crash.log.
+                        + (!_startupUiReady
+                            ? "-- recent diagnostics --\n" + Engine.SdlDiagLog.Snapshot() + "\n\n"
+                            : string.Empty));
+                }
+                else if (hits == 4 || hits % 500 == 0)
+                {
+                    System.IO.File.AppendAllText(logPath,
+                        $"[{DateTime.Now:HH:mm:ss}] DISPATCHER (hit {hits}, further identical entries suppressed): {signature.Split('\n')[0]}\n\n");
+                }
+            }
+            catch { }
+
+            // Once the render thread is zombied, suppress ALL cascading exceptions
+            // silently: they're all downstream failures from the same GPU device loss.
+            if (_gpuLost)
+                return;
+
+            // GPU device lost (common after sleep/wake): fall back to software
+            // rendering silently and suppress all further render exceptions.
+            if (IsGpuLostException(e.Exception))
+            {
+                _gpuLost = true;
+                return;
+            }
+
+            // One dialog per signature per session. A storyboard that dies
+            // during template application rethrows on every layout retry,
+            // and the 3-second limiter alone re-shows the same dialog for
+            // as long as the storm lasts.
+            if (hits > 1)
+            {
+                _suppressedErrorCount++;
+                if (!_startupUiReady)
+                    ShutdownAfterStartupError();
+                return;
+            }
+
+            // Rate-limit: if an error was shown in the last 3 seconds, suppress
+            // the popup to prevent the infinite MessageBox loop that occurs when
+            // the 30Hz DispatcherTimer fires during the modal MessageBox.Show()
+            // nested dispatcher pump and hits the same exception repeatedly.
+            if (_lastErrorTime.IsRunning && _lastErrorTime.ElapsedMilliseconds < 3000)
+            {
+                _suppressedErrorCount++;
+                if (!_startupUiReady)
+                    ShutdownAfterStartupError();
+                return;
+            }
+
+            _lastErrorTime.Restart();
+            string suppressed = _suppressedErrorCount > 0
+                ? "\n\n" + string.Format(Strings.Instance.App_SuppressedErrors_Format, _suppressedErrorCount)
+                : string.Empty;
+            _suppressedErrorCount = 0;
+
+            MessageBox.Show(
+                string.Format(Strings.Instance.App_UnexpectedError_Format,
+                    signature, ExceptionStackChain(e.Exception)) + suppressed,
+                Strings.Instance.App_Error,
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+
+            // A dispatcher exception before startup completes means
+            // OnStartup aborted: the window never finished constructing, so
+            // e.Handled=true would leave a windowless elevated process
+            // running until the user finds it in Task Manager (v4.0.0
+            // light-theme launch crash). Nothing to keep alive. Exit.
+            if (!_startupUiReady)
+                ShutdownAfterStartupError();
+        }
+
+        private void ShutdownAfterStartupError()
+        {
+            (MainWindow as PadForge.MainWindow)?.PrepareForExit();
+            Shutdown(1);
+        }
+
+        protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+        {
+            base.OnSessionEnding(e);
+            // WPF shuts down after an accepted session-ending request.
+            if (!e.Cancel)
+                (MainWindow as PadForge.MainWindow)?.PrepareForExit();
+        }
+
+        private static bool IsGpuLostException(Exception ex)
+        {
+            var trace = ex.StackTrace;
+            return trace != null &&
+                   (trace.Contains("DUCE.Channel.SyncFlush") ||
+                    trace.Contains("NotifyPartitionIsZombie"));
+        }
+
+    }
+
+    /// <summary>Forwards WPF data-binding ERROR traces to the in-memory
+    /// diagnostics ring (BINDERR lines, surfaced in crash.log's appendix).
+    /// Errors only, so a healthy session records nothing. Never throws: a
+    /// diagnostics listener must not take the UI down.</summary>
+    internal sealed class DiagBindingTraceListener : System.Diagnostics.TraceListener
+    {
+        public override void Write(string message) { }
+
+        public override void WriteLine(string message)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(message))
+                    Engine.SdlDiagLog.WriteLine("BINDERR " + message);
+            }
+            catch { }
+        }
+    }
+}

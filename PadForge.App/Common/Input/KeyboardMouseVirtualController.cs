@@ -1,0 +1,639 @@
+﻿using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using PadForge.Engine;
+
+namespace PadForge.Common.Input
+{
+    /// <summary>
+    /// Virtual controller that translates KbmRawState into keyboard and mouse
+    /// input via the Windows SendInput API. Always available (no driver required).
+    ///
+    /// Mapping targets are configured in the mapping page and stored in PadSetting
+    /// as KBM dictionary entries. Step 3 maps physical inputs to KbmRawState,
+    /// and this controller sends the appropriate key presses and mouse actions.
+    /// </summary>
+    internal sealed class KeyboardMouseVirtualController : IVirtualController
+    {
+        private bool _connected;
+        private bool _disposed;
+
+        // Change detection: previous key states (4 × 64 bits = 256 VK codes)
+        private ulong _prevKeys0, _prevKeys1, _prevKeys2, _prevKeys3;
+        // Previous mouse button state
+        private byte _prevMouseButtons;
+
+        // Sub-pixel accumulators for mouse delta + scroll. Sources like
+        // gyro-to-mouse produce per-frame deltas well under 1 pixel that
+        // would truncate to 0 in a raw (int) cast and never move the
+        // cursor. Accumulate the fractional residue across frames so the
+        // cursor moves once the residue crosses an integer boundary.
+        // Same pattern as the macro-action mouse-move path at
+        // InputManager.Step4b.EvaluateMacros.cs:814-816.
+        private float _mxAccumulator;
+        private float _myAccumulator;
+        private float _scrollAccumulator;
+        private float _scrollAccumulatorH;
+        // Last absolute-pointer pixel written, so the per-poll SetCursorPos is
+        // skipped when the target hasn't moved. int.MinValue = "no write yet /
+        // pointer released", which forces the next valid frame to write.
+        private int _lastAbsCursorX = int.MinValue;
+        private int _lastAbsCursorY = int.MinValue;
+
+        // Cursor speed at full axis deflection, in pixels per SECOND.
+        //
+        // Time-based, not per-poll. The old constant was 15 px per POLL,
+        // which made cursor speed a function of the polling-interval
+        // setting, and at the default 1 ms interval put full deflection at
+        // 15,000 px/s: the owner's report was "I barely nudge it and it
+        // almost instantly hits the other side of the screen". The proven
+        // desktop-cursor reference is DS4Windows' stick-as-mouse, which is
+        // velocity x timeDelta with a default full-scale of
+        // sensitivity 25 x MOUSESPEEDFACTOR 48 = 1,200 px/s
+        // (DS4Windows Mapping.cs:829, :5437). The per-stick KBM speed knob
+        // upstream scales from here.
+        private const float MouseFullScalePxPerSec = 1200f;
+
+        // Gyro's own sub-count remainder. Separate from the deflection
+        // lane's so a stick and a gyro on the same axis do not trade
+        // fractional motion, and so the direction-flip reset only discards
+        // gyro's own carry.
+        private float _gxAccumulator;
+        private float _gyAccumulator;
+
+        /// <summary>One exact-counts step, shared by the gyro, touchpad,
+        /// and stick-coast lanes (#324). Takes the per-poll value ALREADY
+        /// in screen space, clears the fractional remainder when that
+        /// value genuinely reverses against it (DS4Windows
+        /// MouseCursor.cs:108, the same-operand check), accumulates, and
+        /// returns the whole-count part. The congruence is structural:
+        /// the check and the accumulation see the SAME operand, so the
+        /// bug this replaces cannot recur. The gyro lane shipped with the
+        /// check on the PRE-negation value while accumulating the negated
+        /// one, so steady motion read as a reversal every poll, the
+        /// remainder died, and all sub-count motion (slow gyro at
+        /// 1000 Hz) was suppressed (#319, vlue-c).</summary>
+        internal static int StepExactCounts(ref float accumulator, float screenValue)
+        {
+            if (screenValue == 0f || (accumulator > 0f) != (screenValue > 0f))
+                accumulator = 0f;
+            accumulator += screenValue;
+            int whole = (int)accumulator;
+            accumulator -= whole;
+            return whole;
+        }
+        private float _txAccumulator;
+        private float _tyAccumulator;
+        // Stick trackball coast (#291): its own remainder pair, same
+        // rationale as the gyro/touch pairs above. A fourth source on the
+        // same axis gets its own accumulator so lanes never trade
+        // fractional motion.
+        private float _sxAccumulator;
+        private float _syAccumulator;
+
+        // Scroll speed at full axis deflection, in wheel notches per SECOND.
+        //
+        // Same fix as the cursor lane: the old constant was 3 notches per
+        // POLL, i.e. 3,000/s at the default 1 ms interval and poll-rate-
+        // dependent besides. Nobody felt that only because a linear rate
+        // lets a barely-tilted stick self-regulate. The reference is
+        // DS4Windows' stick-wheel: a 10 ms cadence with full deflection
+        // counting one notch per three runs, ~33 notches/s
+        // (Mapping.cs GetMouseWheelMapping: "Use 3 runs as a full mouse
+        // wheel tick" on a 10 ms gate). The KBM speed knob scales from
+        // here.
+        private const float ScrollFullScaleNotchesPerSec = 100f / 3f;
+
+        // Wall-clock between SubmitKbmState calls, so the rate lanes above
+        // are poll-rate-independent. Clamped so a stall (debugger, suspend)
+        // cannot spend as one giant delta on resume.
+        private long _lastSubmitTimestamp;
+        private float _submitDt;
+
+        /// <summary>Seconds credited to one submit: never negative, capped at
+        /// 50 ms so a stall resumes gently instead of leaping.</summary>
+        internal static float ClampSubmitDt(double seconds)
+            => seconds <= 0 ? 0f : (float)Math.Min(seconds, 0.05);
+
+        /// <summary>Pixels one submit contributes for a stick deflection:
+        /// deflection fraction x full-scale px/s x dt. Pure, so the rate
+        /// contract (time-based, poll-rate-independent, DS4Windows-scaled)
+        /// is directly testable.</summary>
+        internal static float MouseStickPixels(short deflection, float dtSeconds)
+            => deflection / 32767.0f * MouseFullScalePxPerSec * dtSeconds;
+
+        /// <summary>The scroll twin of <see cref="MouseStickPixels"/>, in
+        /// wheel notches.</summary>
+        internal static float ScrollStickNotches(short deflection, float dtSeconds)
+            => deflection / 32767.0f * ScrollFullScaleNotchesPerSec * dtSeconds;
+
+        // SOCD cleaner (discussion #205, Snap Tap). Transforms the logical
+        // key bitset before change detection; no-op while mode is Off.
+        private readonly SocdCleaner _socd = new();
+        // Applied config references for the per-poll fast path: the UI thread
+        // swaps whole strings on the slot config (reference writes are
+        // atomic), so two reference compares detect an edit.
+        private string _appliedSocdMode;
+        private string _appliedSocdPairs;
+
+        public VirtualControllerType Type => VirtualControllerType.KeyboardMouse;
+        public bool IsConnected => _connected;
+        public int FeedbackPadIndex { get; set; }
+
+        public KeyboardMouseVirtualController(int padIndex)
+        {
+        }
+
+        public void Connect()
+        {
+            if (_connected) return;
+            _connected = true;
+            _prevKeys0 = _prevKeys1 = _prevKeys2 = _prevKeys3 = 0;
+            _prevMouseButtons = 0;
+            // Fresh time base: the first submit after a (re)connect credits
+            // zero seconds instead of the idle gap (the dt clamp would cap
+            // that gap anyway; this just makes the contract exact).
+            _lastSubmitTimestamp = 0;
+            _socd.Reset();
+        }
+
+        /// <summary>
+        /// Applies the slot's SOCD config. Called from the poll loop before
+        /// each submit; reference-compare fast path keeps the steady-state
+        /// cost at two compares.
+        /// </summary>
+        public void ApplySocdConfig(string mode, string pairs)
+        {
+            if (ReferenceEquals(mode, _appliedSocdMode)
+                && ReferenceEquals(pairs, _appliedSocdPairs))
+                return;
+            _appliedSocdMode = mode;
+            _appliedSocdPairs = pairs;
+            _socd.Configure(mode, pairs);
+        }
+
+        public void Disconnect()
+        {
+            if (!_connected) return;
+            _connected = false;
+            ReleaseAll();
+            _mxAccumulator = 0f;
+            _myAccumulator = 0f;
+            _scrollAccumulator = 0f;
+            _scrollAccumulatorH = 0f;
+            // Same reason as the others: a stale sub-count carry must not
+            // survive a reconnect and spend itself on the first new poll.
+            _gxAccumulator = 0f;
+            _gyAccumulator = 0f;
+            _txAccumulator = 0f;
+            _tyAccumulator = 0f;
+            _sxAccumulator = 0f;
+            _syAccumulator = 0f;
+        }
+
+        /// <summary>
+        /// No-op — KBM uses SubmitKbmState instead.
+        /// </summary>
+        public void SubmitGamepadState(Gamepad gp) { }
+
+        /// <summary>
+        /// Sends keyboard and mouse input based on the KBM raw state.
+        /// Uses change detection to only send key down/up on transitions.
+        /// </summary>
+        public void SubmitKbmState(KbmRawState raw)
+        {
+            // Wall-clock dt for the rate lanes (cursor, scroll): measured
+            // here rather than passed in, so the contract cannot drift when a
+            // caller forgets, and the first submit credits zero.
+            long nowTs = Stopwatch.GetTimestamp();
+            _submitDt = ClampSubmitDt(_lastSubmitTimestamp == 0
+                ? 0.0
+                : (nowTs - _lastSubmitTimestamp) / (double)Stopwatch.Frequency);
+            _lastSubmitTimestamp = nowTs;
+
+            if (!_connected) return;
+
+            // --- SOCD cleaning (discussion #205) ---
+            // Transforms the logical bitset before change detection AND
+            // before the _prevKeys assignment, so suppressing a loser emits
+            // its key-up and a later release of the winner lets the still-
+            // held loser's bit through again as a fresh key-down (Snap Tap
+            // re-press, hitboxer's OPPOSITE mode).
+            _socd.Apply(ref raw.Keys0, ref raw.Keys1, ref raw.Keys2, ref raw.Keys3);
+
+            // --- Keyboard keys (change detection per VK) ---
+            // Releases across ALL four words before any press: the
+            // release-before-press discipline must be global, not
+            // per-word, or a cross-word SOCD pair (arrow + letter) still
+            // exposed both directions held between the two SendInput
+            // calls when the winner's word processed first.
+            ProcessKeyWord(raw.Keys0, _prevKeys0, 0, releases: true);
+            ProcessKeyWord(raw.Keys1, _prevKeys1, 64, releases: true);
+            ProcessKeyWord(raw.Keys2, _prevKeys2, 128, releases: true);
+            ProcessKeyWord(raw.Keys3, _prevKeys3, 192, releases: true);
+            ProcessKeyWord(raw.Keys0, _prevKeys0, 0, releases: false);
+            ProcessKeyWord(raw.Keys1, _prevKeys1, 64, releases: false);
+            ProcessKeyWord(raw.Keys2, _prevKeys2, 128, releases: false);
+            ProcessKeyWord(raw.Keys3, _prevKeys3, 192, releases: false);
+            _prevKeys0 = raw.Keys0;
+            _prevKeys1 = raw.Keys1;
+            _prevKeys2 = raw.Keys2;
+            _prevKeys3 = raw.Keys3;
+
+            // --- Mouse buttons (change detection) ---
+            ProcessMouseButtons(raw.MouseButtons);
+            _prevMouseButtons = raw.MouseButtons;
+
+            // --- Mouse movement (deadzone already applied in Step 3) ---
+            // Routed through the injector accumulator, never a SendInput on
+            // this (the poll) thread: injected mouse movement traverses
+            // every process's low-level mouse hook chain synchronously, and
+            // a stick at full deflection crosses the accumulator nearly
+            // every tick. The macro mouse path measured this exact
+            // per-poll-SendInput mechanism collapsing the loop to ~200 Hz
+            // and grew the injector thread; this lane rides the same one.
+            if (raw.MouseDeltaX != 0 || raw.MouseDeltaY != 0)
+            {
+                _mxAccumulator += MouseStickPixels(raw.MouseDeltaX, _submitDt);
+                _myAccumulator += -MouseStickPixels(raw.MouseDeltaY, _submitDt);
+                int dx = (int)_mxAccumulator;
+                int dy = (int)_myAccumulator;
+                _mxAccumulator -= dx;
+                _myAccumulator -= dy;
+                if (dx != 0 || dy != 0)
+                    InputManager.AccumulateMouseMoveInput(dx, dy);
+            }
+
+            // --- Gyro exact counts (#79 feel) ---
+            // Its own accumulator, not the deflection one above: this lane
+            // is already in mouse counts and already time-scaled, so running
+            // it through the cursor rate would re-apply a spend the
+            // engine has just removed.
+            if (raw.MouseGyroX != 0f || raw.MouseGyroY != 0f)
+            {
+                // BOTH axes negate into screen space. SDL's gyro frame is
+                // nose-relative: positive yaw is nose LEFT and positive pitch
+                // is nose UP (SDL_sensor.h, and the sign note on the gyro
+                // button read). Screen space is the opposite on both counts,
+                // +X right and +Y down. Turning the controller left has to
+                // move the cursor left, so yaw negates exactly like pitch
+                // does; leaving X alone pointed the cursor the wrong way,
+                // which is a thing you feel immediately and a thing no
+                // amount of sensitivity tuning fixes. The negation happens
+                // HERE, once, so the step's reversal check sees the same
+                // screen-space operand it accumulates (#324: checking the
+                // pre-negation value read steady motion as a reversal every
+                // poll and killed all sub-count movement).
+                int gdx = StepExactCounts(ref _gxAccumulator, -raw.MouseGyroX);
+                int gdy = StepExactCounts(ref _gyAccumulator, -raw.MouseGyroY);
+                if (gdx != 0 || gdy != 0)
+                    InputManager.AccumulateMouseMoveInput(gdx, gdy);
+            }
+
+            // --- Touchpad exact counts (the gyro lane's twin) ---
+            // NEITHER axis negates, unlike the gyro lane above. A finger on a
+            // pad is already screen-aligned: SDL reports raw_y = 0 at the top,
+            // so a finger moving down yields a positive delta and screen-Y is
+            // positive-down too. The gyro needs its flip because SDL's frame
+            // is nose-relative (+yaw is nose LEFT, +pitch is nose UP), which
+            // is the opposite of the screen on both axes.
+            //
+            // Net parity with the old deflection lane is preserved: that path
+            // negated twice (Step 3 NegateAxis, then the VC) and arrived at
+            // the same sign this arrives at with none.
+            if (raw.MouseTouchX != 0f || raw.MouseTouchY != 0f)
+            {
+                int tdx = StepExactCounts(ref _txAccumulator, raw.MouseTouchX);
+                int tdy = StepExactCounts(ref _tyAccumulator, raw.MouseTouchY);
+                if (tdx != 0 || tdy != 0)
+                    InputManager.AccumulateMouseMoveInput(tdx, tdy);
+            }
+
+            // --- Stick trackball coast (#291), exact counts ---
+            // Y negates into screen space exactly as the deflection lane's
+            // spend does (-MouseStickPixels above), because the coast is
+            // launched FROM that lane's deflections: KbmMouseY positive is
+            // up, screen Y positive is down.
+            if (raw.MouseStickCoastX != 0f || raw.MouseStickCoastY != 0f)
+            {
+                int sdx = StepExactCounts(ref _sxAccumulator, raw.MouseStickCoastX);
+                int sdy = StepExactCounts(ref _syAccumulator, -raw.MouseStickCoastY);
+                if (sdx != 0 || sdy != 0)
+                    InputManager.AccumulateMouseMoveInput(sdx, sdy);
+            }
+
+            // --- Flick stick exact counts (#225) ---
+            // Same injector lane, forwarded 1:1. NOT scaled by the
+            // cursor rate above and NOT run through the accumulator: the
+            // engine tick already calibrated the value in mouse counts
+            // (counts-per-360 on the source) and carries its own sub-count
+            // residual. Scaling here would break the flick = exact camera
+            // angle contract.
+            if (raw.MouseFlickX != 0)
+                InputManager.AccumulateMouseMoveInput(raw.MouseFlickX, 0);
+
+            // --- Absolute pointer (Wii IR pointing, issue #146) ---
+            // Touchmote idiom: position the OS cursor directly at the aim point
+            // (Touchmote MouseSimulator.cs:154, SetCursorPos), mapped over the
+            // primary screen. Only while the camera tracks the sensor bar; on
+            // sight loss the cursor holds its last position instead of snapping,
+            // exactly like Touchmote when the bar leaves the camera's view.
+            if (raw.MouseAbsValid
+                && PadForge.Services.CursorControlService.TryGetPrimarySize(out int absW, out int absH))
+            {
+                int px = (int)MathF.Round((raw.MouseAbsX * 0.5f + 0.5f) * (absW - 1));
+                int py = (int)MathF.Round((raw.MouseAbsY * 0.5f + 0.5f) * (absH - 1));
+                // Mixed mapping (IR on one mouse axis, a stick on the other):
+                // only one coordinate is absolute-driven. The un-driven one
+                // keeps the cursor's current position instead of recentering
+                // to the 0f field default every poll, which pinned the
+                // stick-driven axis. Producers that predate the per-axis
+                // flags leave both false and take the both-axes path.
+                if (raw.MouseAbsXValid != raw.MouseAbsYValid && GetCursorPos(out POINT cur))
+                {
+                    if (!raw.MouseAbsXValid) px = cur.X;
+                    if (!raw.MouseAbsYValid) py = cur.Y;
+                }
+                px = Math.Clamp(px, 0, absW - 1);
+                py = Math.Clamp(py, 0, absH - 1);
+                // Change-gate: SetCursorPos crosses every WH_MOUSE_LL hook in
+                // the system, so a resting finger firing it every poll (1 kHz)
+                // is the same syscall-storm class as the SendInput poll-rate
+                // regression. Only write when the target pixel actually moved.
+                if (px != _lastAbsCursorX || py != _lastAbsCursorY)
+                {
+                    SetCursorPos(px, py);
+                    _lastAbsCursorX = px;
+                    _lastAbsCursorY = py;
+                }
+            }
+            else
+            {
+                // Pointer released (or absent this frame): drop the cache so the
+                // next engagement always repositions, even to the same pixel the
+                // cursor may have drifted from via other input.
+                _lastAbsCursorX = int.MinValue;
+                _lastAbsCursorY = int.MinValue;
+            }
+
+            // --- Mouse scroll (deadzone already applied in Step 3) ---
+            if (raw.ScrollDelta != 0)
+            {
+                _scrollAccumulator += ScrollStickNotches(raw.ScrollDelta, _submitDt);
+                int scroll = (int)_scrollAccumulator;
+                _scrollAccumulator -= scroll;
+                if (scroll != 0)
+                    InputManager.AccumulateMouseScrollInput(scroll * 120); // 120 = WHEEL_DELTA
+            }
+
+            // --- Horizontal mouse scroll (issue #154, the office-mouse tilt
+            //     wheel). Same accumulator idiom; positive = scroll right,
+            //     matching MOUSEEVENTF_HWHEEL's positive direction. ---
+            if (raw.ScrollDeltaH != 0)
+            {
+                _scrollAccumulatorH += ScrollStickNotches(raw.ScrollDeltaH, _submitDt);
+                int scrollH = (int)_scrollAccumulatorH;
+                _scrollAccumulatorH -= scrollH;
+                if (scrollH != 0)
+                    InputManager.AccumulateMouseScrollHInput(scrollH * 120); // 120 = WHEEL_DELTA
+            }
+        }
+
+        public void RegisterFeedbackCallback(int padIndex, Vibration[] vibrationStates)
+        {
+            // Keyboard/Mouse has no rumble feedback — no-op.
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Disconnect();
+        }
+
+        // ─────────────────────────────────────────────
+        //  Key/mouse state processing
+        // ─────────────────────────────────────────────
+
+        /// <summary>One phase of the frame's key flush. Callers run a
+        /// full release pass over all four VK words, then a full press
+        /// pass, hitboxer's structural discipline (windows.jai
+        /// low_level_keyboard_proc: the loser's KEYUP is injected before
+        /// the winner's keydown propagates). Without global two-phase
+        /// ordering, a SOCD swap emitted the key-down first whenever the
+        /// winner's VK bit or word sorted lower, and a game sampling
+        /// between the two SendInput calls saw both opposite directions
+        /// held, the exact state SOCD cleaning exists to make
+        /// unobservable.</summary>
+        private void ProcessKeyWord(ulong current, ulong previous, int baseVk, bool releases)
+        {
+            ulong changed = current ^ previous;
+            if (changed == 0) return;
+
+            ulong phaseBits = releases ? (changed & ~current) : (changed & current);
+            for (int bit = 0; bit < 64; bit++)
+            {
+                if ((phaseBits & (1UL << bit)) == 0) continue;
+                SendKeyboard((ushort)(baseVk + bit), !releases);
+            }
+        }
+
+        private void ProcessMouseButtons(byte current)
+        {
+            byte changed = (byte)(current ^ _prevMouseButtons);
+            if (changed == 0) return;
+
+            // Bit 0 = LMB
+            if ((changed & 1) != 0)
+                SendMouseButton(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, (current & 1) != 0);
+            // Bit 1 = RMB
+            if ((changed & 2) != 0)
+                SendMouseButton(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, (current & 2) != 0);
+            // Bit 2 = MMB
+            if ((changed & 4) != 0)
+                SendMouseButton(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, (current & 4) != 0);
+            // Bit 3 = X1
+            if ((changed & 8) != 0)
+                SendMouseButtonX(XBUTTON1, (current & 8) != 0);
+            // Bit 4 = X2
+            if ((changed & 16) != 0)
+                SendMouseButtonX(XBUTTON2, (current & 16) != 0);
+        }
+
+        private void ReleaseAll()
+        {
+            // Release all held keys (current = 0, so only the release
+            // phase has work).
+            ProcessKeyWord(0, _prevKeys0, 0, releases: true);
+            ProcessKeyWord(0, _prevKeys1, 64, releases: true);
+            ProcessKeyWord(0, _prevKeys2, 128, releases: true);
+            ProcessKeyWord(0, _prevKeys3, 192, releases: true);
+            _prevKeys0 = _prevKeys1 = _prevKeys2 = _prevKeys3 = 0;
+
+            // Release all mouse buttons
+            ProcessMouseButtons(0);
+            _prevMouseButtons = 0;
+        }
+
+        // ─────────────────────────────────────────────
+        //  SendInput P/Invoke
+        //
+        //  The INPUT struct uses a union (MOUSEINPUT / KEYBDINPUT)
+        //  that contains IntPtr (ULONG_PTR). On x64, IntPtr is 8 bytes
+        //  with 8-byte alignment, so the union must start at offset 8
+        //  (after DWORD type + 4 bytes padding). Using LayoutKind.Sequential
+        //  with a separate Explicit union struct lets the CLR handle
+        //  platform-correct alignment automatically.
+        // ─────────────────────────────────────────────
+
+        private const int INPUT_MOUSE = 0;
+        private const int INPUT_KEYBOARD = 1;
+
+        private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+        private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+        private const uint MOUSEEVENTF_XDOWN = 0x0080;
+        private const uint MOUSEEVENTF_XUP = 0x0100;
+
+        private const uint XBUTTON1 = 0x0001;
+        private const uint XBUTTON2 = 0x0002;
+
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct InputUnion
+        {
+            [FieldOffset(0)] public MOUSEINPUT mi;
+            [FieldOffset(0)] public KEYBDINPUT ki;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public int type;
+            public InputUnion u;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        // Absolute cursor positioning for the Wii IR pointer (issue #146),
+        // the same call Touchmote's MouseSimulator uses (SetCursorPosition).
+        [DllImport("user32.dll")]
+        private static extern bool SetCursorPos(int x, int y);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        // Current cursor position, read when a mixed mapping drives only
+        // one absolute axis so the other coordinate passes through
+        // unchanged (the delta-driven axis keeps its integrated position).
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        private static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
+
+        // Every event below carries InputHookManager.OutputTag, so the
+        // hooks and the Raw Input reader never take PadForge's own output
+        // for input.
+
+        /// <summary>The key, scan code and flags an output key event goes out
+        /// with. The E0 keys carry the extended flag or SendInput types their
+        /// numpad twin, and Numpad Enter's index goes out as VK_RETURN with
+        /// the flag: the table the keyboard hook and the macro emitter use
+        /// (InputHookManager.OutputKey). Split from SendKeyboard so it runs
+        /// without SendInput.</summary>
+        internal static (ushort Vk, ushort Scan, uint Flags) KeyEvent(ushort vk, bool down)
+        {
+            var (outVk, extended) = PadForge.Engine.Common.InputHookManager.OutputKey(vk);
+            return (outVk, (ushort)MapVirtualKeyW(outVk, 0),
+                (down ? 0u : KEYEVENTF_KEYUP) | (extended ? KEYEVENTF_EXTENDEDKEY : 0u));
+        }
+
+        private static void SendKeyboard(ushort vk, bool down)
+        {
+            var (outVk, scan, flags) = KeyEvent(vk, down);
+            var input = new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                u = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = outVk,
+                        wScan = scan,
+                        dwFlags = flags,
+                        dwExtraInfo = PadForge.Engine.Common.InputHookManager.OutputTag
+                    }
+                }
+            };
+            SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        }
+
+        private static void SendMouseButton(uint downFlag, uint upFlag, bool down)
+        {
+            var input = new INPUT
+            {
+                type = INPUT_MOUSE,
+                u = new InputUnion
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dwFlags = down ? downFlag : upFlag,
+                        dwExtraInfo = PadForge.Engine.Common.InputHookManager.OutputTag
+                    }
+                }
+            };
+            SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        }
+
+        private static void SendMouseButtonX(uint xButton, bool down)
+        {
+            var input = new INPUT
+            {
+                type = INPUT_MOUSE,
+                u = new InputUnion
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
+                        mouseData = xButton,
+                        dwExtraInfo = PadForge.Engine.Common.InputHookManager.OutputTag
+                    }
+                }
+            };
+            SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        }
+
+    }
+}

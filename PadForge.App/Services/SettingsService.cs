@@ -1,0 +1,7802 @@
+﻿using System;
+using System.IO;
+using System.Linq;
+using System.Windows.Threading;
+using System.Xml.Serialization;
+using PadForge.Common;
+using PadForge.Common.Input;
+using PadForge.Engine;
+using PadForge.Engine.Data;
+using PadForge.Resources.Strings;
+using PadForge.ViewModels;
+
+namespace PadForge.Services
+{
+    /// <summary>
+    /// Service responsible for loading and saving PadForge settings to XML files.
+    /// Handles the bidirectional sync between the SettingsManager's data collections
+    /// and the WPF ViewModels.
+    /// 
+    /// Settings file search order:
+    ///   1. PadForge.xml (preferred for new installs)
+    ///   2. Settings.xml (generic fallback)
+    /// 
+    /// The settings file lives next to the executable.
+    /// </summary>
+    public class SettingsService
+    {
+        // Hoisted: the XmlSerializer(Type) ctor is cache-backed but still
+        // does a lookup + small alloc per call; one instance serves every
+        // save/load (XmlSerializer is thread-safe for Serialize/Deserialize).
+        private static readonly System.Xml.Serialization.XmlSerializer s_settingsSerializer =
+            new(typeof(SettingsFileData));
+
+        // ─────────────────────────────────────────────
+        //  Constants
+        // ─────────────────────────────────────────────
+
+        /// <summary>Primary settings file name.</summary>
+        public const string PrimaryFileName = "PadForge.xml";
+
+        /// <summary>Fallback settings file name.</summary>
+        public const string FallbackFileName = "Settings.xml";
+
+        // ─────────────────────────────────────────────
+        //  State
+        // ─────────────────────────────────────────────
+
+        private readonly MainViewModel _mainVm;
+        private string _settingsFilePath;
+        private DispatcherTimer _autoSaveTimer;
+        private readonly List<UserProfileData> _userProfiles = new();
+
+        /// <summary>App-layer hook for fetching the active profile's
+        /// custom touchpad gestures at save time. SettingsService
+        /// doesn't own the live list (that's InputService._activeTouchpadGestures);
+        /// this provider lets the save paths pull from it without a
+        /// reverse reference. Returns null = no gestures to persist.</summary>
+        public System.Func<PadForge.Engine.Touchpad.TouchpadCustomGesture[]> TouchpadGesturesProvider { get; set; }
+
+        private System.Action<PadForge.Engine.Touchpad.TouchpadCustomGesture[]> _touchpadGesturesApplier;
+        private PadForge.Engine.Touchpad.TouchpadCustomGesture[] _pendingTouchpadGesturesToApply;
+
+        /// <summary>App-layer hook for restoring touchpad gestures
+        /// after a settings load — InputService re-seeds its working
+        /// list from whatever was persisted (default-profile gestures
+        /// from AppSettings.TouchpadGestures, named-profile gestures
+        /// from each ProfileData.TouchpadGestures, etc.).
+        ///
+        /// <para>The setter auto-flushes any gestures stashed by an
+        /// earlier load that ran before the applier was wired —
+        /// SettingsService.LoadFromFile runs at startup BEFORE
+        /// InputService.StartEngine attaches the applier, so the
+        /// load path stashes the loaded gestures in a pending slot
+        /// and this property's setter invokes them on first
+        /// assignment.</para></summary>
+        public System.Action<PadForge.Engine.Touchpad.TouchpadCustomGesture[]> TouchpadGesturesApplier
+        {
+            get => _touchpadGesturesApplier;
+            set
+            {
+                _touchpadGesturesApplier = value;
+                if (value != null && _pendingTouchpadGesturesToApply != null)
+                {
+                    var pending = _pendingTouchpadGesturesToApply;
+                    _pendingTouchpadGesturesToApply = null;
+                    try { value(pending); } catch { /* applier is best-effort */ }
+                }
+            }
+        }
+
+        /// <summary>Installs a custom-gesture catalog through the applier when
+        /// it is wired, or stages it for the applier's setter to flush when it
+        /// is not. Both load-path callers (the default catalog in
+        /// LoadAppSettings, the active named profile's own catalog in
+        /// LoadProfiles) share this so the LAST caller wins, which is what
+        /// makes the named profile's catalog override the default's on a cold
+        /// start. Kept as one helper because the two call sites diverging is
+        /// exactly how the named profile's gestures got lost.</summary>
+        private void ApplyOrStageTouchpadGestures(PadForge.Engine.Touchpad.TouchpadCustomGesture[] gestures)
+        {
+            if (_touchpadGesturesApplier != null)
+                _touchpadGesturesApplier(gestures);
+            else
+                _pendingTouchpadGesturesToApply = gestures;
+        }
+
+        /// <summary>
+        /// Full path to the active settings file.
+        /// </summary>
+        public string SettingsFilePath => _settingsFilePath;
+
+        /// <summary>
+        /// Runtime holder for the Remote Link (issue #138) identity + trust list,
+        /// loaded from AppSettings and written back by BuildAppSettings. The static
+        /// identity is minted lazily on first Remote Link use, not on load, so
+        /// loading touches no behavior. Not serialized directly — it mirrors the
+        /// AppSettingsData.RemoteLink* fields.
+        /// </summary>
+        public sealed class RemoteLinkRuntime
+        {
+            public string ProtectedPrivateBase64 { get; set; } = "";
+            public string PublicBase64 { get; set; } = "";
+            /// <summary>How the private key above is wrapped at rest. Default machine-bound
+            /// (Secure); the user can switch to a portable mode for thumb-drive use.</summary>
+            public PadForge.Engine.RemoteLink.IdentityProtectionMode IdentityProtection { get; set; }
+                = PadForge.Engine.RemoteLink.IdentityProtectionMode.Secure;
+            public PadForge.Engine.RemoteLink.PeerTrustStore Trust { get; set; }
+                = new PadForge.Engine.RemoteLink.PeerTrustStore();
+        }
+
+        /// <summary>The loaded Remote Link identity + trust list (see <see cref="RemoteLinkRuntime"/>).</summary>
+        public RemoteLinkRuntime RemoteLink { get; private set; } = new RemoteLinkRuntime();
+
+        /// <summary>
+        /// Whether settings have been modified since last save.
+        /// </summary>
+        public bool IsDirty { get; private set; }
+
+        private long _assignmentRevision = 1;
+        internal long AssignmentRevision => System.Threading.Interlocked.Read(ref _assignmentRevision);
+        internal void InvalidateAssignmentSnapshot() => System.Threading.Interlocked.Increment(ref _assignmentRevision);
+
+        /// <summary>
+        /// Raised after autosave completes so callers can perform post-save actions
+        /// (e.g. refreshing the default profile snapshot).
+        /// </summary>
+        public event EventHandler AutoSaved;
+
+        // ─────────────────────────────────────────────
+        //  Constructor
+        // ─────────────────────────────────────────────
+
+        public SettingsService(MainViewModel mainVm)
+        {
+            _mainVm = mainVm ?? throw new ArgumentNullException(nameof(mainVm));
+
+            // Wire the post-MergeMappingSetsFromLegacy hook so device-
+            // assignment changes (DeviceService) trigger the motion-rows
+            // backfill without each caller needing an instance reference.
+            // See AfterMappingSetsRefreshed for context.
+            AfterMappingSetsRefreshed = EnsureMotionRowsForAllSlots;
+
+            // The service toggles author themselves into the active
+            // profile on a user change: the three mirrors plus head tracking.
+            // See OnDashboardServiceToggleChanged.
+            _mainVm.Dashboard.PropertyChanged += OnDashboardServiceToggleChanged;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Initialize
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Initializes the settings service: ensures SettingsManager collections
+        /// exist, finds the settings file, and loads it.
+        /// </summary>
+        public void Initialize()
+        {
+            // Ensure SettingsManager collections are initialized.
+            if (SettingsManager.UserDevices == null)
+                SettingsManager.UserDevices = new DeviceCollection();
+            if (SettingsManager.UserSettings == null)
+                SettingsManager.UserSettings = new SettingsCollection();
+
+            // Find or create the settings file.
+            _settingsFilePath = FindSettingsFile();
+
+            // Load settings from disk.
+            if (File.Exists(_settingsFilePath))
+            {
+                LoadFromFile(_settingsFilePath);
+            }
+            else
+            {
+                // No settings file — initialize profiles with the Default entry.
+                LoadProfiles(null, null);
+            }
+
+            // Push file path to ViewModel.
+            _mainVm.Settings.SettingsFilePath = _settingsFilePath;
+            _mainVm.Settings.HasUnsavedChanges = false;
+            IsDirty = false;
+            // Re-arm AFTER the clear so a load-time profile compaction
+            // actually reaches disk (round 34).
+            if (_profilesCompactedOnLoad) { _profilesCompactedOnLoad = false; MarkDirty(); }
+            if (_accessCodeUnsavedOnLoad) { _accessCodeUnsavedOnLoad = false; MarkDirty(); }
+        }
+
+        // ─────────────────────────────────────────────
+        //  File discovery
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Finds the settings file. Checks for the primary file first,
+        /// then fallback, then creates the primary file path for new installs.
+        /// </summary>
+        internal static string FindSettingsFile()
+        {
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // Check primary file.
+            string primaryPath = Path.Combine(appDir, PrimaryFileName);
+            if (File.Exists(primaryPath))
+                return primaryPath;
+
+            // Check fallback file.
+            string fallbackPath = Path.Combine(appDir, FallbackFileName);
+            if (File.Exists(fallbackPath))
+                return fallbackPath;
+
+            // Neither exists — use primary path for new file.
+            return primaryPath;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Load
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Loads settings from an XML file into the SettingsManager collections.
+        /// </summary>
+        /// <param name="filePath">Path to the settings XML file.</param>
+        public void LoadFromFile(string filePath)
+        {
+            InvalidateAssignmentSnapshot();
+            if (!File.Exists(filePath))
+                return;
+
+            try
+            {
+                SettingsFileData data;
+                var serializer = s_settingsSerializer;
+
+                using (var stream = File.OpenRead(filePath))
+                {
+                    data = (SettingsFileData)serializer.Deserialize(stream);
+                }
+
+                if (data == null)
+                    return;
+
+                // Schema migration: files saved before the v4.x rename spell
+                // the per-(slot, device) config arrays PlayStationConfigs /
+                // ProfilePlayStationConfigs. Move them to the new names
+                // before anything consumes the data.
+                data.MigrateLegacySchema();
+
+                // Pre-deserialization migrations applied to every PadSetting
+                // before they're handed out to UserSettings or the VM.
+                //
+                // TouchpadClick: prior versions auto-mapped this to "Button 11"
+                // because SDL3's HIDAPI PS5/PS4 drivers report touchpad press
+                // at joystick button index 11. v3.0.x makes "Touchpad 0 Click"
+                // the canonical descriptor (consistent with the Touchpad 0
+                // Finger N X/Y/Down family) and stops mirroring the bool into
+                // state.Buttons[11], so legacy "Button 11" stops resolving.
+                // Translate it on load so DualSense / DS4 users don't have to
+                // re-map.
+                // Gated on the paired device actually having a touchpad:
+                // "Button 11" is ALSO a legitimate descriptor for a generic
+                // device's twelfth button deliberately mapped to the
+                // touchpad-click target (arcade sticks, button boxes), and
+                // the unconditional rewrite silently retargeted it to a
+                // Buttons[16] slot such a device never populates. Only the
+                // legacy Sony auto-map ever wrote "Button 11" here, and
+                // Sony pads are exactly the devices that report a touchpad.
+                if (data.PadSettings != null)
+                {
+                    foreach (var ps in data.PadSettings)
+                    {
+                        // Applied per device below, on that device's own cloned
+                        // settings. Rewriting the shared template judged the whole
+                        // checksum group on ANY one paired device and handed the
+                        // rewrite to the others, which is the retarget this gate
+                        // exists to prevent. The touchpad flag joins the count
+                        // because the count shipped AFTER the era this migration
+                        // judges, so it reads zero on exactly the legacy configs
+                        // that need it, and every other consumer already falls
+                        // back the same way.
+                        if (ps?.TouchpadClick != "Button 11") continue;
+                        bool pairedTouchpadDevice = false;
+                        if (data.Settings != null && data.Devices != null)
+                        {
+                            foreach (var us in data.Settings)
+                            {
+                                if (us == null || us.PadSettingChecksum == null
+                                    || us.PadSettingChecksum != ps.PadSettingChecksum) continue;
+                                foreach (var ud in data.Devices)
+                                {
+                                    if (ud != null && ud.InstanceGuid == us.InstanceGuid
+                                        && (ud.CapTouchpadCount > 0 || ud.HasTouchpad))
+                                    {
+                                        pairedTouchpadDevice = true;
+                                        break;
+                                    }
+                                }
+                                if (pairedTouchpadDevice) break;
+                            }
+                        }
+                        if (pairedTouchpadDevice)
+                            ps.TouchpadClick = "Touchpad 0 Click";
+                    }
+                }
+
+                // Populate SettingsManager collections. Dedupe device
+                // records by InstanceGuid on the way in: a historical
+                // incident (identity churn during the 2026-07-20 driver
+                // upgrade) minted EMPTY ghost duplicates of real records,
+                // and first-match lookups then resolved a capability-less
+                // ghost, which silently broke the type-switch automap
+                // (CreateDefaultPadSetting saw CapType 0 and authored an
+                // empty PadSetting). Richest record per guid wins.
+                // A reload runs with the engine live (the Settings page's own
+                // Reload button), and the runtime binds a device's open handle to
+                // its RECORD, not to the collection. Dropping the records
+                // stranded that binding: the offline transition is reachable only
+                // through a record, so a reload skipped the wheel, LED and
+                // feedback re-arm a real disconnect performs, and a browser or
+                // peer pad had no way back at all, because only a fresh connect
+                // registers one. Carry the live runtime state onto the loaded
+                // twin, and keep a live record the file does not describe.
+                lock (SettingsManager.UserDevices.SyncRoot)
+                {
+                    var liveRecords = new Dictionary<Guid, UserDevice>();
+                    foreach (var prev in SettingsManager.UserDevices.Items)
+                        if (prev?.Device != null) liveRecords[prev.InstanceGuid] = prev;
+                    SettingsManager.UserDevices.Items.Clear();
+                    if (data.Devices != null)
+                    {
+                        int dropped = 0, voicePurged = 0;
+                        foreach (var ud in DedupeDevicesByGuid(data.Devices, ref dropped))
+                        {
+                            // A withdrawn pre-release briefly registered a
+                            // "Voice Macros" pseudo-device (voice://). Drop
+                            // its persisted row: features are not devices.
+                            if (ud?.DevicePath != null
+                                && ud.DevicePath.StartsWith("voice://", StringComparison.Ordinal))
+                            { voicePurged++; continue; }
+                            if (ud != null && liveRecords.Remove(ud.InstanceGuid, out var prevLive))
+                                CarryRuntimeState(prevLive, ud);
+                            SettingsManager.UserDevices.Items.Add(ud);
+                        }
+                        if (dropped > 0)
+                            PadForge.Engine.SdlDiagLog.WriteLine(
+                                $"CFG dropped {dropped} duplicate-guid ghost device record(s) at load");
+                        if (voicePurged > 0)
+                            PadForge.Engine.SdlDiagLog.WriteLine(
+                                $"CFG dropped {voicePurged} withdrawn voice:// pseudo-device record(s) at load");
+                    }
+                }
+
+                lock (SettingsManager.UserSettings.SyncRoot)
+                {
+                    SettingsManager.UserSettings.Items.Clear();
+                    if (data.Settings != null)
+                    {
+                        foreach (var us in data.Settings)
+                        {
+                            // Link PadSetting — clone the template so each device
+                            // has its own independent PadSetting instance. Without
+                            // cloning, devices that share a checksum would share the
+                            // same object, so modifying one device's settings would
+                            // silently corrupt the other's.
+                            if (data.PadSettings != null && us.PadSettingChecksum != null)
+                            {
+                                var template = data.PadSettings.FirstOrDefault(
+                                    p => p.PadSettingChecksum == us.PadSettingChecksum);
+                                if (template != null)
+                                {
+                                    // CloneDeep copies all properties + mapping arrays
+                                    var ps = template.CloneDeep();
+                                    us.SetPadSetting(ps);
+                                }
+                            }
+
+                            SettingsManager.UserSettings.Items.Add(us);
+                        }
+                    }
+                }
+
+                // Purge EMPTY orphaned UserSettings left by older versions.
+                //
+                // This began as a migration: a much older DeleteSlot parked
+                // entries at MapTo = -1 instead of removing them, they piled
+                // up, and they overflowed the FindByInstanceGuid buffer
+                // (bc456e3c). That commit fixed DeleteSlot, filtered the
+                // buffer lookup on MapTo >= 0, and added this sweep for files
+                // the old build had already written.
+                //
+                // Purging on MapTo alone outlived its purpose and started
+                // eating live data. ApplyProfile parks every device the
+                // incoming profile does not assign at MapTo = -1 and KEEPS
+                // its PadSetting, deliberately, so switching back restores
+                // it (InputService.ApplyProfile). Those parked rows carry the
+                // user's mappings: in the reporter's file all 104 Map
+                // elements sat on PadSettings reached from profile entries,
+                // and 53 of them belonged to parked rows. Deleting them here
+                // left the device unassigned, the next assign found no
+                // PadSetting and wrote a fresh raw-surface auto-map over the
+                // slot, and the autosave then wrote all of that over the
+                // STORED profile, which is why Load could not bring it back
+                // and only a re-import could (#404, discussion #395).
+                //
+                // So judge on emptiness, not on MapTo. A parked row with a
+                // PadSetting is a user's authoring. A parked row with none is
+                // the legacy orphan this sweep was written for. The buffer
+                // that started it is protected by the lookup's own MapTo >= 0
+                // filter, not by this sweep.
+                //
+                // Lock guards the polling thread's FindByInstanceGuid /
+                // FindByPadIndex iteration: Reload() can fire while the engine
+                // is running, and List<T>.RemoveAll mutating concurrently with
+                // a foreach is undefined behavior.
+                lock (SettingsManager.UserSettings.SyncRoot)
+                {
+                    SettingsManager.UserSettings.Items.RemoveAll(IsEmptyLegacyOrphan);
+                }
+
+                // Phase 2A — load persisted SlotMappingSets when present;
+                // fall back to one-time legacy migration only for slots
+                // where the XML had no MappingSet (or an empty one). Once
+                // a slot's MappingSet is authoritative, UI multi-source
+                // edits survive the save round-trip.
+                LoadOrMigrateSlotMappingSets(data.SlotMappingSets);
+
+                // Load app settings into ViewModel.
+                if (data.AppSettings != null)
+                    LoadAppSettings(data.AppSettings);
+                else
+                {
+                    // A file without AppSettings has no saved slot topology.
+                    AutoCreateSlotsFromExistingAssignments();
+                    SlotAppearancePersistence.Apply(_mainVm.Pads,
+                        SlotAppearancePersistence.ResolveApp(new AppSettingsData(), _mainVm.Pads));
+                }
+
+                // Publish user-imported HIDMaestro profiles to the catalog
+                // so they appear in the Extended dropdown alongside the
+                // built-in entries. _userProfiles is the in-memory mirror
+                // of AppSettings.UserProfiles, mutated live by
+                // AddUserProfile() and serialized back out on save.
+                _userProfiles.Clear();
+                if (data.AppSettings?.UserProfiles != null)
+                {
+                    foreach (var p in data.AppSettings.UserProfiles)
+                    {
+                        if (p != null && !string.IsNullOrWhiteSpace(p.Json))
+                            _userProfiles.Add(p);
+                    }
+                }
+                Common.Input.HMaestroProfileCatalog.UserProfilesProvider =
+                    () => _userProfiles
+                        .Where(p => !string.IsNullOrWhiteSpace(p?.Json))
+                        .Select(p => p.Json)
+                        .ToList();
+                Common.Input.HMaestroProfileCatalog.Reload();
+
+                // Load pad-specific settings.
+                if (data.PadSettings != null)
+                    LoadPadSettings(data.Settings, data.PadSettings);
+
+                // Load profiles.
+                LoadProfiles(data.Profiles, data.AppSettings);
+
+                // Load macros into pad ViewModels. MUST run after
+                // LoadProfiles, for the reason the ghost guard below does.
+                // LoadMacros drops every macro on an uncreated slot, and
+                // until LoadProfiles applies the ACTIVE profile's topology,
+                // SlotCreated holds the DEFAULT profile's. With a named
+                // profile active at shutdown, the file's macros are that
+                // profile's, so each one on a slot only the active profile
+                // owns was dropped, and the next save wrote the emptied list
+                // over the stored profile's copy (discussion #467).
+                // ApplyProfile loads a profile's macros after its topology
+                // for the same reason.
+                if (data.Macros != null)
+                    LoadMacros(data.Macros);
+
+                // Ghost-mapping guard: saves written before DeleteSlot
+                // dropped the slot's MappingSet can carry authored sets for
+                // slots that no longer exist. Loading one parks it in
+                // memory where the next same-index CreateSlot resurrects
+                // the deleted VC's bindings. MUST run after LoadProfiles,
+                // not after LoadAppSettings: LoadAppSettings restores the
+                // DEFAULT profile's topology, and when a named profile was
+                // active at shutdown, LoadProfiles then overwrites
+                // SlotCreated with the ACTIVE profile's. Masking between
+                // the two judged the active profile's live sets against
+                // the default's topology and gutted every slot only the
+                // active profile owns; the next autosave then wrote the
+                // gutted set over the STORED profile too, which is how a
+                // shift layer authored on an active profile was
+                // permanently wiped by a restart (discussion #375). Phase
+                // 2A (LoadOrMigrateSlotMappingSets) is still too early for
+                // the same reason. Same shape as the lighting-config skip
+                // for uncreated slots in ApplyDeviceSlotConfigs.
+                MaskMappingSetsForUncreatedSlots();
+
+                // Backfill motion-passthrough rows for every Sony-class
+                // slot. Runs after LoadAppSettings has populated slot
+                // types so we know which slots are eligible. Idempotent
+                // — a device already represented in the slot's motion
+                // row is not re-added.
+                EnsureMotionRowsForAllSlots();
+            }
+            catch (Exception ex)
+            {
+                // The file exists but couldn't be read. A later save would
+                // overwrite it with defaults, so preserve the original first.
+                try
+                {
+                    string bad = filePath + ".unreadable-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                    if (!File.Exists(bad))
+                        File.Copy(filePath, bad);
+                }
+                catch { /* preservation is best-effort */ }
+
+                // The app continues with defaults; seed the Profiles list
+                // (built-in Default entry) the same way a fresh install does.
+                if (_mainVm.Settings.ProfileItems.Count == 0)
+                    LoadProfiles(null, null);
+
+                _mainVm.SetStatus(string.Format(Strings.Instance.Status_ErrorLoadingSettings_Format, ex.Message), persist: true);
+            }
+        }
+
+        /// <summary>
+        /// Post-load backfill: for every slot, ensure the slot's
+        /// <see cref="MappingSet"/> has motion-passthrough rows for every
+        /// gyro / accel-capable assigned device. Sony-class slots only.
+        /// Idempotent — safe to call multiple times.
+        /// </summary>
+        private void EnsureMotionRowsForAllSlots()
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null || _mainVm?.Pads == null) return;
+
+            UserDevice[] devSnapshot;
+            UserSetting[] userSettingsSnapshot;
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                devSnapshot = SettingsManager.UserDevices.Items.ToArray();
+            }
+            lock (SettingsManager.UserSettings.SyncRoot)
+            {
+                userSettingsSnapshot = SettingsManager.UserSettings.Items.ToArray();
+            }
+
+            // Per-guid capability lookup. Devices not currently known
+            // (offline / never enumerated) report no caps and get no row;
+            // they'll be backfilled on the next load after they appear.
+            (bool HasGyro, bool HasAccel, bool HasAccelAux, bool HasGyroAux) Caps(Guid guid)
+            {
+                foreach (var ud in devSnapshot)
+                {
+                    if (ud != null && ud.InstanceGuid == guid)
+                        return (ud.HasGyro, ud.HasAccel, ud.HasAccelAux, ud.HasGyroAux);
+                }
+                return (false, false, false, false);
+            }
+
+            for (int slot = 0; slot < sets.Length && slot < _mainVm.Pads.Count; slot++)
+            {
+                if (!SettingsManager.SlotCreated[slot]) continue;
+                var slotType = _mainVm.Pads[slot].OutputType;
+
+                var devicesForSlot = new List<(string DeviceGuid, bool HasGyro, bool HasAccel)>();
+                foreach (var us in userSettingsSnapshot)
+                {
+                    if (us == null || us.MapTo != slot) continue;
+                    var caps = Caps(us.InstanceGuid);
+                    devicesForSlot.Add((us.InstanceGuid.ToString(), caps.HasGyro, caps.HasAccel));
+                }
+                if (devicesForSlot.Count == 0) continue;
+
+                var ms = sets[slot] ?? (sets[slot] = new MappingSet());
+                // Valve profiles on an Extended slot carry an IMU in their
+                // native frame, so their motion rows are backfilled too.
+                bool valveProfile = slotType == VirtualControllerType.Extended
+                    && Models2D.NintendoPreviewMap.IsValve(_mainVm.Pads[slot].ProfileId);
+                MappingSetMigrator.EnsureMotionRows(ms, (int)slotType, valveProfile, devicesForSlot);
+
+                // Mirror the row presence into each device's PadSetting
+                // MotionGyro / MotionAccel descriptor fields so the
+                // mapping-table MappingItem (which reads via PadSetting
+                // reflection) shows the right source name for the
+                // row. Motion-capable families only (PlayStation, and
+                // Nintendo since HM v1.3.18's virtual Switch Pro IMU) —
+                // other slots have no MotionRow and clear the fields.
+                bool isSony = slotType is Engine.VirtualControllerType.PlayStation
+                    or Engine.VirtualControllerType.Nintendo;
+                foreach (var us in userSettingsSnapshot)
+                {
+                    if (us == null || us.MapTo != slot) continue;
+                    var ps = us.GetPadSetting();
+                    if (ps == null) continue;
+                    var caps = Caps(us.InstanceGuid);
+                    string newGyro  = (isSony && caps.HasGyro)  ? MappingSetMigrator.MotionGyroSourceDescriptor  : "";
+                    string newAccel = (isSony && caps.HasAccel) ? MappingSetMigrator.MotionAccelSourceDescriptor : "";
+                    // A user-picked aux source ("Motion Accel L", the Nunchuk /
+                    // left Joy-Con, #199 follow-up) survives the recompute: the
+                    // mirror only snaps between default-present and absent, and
+                    // the authoritative MappingSet row already carries the pick.
+                    if (isSony && caps.HasAccelAux
+                        && MappingSetMigrator.IsMotionAccelAuxDescriptor(ps.MotionAccel))
+                        newAccel = MappingSetMigrator.MotionAccelAuxSourceDescriptor;
+                    // Same survival rule for the aux GYRO pick (#252): without
+                    // it, choosing the left Joy-Con's gyro for the slot's
+                    // motion stream was silently reverted to the body gyro on
+                    // the next recompute.
+                    if (isSony && caps.HasGyroAux
+                        && MappingSetMigrator.IsMotionGyroAuxDescriptor(ps.MotionGyro))
+                        newGyro = MappingSetMigrator.MotionGyroAuxSourceDescriptor;
+                    if (ps.MotionGyro != newGyro || ps.MotionAccel != newAccel)
+                    {
+                        ps.MotionGyro = newGyro;
+                        ps.MotionAccel = newAccel;
+                        ps.UpdateChecksum();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Phase 2A: load <see cref="MappingSet"/>s persisted in the XML
+        /// when present; one-time-migrate from legacy <see cref="PadSetting"/>
+        /// fields for slots whose XML had no MappingSet (or an empty one).
+        /// Once a slot's MappingSet has been authored / loaded, it's the
+        /// authoritative source for descriptors and the legacy fields stop
+        /// being consulted on subsequent loads.
+        /// </summary>
+        /// <summary>Test seam for the startup load path.</summary>
+        internal static void LoadOrMigrateSlotMappingSetsForTest(MappingSet[] persisted)
+            => LoadOrMigrateSlotMappingSets(persisted);
+
+        /// <summary>Replaces any authored MappingSet sitting at an
+        /// UNCREATED slot index with a fresh empty one. A slot's set dies
+        /// with the slot (PadViewModel.ResetAllSettings swaps it out at
+        /// delete time), but saves written before that fix still carry
+        /// the deleted VC's set, and a loaded ghost resurrects the moment
+        /// the same type is created at the same index. Reference swap,
+        /// never in-place mutation: the poll thread may be walking the
+        /// stale set. Internal for the delete-then-recreate pins.</summary>
+        internal static void MaskMappingSetsForUncreatedSlots()
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null) return;
+            int n = Math.Min(sets.Length, SettingsManager.SlotCreated.Length);
+            for (int slot = 0; slot < n; slot++)
+            {
+                if (SettingsManager.SlotCreated[slot]) continue;
+                if (sets[slot] == null || !sets[slot].HasAuthoredContent) continue;
+                sets[slot] = new MappingSet();
+                Common.Input.InputManager.ResetSourceKindRuntimeForSlot(slot);
+            }
+        }
+
+        private static void LoadOrMigrateSlotMappingSets(MappingSet[] persisted)
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null || sets.Length == 0) return;
+
+            for (int slot = 0; slot < sets.Length; slot++)
+            {
+                MappingSet fromXml = (persisted != null && slot < persisted.Length)
+                    ? persisted[slot]
+                    : null;
+                // Legacy raw-surface targets normalize to the current
+                // "Raw*" grammar before any content decision.
+                MappingSetMigrator.NormalizeRawSurfaceTargets(fromXml);
+
+                // Content gate lives on the set itself (HasAuthoredContent:
+                // rows, shift activators, menus, authoritative ownership,
+                // rumble-audio config) so a new slot-scoped structure cannot
+                // be silently discarded on restart the way the old inline
+                // rows-only check deleted a menus-only slot's menu on every
+                // launch (audit 2026-07-16).
+                bool xmlHasContent = fromXml != null && fromXml.HasAuthoredContent;
+                if (xmlHasContent)
+                {
+                    SanitizeMappingSet(fromXml, slot);
+                    sets[slot] = fromXml;
+                    continue;
+                }
+
+                // Initial migration from legacy fields.
+                sets[slot] = BuildOneSlotFromLegacy(slot);
+            }
+        }
+
+        /// <summary>
+        /// In-place cleanup of a loaded MappingSet:
+        /// 1. Deduplicates row Sources by (DeviceGuid, Descriptor, Invert,
+        ///    HalfAxis, InvertOutput, Kind, GateDescriptor). Heals the
+        ///    per-save accumulation bug from earlier multi-source builds.
+        /// 2. Strips rows left with no sources, except empty motion rows
+        ///    (they disable automatic DSU selection) and empty NoInherit
+        ///    rows (they block layer fallback). Both are authored states.
+        /// It does NOT drop a source because its device is not gamepad-class.
+        /// That filter lived here once and clobbered legitimate cross-device
+        /// rows, a keyboard key on ButtonA being the ordinary case, so it was
+        /// removed. The one place a device-class gate still runs is the
+        /// legacy migration in BuildOneSlotFromLegacy, which carries an
+        /// IsGamepadEligible flag into MappingSetMigrator for gamepad-only
+        /// targets.
+        /// Internal for the PadForge.Tests dedup pins.
+        /// </summary>
+        internal static void SanitizeMappingSet(MappingSet ms, int slot)
+        {
+            if (ms?.Rows == null) return;
+
+            // Cross-device mappings are intentional: a keyboard key
+            // mapped to ButtonA legitimately stores as
+            // {DeviceGuid=keyboard, Descriptor="Button N"}. The
+            // earlier non-gamepad-on-gamepad-target filter dropped
+            // those legitimate rows and clobbered the user's mappings.
+            // Sanitize now only dedups true duplicates and strips empty
+            // rows. Invert / HalfAxis / InvertOutput / Kind are part of
+            // the key: two sources sharing a descriptor but differing in
+            // a modifier are distinct reads (a half-axis scroll pair
+            // differs only in Invert), and collapsing them dropped one
+            // direction on reload. GateDescriptor (v18) joins them for
+            // the same reason: a gated and an ungated read of one
+            // descriptor (Steam's requires_click D-pad beside a plain
+            // touch D-pad) are distinct sources, and the shorter key
+            // deleted one of them on every load.
+            foreach (var row in ms.Rows)
+            {
+                // Custom source positions are significant, including duplicates.
+                if (row?.Sources == null || row.CombineMode == "Custom") continue;
+                var seen = new HashSet<(string, string, bool, bool, bool, string, string, string, string, string, string)>();
+                int writeIdx = 0;
+                for (int i = 0; i < row.Sources.Count; i++)
+                {
+                    var s = row.Sources[i];
+                    if (s == null) continue;
+                    // Gate2Descriptor (v26) joins the key for the same
+                    // reason GateDescriptor did: two wedge sources sharing
+                    // everything but the second AND companion are distinct
+                    // reads, and the shorter key deleted one on every load.
+                    // The parameter fields join the key because the
+                    // descriptorless kinds are read through them and not through
+                    // the descriptor, which they leave empty on purpose. Two
+                    // incremental sources on one device therefore keyed
+                    // identically, and the second was deleted on every load.
+                    var key = ((s.DeviceGuid ?? "").ToLowerInvariant(), s.Descriptor ?? "",
+                        s.Invert, s.HalfAxis, s.InvertOutput, s.Kind ?? "", s.GateDescriptor ?? "",
+                        s.Gate2Descriptor ?? "", s.ParamUp ?? "", s.ParamDown ?? "",
+                        s.ParamModifier ?? "");
+                    if (!seen.Add(key)) continue;
+                    row.Sources[writeIdx++] = s;
+                }
+                if (writeIdx < row.Sources.Count)
+                    row.Sources.RemoveRange(writeIdx, row.Sources.Count - writeIdx);
+            }
+
+            // Empty motion rows disable automatic DSU selection. Empty
+            // NoInherit rows block layer fallback. Both survive a reload.
+            ms.Rows.RemoveAll(r => r == null
+                || ((r.Sources == null || r.Sources.Count == 0) && !r.NoInherit
+                    && !MappingSetMigrator.IsMotionTarget(r.Target)));
+        }
+
+        /// <summary>Moves the runtime-only half of a device record onto its
+        /// freshly loaded twin. Everything here is serializer-ignored and owned
+        /// by the polling thread, so a settings reload has to hand it over
+        /// rather than let it die with the record the file replaced.</summary>
+        private static void CarryRuntimeState(UserDevice from, UserDevice to)
+        {
+            to.Device = from.Device;
+            to.IsOnline = from.IsOnline;
+            to.InputState = from.InputState;
+            to.InputStateSeq = from.InputStateSeq;
+            to.OldInputState = from.OldInputState;
+            to.PtpStatePool = from.PtpStatePool;
+            to.DeviceObjects = from.DeviceObjects;
+            to.ActuatorCount = from.ActuatorCount;
+            to.ForceFeedbackState = from.ForceFeedbackState;
+            to.LastActiveTick = from.LastActiveTick;
+            to.IdleTrackedConnection = from.IdleTrackedConnection;
+            to.LastIdleCheckTick = from.LastIdleCheckTick;
+            to.LastQuickChargeCheckTick = from.LastQuickChargeCheckTick;
+            to.QuickChargePrevCharging = from.QuickChargePrevCharging;
+        }
+
+        /// <summary>A UserSetting the legacy-orphan sweep may drop: parked
+        /// off every slot AND carrying no settings object at all. A parked
+        /// row WITH a PadSetting is what ApplyProfile creates for every
+        /// device the incoming profile does not assign, and it holds that
+        /// device's mappings, so it must survive a load (#404, discussion
+        /// #395). Internal so the round-trip tests can pin both halves.</summary>
+        internal static bool IsEmptyLegacyOrphan(UserSetting us)
+            => us == null || (us.MapTo < 0 && us.GetPadSetting() == null);
+
+        private static MappingSet BuildOneSlotFromLegacy(int slot)
+        {
+            UserSetting[] snapshot;
+            lock (SettingsManager.UserSettings.SyncRoot)
+            {
+                snapshot = SettingsManager.UserSettings.Items.ToArray();
+            }
+
+            // Look up each device's CapType so the migrator can skip
+            // emitting gamepad-target sources for keyboards / mice /
+            // touchpads (whose auto-mapped stale gamepad descriptors
+            // would pollute the per-VC MappingSet — an axis source
+            // pointing at state.Axis[0] reads uninitialized 0 → bipolar
+            // -1 → joystick stuck pointing left during evaluation).
+            //
+            // Joystick-class devices (DirectInput joysticks, arcade
+            // sticks, throttles, racing wheels, flight sticks) ARE
+            // legitimate gamepad-target contributors — they expose real
+            // axes / buttons / POVs and the user explicitly authored
+            // mappings on them. Excluding them was dropping arcade-stick
+            // and joystick mappings during legacy migration. The
+            // controller-class set mirrors DeviceService.AutoEnableHidingDefaults.
+            UserDevice[] devSnapshot;
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                devSnapshot = SettingsManager.UserDevices.Items.ToArray();
+            }
+
+            bool IsControllerClass(Guid g)
+            {
+                foreach (var ud in devSnapshot)
+                {
+                    if (ud != null && ud.InstanceGuid == g)
+                    {
+                        return ud.CapType == InputDeviceType.Gamepad
+                            || ud.CapType == InputDeviceType.Joystick
+                            || ud.CapType == InputDeviceType.Driving
+                            || ud.CapType == InputDeviceType.Flight
+                            || ud.CapType == InputDeviceType.FirstPerson
+                            || ud.CapType == InputDeviceType.Supplemental;
+                    }
+                }
+                // Unknown device — be conservative and assume non-controller
+                // so we don't pollute. The user can always re-record on
+                // an actual controller.
+                return false;
+            }
+
+            var devicesForSlot = new List<(string DeviceGuid, PadSetting PadSetting, bool IsGamepadEligible)>();
+            foreach (var us in snapshot)
+            {
+                if (us == null || us.MapTo != slot) continue;
+                var ps = us.GetPadSetting();
+                if (ps == null) continue;
+                devicesForSlot.Add((
+                    us.InstanceGuid.ToString(),
+                    ps,
+                    IsControllerClass(us.InstanceGuid)));
+            }
+
+            return MappingSetMigrator.BuildFromLegacy(slot, devicesForSlot);
+        }
+
+        /// <summary>
+        /// Phase 2C — push the per-VC PadViewModel's MappingItem
+        /// <c>ExtraSources</c> + <c>CombineMode</c> + <c>CombineExpression</c>
+        /// into the in-memory <see cref="SettingsManager.SlotMappingSets"/>
+        /// so they survive the legacy-merge step and the XML round-trip.
+        /// Runs in <see cref="SaveToFile"/> right after the UI → PadSetting
+        /// push. Also exposed to the recording pipeline so a freshly-recorded
+        /// mapping lands in the in-memory MappingSet immediately, keeping the
+        /// per-VC Mappings tab consistent without waiting for the next
+        /// debounced save / device-dropdown toggle.
+        /// </summary>
+        internal void PushUiExtraSourcesIntoSlotMappingSets()
+        {
+            // THE VIEWMODELS ARE NOT A SOURCE OF TRUTH MID-SWAP.
+            // ApplyProfile installs the incoming profile's MappingSets and
+            // only reconciles the grids ~40 lines later; anything that pushes
+            // in between writes the OUTGOING profile's rows over them, and the
+            // `sets[slot] ?? (sets[slot] = new MappingSet())` below happily
+            // RESURRECTS a slot the incoming profile deliberately left null.
+            // That is how an authored-empty profile came up owning the default
+            // profile's mappings, rebound to whatever pad was assigned next,
+            // and how reverting to default came back on the other profile's
+            // device. The flag existed and read correctly; it just guarded the
+            // adoption drain's call site instead of this method, and the push
+            // that fires inside ApplyProfile arrives via
+            // OnSelectedDeviceChanged, raised by UpdatePadDeviceInfo when it
+            // rebuilds the pad device lists. Guard the writer, not the callers.
+            if (InputService.VmMappingsStale) return;
+
+            var pads = _mainVm?.Pads;
+            if (pads == null) return;
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null) return;
+
+            for (int slot = 0; slot < pads.Count && slot < sets.Length; slot++)
+            {
+                var padVm = pads[slot];
+                if (padVm == null) continue;
+
+                // An UNCREATED slot has no VC for the grid to describe, so
+                // its grid is never a source of truth. Concretely: in the
+                // delete flow, RefreshAfterSlotReorder runs
+                // UpdatePadDeviceInfo BEFORE it rebuilds the grids, and
+                // that can raise OnSelectedDeviceChanged, which lands here
+                // while the deleted pad's grid still holds the deleted
+                // VC's rows and MappingsViewLoaded is still true. Without
+                // this gate the push wrote those rows straight back into
+                // the set DeleteSlot had just emptied, resurrecting the
+                // deleted VC's mappings for the next same-index create
+                // (owner re-report 2026-08-02, after the delete-time swap
+                // alone proved insufficient). Same self-guarding rule as
+                // the stale-flag check above: the writer gates itself, so
+                // every present and future caller inherits it.
+                if (slot < SettingsManager.SlotCreated.Length
+                    && !SettingsManager.SlotCreated[slot])
+                    continue;
+
+                // A pad whose grid has not been hydrated yet is NOT a
+                // source of truth (round eleven). MappingsViewLoaded is
+                // false across a device assignment and every output-type
+                // switch, precisely while the MappingSet holds freshly
+                // auto-mapped rows the ViewModel has never seen. Pushing
+                // there rebuilds those rows from an empty grid and wipes
+                // them, which is the MappingSet-level twin of the
+                // "21 descriptors to 0 in 2 ms" failure the PadSetting
+                // save path already guards against. Harmless before this
+                // week, because the only caller was the autosave, which
+                // never ran inside those windows; the adoption drain
+                // does.
+                if (!padVm.MappingsViewLoaded) continue;
+
+                // Ensure the slot has a MappingSet to mutate.
+                var ms = sets[slot] ?? (sets[slot] = new MappingSet());
+
+                // Save into whichever layer the user is currently authoring.
+                // Defaults to "Base"; switching the nested Mappings tab to a
+                // shift layer routes edits into that layer's rows instead.
+                // Rows for OTHER layers stay untouched — this slot can
+                // accumulate multi-layer authoring without bleed.
+                string activeMask = string.IsNullOrEmpty(padVm.ActiveLayerMask) ? "Base" : padVm.ActiveLayerMask;
+
+                foreach (var mapping in padVm.Mappings)
+                {
+                    if (mapping == null || string.IsNullOrEmpty(mapping.TargetSettingName)) continue;
+
+                    // Find or create the row for this Target on the active layer.
+                    MappingRow row = null;
+                    foreach (var r in ms.Rows)
+                    {
+                        if (r != null
+                            && string.Equals(r.LayerMask ?? "Base", activeMask, StringComparison.Ordinal)
+                            && string.Equals(r.Target, mapping.TargetSettingName, StringComparison.Ordinal))
+                        {
+                            row = r;
+                            break;
+                        }
+                    }
+                    if (row == null)
+                    {
+                        // An empty motion row is how a user switches that
+                        // channel off, and EnsureMotionRows leaves one alone.
+                        // A grid saved before any device reached the slot has
+                        // nothing in either motion row, and writing them out
+                        // anyway switched off the motion auto-map for the next
+                        // assignment while every other row filled in
+                        // (discussion #446). Only a row the user emptied reads
+                        // as off, and that row already exists.
+                        if (MappingSetMigrator.IsMotionTarget(mapping.TargetSettingName)
+                            && !mapping.HasAnySource && !mapping.NoInherit)
+                            continue;
+                        row = new MappingRow { Target = mapping.TargetSettingName, LayerMask = activeMask };
+                        ms.Rows.Add(row);
+                    }
+
+                    row.CombineMode = mapping.CombineMode ?? "";
+                    row.CombineExpression = mapping.CombineExpression ?? "";
+                    row.SuppressBipolarPair = mapping.IsCustomCombine && mapping.SuppressBipolarPair;
+                    row.TrimDeadzone = mapping.TrimDeadzone;
+                    row.TrimRate = mapping.TrimRate;
+                    row.TrimResetOnRelease = mapping.TrimResetOnRelease;
+                    row.MotionResponse = mapping.MotionResponse ?? "";
+                    row.MotionSpeed = mapping.MotionSpeed;
+                    row.MotionMinSpeed = mapping.MotionMinSpeed;
+                    row.MotionAngle = mapping.MotionAngle;
+                    row.MotionDeadzone = mapping.MotionDeadzone;
+
+                    // NoInherit is meaningful only on non-Base rows. Force
+                    // false on Base regardless of the MappingItem state so
+                    // an unsetter on Base (defensive) can't leak.
+                    row.NoInherit = !string.Equals(activeMask, "Base", StringComparison.Ordinal)
+                                    && mapping.NoInherit;
+
+                    // Preserve the absolute-pointer region geometry (#9 B-15)
+                    // across the clear+rebuild below. Unlike flick (which has a
+                    // hand-author card to re-stamp from), ParamPointerCenter/
+                    // Extent have no VM card, so the row's own pre-rebuild
+                    // sources are the only source of truth. Without this, the
+                    // first pad-page save of an imported mouse_region mapping
+                    // reset the geometry to the full-screen identity map.
+                    var preservedPointer = CaptureTouchpadPointerParams(row);
+
+                    // Same reason, same shape: preserve the response-curve /
+                    // outer-range channel (translator v11) across the
+                    // clear+rebuild. ParamCurveExponent / ParamRangeOuter have
+                    // no VM card (only the Workshop translator stamps them),
+                    // so the row's own pre-rebuild sources are the only source
+                    // of truth. Without this an imported response curve
+                    // survived exactly until the first pad-page save.
+                    var preservedCurveRange = CaptureCurveRangeParams(row);
+
+                    // Phase 2C. Clear and rebuild Sources from the UI
+                    // state so MappingSet is fully authoritative for
+                    // this row. This stops keyboard primaries (which
+                    // the legacy gamepad-only migrator filters out of
+                    // rebuilt rows) from disappearing across save
+                    // round-trips when a non-gamepad device authored
+                    // the primary descriptor.
+                    // Rebuild into a DETACHED list and swap the reference once the
+                    // row is complete. The poll thread reads row.Sources every
+                    // frame without a lock, so clearing and refilling in place
+                    // let it observe a half-built row: an empty read at best, an
+                    // ArgumentOutOfRangeException between a stale Count and the
+                    // indexer at worst, which aborts the whole mapping pass for
+                    // that frame. Same discipline as the shift-activator swap.
+                    var rebuiltSources = new List<MappingSource>();
+
+                    // Push the primary as Sources[0] when present.
+                    // Cross-device mappings are intentional — a keyboard
+                    // key mapped to ButtonA legitimately lives here as
+                    // {DeviceGuid=keyboard, Descriptor="Button 5"}, and
+                    // an earlier defensive filter that rejected non-
+                    // gamepad device sources on gamepad targets was
+                    // dropping those legit rows. The SaveViewModelToPadSetting
+                    // owning-device routing now prevents bleed at the
+                    // source (the only legitimate path that writes a
+                    // descriptor into a device's PadSetting), so the
+                    // filter here is no longer needed.
+                    string primaryDesc = mapping.SourceDescriptor ?? "";
+                    // A Toggle (#461) or Rapid Trigger (#482) primary keeps its
+                    // input in the descriptor like Direct, so it saves through
+                    // the descriptor branch below, carrying its kind.
+                    bool primaryIsKind = mapping.PrimaryKindSource != null
+                        && !PadForge.Engine.Common.Mapping.SourceEvaluator.IsDescriptorKind(mapping.PrimaryKindSource.Kind);
+                    if (primaryIsKind)
+                    {
+                        // Non-Direct primary kind (Incremental / Ramped / InvertOnHold,
+                        // #111 follow-up). The descriptor is unused; persist the kind and
+                        // its params as Sources[0] so the load reads it as the primary.
+                        rebuiltSources.Add(mapping.PrimaryKindSource.ToDomain());
+                    }
+                    else if (!string.IsNullOrEmpty(primaryDesc))
+                    {
+                        // Strip any I/H prefix off the descriptor so
+                        // the new schema's per-source bool flags are
+                        // the source of truth, matching how the
+                        // migrator emits sources.
+                        //
+                        // The prefix-exempt families never carry the encoding:
+                        // their names start with the same letter the prefix uses
+                        // and prefixing would double it, which is why the rebuild
+                        // leaves them whole and says their invert rides the row
+                        // flag. Nothing read that flag, so every scan below
+                        // reported not inverted and the user's own checkbox was
+                        // dropped on every save while the engine kept honoring
+                        // the stored value. Seed from the row for those families.
+                        // The scan is a no-op on them.
+                        bool exemptPrimary = PadForge.Engine.Common.Mapping.SourceCoercion
+                            .IsPrefixExemptDescriptor(primaryDesc);
+                        bool inv = exemptPrimary && mapping.IsInverted;
+                        bool half = exemptPrimary && mapping.IsHalfAxis;
+                        string clean = primaryDesc;
+                        if (clean.StartsWith("IH", StringComparison.OrdinalIgnoreCase))
+                        { inv = true; half = true; clean = clean.Substring(2); }
+                        else if (clean.StartsWith("I", StringComparison.OrdinalIgnoreCase) && clean.Length > 1 && !char.IsDigit(clean[1])
+                                 && !PadForge.Engine.Common.Mapping.SourceCoercion.IsPrefixExemptDescriptor(clean))
+                        { inv = true; clean = clean.Substring(1); }
+                        else if (clean.StartsWith("H", StringComparison.OrdinalIgnoreCase) && clean.Length > 1 && !char.IsDigit(clean[1]))
+                        { half = true; clean = clean.Substring(1); }
+
+                        rebuiltSources.Add(new MappingSource
+                        {
+                            Kind = mapping.PrimaryKindSource?.DescriptorKind ?? "Direct",
+                            DeviceGuid = mapping.PrimarySourceDeviceGuid ?? "",
+                            Descriptor = clean,
+                            Invert = inv,
+                            HalfAxis = half,
+                            Bidirectional = mapping.IsBidirectional,
+                            InvertOutput = mapping.InvertOutput,
+                            ParamAccel = mapping.ParamAccel,
+                            DeadZone = mapping.MappingDeadZone,
+                            GyroSensitivity = mapping.GyroSensitivity > 0 ? mapping.GyroSensitivity : 1.0,
+                            MouseCursorSensitivity = mapping.MouseCursorSensitivity > 0 ? mapping.MouseCursorSensitivity : 1.0,
+                            IrPointerSensitivity = mapping.IrPointerSensitivity > 0 ? mapping.IrPointerSensitivity : 1.0,
+                            Sensitivity = mapping.Sensitivity > 0 ? mapping.Sensitivity : 1.0,
+                            ParamRapidTriggerDistance = mapping.PrimaryKindSource?.ParamRapidTriggerDistance
+                                ?? MappingSource.DefaultRapidTriggerDistance,
+                        });
+
+                        // For bipolar axis rows, also encode the Neg
+                        // descriptor as a paired source with Invert
+                        // flipped (the load path detects this pair).
+                        if (!string.IsNullOrEmpty(mapping.NegSettingName)
+                            && !string.IsNullOrEmpty(mapping.NegSourceDescriptor))
+                        {
+                            string negRaw = mapping.NegSourceDescriptor;
+                            bool ninv = false, nhalf = false;
+                            string ncl = negRaw;
+                            if (ncl.StartsWith("IH", StringComparison.OrdinalIgnoreCase))
+                            { ninv = true; nhalf = true; ncl = ncl.Substring(2); }
+                            else if (ncl.StartsWith("I", StringComparison.OrdinalIgnoreCase) && ncl.Length > 1 && !char.IsDigit(ncl[1])
+                                     && !PadForge.Engine.Common.Mapping.SourceCoercion.IsPrefixExemptDescriptor(ncl))
+                            { ninv = true; ncl = ncl.Substring(1); }
+                            else if (ncl.StartsWith("H", StringComparison.OrdinalIgnoreCase) && ncl.Length > 1 && !char.IsDigit(ncl[1]))
+                            { nhalf = true; ncl = ncl.Substring(1); }
+                            // Negative source: flip Invert relative to
+                            // primary's encoded inversion.
+                            rebuiltSources.Add(new MappingSource
+                            {
+                                Kind = "Direct",
+                                DeviceGuid = mapping.PrimarySourceDeviceGuid ?? "",
+                                Descriptor = ncl,
+                                Invert = !ninv,
+                                HalfAxis = nhalf,
+                                Bidirectional = mapping.IsBidirectional,
+                                // Same row, same ramp: the primary leg
+                                // above carries ParamAccel and this one
+                                // did not, so acceleration applied to one
+                                // direction of a bipolar axis only.
+                                // InvertOutput is deliberately NOT copied
+                                // here: the migrator's neg-leg convention
+                                // FLIPS it for half-axis sources rather
+                                // than copying it, and this path has never
+                                // stamped it. Aligning the two is its own
+                                // adjudication, not a rider on ParamAccel.
+                                ParamAccel = mapping.ParamAccel,
+                                DeadZone = mapping.MappingDeadZone,
+                                GyroSensitivity = mapping.GyroSensitivity > 0 ? mapping.GyroSensitivity : 1.0,
+                                MouseCursorSensitivity = mapping.MouseCursorSensitivity > 0 ? mapping.MouseCursorSensitivity : 1.0,
+                                IrPointerSensitivity = mapping.IrPointerSensitivity > 0 ? mapping.IrPointerSensitivity : 1.0,
+                                Sensitivity = mapping.Sensitivity > 0 ? mapping.Sensitivity : 1.0,
+                            });
+                        }
+                    }
+
+                    if (rebuiltSources.Count == 0 && mapping.IsCustomCombine && mapping.PrimarySourceExists)
+                        rebuiltSources.Add(new MappingSource());
+
+                    foreach (var extra in mapping.ExtraSources)
+                    {
+                        if (extra != null) rebuiltSources.Add(extra.ToDomain());
+                        else if (mapping.IsCustomCombine) rebuiltSources.Add(new MappingSource());
+                    }
+
+                    // Publish the finished row in one atomic reference assignment.
+                    row.Sources = rebuiltSources;
+
+                    // Steering source kind (#94): steering is a per-stick GLOBAL, not a
+                    // per-layer mapping, so it has to live on the Base row that normal
+                    // (no-shift) play evaluates. Only stamp here when authoring Base; the
+                    // reconciliation pass below keeps the Base row in sync when the user is
+                    // authoring a shift layer. Persists on MappingSource (survives clones
+                    // via Clone()).
+                    if (string.Equals(activeMask, "Base", StringComparison.Ordinal))
+                        ApplySteeringKindToRow(row, mapping.TargetSettingName, padVm, slot);
+
+                    // Motion Lean tuning rides every layer's rows (the descriptor is a
+                    // normal input, not a Base-only steering mode).
+                    ApplyMotionLeanParamsToRow(row, padVm, slot);
+                    ApplyGyroTiltParamsToRow(row, padVm, slot);
+
+                    // Flick stick tuning (#225) rides every layer's rows the same
+                    // way: the descriptor is a normal input and #225's headline is
+                    // the shift-layer host, so layer rows must carry the card's
+                    // knobs too.
+                    ApplyFlickStickParamsToRow(row, padVm, slot);
+
+                    // Restore the absolute-pointer region geometry captured
+                    // before the rebuild (#9 B-15). No card sources these, so
+                    // the pre-rebuild values are re-stamped onto the matching
+                    // rebuilt pointer sources.
+                    ApplyTouchpadPointerParamsToRow(row, preservedPointer);
+                    ApplyCurveRangeParamsToRow(row, preservedCurveRange);
+                }
+
+                // Steering Kind reconciliation on the Base layer (#94). The per-mapping
+                // loop above only rebuilds the active layer's rows, but steering Kind must
+                // track the StickConfigItem state on the Base row regardless of which layer
+                // is being authored. When authoring a shift layer, re-stamp the Base
+                // steering rows when steering is on, and clear a stale Kind when it's off —
+                // otherwise turning steering off from a shift layer leaves the Base row
+                // stuck in a steering mode forever.
+                if (!string.Equals(activeMask, "Base", StringComparison.Ordinal))
+                {
+                    foreach (var stick in padVm.GetSteerableSticks())
+                    foreach (var target in new[] { stick.XTarget, stick.YTarget })
+                    {
+                        MappingRow baseRow = null;
+                        foreach (var r in ms.Rows)
+                        {
+                            if (r != null
+                                && string.Equals(r.LayerMask ?? "Base", "Base", StringComparison.Ordinal)
+                                && string.Equals(r.Target, target, StringComparison.Ordinal))
+                            { baseRow = r; break; }
+                        }
+                        if (baseRow?.Sources == null || baseRow.Sources.Count == 0) continue;
+                        // Per-source stamp handles revert of non-steered sources internally.
+                        ApplySteeringKindToRow(baseRow, target, padVm, slot);
+                    }
+                }
+            }
+        }
+
+        // Stamps per-assigned-device steering onto EVERY source in a stick-axis row. Each
+        // source's steering mode + tunables come from ITS OWN device's PadSetting, and it
+        // reads that device's OWN stick axes (so two devices on one slot each get their own
+        // wheel with the right axes). A source whose device isn't steering on this channel
+        // is reverted to a plain Direct mapping on its own axis. Returns true if any source
+        // on the row received a steering kind.
+        private static bool ApplySteeringKindToRow(MappingRow row, string target, PadViewModel padVm, int slot)
+        {
+            if (row?.Sources == null || row.Sources.Count == 0 || padVm == null) return false;
+            // Resolve this row's target to a stick index + its X/Y axis targets, covering both
+            // the standard gamepad pair and an Extended custom layout's numbered sticks.
+            if (!ResolveSteerTarget(padVm, target, out int stickIdx, out bool rowIsY, out string xTarget, out string yTarget))
+                return false;
+            bool any = false;
+
+            foreach (var src in row.Sources)
+            {
+                if (src == null || Engine.Common.Mapping.SourceEvaluator.IsUnmappedDirect(src)
+                    || src.Kind == "InvertOnHold") continue;
+                var cfg = ReadDeviceSteering(slot, src.DeviceGuid, stickIdx, padVm);
+                // Motion Lean is NOT stamped here. It's a first-class input descriptor
+                // ("Motion Lean" in the picker) the user maps to an axis like any gyro
+                // input; its sources keep Kind=Direct, so the revert guard below leaves
+                // them alone, and ApplyMotionLeanParamsToRow pushes the gyro-tab card's
+                // tuning onto them. The old design (gyro-tab Enable + target dropdown
+                // overriding the chosen stick axis's source with MotionLeanX) replaced
+                // one input with another — removed.
+                // AngleToAxisY outputs to the Y channel; every other mode to X. Only stamp
+                // this source when its device's mode targets THIS row's channel.
+                bool wantY = string.Equals(cfg.Kind, "AngleToAxisY", StringComparison.Ordinal);
+                if (cfg.Active && wantY == rowIsY)
+                {
+                    src.Kind = cfg.Kind;
+                    // Motion-lean reads gravity (by DeviceGuid), not stick axes. The 2D
+                    // modes read the DEVICE's own X axis (Descriptor) + Y axis
+                    // (ParamYDescriptor) — independent of which row we're stamping, so
+                    // AngleToAxisY on the Y row still gets X from the X target.
+                    if (!string.Equals(cfg.Kind, "MotionLeanX", StringComparison.Ordinal))
+                    {
+                        src.Descriptor = GetDeviceAxisDescriptor(padVm, xTarget, src.DeviceGuid);
+                        src.ParamYDescriptor = GetDeviceAxisDescriptor(padVm, yTarget, src.DeviceGuid);
+                    }
+                    src.ParamWindRangeDeg = cfg.WindRange;
+                    src.ParamWindPower = cfg.WindPower;
+                    src.ParamWindUnwindRate = cfg.WindUnwind;
+                    src.ParamAngleInnerDz = cfg.AngleInner;
+                    src.ParamAngleOuterDz = cfg.AngleOuter;
+                    src.ParamMotionInnerDz = cfg.MotionInner;
+                    src.ParamMotionOuterDz = cfg.MotionOuter;
+                    src.ParamControllerOrientation = cfg.Orient;
+                    any = true;
+                }
+                else
+                {
+                    // Not the steering output for this source's device. Revert it to a plain
+                    // Direct read of its own axis — but ONLY if it's currently a steering kind.
+                    // A normal mapping the user put on this axis (a button, a two-button
+                    // neg-pair, an axis) is left untouched: rewriting every source's descriptor
+                    // here clobbered neg-pairs down to the primary and broke button→axis maps.
+                    RevertSourceToDirect(src, target, padVm);
+                }
+            }
+            return any;
+        }
+
+        private static bool IsSteeringKind(string k)
+            => k == "WindingStick" || k == "AngleToAxisX" || k == "AngleToAxisY" || k == "MotionLeanX";
+
+        // Reads one device's per-stick steering config from its own PadSetting (per
+        // slot+device), applying the same defaults the UI load path uses. A guid-less
+        // source falls back to the live UI config for the selected stick.
+        private static (bool Active, string Kind, double WindRange, double WindPower, double WindUnwind,
+            double AngleInner, double AngleOuter, double MotionInner, double MotionOuter, string Orient)
+            ReadDeviceSteering(int slot, string deviceGuid, int stickIdx, PadViewModel padVm)
+        {
+            // The SELECTED device's latest steering lives in the live StickConfigs (the UI),
+            // which can be newer than its PadSetting; read it there so the stamp never lags a
+            // save. A guid-less source also uses the UI. Other devices read their own stored
+            // PadSetting so each keeps its own wheel.
+            Guid sel = padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty;
+            bool useUi = string.IsNullOrEmpty(deviceGuid)
+                || (sel != Guid.Empty && Guid.TryParse(deviceGuid, out var dg) && dg == sel);
+            if (useUi)
+            {
+                var s = padVm.StickConfigs?.FirstOrDefault(x => x.Index == stickIdx);
+                if (s == null) return (false, "Direct", 900, 1, 1800, 0, 10, 15, 135, "Forward");
+                // Motion fields are constants now — per-stick Motion Lean moved to Motion
+                // Steering, which supplies its own inner/outer/orient via the cfg override.
+                return (s.IsSteeringActive, s.SteeringKind, s.WindRangeDeg, s.WindPower, s.WindUnwindRate,
+                    s.AngleInnerDz, s.AngleOuterDz, 15, 135, "Forward");
+            }
+            PadSetting ps = Guid.TryParse(deviceGuid, out var g)
+                ? SettingsManager.FindSettingByInstanceGuidAndSlot(g, slot)?.GetPadSetting()
+                : null;
+            if (ps == null) return (false, "Direct", 900, 1, 1800, 0, 10, 15, 135, "Forward");
+            string kind = ps.GetRawMapping($"Stick{stickIdx}SteerKind");
+            // MotionLeanX is no longer a per-stick mode — it's driven by Motion Steering
+            // (gyro tab) via its own override. Treat a stored per-stick MotionLeanX as
+            // Direct so an old profile doesn't ghost-lean while the new card sits idle.
+            if (string.IsNullOrEmpty(kind) || kind == "MotionLeanX") kind = "Direct";
+            double D(string key, double dflt)
+                => double.TryParse(ps.GetRawMapping(key), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v) ? v : dflt;
+            return (kind != "Direct", kind,
+                D($"Stick{stickIdx}SteerWindRange", 900),
+                D($"Stick{stickIdx}SteerWindPower", 1),
+                D($"Stick{stickIdx}SteerWindUnwind", 1800),
+                D($"Stick{stickIdx}SteerAngleInner", 0),
+                D($"Stick{stickIdx}SteerAngleOuter", 10),
+                15, 135, "Forward");
+        }
+
+        // Resolves a stick-axis target (standard Left/Right or Extended RawAxis{n}) to a
+        // stick index + whether it's the Y axis, plus that stick's X/Y targets. One code path
+        // for both layouts, driven by the slot's actual sticks (PadViewModel.GetSteerableSticks).
+        private static bool ResolveSteerTarget(PadViewModel padVm, string target,
+            out int stickIdx, out bool rowIsY, out string xTarget, out string yTarget)
+        {
+            stickIdx = -1; rowIsY = false; xTarget = ""; yTarget = "";
+            if (string.IsNullOrEmpty(target)) return false;
+            var sticks = padVm.GetSteerableSticks();
+            for (int g = 0; g < sticks.Count; g++)
+            {
+                if (string.Equals(sticks[g].XTarget, target, StringComparison.Ordinal))
+                { stickIdx = g; rowIsY = false; xTarget = sticks[g].XTarget; yTarget = sticks[g].YTarget; return true; }
+                if (string.Equals(sticks[g].YTarget, target, StringComparison.Ordinal))
+                { stickIdx = g; rowIsY = true;  xTarget = sticks[g].XTarget; yTarget = sticks[g].YTarget; return true; }
+            }
+            return false;
+        }
+
+        // Pushes the Motion Steering card's per-device tuning (tilt deadzones + grip
+        // orientation) onto every "Motion Lean" source in a row. Motion Lean is a
+        // first-class input descriptor — the user maps it to an axis from the picker
+        // — so this NEVER changes a source's Kind, Descriptor, or target; it only
+        // refreshes the lean parameters the evaluator reads (ParamMotion* on the
+        // source). Mirrors ReadDeviceSteering's per-device resolution: the SELECTED
+        // device reads the live UI (newer than its PadSetting), every other device
+        // reads its own stored PadSetting so each keeps its own tilt tuning.
+        private static void ApplyMotionLeanParamsToRow(MappingRow row, PadViewModel padVm, int slot)
+        {
+            if (row?.Sources == null || padVm == null) return;
+            foreach (var src in row.Sources)
+            {
+                // Both lean families ride the same Motion Steering card
+                // parameters: the primary "Motion Lean" and the aux
+                // "Motion Lean L" (#199, Nunchuk / left Joy-Con).
+                if (src == null
+                    || (!Engine.Common.Mapping.SourceCoercion.IsMotionLeanDescriptor(src.Descriptor)
+                        && !Engine.Common.Mapping.SourceCoercion.IsMotionLeanAuxDescriptor(src.Descriptor)))
+                    continue;
+
+                Guid sel = padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty;
+                bool useUi = string.IsNullOrEmpty(src.DeviceGuid)
+                    || (sel != Guid.Empty && Guid.TryParse(src.DeviceGuid, out var dg) && dg == sel);
+                if (useUi)
+                {
+                    src.ParamMotionInnerDz = padVm.MotionSteerInnerDz;
+                    src.ParamMotionOuterDz = padVm.MotionSteerOuterDz;
+                    src.ParamControllerOrientation = padVm.MotionSteerOrient;
+                    continue;
+                }
+
+                PadSetting ps = Guid.TryParse(src.DeviceGuid, out var g)
+                    ? SettingsManager.FindSettingByInstanceGuidAndSlot(g, slot)?.GetPadSetting()
+                    : null;
+                if (ps == null) continue; // keep the source's existing params
+                double D(string key, double dflt)
+                    => double.TryParse(ps.GetRawMapping(key), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v) ? v : dflt;
+                string orient = ps.GetRawMapping("MotionSteerOrient");
+                src.ParamMotionInnerDz = D("MotionSteerInner", 15);
+                src.ParamMotionOuterDz = D("MotionSteerOuter", 135);
+                src.ParamControllerOrientation = string.IsNullOrEmpty(orient) ? "Forward" : orient;
+            }
+        }
+
+        // Pushes the Gyro Tilt card's per-device envelope (#292) onto every
+        // "Gyro Tilt X/Y" source in a row. Same contract as
+        // ApplyMotionLeanParamsToRow: never changes Kind, Descriptor, or
+        // target; the SELECTED device reads the live UI (newer than its
+        // PadSetting), every other device reads its own stored PadSetting.
+        private static void ApplyGyroTiltParamsToRow(MappingRow row, PadViewModel padVm, int slot)
+        {
+            if (row?.Sources == null || padVm == null) return;
+            foreach (var src in row.Sources)
+            {
+                if (src == null
+                    || !Engine.Common.Mapping.SourceCoercion.IsGyroTiltDescriptor(src.Descriptor))
+                    continue;
+
+                Guid sel = padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty;
+                bool useUi = string.IsNullOrEmpty(src.DeviceGuid)
+                    || (sel != Guid.Empty && Guid.TryParse(src.DeviceGuid, out var dg) && dg == sel);
+                if (useUi)
+                {
+                    src.ParamTiltRangeDeg = padVm.GyroTiltRangeDeg;
+                    src.ParamTiltInnerDz = padVm.GyroTiltInnerDz;
+                    continue;
+                }
+
+                PadSetting ps = Guid.TryParse(src.DeviceGuid, out var g)
+                    ? SettingsManager.FindSettingByInstanceGuidAndSlot(g, slot)?.GetPadSetting()
+                    : null;
+                if (ps == null) continue; // keep the source's existing params
+                double D(string key, double dflt)
+                    => double.TryParse(ps.GetRawMapping(key), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v) ? v : dflt;
+                src.ParamTiltRangeDeg = D("GyroTiltRange", 25);
+                src.ParamTiltInnerDz = D("GyroTiltInner", 0);
+            }
+        }
+
+        // Pushes the Flick Stick card's per-device tuning (#225) onto every
+        // "Flick Stick ..." source in a row. Same shape as
+        // ApplyMotionLeanParamsToRow: never changes Kind, Descriptor, or
+        // target; the SELECTED device reads the live UI, other devices read
+        // their own stored PadSetting. A device whose PadSetting has never
+        // stored the card ("FlickStickDots" absent) keeps the source's
+        // existing params, so a fresh Workshop import's translator-carried
+        // Dots Per 360 survives until the user actually tunes the card (the
+        // load path seeds the card FROM the source in that state, so the
+        // selected device's stamp writes the same values back).
+        // Captures the absolute-pointer region geometry (#9 B-15) from a row's
+        // sources before the save rebuild clears them. Keyed by (device,
+        // descriptor) so a multi-source / multi-device row restores each
+        // pointer source's own geometry. Returns an empty list when the row
+        // holds no pointer source (the common case, zero allocation churn).
+        private static System.Collections.Generic.List<(string device, string desc, double center, double extent)>
+            CaptureTouchpadPointerParams(MappingRow row)
+        {
+            var list = new System.Collections.Generic.List<(string, string, double, double)>();
+            if (row?.Sources == null) return list;
+            foreach (var s in row.Sources)
+            {
+                if (s == null
+                    || !Engine.Common.Mapping.SourceCoercion.IsTouchpadPointerDescriptor(s.Descriptor))
+                    continue;
+                list.Add((s.DeviceGuid ?? "", s.Descriptor ?? "", s.ParamPointerCenter, s.ParamPointerExtent));
+            }
+            return list;
+        }
+
+        // Re-stamps the captured pointer geometry onto the rebuilt pointer
+        // sources. The rebuild strips I/H prefixes, but pointer descriptors
+        // carry none (they start with "Touchpad"), so the clean descriptor
+        // matches the captured one exactly.
+        private static void ApplyTouchpadPointerParamsToRow(MappingRow row,
+            System.Collections.Generic.List<(string device, string desc, double center, double extent)> preserved)
+        {
+            if (row?.Sources == null || preserved == null || preserved.Count == 0) return;
+            foreach (var src in row.Sources)
+            {
+                if (src == null
+                    || !Engine.Common.Mapping.SourceCoercion.IsTouchpadPointerDescriptor(src.Descriptor))
+                    continue;
+                foreach (var p in preserved)
+                {
+                    if (string.Equals(p.desc, src.Descriptor, StringComparison.Ordinal)
+                        && string.Equals(p.device ?? "", src.DeviceGuid ?? "", StringComparison.OrdinalIgnoreCase))
+                    {
+                        src.ParamPointerCenter = p.center;
+                        src.ParamPointerExtent = p.extent;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Captures the response-curve / outer-range channel (translator v11)
+        // from a row's sources before the save rebuild clears them. Direct
+        // analog of CaptureTouchpadPointerParams above, same reason:
+        // ParamCurveExponent / ParamRangeOuter have no VM card to re-stamp
+        // from, so the pre-rebuild sources are the only source of truth.
+        // Keyed by (device, descriptor); captures only sources carrying a
+        // non-default value (the common case returns an empty list).
+        private static System.Collections.Generic.List<(string device, string desc, MappingSource stamp)>
+            CaptureCurveRangeParams(MappingRow row)
+        {
+            var list = new System.Collections.Generic.List<(string, string, MappingSource)>();
+            if (row?.Sources == null) return list;
+            foreach (var s in row.Sources)
+            {
+                // v18 widened the channel: anti-deadzone floor, mouse-feel
+                // knobs (smoothing / threshold / accel / trackball), and
+                // the per-source AND gate all ride the same no-VM-card
+                // capture. The captured source object itself is the stamp
+                // carrier (it is about to be discarded by the rebuild).
+                // v26 widened it again: the radial stick-deadzone stamps
+                // and the second AND gate are no-VM-card fields the rebuild
+                // would otherwise wipe on the first pad-page save. The flick
+                // rotation offset HAS a card row now (Flick Stick card), but
+                // it stays in this net because the push is skipped while that
+                // card is unseeded, and the rebuild does not wait for it.
+                // ParamAccel LEFT the net (round 40 follow-up): the row
+                // editors author it now, it rides the VM round-trip like
+                // Invert / Bidirectional, and a net re-stamp would resurrect
+                // a value the user just zeroed, the exact defect the
+                // InvertOutput net was deleted for.
+                if (s == null
+                    || (s.ParamCurveExponent <= 0 && s.ParamRangeOuter <= 0
+                        && s.ParamAntiDeadzone <= 0
+                        && string.IsNullOrEmpty(s.GateDescriptor)
+                        && string.IsNullOrEmpty(s.Gate2Descriptor)
+                        && s.ParamStickDeadZoneShape == 0
+                        && s.ParamStickDeadZoneInner <= 0
+                        && s.ParamFlickRotationOffsetDeg == 0))
+                {
+                    continue;
+                }
+                list.Add((s.DeviceGuid ?? "", s.Descriptor ?? "", s));
+            }
+            return list;
+        }
+
+        // Re-stamps the captured curve/range params onto the rebuilt sources.
+        // The rebuild strips the I/H prefix back off, so the rebuilt
+        // descriptor matches the captured (already-clean) one exactly; a
+        // source re-authored to a different descriptor correctly keeps the
+        // off default, since the translator stamped the params for the
+        // descriptor it emitted.
+        private static void ApplyCurveRangeParamsToRow(MappingRow row,
+            System.Collections.Generic.List<(string device, string desc, MappingSource stamp)> preserved)
+        {
+            if (row?.Sources == null || preserved == null || preserved.Count == 0) return;
+            foreach (var src in row.Sources)
+            {
+                if (src == null) continue;
+                foreach (var p in preserved)
+                {
+                    if (string.Equals(p.desc, src.Descriptor ?? "", StringComparison.Ordinal)
+                        && string.Equals(p.device ?? "", src.DeviceGuid ?? "", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (p.stamp.ParamCurveExponent > 0) src.ParamCurveExponent = p.stamp.ParamCurveExponent;
+                        if (p.stamp.ParamRangeOuter > 0) src.ParamRangeOuter = p.stamp.ParamRangeOuter;
+                        if (p.stamp.ParamAntiDeadzone > 0) src.ParamAntiDeadzone = p.stamp.ParamAntiDeadzone;
+                        if (!string.IsNullOrEmpty(p.stamp.GateDescriptor)) src.GateDescriptor = p.stamp.GateDescriptor;
+                        if (!string.IsNullOrEmpty(p.stamp.Gate2Descriptor)) src.Gate2Descriptor = p.stamp.Gate2Descriptor;
+                        if (p.stamp.ParamStickDeadZoneShape != 0) src.ParamStickDeadZoneShape = p.stamp.ParamStickDeadZoneShape;
+                        if (p.stamp.ParamStickDeadZoneInner > 0) src.ParamStickDeadZoneInner = p.stamp.ParamStickDeadZoneInner;
+                        if (p.stamp.ParamFlickRotationOffsetDeg != 0) src.ParamFlickRotationOffsetDeg = p.stamp.ParamFlickRotationOffsetDeg;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // PadViewModels whose Flick Stick card LoadFlickStickCard has
+        // loaded at least once. The save-side stamp below must not push
+        // VM values into a row when the card was never loaded for the
+        // VM (the no-device save leg skips LoadFlickStickCard), because
+        // the VM then holds ctor defaults and stamping them wipes an
+        // import's translator-carried tuning.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<PadViewModel, object>
+            _flickStickCardSeeded = new();
+
+        private static void ApplyFlickStickParamsToRow(MappingRow row, PadViewModel padVm, int slot)
+        {
+            if (row?.Sources == null || padVm == null) return;
+            bool cardSeeded = _flickStickCardSeeded.TryGetValue(padVm, out _);
+            foreach (var src in row.Sources)
+            {
+                if (src == null
+                    || !Engine.Common.Mapping.SourceCoercion.IsFlickStickDescriptor(src.Descriptor))
+                    continue;
+
+                Guid sel = padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty;
+                bool useUi = string.IsNullOrEmpty(src.DeviceGuid)
+                    || (sel != Guid.Empty && Guid.TryParse(src.DeviceGuid, out var dg) && dg == sel);
+                if (useUi)
+                {
+                    // Unseeded card: the VM carries ctor defaults, not
+                    // user edits, so keep the source's existing params.
+                    if (!cardSeeded) continue;
+                    src.ParamFlickCountsPer360 = padVm.FlickCountsPer360;
+                    src.ParamFlickTime = padVm.FlickTime;
+                    src.ParamFlickThreshold = padVm.FlickThreshold;
+                    src.ParamFlickSnapMode = padVm.FlickSnapMode;
+                    src.ParamFlickSnapStrength = padVm.FlickSnapStrength;
+                    src.ParamFlickDeadzoneAngle = padVm.FlickForwardDeadzone;
+                    src.ParamFlickSmooth = padVm.FlickSmoothing;
+                    src.ParamFlickOnEngage = padVm.FlickOnEngage;
+                    src.ParamFlickRotationOffsetDeg = padVm.FlickRotationOffset;
+                    continue;
+                }
+
+                PadSetting ps = Guid.TryParse(src.DeviceGuid, out var g)
+                    ? SettingsManager.FindSettingByInstanceGuidAndSlot(g, slot)?.GetPadSetting()
+                    : null;
+                if (ps == null) continue; // keep the source's existing params
+                if (string.IsNullOrEmpty(ps.GetRawMapping("FlickStickDots")))
+                    continue; // card never stored for this device: keep import values
+                double D(string key, double dflt)
+                    => double.TryParse(ps.GetRawMapping(key), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v) ? v : dflt;
+                string snap = ps.GetRawMapping("FlickStickSnapMode");
+                src.ParamFlickCountsPer360 = D("FlickStickDots", 14400);
+                src.ParamFlickTime = D("FlickStickTime", 0.1);
+                src.ParamFlickThreshold = D("FlickStickThreshold", 0.9);
+                src.ParamFlickSnapMode = string.IsNullOrEmpty(snap) ? "None" : snap;
+                src.ParamFlickSnapStrength = D("FlickStickSnapStrength", 1.0);
+                src.ParamFlickDeadzoneAngle = D("FlickStickForwardDz", 0);
+                src.ParamFlickSmooth = D("FlickStickSmoothing", -1);
+                src.ParamFlickOnEngage = ps.GetRawMapping("FlickStickOnEngage") == "1";
+                src.ParamFlickRotationOffsetDeg = D("FlickStickRotationOffset", 0);
+            }
+        }
+
+        /// <summary>Loads the Flick Stick card fields (#225) from a device's
+        /// PadSetting extended mappings into the VM. When the card was never
+        /// stored for this device ("FlickStickDots" absent) and the slot's
+        /// MappingSet carries a flick source, the card seeds FROM that
+        /// source, so a Workshop import's translator-carried Dots Per 360
+        /// surfaces instead of defaults (and the next save persists it).
+        /// One body shared by the startup load (LoadPadSettings) and the
+        /// device-switch load (InputService.LoadPadSettingToViewModel) so
+        /// the two legs cannot drift.</summary>
+        internal static void LoadFlickStickCard(PadViewModel padVm, PadSetting ps, Guid deviceGuid = default)
+        {
+            if (padVm == null || ps == null) return;
+            // The startup leg knows the device whose PadSetting this is. The
+            // device-switch leg loads the selected device, so fall back to it
+            // rather than seeding from whatever source happens to come first.
+            if (deviceGuid == Guid.Empty) deviceGuid = padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty;
+            // Both legs below fill every card field, so the VM is seeded
+            // from here on and the save-side stamp may trust its values.
+            _flickStickCardSeeded.AddOrUpdate(padVm, null);
+            string dots = ps.GetRawMapping("FlickStickDots");
+            if (string.IsNullOrEmpty(dots))
+            {
+                var seed = FindSlotFlickStickSource(padVm.PadIndex,
+                    deviceGuid == Guid.Empty ? null : deviceGuid.ToString());
+                if (seed != null)
+                {
+                    padVm.FlickCountsPer360 = seed.ParamFlickCountsPer360;
+                    padVm.FlickTime = seed.ParamFlickTime;
+                    padVm.FlickThreshold = seed.ParamFlickThreshold;
+                    padVm.FlickSnapMode = seed.ParamFlickSnapMode;
+                    padVm.FlickSnapStrength = seed.ParamFlickSnapStrength;
+                    padVm.FlickForwardDeadzone = seed.ParamFlickDeadzoneAngle;
+                    padVm.FlickSmoothing = seed.ParamFlickSmooth;
+                    padVm.FlickOnEngage = seed.ParamFlickOnEngage;
+                    padVm.FlickRotationOffset = seed.ParamFlickRotationOffsetDeg;
+                    return;
+                }
+            }
+            double D(string key, double dflt)
+                => double.TryParse(ps.GetRawMapping(key), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v) ? v : dflt;
+            string snap = ps.GetRawMapping("FlickStickSnapMode");
+            padVm.FlickCountsPer360 = D("FlickStickDots", 14400);
+            padVm.FlickTime = D("FlickStickTime", 0.1);
+            padVm.FlickThreshold = D("FlickStickThreshold", 0.9);
+            padVm.FlickSnapMode = string.IsNullOrEmpty(snap) ? "None" : snap;
+            padVm.FlickSnapStrength = D("FlickStickSnapStrength", 1.0);
+            padVm.FlickForwardDeadzone = D("FlickStickForwardDz", 0);
+            padVm.FlickSmoothing = D("FlickStickSmoothing", -1);
+            padVm.FlickOnEngage = ps.GetRawMapping("FlickStickOnEngage") == "1";
+            padVm.FlickRotationOffset = D("FlickStickRotationOffset", 0);
+        }
+
+        /// <summary>Writes the Flick Stick card fields (#225) into a device's
+        /// PadSetting extended mappings. Shared by the serialize sweep
+        /// (UpdatePadSettingsFromViewModels) and the device-switch save
+        /// (InputService.SaveViewModelToPadSetting), the same mirror
+        /// discipline the Motion Steering keys follow.</summary>
+        internal static void SaveFlickStickCard(PadViewModel padVm, PadSetting ps)
+        {
+            if (padVm == null || ps == null) return;
+            var ic = System.Globalization.CultureInfo.InvariantCulture;
+            ps.SetRawMapping("FlickStickDots", padVm.FlickCountsPer360.ToString(ic));
+            ps.SetRawMapping("FlickStickTime", padVm.FlickTime.ToString(ic));
+            ps.SetRawMapping("FlickStickThreshold", padVm.FlickThreshold.ToString(ic));
+            ps.SetRawMapping("FlickStickSnapMode", padVm.FlickSnapMode);
+            ps.SetRawMapping("FlickStickSnapStrength", padVm.FlickSnapStrength.ToString(ic));
+            ps.SetRawMapping("FlickStickForwardDz", padVm.FlickForwardDeadzone.ToString(ic));
+            ps.SetRawMapping("FlickStickSmoothing", padVm.FlickSmoothing.ToString(ic));
+            ps.SetRawMapping("FlickStickOnEngage", padVm.FlickOnEngage ? "1" : "0");
+            ps.SetRawMapping("FlickStickRotationOffset", padVm.FlickRotationOffset.ToString(ic));
+        }
+
+        /// <summary>The "Flick Stick ..." source in a slot's MappingSet that
+        /// belongs to <paramref name="deviceGuid"/>, else one pinned to no
+        /// device, else null. The load legs seed the Flick Stick card from it
+        /// when that device's PadSetting has never stored the card, so a
+        /// Workshop import's translator-carried tuning surfaces instead of
+        /// defaults.
+        ///
+        /// <para>The receiving device decides. Returning the slot's first
+        /// flick source regardless of owner handed a second device the first
+        /// one's tuning. An empty source guid is the "any device" sentinel and
+        /// stays eligible for every device, which is what keeps a Workshop
+        /// import seeding at all: its rows carry no concrete device.</para></summary>
+        internal static Engine.Data.MappingSource FindSlotFlickStickSource(int slot, string deviceGuid)
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null || slot < 0 || slot >= sets.Length) return null;
+            var rows = sets[slot]?.Rows;
+            if (rows == null) return null;
+            Engine.Data.MappingSource wildcard = null;
+            foreach (var row in rows)
+            {
+                var sources = row?.Sources;
+                if (sources == null) continue;
+                foreach (var src in sources)
+                {
+                    if (src == null
+                        || !Engine.Common.Mapping.SourceCoercion.IsFlickStickDescriptor(src.Descriptor))
+                        continue;
+                    string owner = src.DeviceGuid ?? "";
+                    if (!string.IsNullOrEmpty(deviceGuid)
+                        && string.Equals(owner, deviceGuid, StringComparison.OrdinalIgnoreCase))
+                        return src;
+                    if (owner.Length == 0 || owner == Guid.Empty.ToString())
+                        wildcard ??= src;
+                }
+            }
+            return wildcard;
+        }
+
+        // The bare stick-axis descriptor a given device reads for <paramref name="target"/>
+        // (e.g. "Axis 2"), from the UI mappings' primary source or the matching ExtraSource.
+        // Empty when the device has no source on that target.
+        private static string GetDeviceAxisDescriptor(PadViewModel padVm, string target, string deviceGuid)
+        {
+            var m = padVm?.Mappings?.FirstOrDefault(x => x.TargetSettingName == target);
+            if (m == null) return "";
+            if (!string.IsNullOrEmpty(m.SourceDescriptor)
+                && string.Equals(m.PrimarySourceDeviceGuid ?? "", deviceGuid ?? "", StringComparison.OrdinalIgnoreCase))
+                return StripSourcePrefix(m.SourceDescriptor);
+            var extra = m.ExtraSources?.FirstOrDefault(e => e != null && !string.IsNullOrEmpty(e.Descriptor)
+                && string.Equals(e.DeviceGuid ?? "", deviceGuid ?? "", StringComparison.OrdinalIgnoreCase));
+            return extra != null ? StripSourcePrefix(extra.Descriptor) : "";
+        }
+
+        // Reverts ONE source to a plain Direct read of its row's own device axis — but only
+        // if it's currently a steering kind. A normal Direct mapping (button, neg-pair, axis)
+        // is left untouched so this stamp never rewrites the user's own axis mappings.
+        private static void RevertSourceToDirect(Engine.Data.MappingSource src, string target, PadViewModel padVm)
+        {
+            if (src == null || !IsSteeringKind(src.Kind)) return;
+            src.Kind = "Direct";
+            src.Descriptor = GetDeviceAxisDescriptor(padVm, target, src.DeviceGuid);
+            src.ParamYDescriptor = "";
+            src.ParamWindRangeDeg = 0; src.ParamWindPower = 0; src.ParamWindUnwindRate = 0;
+            src.ParamAngleInnerDz = 0; src.ParamAngleOuterDz = 0;
+            src.ParamMotionInnerDz = 0; src.ParamMotionOuterDz = 0;
+            src.ParamControllerOrientation = null;
+        }
+
+        // Strips a leading I / H / IH inversion prefix off a source descriptor, matching
+        // the primary-source cleaning above; steering reads the bare axis.
+        private static string StripSourcePrefix(string d)
+        {
+            if (string.IsNullOrEmpty(d)) return "";
+            if (d.StartsWith("IH", StringComparison.OrdinalIgnoreCase)) return d.Substring(2);
+            if (d.StartsWith("I", StringComparison.OrdinalIgnoreCase) && d.Length > 1 && !char.IsDigit(d[1])
+                && !PadForge.Engine.Common.Mapping.SourceCoercion.IsPrefixExemptDescriptor(d)) return d.Substring(1);
+            if (d.StartsWith("H", StringComparison.OrdinalIgnoreCase) && d.Length > 1 && !char.IsDigit(d[1])) return d.Substring(1);
+            return d;
+        }
+
+        /// <summary>
+        /// Phase 2A merge: additively reconcile each slot's MappingSet
+        /// with the per-device PadSetting fields. Adding a new device
+        /// to a slot that already has authored mappings (e.g. keyboard
+        /// custom mappings, then the user assigns a DualSense whose
+        /// auto-mapper populates ButtonA="Button 0" / etc) used to
+        /// CLOBBER the existing rows — the rebuilt rows came from
+        /// PadSetting and the existing rows' primary sources got
+        /// dropped because the gamepad-only migrator filter skipped
+        /// non-gamepad devices.
+        ///
+        /// New behavior: existing rows are preserved as the source of
+        /// truth (they already include the user's primary + extras
+        /// after <see cref="PushUiExtraSourcesIntoSlotMappingSets"/>);
+        /// rebuilt rows only contribute auto-mapped sources for
+        /// newly-added devices that aren't already represented by a
+        /// matching (DeviceGuid, Descriptor) entry. Sources whose
+        /// owning device left the slot get dropped.
+        /// </summary>
+        /// <summary>Public hook so callers outside the save pipeline
+        /// (e.g. device-assignment changes) can trigger the merge so
+        /// newly-assigned devices' auto-mapped sources appear in the
+        /// per-VC view without waiting for the next save / reload.</summary>
+        /// <summary>Post-refresh hook wired by the SettingsService instance
+        /// constructor so static callers of <see cref="RefreshMappingSetsFromLegacy"/>
+        /// trigger the per-instance motion-rows backfill without taking an
+        /// instance reference. Lets DeviceService / MainWindow keep calling
+        /// the static refresh while the backfill still runs.</summary>
+        public static Action AfterMappingSetsRefreshed { get; set; }
+
+        /// <summary>Richness score for duplicate-guid device-record
+        /// resolution: capability objects beat a typed record, which
+        /// beats a named one. An empty ghost scores 0.</summary>
+        internal static int DeviceRecordRichness(Engine.Data.UserDevice d)
+        {
+            if (d == null) return -1;
+            int score = 0;
+            if (d.DeviceObjects != null && d.DeviceObjects.Length > 0) score += 4;
+            if (d.CapType != 0) score += 2;
+            if (!string.IsNullOrEmpty(d.InstanceName)) score += 1;
+            return score;
+        }
+
+        /// <summary>Collapses duplicate-InstanceGuid device records to the
+        /// richest one per guid (stable: earlier record wins ties).
+        /// Guid.Empty records pass through untouched. Ghost duplicates of
+        /// real records broke first-match lookups; see the load site.</summary>
+        internal static System.Collections.Generic.List<Engine.Data.UserDevice> DedupeDevicesByGuid(
+            System.Collections.Generic.IEnumerable<Engine.Data.UserDevice> devices, ref int dropped)
+        {
+            var result = new System.Collections.Generic.List<Engine.Data.UserDevice>();
+            var byGuid = new System.Collections.Generic.Dictionary<System.Guid, int>();
+            foreach (var ud in devices)
+            {
+                if (ud == null) continue;
+                if (ud.InstanceGuid == System.Guid.Empty)
+                {
+                    result.Add(ud);
+                    continue;
+                }
+                if (byGuid.TryGetValue(ud.InstanceGuid, out int at))
+                {
+                    dropped++;
+                    if (DeviceRecordRichness(ud) > DeviceRecordRichness(result[at]))
+                        result[at] = ud;
+                    continue;
+                }
+                byGuid[ud.InstanceGuid] = result.Count;
+                result.Add(ud);
+            }
+            return result;
+        }
+
+        public static void RefreshMappingSetsFromLegacy()
+        {
+            MergeMappingSetsFromLegacy();
+            AfterMappingSetsRefreshed?.Invoke();
+        }
+
+        /// <summary>Removes every source bound to the given device from
+        /// every slot's MappingSet, drops any row that ends up empty as
+        /// a result, and clears the device's cached PadSetting. Called
+        /// on unassign so that an immediate reassign gets a clean auto-
+        /// map slate — the prior mappings (auto-mapped or user-edited)
+        /// must not persist across the unassign / reassign round-trip.</summary>
+        public static void StripDeviceFromAllSlots(Guid instanceGuid)
+        {
+            for (int slot = 0; slot < (SettingsManager.SlotMappingSets?.Length ?? 0); slot++)
+                StripDeviceFromSlot(instanceGuid, slot);
+        }
+
+        /// <summary>Clear one route without removing the device's sources from its other slots.</summary>
+        public static void StripDeviceFromSlot(Guid instanceGuid, int slotIndex)
+        {
+            string guidStr = instanceGuid.ToString().ToLowerInvariant();
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets != null)
+            {
+                for (int slot = 0; slot < sets.Length; slot++)
+                {
+                    if (slot != slotIndex) continue;
+                    var ms = sets[slot];
+                    if (ms?.Rows == null) continue;
+                    ms.Rows.RemoveAll(row => RemoveRowSources(row, s =>
+                            !string.IsNullOrEmpty(s?.DeviceGuid)
+                            && string.Equals(s.DeviceGuid.ToLowerInvariant(), guidStr, StringComparison.Ordinal)));
+                    // Keep rows that were already empty and explicit NoInherit rows.
+                    // RemoveRowSources dropped ordinary rows emptied by device cleanup.
+                    ms.Rows.RemoveAll(r => r == null
+                        || ((r.Sources == null || r.Sources.Count == 0) && !r.NoInherit
+                            && !MappingSetMigrator.IsMotionTarget(r.Target)));
+                }
+            }
+        }
+
+        private static bool RemoveRowSources(MappingRow row, Predicate<MappingSource> remove)
+        {
+            if (row?.Sources == null) return false;
+            bool wasAuthoredEmpty = MappingSetMigrator.IsEmptyMotionRow(row);
+            // A custom row's source POSITIONS are its expression's arguments on
+            // every target family, not only motion. Compacting a non-motion
+            // custom row silently renumbered them: dropping the device behind the
+            // first argument promoted the second into its place and left the
+            // expression reading the wrong input.
+            if (row.CombineMode != "Custom")
+            {
+                int removed = row.Sources.RemoveAll(remove);
+                return removed > 0 && row.Sources.Count == 0
+                    && row.CombineMode != "Custom" && !row.NoInherit && !wasAuthoredEmpty;
+            }
+
+            var kept = new List<MappingSource>(row.Sources.Count);
+            foreach (var source in row.Sources)
+            {
+                if (!remove(source)) kept.Add(source);
+                else if (!string.Equals(source?.Kind ?? "Direct", "InvertOnHold", StringComparison.Ordinal))
+                    kept.Add(new MappingSource());
+            }
+            row.Sources = kept;
+            return false;
+        }
+
+        private static void MergeMappingSetsFromLegacy()
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null || sets.Length == 0) return;
+
+            UserSetting[] usSnapshot;
+            lock (SettingsManager.UserSettings.SyncRoot)
+                usSnapshot = SettingsManager.UserSettings.Items.ToArray();
+
+            for (int slot = 0; slot < sets.Length; slot++)
+            {
+                var rebuilt = BuildOneSlotFromLegacy(slot);
+                var current = sets[slot];
+                // Idempotent legacy-grammar belt: whatever lane a set
+                // arrived through (paste, import, old profile), its
+                // raw-surface targets read as current grammar here.
+                MappingSetMigrator.NormalizeRawSurfaceTargets(current);
+
+                // Devices currently assigned to this slot (lowercase
+                // GUID strings) — used to drop sources for devices
+                // that are no longer mapped here.
+                var devGuidsInSlot = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var us in usSnapshot)
+                {
+                    if (us != null && us.MapTo == slot)
+                        devGuidsInSlot.Add(us.InstanceGuid.ToString().ToLowerInvariant());
+                }
+                // Merge diagnostics (2026-07-22, automap-loss hunt): the
+                // saved state showed raw-target rows with ZERO sources
+                // after a type switch that provably authored them. Name
+                // what this merge run sees and produces per slot.
+                if (devGuidsInSlot.Count > 0 || (current?.Rows?.Count ?? 0) > 0)
+                {
+                    int rebuiltRaw = 0, rebuiltRawSrc = 0;
+                    foreach (var rr in rebuilt.Rows)
+                    {
+                        if (rr?.Target != null && rr.Target.StartsWith("Raw", StringComparison.Ordinal))
+                        {
+                            rebuiltRaw++;
+                            rebuiltRawSrc += rr.Sources?.Count ?? 0;
+                        }
+                    }
+                    PadForge.Engine.SdlDiagLog.WriteLine(
+                        $"MERGE slot={slot} devs={devGuidsInSlot.Count} curRows={current?.Rows?.Count ?? -1}"
+                        + $" rebuiltRawRows={rebuiltRaw} rebuiltRawSrcs={rebuiltRawSrc}");
+                }
+
+                if (current?.Rows == null)
+                {
+                    // Carry Workshop ownership across the replacement. The
+                    // rebuilt set is built from the legacy per-device canon
+                    // and has the flag at its default false, so handing it
+                    // over bare silently un-gates every later merge: the two
+                    // guards below both key on current.Authoritative, and an
+                    // import that lost the flag gets its rows rebound to the
+                    // assigned pad and gains the automap's unmatched rows.
+                    // The owner's file showed exactly that split, a live set
+                    // reading Authoritative="false" beside the profile copy
+                    // that still read true.
+                    if (current != null) rebuilt.Authoritative = current.Authoritative;
+                    sets[slot] = rebuilt;
+                    continue;
+                }
+
+                // Index rebuilt rows by (Target, LayerMask) so we can
+                // quickly look up auto-mapped sources to add to each
+                // existing row.
+                var rebuiltByKey = new Dictionary<(string, string), Engine.Data.MappingRow>();
+                foreach (var rr in rebuilt.Rows)
+                {
+                    if (rr == null) continue;
+                    rebuiltByKey[(rr.Target ?? "", rr.LayerMask ?? "Base")] = rr;
+                }
+
+                // Everything on the set that ISN'T Rows survives the merge
+                // container swap. The merge rebuilds Base rows from the
+                // per-device PadSetting fields, so every field the legacy
+                // data can't repopulate — ownership, shift activators,
+                // menus, and the Base layer's appearance — has to be
+                // carried across by hand or it's dropped on every legacy
+                // load. Lists carry by reference; `current` is discarded.
+                var merged = new Engine.Data.MappingSet
+                {
+                    Authoritative = current.Authoritative,
+                    ShiftActivators = current.ShiftActivators
+                        ?? new List<Engine.Data.ShiftActivator>(),
+                    Menus = current.Menus
+                        ?? new List<PadForge.Engine.Menus.MenuDefinitionEntry>(),
+                    BaseLayerName = current.BaseLayerName ?? "",
+                    BaseColor = current.BaseColor ?? "",
+                    BaseIcon = current.BaseIcon ?? "",
+                };
+                // Workshop stamps (v18) are part of the "everything that
+                // isn't Rows" family this swap must carry, via the shared
+                // helper. Dropping them here erased an imported profile's
+                // deadzone shape / gyro engage on every device assign or
+                // unassign (the merge runs on both).
+                current.CopyWorkshopStampsTo(merged);
+                // Rumble-audio config (#236) is part of the same not-Rows
+                // family: the merge runs on every device assign/unassign,
+                // and dropping the config here would kill the slot's
+                // bass-shaker routing whenever a device joined or left.
+                // Reference carry is safe; `current` is discarded.
+                merged.RumbleAudio = current.RumbleAudio;
+                // SOCD authoring (#240), same family.
+                merged.SocdMode = current.SocdMode ?? "";
+                merged.SocdPairs = current.SocdPairs ?? "";
+                // Keep Awake (#270), same family.
+                merged.KeepAwakeEnabled = current.KeepAwakeEnabled;
+                merged.KeepAwakeAxis = current.KeepAwakeAxis ?? "";
+                merged.KeepAwakeDeflection = current.KeepAwakeDeflection;
+                merged.KeepAwakeMotion = current.KeepAwakeMotion;
+                var consumedRebuilt = new HashSet<(string, string)>();
+
+                foreach (var er in current.Rows)
+                {
+                    if (er == null) continue;
+
+                    // Drop sources for devices that left the slot.
+                    if (RemoveRowSources(er, s =>
+                            !string.IsNullOrEmpty(s?.DeviceGuid)
+                            && !devGuidsInSlot.Contains(s.DeviceGuid.ToLowerInvariant())))
+                        continue;
+
+                    var key = (er.Target ?? "", er.LayerMask ?? "Base");
+                    bool preserveMotionSources = MappingSetMigrator.PreservesMotionSources(er);
+                    // A Toggle or Rapid Trigger reads its own input on every
+                    // device just as Direct does, so an any-device one covers
+                    // them too.
+                    bool preserveAnyDeviceSources = er.Sources?.Any(source => source != null
+                        && PadForge.Engine.Common.Mapping.SourceEvaluator.IsDescriptorKind(source.Kind)
+                        && string.IsNullOrEmpty(source.DeviceGuid)
+                        && !string.IsNullOrWhiteSpace(source.Descriptor)) == true;
+                    // Any Device already covers newly assigned devices. Keep the
+                    // authored row instead of adding their legacy default sources.
+                    if (preserveMotionSources || preserveAnyDeviceSources) consumedRebuilt.Add(key);
+
+                    // An authoritative set (Workshop import) owns its rows
+                    // completely: the rebuilt-from-legacy set contributes
+                    // nothing, because the imported rows already spell out
+                    // every binding and auto-mapped legacy descriptors
+                    // would double each input. Departed-device cleanup
+                    // (above) and the empty-row drop (below) still run.
+                    //
+                    // Only Base-layer rows merge with rebuilt; non-Base
+                    // (Shift) rows carry forward intact.
+                    if (!current.Authoritative && !preserveMotionSources && !preserveAnyDeviceSources
+                        && string.Equals(er.LayerMask ?? "Base", "Base", StringComparison.Ordinal)
+                        && rebuiltByKey.TryGetValue(key, out var rrow))
+                    {
+                        // Only inject rebuilt sources for devices that
+                        // aren't already represented on this row. If the
+                        // row already has any source from a given device,
+                        // the user's authoring is authoritative for that
+                        // device — don't double-add the same device's
+                        // auto-mapped legacy descriptor as an extra
+                        // source (the "deleted extra keeps coming back"
+                        // alias bug). Device-by-device gate is stricter
+                        // than the previous (DeviceGuid, Descriptor)
+                        // dedup which couldn't distinguish a
+                        // user-deleted duplicate from a never-seen one.
+                        var devicesPresent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var s in er.Sources)
+                        {
+                            if (s == null) continue;
+                            devicesPresent.Add((s.DeviceGuid ?? "").ToLowerInvariant());
+                        }
+                        if (rrow.Sources != null)
+                        {
+                            foreach (var s in rrow.Sources)
+                            {
+                                if (s == null) continue;
+                                if (devicesPresent.Contains((s.DeviceGuid ?? "").ToLowerInvariant()))
+                                    continue;
+                                er.Sources.Add(s);
+                            }
+                        }
+                        // Only mark the rebuilt row consumed when the
+                        // existing row actually has surviving sources.
+                        // If every source dropped (e.g. the device that
+                        // owned them left the slot), the existing row
+                        // gets discarded below and we WANT the rebuilt
+                        // row to land via the unconsumed-rebuilt pass
+                        // — otherwise auto-mappings for a freshly-
+                        // assigned replacement device vanish.
+                        if (er.Sources != null && er.Sources.Count > 0)
+                            consumedRebuilt.Add(key);
+                    }
+
+                    // Empty motion and NoInherit rows retain their meaning.
+                    // Other empty rows can be supplied by the rebuilt set below.
+                    if ((er.Sources == null || er.Sources.Count == 0) && !er.NoInherit
+                        && !MappingSetMigrator.IsMotionTarget(er.Target)) continue;
+
+                    merged.Rows.Add(er);
+                }
+
+                // Merge diagnostics second half: what survived.
+                {
+                    int mergedRaw = 0, mergedRawSrc = 0;
+                    foreach (var mr in merged.Rows)
+                    {
+                        if (mr?.Target != null && mr.Target.StartsWith("Raw", StringComparison.Ordinal))
+                        {
+                            mergedRaw++;
+                            mergedRawSrc += mr.Sources?.Count ?? 0;
+                        }
+                    }
+                    if (mergedRaw > 0 || devGuidsInSlot.Count > 0)
+                        PadForge.Engine.SdlDiagLog.WriteLine(
+                            $"MERGE slot={slot} keptRawRows={mergedRaw} keptRawSrcs={mergedRawSrc} (pre-unconsumed pass)");
+                }
+
+                // Add rebuilt rows that didn't match any existing row
+                // (newly-added device whose auto-mapping introduces a
+                // target the user hasn't authored yet). Skipped entirely
+                // for authoritative sets, same rationale as above.
+                if (!current.Authoritative)
+                {
+                    foreach (var rr in rebuilt.Rows)
+                    {
+                        if (rr == null) continue;
+                        var key = (rr.Target ?? "", rr.LayerMask ?? "Base");
+                        if (consumedRebuilt.Contains(key)) continue;
+                        if (rr.Sources == null || rr.Sources.Count == 0) continue;
+                        merged.Rows.Add(rr);
+                    }
+                }
+
+                sets[slot] = merged;
+            }
+        }
+
+        /// <summary>
+        /// Pushes application-level settings to the SettingsViewModel.
+        /// </summary>
+        private void LoadAppSettings(AppSettingsData appSettings)
+        {
+            var vm = _mainVm.Settings;
+            PadForge.Common.SoundPackageManager.LoadRegistry(
+                appSettings.SoundPackages?.Select(p => (p.Name, p.Path)));
+            PadForge.Common.IconPackageManager.LoadRegistry(
+                appSettings.IconPackages?.Select(p => (p.Name, p.Path)));
+            PadForge.Common.Input.NfcTagRegistry.LoadRegistry(
+                appSettings.NfcTags?.Select(t => (t.Uid, t.Name, t.Button)));
+            PadForge.Common.Input.VoicePhraseRegistry.LoadRegistry(
+                appSettings.VoicePhrases?.Select(v => (v.Phrase, v.Name, v.Button)));
+            // Handheld hidden buttons (#343): definitions first, then the
+            // toggle, so the row that appears on enable already has them.
+            PadForge.Common.Input.HandheldButtonRegistry.LoadRegistry(
+                appSettings.HandheldButtons?.Select(b => b.ToEntry()), appSettings.HandheldMachineKey);
+            vm.HandheldButtonsEnabled = appSettings.HandheldButtonsEnabled;
+            // Head tracking (#355) loads with the Dashboard services below:
+            // its enable is a per-profile leg under the authoring guard.
+            // PS Move calibration blobs (#277): captured at pair time over USB,
+            // consumed by the Bluetooth lane for sensor scaling.
+            PadForge.Common.Input.PsMoveCalibrationRegistry.LoadRegistry(appSettings.PsMoveCalibrations);
+            PadForge.Services.Ds3PairingService.CalibrationStore =
+                PadForge.Common.Input.PsMoveCalibrationRegistry.Store;
+            try
+            {
+                var hidden = appSettings.MappingPickerHiddenDevices;
+                var pads = _mainVm?.Pads;
+                if (hidden != null && pads != null)
+                    for (int i = 0; i < pads.Count && i < hidden.Length; i++)
+                        pads[i]?.SetHiddenPickerDeviceKeys(
+                            (hidden[i] ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries));
+            }
+            catch { /* view preference; never blocks a load */ }
+            PadForge.Services.VoiceMacroService.Enabled = appSettings.VoiceMacrosEnabled;
+            PadForge.Services.VoiceMacroService.MinConfidence =
+                float.IsFinite(appSettings.VoiceMinConfidence)
+                    ? Math.Clamp(appSettings.VoiceMinConfidence, 0f, 1f) : 0.80f;
+            PadForge.Services.VoiceMacroService.ListeningMode =
+                appSettings.VoiceListeningMode == 1 ? 1 : 0;
+            // Headset trackers (#188): addresses that ever qualified, so
+            // the sweep's HID-service re-request survives an app restart
+            // while the sensor node is absent.
+            PadForge.Common.Input.SonyHeadsetMotionRuntime.LoadPersistedAddresses(
+                appSettings.HeadsetTrackerAddresses);
+
+            // Remote Link (issue #138): carry the stored identity + trust list into
+            // the runtime holder. No minting here — the identity is created lazily
+            // on first Remote Link start — so this stays behavior-neutral on load.
+            try
+            {
+                // Mutate the existing holder + trust store in place (don't swap the
+                // instances) so a running LinkServer's references stay current across
+                // a Reload — else peers paired after a reload would be dropped on save
+                // and their gamepad-only restriction bypassed.
+                RemoteLink.ProtectedPrivateBase64 = appSettings.RemoteLinkIdentityPrivate ?? "";
+                RemoteLink.PublicBase64 = appSettings.RemoteLinkIdentityPublic ?? "";
+                RemoteLink.IdentityProtection =
+                    Enum.TryParse<PadForge.Engine.RemoteLink.IdentityProtectionMode>(appSettings.RemoteLinkIdentityProtection, out var ipm)
+                        ? ipm : PadForge.Engine.RemoteLink.IdentityProtectionMode.Secure;
+                RemoteLink.Trust.ReplaceAll(appSettings.RemoteLinkPeers);
+            }
+            catch (Exception ex)
+            {
+                // A partial failure here (e.g. ReplaceAll throwing on a malformed peer)
+                // leaves the trust store half-restored, and the next Save() would persist
+                // that loss back to PadForge.xml, silently dropping paired peers and their
+                // gamepad-only restriction. Surface it instead of swallowing blind.
+                System.Diagnostics.Debug.WriteLine("[RemoteLink] identity/trust restore failed: " + ex);
+            }
+            vm.RefreshTrustedPeers(RemoteLink.Trust?.Peers);
+            vm.AutoStartEngine = appSettings.AutoStartEngine;
+            vm.MinimizeToTray = appSettings.MinimizeToTray;
+            vm.CloseToTray = appSettings.CloseToTray;
+            vm.AlwaysShowTrayIcon = appSettings.AlwaysShowTrayIcon;
+            vm.CheckForUpdatesAutomatically = appSettings.CheckForUpdatesAutomatically;
+            vm.InstallUpdatesAutomatically = appSettings.InstallUpdatesAutomatically;
+            vm.IncludePreReleaseUpdates = appSettings.IncludePreReleaseUpdates;
+            vm.BatteryNotifyEnabled = appSettings.BatteryNotifyEnabled;
+            vm.BatteryNotifyThreshold = appSettings.BatteryNotifyThreshold;
+            vm.BatteryNotifyVibrate = appSettings.BatteryNotifyVibrate;
+            vm.AssignOfferNewDevice = appSettings.AssignOfferNewDevice;
+            vm.AssignOfferEmptySlot = appSettings.AssignOfferEmptySlot;
+            vm.StartMinimized = appSettings.StartMinimized;
+            vm.DiagnosticsLoggingEnabled = appSettings.DiagnosticsLoggingEnabled;
+            // Arm the mirror on cold start (#303): the toggle's
+            // PropertyChanged handler covers live changes, but an
+            // auto-started session needs the persisted state applied here.
+            Common.DiagnosticsLogControl.Apply(appSettings.DiagnosticsLoggingEnabled);
+            vm.StartAtLogin = appSettings.StartAtLogin;
+            vm.EnablePollingOnFocusLoss = appSettings.EnablePollingOnFocusLoss;
+            vm.PollingRateMs = appSettings.PollingRateMs;
+            vm.HmInactivityDestroyTimeoutSeconds = appSettings.HmInactivityDestroyTimeoutSeconds;
+            vm.SelectedThemeIndex = appSettings.ThemeIndex;
+            vm.EnableInputHiding = appSettings.EnableInputHiding;
+            vm.KeepHidHideCloaksBetweenLaunches = appSettings.KeepHidHideCloaksBetweenLaunches;
+            vm.FlydigiEnhancedProtocol = appSettings.FlydigiEnhancedProtocol;
+            vm.GKeysEnabled = appSettings.GKeysEnabled;
+            vm.AnalogKeyboardsEnabled = appSettings.AnalogKeyboardsEnabled;
+            vm.BlissBoxEnabled = appSettings.BlissBoxEnabled;
+            vm.BlissBoxPorts = BlissBoxPortData.Normalize(appSettings.BlissBoxPorts);
+            vm.DefaultProfileDreamcastPicture = appSettings.DefaultProfileDreamcastPicture;
+            // The hint must be in place before SDL_Init, and a hint set early
+            // persists, so the load applies it (#395).
+            PadForge.Common.Input.InputManager.ApplyFlydigiEnhancedProtocol(appSettings.FlydigiEnhancedProtocol);
+            // Default-profile custom-gesture catalog. InputService
+            // wires the applier from StartEngine, which runs AFTER
+            // this load path on cold start, so stash the loaded list
+            // in a pending slot when the applier isn't ready yet. The
+            // setter on TouchpadGesturesApplier flushes it on first
+            // assignment. When a NAMED profile is active, the
+            // block in LoadProfiles overrides this with that profile's
+            // own catalog: ApplyProfile (and with it
+            // ApplyProfileTouchpadGestures) does NOT run on the cold
+            // path, so this stash would otherwise stay live and the
+            // first autosave would write the default's gestures back
+            // over the named profile's.
+            ApplyOrStageTouchpadGestures(appSettings.TouchpadGestures);
+            vm.HidHideWhitelistPaths.Clear();
+            if (appSettings.HidHideWhitelistPaths != null)
+            {
+                foreach (var p in appSettings.HidHideWhitelistPaths)
+                    if (!string.IsNullOrWhiteSpace(p))
+                        vm.HidHideWhitelistPaths.Add(p);
+            }
+            vm.SerialControllers.Clear();
+            if (appSettings.SerialControllers != null)
+            {
+                foreach (var s in appSettings.SerialControllers)
+                    if (s != null && !string.IsNullOrWhiteSpace(s.Port) && !string.IsNullOrWhiteSpace(s.Protocol))
+                        vm.SerialControllers.Add(s);
+            }
+            // Applied at load, before SDL_Init, as the Flydigi switch is (#33).
+            PadForge.Common.Input.InputManager.ApplySerialControllers(vm.SerialControllers);
+            vm.WinUsbOptIns.Clear();
+            if (appSettings.WinUsbOptIns != null)
+            {
+                foreach (var id in appSettings.WinUsbOptIns)
+                    if (!string.IsNullOrWhiteSpace(id))
+                        vm.WinUsbOptIns.Add(id);
+            }
+            vm.ICadePads.Clear();
+            if (appSettings.ICadePads != null)
+            {
+                foreach (var pair in appSettings.ICadePads)
+                    if (PadForge.Common.Input.ICadePads.TryParse(pair, out _, out _))
+                        vm.ICadePads.Add(pair);
+            }
+            // Applied at load, before SDL_Init, as the serial list is.
+            PadForge.Common.Input.InputManager.ApplyICadePads(vm.ICadePads);
+            vm.DjiRemoteHosts.Clear();
+            if (appSettings.DjiRemoteHosts != null)
+            {
+                foreach (var host in appSettings.DjiRemoteHosts)
+                    if (PadForge.Common.Input.DjiRemoteHosts.TryNormalize(host, out string key)
+                        && !vm.DjiRemoteHosts.Contains(key))
+                        vm.DjiRemoteHosts.Add(key);
+            }
+            PadForge.Common.Input.InputManager.ApplyDjiRemoteHosts(vm.DjiRemoteHosts);
+            vm.UsioLayout = PadForge.Common.Input.InputManager.NormalizeUsioLayout(appSettings.UsioLayout);
+            PadForge.Common.Input.InputManager.ApplyUsioLayout(vm.UsioLayout, reopen: false);
+            vm.SetLanguageFromCode(appSettings.Language);
+            vm.EnableAutoProfileSwitching = appSettings.EnableAutoProfileSwitching;
+            SettingsManager.EnableAutoProfileSwitching = appSettings.EnableAutoProfileSwitching;
+            vm.EnableExternalControl = appSettings.EnableExternalControl;
+            SettingsManager.EnableExternalControl = appSettings.EnableExternalControl;
+            vm.EnableCommunityConfigLookup = appSettings.EnableCommunityConfigLookup;
+            vm.ShowLegacyWorkshopConfigs = appSettings.ShowLegacyWorkshopConfigs;
+            SettingsManager.ActiveProfileId = appSettings.ActiveProfileId;
+            // Migrate legacy global macros and store.
+            if (appSettings.GlobalMacros != null)
+                foreach (var gm in appSettings.GlobalMacros)
+                    gm.MigrateLegacyTrigger();
+            SettingsManager.GlobalMacros = appSettings.GlobalMacros;
+
+            // Load per-slot created/enabled state BEFORE OutputType,
+            // because setting OutputType fires PropertyChanged → RefreshNavControllerItems()
+            // which reads SlotCreated[]. If SlotCreated isn't loaded yet, the sidebar
+            // gets built with the wrong slot set and triggers a double-rebuild crash.
+            if (appSettings.SlotCreated != null && appSettings.SlotCreated.Length >= 1)
+            {
+                int count = Math.Min(appSettings.SlotCreated.Length, SettingsManager.SlotCreated.Length);
+                Array.Copy(appSettings.SlotCreated, SettingsManager.SlotCreated, count);
+            }
+            else
+            {
+                // Backward compat: auto-create slots for existing device assignments.
+                AutoCreateSlotsFromExistingAssignments();
+            }
+
+            if (appSettings.SlotEnabled != null && appSettings.SlotEnabled.Length >= 1)
+            {
+                int count = Math.Min(appSettings.SlotEnabled.Length, SettingsManager.SlotEnabled.Length);
+                Array.Copy(appSettings.SlotEnabled, SettingsManager.SlotEnabled, count);
+            }
+            // else: defaults are all true, which is correct for migration.
+
+            // Load per-slot virtual controller types (after SlotCreated/SlotEnabled).
+            if (appSettings.SlotControllerTypes != null)
+            {
+                for (int i = 0; i < _mainVm.Pads.Count && i < appSettings.SlotControllerTypes.Length; i++)
+                {
+                    // Only load types for created slots. Uncreated slots keep the
+                    // default (Xbox) to prevent stale values from previous sessions
+                    // leaking into the engine's SlotControllerTypes array.
+                    if (SettingsManager.SlotCreated[i] &&
+                        Enum.IsDefined(typeof(Engine.VirtualControllerType), appSettings.SlotControllerTypes[i]))
+                        _mainVm.Pads[i].OutputType = (Engine.VirtualControllerType)appSettings.SlotControllerTypes[i];
+                }
+            }
+
+            // Load per-slot HIDMaestro profile slugs (after OutputType so the
+            // OutputType setter doesn't clear them via its category-change reset).
+            if (appSettings.SlotProfileIds != null)
+            {
+                for (int i = 0; i < _mainVm.Pads.Count && i < appSettings.SlotProfileIds.Length; i++)
+                {
+                    if (SettingsManager.SlotCreated[i])
+                    {
+                        // The persisted profile and the persisted mapping
+                        // data were saved together, so they are already on
+                        // one wire. Stamp before the VM assignment or the
+                        // ProfileId setter's Nintendo wire translation
+                        // reads a stale previous value and mistranslates
+                        // consistent data on every launch.
+                        SettingsManager.StampNintendoWire(i, appSettings.SlotProfileIds[i]);
+                        _mainVm.Pads[i].ProfileId = appSettings.SlotProfileIds[i];
+                    }
+                }
+            }
+
+            SlotAppearancePersistence.Apply(_mainVm.Pads,
+                SlotAppearancePersistence.ResolveApp(appSettings, _mainVm.Pads));
+
+            // Audio tab (issue #83): per-slot macro-sound master volume.
+            if (appSettings.SlotSoundVolumes != null)
+            {
+                for (int i = 0; i < _mainVm.Pads.Count && i < appSettings.SlotSoundVolumes.Length; i++)
+                    _mainVm.Pads[i].SoundMasterVolume = appSettings.SlotSoundVolumes[i];
+            }
+
+            // Reconcile per-group order lists with the loaded topology. Pads
+            // that the persisted lists reference but that are no longer
+            // created (or that have changed types) are dropped; pads that
+            // are created in a group but missing from the persisted list
+            // (legacy XML, externally edited, etc.) are appended in
+            // ascending pad-index order.
+            SettingsManager.SlotOrders.RebuildFromCurrentTopology(
+                pi => _mainVm.Pads[pi].OutputType,
+                appSettings.XboxSlotOrder,
+                appSettings.PlayStationSlotOrder,
+                appSettings.ExtendedSlotOrder,
+                appSettings.KeyboardMouseSlotOrder,
+                appSettings.MidiSlotOrder,
+                appSettings.NintendoSlotOrder,
+                appSettings.VrSlotOrder);
+
+            ApplyExtendedConfigs(appSettings.ExtendedConfigs);
+            ApplyDeviceSlotConfigs(appSettings.DeviceSlotConfigs);
+            ApplyMidiConfigs(appSettings.MidiConfigs);
+            ApplyKbmConfigs(appSettings.KbmConfigs);
+
+            // Load DSU motion server settings (now on Dashboard VM).
+            _mainVm.Dashboard.EnableDsuMotionServer = appSettings.EnableDsuMotionServer;
+            _mainVm.Dashboard.DsuMotionServerPort = appSettings.DsuMotionServerPort > 0
+                ? appSettings.DsuMotionServerPort : 26760;
+
+            // Head tracking (#355): sources and ranges first, then the
+            // toggle (under the guard below), so the row opens under the
+            // saved port.
+            _mainVm.Dashboard.HeadTrackingUdpPort = appSettings.HeadTrackingUdpPort > 0
+                ? appSettings.HeadTrackingUdpPort : PadForge.Common.Input.HeadTrackingRuntime.DefaultUdpPort;
+            _mainVm.Dashboard.HeadTrackingRotationRange = appSettings.HeadTrackingRotationRange > 0
+                ? appSettings.HeadTrackingRotationRange : PadForge.Common.Input.HeadTrackingRuntime.DefaultRotationRangeDeg;
+            _mainVm.Dashboard.HeadTrackingTranslationRange = appSettings.HeadTrackingTranslationRange > 0
+                ? appSettings.HeadTrackingTranslationRange : PadForge.Common.Input.HeadTrackingRuntime.DefaultTranslationRangeCm;
+
+            // Load web controller server settings.
+            PadForge.Services.WebCustomLayoutStore.LoadFrom(appSettings.WebCustomLayoutsJson);
+            _mainVm.Dashboard.EnableWebController = appSettings.EnableWebController;
+            // The service toggles' GLOBAL legs (three mirrors plus the
+            // head tracking enable), the value that stands when the active
+            // profile has no opinion. Under the guard, or the
+            // record-on-change hook would write these into the active
+            // profile (ActiveProfileId is already set above) and turn its
+            // null into an opinion it never authored.
+            _applyingServiceToggles = true;
+            try
+            {
+                _mainVm.Dashboard.EnableChromaLightbar = appSettings.EnableChromaLightbar;
+                _mainVm.Dashboard.EnableLightsyncLightbar = appSettings.EnableLightsyncLightbar;
+                _mainVm.Dashboard.EnableSensaHaptics = appSettings.EnableSensaHaptics;
+                _mainVm.Dashboard.HeadTrackingEnabled = appSettings.HeadTrackingEnabled;
+                _mainVm.Dashboard.HeadTrackingFreeTrack = appSettings.HeadTrackingIndependentInputs
+                    ? appSettings.HeadTrackingFreeTrack
+                    : appSettings.HeadTrackingEnabled && appSettings.HeadTrackingFreeTrack;
+                _mainVm.Dashboard.HeadTrackingOpenXr = appSettings.HeadTrackingOpenXr;
+                var savedRanges = appSettings.HeadTrackingAxisRanges;
+                for (int axis = 0; axis < 6; axis++)
+                    PadForge.Common.Input.HeadTrackingRuntime.SetAxisRange(
+                        axis, savedRanges != null && axis < savedRanges.Length ? savedRanges[axis] : 0);
+                PadForge.Common.Input.HeadTrackingRuntime.OpenXrRuntimeManifest =
+                    appSettings.HeadTrackingOpenXrRuntime;
+                // These two live on statics the bound getters read, so a load
+                // that only writes the static leaves the boxes showing the
+                // outgoing values. A Reload or a Reset to Defaults reverted
+                // the engine and left 45 sitting in a range box that no
+                // longer meant anything.
+                _mainVm.Dashboard.NotifyHeadTrackingRangesChanged();
+            }
+            finally { _applyingServiceToggles = false; }
+            _mainVm.Dashboard.WebControllerPort = appSettings.WebControllerPort > 0
+                ? appSettings.WebControllerPort : 8080;
+            _mainVm.Dashboard.EnableWebControllerPlainHttp = appSettings.EnableWebControllerPlainHttp;
+            _mainVm.Dashboard.WebControllerPlainHttpPort =
+                appSettings.WebControllerPlainHttpPort >= 1024 && appSettings.WebControllerPlainHttpPort <= 65535
+                    ? appSettings.WebControllerPlainHttpPort : WebControllerServer.DefaultPlainPort;
+            _mainVm.Dashboard.WebControllerPlainHttpLocalOnly = appSettings.WebControllerPlainHttpLocalOnly;
+            // A missing, damaged or foreign code reads as null, which the view
+            // model ignores, so the fresh code it started with stays.
+            string storedAccessCode = WebControllerAccess.UnprotectFromStorage(appSettings.WebControllerAccessCodeProtected);
+            _mainVm.Dashboard.WebControllerAccessCode = storedAccessCode;
+            _accessCodeUnsavedOnLoad = storedAccessCode == null;
+            if (storedAccessCode != null)
+                _protectedAccessCode = (storedAccessCode, appSettings.WebControllerAccessCodeProtected);
+            _mainVm.Dashboard.EnableRemoteLink = appSettings.EnableRemoteLink;
+            _mainVm.Dashboard.AutoReconnect = appSettings.RemoteLinkAutoReconnect;
+            _mainVm.Dashboard.RemoteLinkPort = appSettings.RemoteLinkPort >= 1024 && appSettings.RemoteLinkPort <= 65535
+                ? appSettings.RemoteLinkPort : 27500;
+
+            // Load touchpad overlay settings.
+            _mainVm.Dashboard.EnableTouchpadOverlay = appSettings.EnableTouchpadOverlay;
+            _mainVm.Dashboard.EnableMenuOverlay = appSettings.EnableMenuOverlay;
+            _mainVm.Dashboard.EnableShiftLayerFlyout = appSettings.EnableShiftLayerFlyout;
+            _mainVm.Dashboard.EnableProfileOverlay = appSettings.EnableProfileOverlay;
+            _mainVm.Dashboard.TouchpadOverlayOpacity = appSettings.TouchpadOverlayOpacity;
+            _mainVm.Dashboard.TouchpadOverlayMonitor = appSettings.TouchpadOverlayMonitor;
+            _mainVm.Dashboard.TouchpadOverlayLeft = appSettings.TouchpadOverlayLeft;
+            _mainVm.Dashboard.TouchpadOverlayTop = appSettings.TouchpadOverlayTop;
+            _mainVm.Dashboard.TouchpadOverlayWidth = appSettings.TouchpadOverlayWidth > 0
+                ? appSettings.TouchpadOverlayWidth : 500;
+            _mainVm.Dashboard.TouchpadOverlayHeight = appSettings.TouchpadOverlayHeight > 0
+                ? appSettings.TouchpadOverlayHeight : 250;
+
+            vm.Use2DControllerView = appSettings.Use2DControllerView;
+            vm.LegacyDriverCleanupOffered = appSettings.LegacyDriverCleanupOffered;
+            vm.FirstRunTourCompleted = appSettings.FirstRunTourCompleted;
+
+            // Restore main window position/size (profile-independent).
+            vm.MainWindowLeft = appSettings.MainWindowLeft;
+            vm.MainWindowTop = appSettings.MainWindowTop;
+            vm.MainWindowWidth = appSettings.MainWindowWidth > 0 ? appSettings.MainWindowWidth : 1100;
+            vm.MainWindowHeight = appSettings.MainWindowHeight > 0 ? appSettings.MainWindowHeight : 720;
+            vm.MainWindowState = appSettings.MainWindowState;
+            vm.MainWindowFullScreen = appSettings.MainWindowFullScreen;
+        }
+
+        /// <summary>Copy From companion: clones the per-slot config tabs
+        /// (Lighting, custom Extended layout, MIDI CC/note layout) from
+        /// <paramref name="srcSlot"/> to <paramref name="dstSlot"/>.
+        /// Device features (lightbar / adaptive triggers / mic LED /
+        /// player LED / audio-reactive / tone filter) are physical-device
+        /// passthrough and copy unconditionally — a DualSense mapped to
+        /// an Xbox slot still has its lightbar driven by DeviceConfig.
+        /// Extended custom layouts and MIDI CC/note ranges are slot-shape
+        /// data, so they only copy when both source and destination share
+        /// that output type. Mappings and per-device tuning live on
+        /// PadSetting and are handled separately by the InputService copy
+        /// path; this method fills the gap for tabs that live on
+        /// PadViewModel.</summary>
+        public void CopySlotConfigsAcrossSlots(int srcSlot, int dstSlot)
+        {
+            if (srcSlot < 0 || dstSlot < 0) return;
+            if (srcSlot >= _mainVm.Pads.Count || dstSlot >= _mainVm.Pads.Count) return;
+            if (srcSlot == dstSlot) return;
+
+            var src = _mainVm.Pads[srcSlot];
+            var dst = _mainVm.Pads[dstSlot];
+            if (src == null || dst == null) return;
+
+            dst.Model3DAppearances = src.Model3DAppearances;
+
+            // The Lighting / Adaptive Triggers / Audio tabs are per-device. Match
+            // each destination device to the SOURCE config for the same device GUID,
+            // so a slot with two differently-configured controllers keeps both rather
+            // than flattening to one. A destination device the source slot did not
+            // have falls back to a representative source config (a configured anchor,
+            // else the first configured per-device entry).
+            dst.EnsureDeviceSlotConfigsForMappedDevices();
+            var srcByGuid = src.PerDeviceSlotConfigs;
+            var srcAnchor = src.DeviceConfig;
+            bool hasSourceDevice = (src.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty) != Guid.Empty
+                || src.MappedDevices.Any(device => device != null && device.InstanceGuid != Guid.Empty);
+            if (!hasSourceDevice && !IsDeviceConfigConfigured(srcAnchor)) srcAnchor = null;
+            var fallbackCfg = IsDeviceConfigConfigured(srcAnchor) ? srcAnchor : null;
+            if (fallbackCfg == null && srcByGuid != null)
+                foreach (var kvp in srcByGuid)
+                    if (IsDeviceConfigConfigured(kvp.Value)) { fallbackCfg = kvp.Value; break; }
+            fallbackCfg ??= srcAnchor;
+
+            if (fallbackCfg != null || (srcByGuid != null && srcByGuid.Count > 0))
+            {
+                if (dst.PerDeviceSlotConfigs != null)
+                {
+                    foreach (var kvp in dst.PerDeviceSlotConfigs)
+                    {
+                        var dstCfg = kvp.Value;
+                        if (dstCfg == null) continue;
+                        var srcCfg = (srcByGuid != null && srcByGuid.TryGetValue(kvp.Key, out var m) && m != null)
+                            ? m : fallbackCfg;
+                        if (srcCfg != null)
+                            ApplyDeviceSlotConfigData(dstCfg, BuildDeviceSlotConfigData(srcCfg, dstSlot, Guid.Empty));
+                    }
+                }
+                // Anchor write only when a real device is selected on the
+                // destination (otherwise dst.DeviceConfig is the shared
+                // sentinel that would leak into every no-device view).
+                if (dst.SelectedMappedDevice != null
+                    && dst.SelectedMappedDevice.InstanceGuid != Guid.Empty)
+                {
+                    var selGuid = dst.SelectedMappedDevice.InstanceGuid;
+                    var srcCfg = (srcByGuid != null && srcByGuid.TryGetValue(selGuid, out var m2) && m2 != null)
+                        ? m2 : (srcAnchor ?? fallbackCfg);
+                    if (srcCfg != null)
+                        ApplyDeviceSlotConfigData(dst.DeviceConfig, BuildDeviceSlotConfigData(srcCfg, dstSlot, Guid.Empty));
+                }
+            }
+
+            // Extended custom layout is virtual-controller-shape data
+            // (thumbstick count / button count / OEM name / FFB), so it
+            // only makes sense when both src and dst are Extended slots.
+            if (src.OutputType == Engine.VirtualControllerType.Extended
+                && dst.OutputType == Engine.VirtualControllerType.Extended)
+            {
+                var s = src.ExtendedConfig;
+                var d = dst.ExtendedConfig;
+                if (s != null && d != null)
+                {
+                    // Triggers to zero FIRST: the two setters clamp against each
+                    // other over one axis budget, so writing sticks against a
+                    // leftover trigger count silently drops the last stick.
+                    d.TriggerCount = 0;
+                    d.ThumbstickCount = s.ThumbstickCount;
+                    d.TriggerCount = s.TriggerCount;
+                    d.PovCount = s.PovCount;
+                    d.ButtonCount = s.ButtonCount;
+                    d.OemNameOverride = s.OemNameOverride;
+                    d.ProductString = s.ProductString ?? string.Empty;
+                    d.VendorId = s.VendorId;
+                    d.ProductId = s.ProductId;
+                    d.Customize = s.Customize;
+                    d.ForceFeedbackEnabled = s.ForceFeedbackEnabled;
+                }
+            }
+
+            // MIDI port layout (channel / velocity / CC + note ranges) is
+            // also slot-output-shape data, only meaningful across MIDI slots.
+            if (src.OutputType == Engine.VirtualControllerType.Midi
+                && dst.OutputType == Engine.VirtualControllerType.Midi)
+            {
+                var s = src.MidiConfig;
+                var d = dst.MidiConfig;
+                if (s != null && d != null)
+                {
+                    d.Channel = s.Channel;
+                    d.Velocity = s.Velocity;
+                    d.StartCc = s.StartCc;
+                    d.CcCount = s.CcCount;
+                    d.StartNote = s.StartNote;
+                    d.NoteCount = s.NoteCount;
+                    dst.RebuildMappings();
+                }
+            }
+
+            // SOCD (#205) is KBM slot-output-shape data, only meaningful
+            // across Keyboard & Mouse slots.
+            if (src.OutputType == Engine.VirtualControllerType.KeyboardMouse
+                && dst.OutputType == Engine.VirtualControllerType.KeyboardMouse)
+            {
+                var s = src.KbmConfig;
+                var d = dst.KbmConfig;
+                if (s != null && d != null)
+                {
+                    d.Surfaces = s.Surfaces;
+                    d.SocdMode = s.SocdMode;
+                    d.SocdPairs = s.SocdPairs;
+                    dst.NotifyKbmSurfacesChanged();
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Copy / Paste clipboard helpers (per-slot)
+        //
+        //  Clipboard Copy/Paste needs to round-trip the per-slot config
+        //  tabs (Lighting / Adaptive Triggers / Mic LED / Player LED /
+        //  Extended custom layout / MIDI CC + note layout) across the
+        //  serialization boundary. The existing Build* / Apply* methods
+        //  above iterate every slot for profile storage; these per-slot
+        //  variants snapshot or apply one slot at a time, mirroring the
+        //  in-process CopySlotConfigsAcrossSlots semantics but via DTOs
+        //  the caller can JSON-serialize.
+        // ─────────────────────────────────────────────
+
+        /// <summary>Snapshots every device config on a single slot
+        /// (anchor + per-device entries). Returns an empty array when
+        /// the slot has nothing configured. Caller is responsible for
+        /// JSON-serializing the result into the clipboard payload.</summary>
+        public ViewModels.DeviceSlotConfigData[] BuildDeviceConfigSnapshotForSlot(int slotIndex)
+        {
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count)
+                return Array.Empty<ViewModels.DeviceSlotConfigData>();
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return Array.Empty<ViewModels.DeviceSlotConfigData>();
+
+            var list = new System.Collections.Generic.List<ViewModels.DeviceSlotConfigData>();
+            if (padVm.DeviceConfig != null)
+                list.Add(BuildDeviceSlotConfigData(padVm.DeviceConfig, slotIndex, Guid.Empty));
+            if (padVm.PerDeviceSlotConfigs != null)
+            {
+                foreach (var kvp in padVm.PerDeviceSlotConfigs)
+                {
+                    if (kvp.Key == Guid.Empty || kvp.Value == null) continue;
+                    list.Add(BuildDeviceSlotConfigData(kvp.Value, slotIndex, kvp.Key));
+                }
+            }
+            return list.ToArray();
+        }
+
+        /// <summary>Paste companion. Applies a clipboard's device-config
+        /// snapshot to the destination slot: the anchor entry
+        /// (DeviceGuid = Empty) writes to <c>padVm.DeviceConfig</c>;
+        /// per-device entries fan out across every entry already in the
+        /// destination's <c>PerDeviceSlotConfigs</c> dict so
+        /// device-switching on the destination doesn't bring back the
+        /// old lightbar. Like the in-process Copy From, this runs
+        /// unconditionally regardless of slot output type. Device
+        /// features are physical-device passthrough.</summary>
+        /// <summary>True when a device-config DTO carries any non-default
+        /// device setting: lighting, adaptive triggers, Mic LED, Player LED, OR audio
+        /// (passthrough / audio-lightbar / mirror source). The audio arm matters because
+        /// the old "is this configured" checks ignored it, so an audio-only setup was
+        /// treated as empty when Copy / Paste / Copy From picked a representative.</summary>
+        public static bool IsDeviceSlotConfigDataConfigured(ViewModels.DeviceSlotConfigData c)
+            => c != null
+            // Rev-aware default checks: a rev-0 DTO (old save / old
+            // profile store, not yet lifted by ApplyDeviceSlotConfigData)
+            // spells "unset" as Off; rev-1 spells it PlayerNumber and
+            // Off there is a deliberate, copy-worthy configuration.
+            && (c.LightbarMode != (c.LightingRev >= 1
+                    ? ViewModels.LightbarMode.PlayerNumber : ViewModels.LightbarMode.Off)
+                || c.LeftTriggerMode != ViewModels.AdaptiveTriggerMode.Off
+                || c.RightTriggerMode != ViewModels.AdaptiveTriggerMode.Off
+                || c.MicLedMode != ViewModels.MicLedMode.Off
+                || c.HeadphoneVolume != 100
+                || c.Ds5AudioBufferLength != PadForge.Common.Input.AudioPassthroughService.Ds5AudioBufferLengthDefault
+                || c.AudioOutputPath != ViewModels.AudioOutputPath.Automatic
+                || c.PlayerLedMode != (c.LightingRev >= 1
+                    ? ViewModels.PlayerLedMode.PlayerNumber : ViewModels.PlayerLedMode.Off)
+                // #209: a chosen Guide LED mode is a deliberate,
+                // copy-worthy configuration (DeviceDefault writes nothing).
+                || c.GuideLedMode != ViewModels.GuideLedMode.DeviceDefault
+                || c.AudioPassthroughEnabled
+                || c.AudioLightbarEnabled
+                || !string.IsNullOrEmpty(c.AudioMirrorSourceId)
+                // #185: a configured engage gate keeps the config alive even
+                // while the passthrough toggle is momentarily off.
+                || (c.AudioMirrorEngageMode != null && c.AudioMirrorEngageMode != "Always")
+                || !string.IsNullOrEmpty(c.AudioMirrorEngageButton)
+                // #202: same keep-alive rule. A chosen tone filter is a
+                // deliberate, copy-worthy configuration.
+                || (c.AudioToneFilterMode != null && c.AudioToneFilterMode != "Off")
+                // #347: a tuned audio chain is deliberate configuration and
+                // must survive the same copy and keep-alive rules.
+                || c.AudioCrossfeedLevel != 0
+                || c.AudioCrossfeedCutHz != 700 || c.AudioCrossfeedFeedDb != 4.5d
+                || c.AudioEqEnabled || !string.IsNullOrEmpty(c.AudioEqBands)
+                || c.AudioEqPreampDb != 0
+                || !c.AudioLimiterEnabled || c.AudioLimiterCeiling != 98
+                || c.AudioPersonaHapticsEnabled || c.AudioPersonaHapticsGain != 100
+                || c.AudioTritonLowPassHz != 250
+                // #239: enabled synthetic pressure is copy-worthy, and a
+                // changed touch level keeps the config alive while the
+                // toggle is momentarily off (the #185/#202 keep-alive rule).
+                || c.TouchpadSyntheticPressure
+                || c.TouchpadSyntheticTouchPercent != 50
+                // An input-reactive overlay is a deliberate configuration on
+                // its own: it rides OVER the base mode, so a slot carrying
+                // only an overlay above a default base is configured.
+                || c.InputReactiveMode != ViewModels.InputReactiveMode.Off);
+
+        /// <summary>VM-shape twin of <see cref="IsDeviceSlotConfigDataConfigured"/>,
+        /// for the in-process Copy From path.</summary>
+        public static bool IsDeviceConfigConfigured(ViewModels.DeviceSlotConfig c)
+            => c != null
+            && (c.LightbarMode != ViewModels.LightbarMode.PlayerNumber
+                || c.LeftTriggerMode != ViewModels.AdaptiveTriggerMode.Off
+                || c.RightTriggerMode != ViewModels.AdaptiveTriggerMode.Off
+                || c.MicLedMode != ViewModels.MicLedMode.Off
+                || c.HeadphoneVolume != 100
+                || c.Ds5AudioBufferLength != PadForge.Common.Input.AudioPassthroughService.Ds5AudioBufferLengthDefault
+                || c.AudioOutputPath != ViewModels.AudioOutputPath.Automatic
+                || c.PlayerLedMode != ViewModels.PlayerLedMode.PlayerNumber
+                || c.GuideLedMode != ViewModels.GuideLedMode.DeviceDefault
+                || c.AudioPassthroughEnabled
+                || c.AudioLightbarEnabled
+                || !string.IsNullOrEmpty(c.AudioMirrorSourceId)
+                || c.AudioMirrorEngageMode != "Always"
+                || !string.IsNullOrEmpty(c.AudioMirrorEngageButton)
+                || c.AudioToneFilterMode != "Off"
+                || c.AudioCrossfeedLevel != 0
+                || c.AudioCrossfeedCutHz != 700 || c.AudioCrossfeedFeedDb != 4.5d
+                || c.AudioEqEnabled || !string.IsNullOrEmpty(c.AudioEqBands)
+                || c.AudioEqPreampDb != 0
+                || !c.AudioLimiterEnabled || c.AudioLimiterCeiling != 98
+                || c.AudioPersonaHapticsEnabled || c.AudioPersonaHapticsGain != 100
+                || c.AudioTritonLowPassHz != 250
+                || c.TouchpadSyntheticPressure
+                || c.TouchpadSyntheticTouchPercent != 50
+                // Same overlay rule as the DTO twin above.
+                || c.InputReactiveMode != ViewModels.InputReactiveMode.Off);
+
+        public void ApplyDeviceSlotConfigsToSlot(int slotIndex,
+            ViewModels.DeviceSlotConfigData[] configs)
+        {
+            if (configs == null || configs.Length == 0) return;
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return;
+
+            // Index the snapshot by device GUID, plus the anchor (Empty GUID).
+            // The copy carries one entry per source device, so the apply lands
+            // each device's settings on the matching destination device instead
+            // of flattening the whole slot to one representative config.
+            var byGuid = new System.Collections.Generic.Dictionary<Guid, ViewModels.DeviceSlotConfigData>();
+            ViewModels.DeviceSlotConfigData anchor = null;
+            foreach (var c in configs)
+            {
+                if (c == null) continue;
+                if (c.DeviceGuid == Guid.Empty) { anchor ??= c; continue; }
+                byGuid[c.DeviceGuid] = c;
+            }
+
+            // Representative config for destination devices the source slot did
+            // not have: a configured anchor, else the first configured per-device
+            // entry, else the anchor so a new device still gets something.
+            var fallback = IsDeviceSlotConfigDataConfigured(anchor) ? anchor : null;
+            if (fallback == null)
+                foreach (var c in configs)
+                    if (IsDeviceSlotConfigDataConfigured(c)) { fallback = c; break; }
+            fallback ??= anchor;
+            if (fallback == null)
+                foreach (var v in byGuid.Values) { fallback = v; break; }
+            if (fallback == null) return;
+
+            padVm.EnsureDeviceSlotConfigsForMappedDevices();
+            if (padVm.PerDeviceSlotConfigs != null)
+            {
+                foreach (var kvp in padVm.PerDeviceSlotConfigs)
+                {
+                    if (kvp.Value == null) continue;
+                    var srcData = byGuid.TryGetValue(kvp.Key, out var m) ? m : fallback;
+                    ApplyDeviceSlotConfigData(kvp.Value, srcData);
+                }
+            }
+            if (padVm.SelectedMappedDevice != null
+                && padVm.SelectedMappedDevice.InstanceGuid != Guid.Empty)
+            {
+                var srcData = byGuid.TryGetValue(padVm.SelectedMappedDevice.InstanceGuid, out var m2)
+                    ? m2 : (anchor ?? fallback);
+                ApplyDeviceSlotConfigData(padVm.DeviceConfig, srcData);
+            }
+        }
+
+        /// <summary>Snapshots the Extended custom layout on a single
+        /// slot. Returns null when the slot isn't Extended or has no
+        /// config. Caller JSON-serializes the result.</summary>
+        public ViewModels.ExtendedSlotConfigData BuildExtendedConfigSnapshotForSlot(int slotIndex)
+        {
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return null;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return null;
+            // The "isn't Extended" half of the contract above. EVERY pad owns an
+            // ExtendedConfig object whether or not it is an Extended slot, so
+            // without this gate copying an Xbox / PlayStation slot exported that
+            // slot's dormant DEFAULTS, and pasting onto a real Extended slot
+            // overwrote its authored counts, VID/PID, and product string.
+            if (padVm.OutputType != Engine.VirtualControllerType.Extended) return null;
+            var cfg = padVm.ExtendedConfig;
+            if (cfg == null) return null;
+            return new ViewModels.ExtendedSlotConfigData
+            {
+                SlotIndex = slotIndex,
+                ThumbstickCount = cfg.ThumbstickCount,
+                TriggerCount = cfg.TriggerCount,
+                PovCount = cfg.PovCount,
+                ButtonCount = cfg.ButtonCount,
+                OemNameOverride = cfg.OemNameOverride,
+                ProductString = cfg.ProductString,
+                VendorId = cfg.VendorId,
+                ProductId = cfg.ProductId,
+                Customize = cfg.Customize,
+                ForceFeedbackEnabled = cfg.ForceFeedbackEnabled,
+            };
+        }
+
+        /// <summary>Paste companion. Only applies when both source and
+        /// destination are Extended slots — the custom layout is the
+        /// virtual controller's shape and doesn't translate to other
+        /// output types.</summary>
+        public void ApplyExtendedConfigToSlot(int slotIndex, ViewModels.ExtendedSlotConfigData cfg)
+        {
+            if (cfg == null) return;
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return;
+            if (padVm.OutputType != Engine.VirtualControllerType.Extended) return;
+            var d = padVm.ExtendedConfig;
+            if (d == null) return;
+            // Triggers to zero FIRST: the two setters clamp against each
+            // other over one axis budget, so writing sticks against a
+            // leftover trigger count silently drops the last stick.
+            d.TriggerCount = 0;
+            d.ThumbstickCount = cfg.ThumbstickCount;
+            d.TriggerCount = cfg.TriggerCount;
+            d.PovCount = cfg.PovCount;
+            d.ButtonCount = cfg.ButtonCount;
+            d.OemNameOverride = cfg.OemNameOverride;
+            d.ProductString = cfg.ProductString ?? string.Empty;
+            d.VendorId = cfg.VendorId;
+            d.ProductId = cfg.ProductId;
+            d.Customize = cfg.Customize;
+            d.ForceFeedbackEnabled = cfg.ForceFeedbackEnabled;
+        }
+
+        /// <summary>Snapshots the MIDI port layout for a single slot.
+        /// Returns null when the slot isn't MIDI.</summary>
+        public ViewModels.MidiSlotConfigData BuildMidiConfigSnapshotForSlot(int slotIndex)
+        {
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return null;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return null;
+            // Same contract gate as the Extended builder above: every pad owns a
+            // dormant MidiConfig, so an ungated copy exported channel 1 /
+            // default ranges from an Xbox slot and clobbered a real MIDI slot's
+            // authored channel and CC/note ranges on paste.
+            if (padVm.OutputType != Engine.VirtualControllerType.Midi) return null;
+            var cfg = padVm.MidiConfig;
+            if (cfg == null) return null;
+            return new ViewModels.MidiSlotConfigData
+            {
+                SlotIndex = slotIndex,
+                Channel = cfg.Channel,
+                Velocity = cfg.Velocity,
+                StartCc = cfg.StartCc,
+                CcCount = cfg.CcCount,
+                StartNote = cfg.StartNote,
+                NoteCount = cfg.NoteCount,
+            };
+        }
+
+        /// <summary>Paste companion. Only applies when both source and
+        /// destination are MIDI slots.</summary>
+        public void ApplyMidiConfigToSlot(int slotIndex, ViewModels.MidiSlotConfigData cfg)
+        {
+            if (cfg == null) return;
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return;
+            if (padVm.OutputType != Engine.VirtualControllerType.Midi) return;
+            var d = padVm.MidiConfig;
+            if (d == null) return;
+            d.Channel = cfg.Channel;
+            d.Velocity = cfg.Velocity;
+            d.StartCc = cfg.StartCc;
+            d.CcCount = cfg.CcCount;
+            d.StartNote = cfg.StartNote;
+            d.NoteCount = cfg.NoteCount;
+            padVm.RebuildMappings();
+        }
+
+        /// <summary>Snapshots the KBM (SOCD) layout for a single slot.
+        /// Returns null when the slot isn't KeyboardMouse.</summary>
+        public ViewModels.KbmSlotConfigData BuildKbmConfigSnapshotForSlot(int slotIndex)
+        {
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return null;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return null;
+            if (padVm.OutputType != Engine.VirtualControllerType.KeyboardMouse) return null;
+            var cfg = padVm.KbmConfig;
+            if (cfg == null) return null;
+            return new ViewModels.KbmSlotConfigData
+            {
+                SlotIndex = slotIndex,
+                Surfaces = cfg.Surfaces,
+                SocdMode = cfg.SocdMode,
+                SocdPairs = cfg.SocdPairs,
+            };
+        }
+
+        /// <summary>Paste companion. Only applies when both source and
+        /// destination are KeyboardMouse slots.</summary>
+        public void ApplyKbmConfigToSlot(int slotIndex, ViewModels.KbmSlotConfigData cfg)
+        {
+            if (cfg == null) return;
+            if (slotIndex < 0 || slotIndex >= _mainVm.Pads.Count) return;
+            var padVm = _mainVm.Pads[slotIndex];
+            if (padVm == null) return;
+            if (padVm.OutputType != Engine.VirtualControllerType.KeyboardMouse) return;
+            var d = padVm.KbmConfig;
+            if (d == null) return;
+            d.Surfaces = cfg.Surfaces;
+            d.SocdMode = cfg.SocdMode;
+            d.SocdPairs = cfg.SocdPairs;
+            // The mode narrows the mapping table and the preview, so a paste
+            // has to tell the view, exactly as a profile apply does.
+            padVm.NotifyKbmSurfacesChanged();
+        }
+
+        /// <summary>
+        /// Applies per-slot Extended configurations.
+        /// Only restores configs for slots that are currently created as Extended.
+        /// </summary>
+        private void ApplyExtendedConfigs(ViewModels.ExtendedSlotConfigData[] configs)
+        {
+            if (configs == null) return;
+            foreach (var cfgData in configs)
+            {
+                int idx = cfgData.SlotIndex;
+                if (idx >= 0 && idx < _mainVm.Pads.Count &&
+                    SettingsManager.SlotCreated[idx] &&
+                    _mainVm.Pads[idx].OutputType == Engine.VirtualControllerType.Extended)
+                {
+                    var cfg = _mainVm.Pads[idx].ExtendedConfig;
+                    // Triggers to zero FIRST: the two setters clamp against
+                    // each other over one axis budget, so writing sticks
+                    // against a leftover trigger count silently drops the
+                    // last stick.
+                    cfg.TriggerCount = 0;
+                    cfg.ThumbstickCount = cfgData.ThumbstickCount;
+                    cfg.TriggerCount = cfgData.TriggerCount;
+                    cfg.PovCount = cfgData.PovCount;
+                    cfg.ButtonCount = cfgData.ButtonCount;
+                    cfg.OemNameOverride = cfgData.OemNameOverride;
+                    cfg.ProductString = cfgData.ProductString ?? string.Empty;
+                    cfg.VendorId = cfgData.VendorId;
+                    cfg.ProductId = cfgData.ProductId;
+                    cfg.Customize = cfgData.Customize;
+                    cfg.ForceFeedbackEnabled = cfgData.ForceFeedbackEnabled;
+                }
+            }
+        }
+
+        /// <summary>Applies per-(slot, device) configurations (adaptive
+        /// triggers, lighting, audio, tone filter). Only restores configs
+        /// for slots that are currently created; the body never gates on
+        /// slot output type.
+        /// <para>Internal: both apply lanes (this file's load path and
+        /// InputService.ApplyProfile) reuse it so a runtime profile switch
+        /// restores lighting / adaptive triggers exactly as app load does.
+        /// Every write mutates the existing DeviceSlotConfig in place and
+        /// never reassigns one, which is load-bearing: UserEffectsDispatcher
+        /// holds a direct PropertyChanged subscription to those instances,
+        /// so replacing one would silently orphan the dispatcher.</para></summary>
+        internal void ApplyDeviceSlotConfigs(ViewModels.DeviceSlotConfigData[] configs)
+        {
+            if (configs == null) return;
+
+            // Pre-scan: which slots already carry per-device entries in
+            // the saved config. v3.1+ saves write one entry per (slot,
+            // device GUID) pair plus a slot-level "anchor" entry (with
+            // DeviceGuid = Empty) for legacy display fallback. The
+            // anchor mirrors whatever device was selected at save time,
+            // so fanning it out across every per-device config (the
+            // pre-v3.1 model) corrupts other devices' settings — most
+            // visibly, it spreads InputReactiveMode = Random from the
+            // selected DualSense to every other Sony pad on the slot
+            // even though Lighting is per-device. Only fan out when
+            // there are NO per-device entries (genuine pre-v3.1 save).
+            var slotsWithPerDeviceEntries = new System.Collections.Generic.HashSet<int>();
+            foreach (var cfgData in configs)
+            {
+                if (cfgData.DeviceGuid != Guid.Empty)
+                    slotsWithPerDeviceEntries.Add(cfgData.SlotIndex);
+            }
+
+            foreach (var cfgData in configs)
+            {
+                int idx = cfgData.SlotIndex;
+                if (idx < 0 || idx >= _mainVm.Pads.Count) continue;
+                // Skip entries for uncreated slots. Older saves (or
+                // pre-2026-05-04 builds before DeleteSlot cleared the
+                // per-device dictionary) can carry stale entries for
+                // slots that have since been deleted; loading them
+                // would resurrect the prior lightbar mode / colors /
+                // palette as soon as the user remaps the same physical
+                // device to a freshly-created slot at the same index.
+                if (!SettingsManager.SlotCreated[idx]) continue;
+                var padVm = _mainVm.Pads[idx];
+
+                // Per-device entry — apply to that device's per-device
+                // DeviceSlotConfig only. The Lighting tab is
+                // per-device, so two pads on one slot legitimately
+                // carry different lightbar / overlay state.
+                if (cfgData.DeviceGuid != Guid.Empty)
+                {
+                    var devCfg = padVm.GetOrCreateDeviceConfig(cfgData.DeviceGuid);
+                    if (devCfg != null)
+                        ApplyDeviceSlotConfigData(devCfg, cfgData);
+                    continue;
+                }
+
+                // Slot-level entry — always apply to the anchor so the
+                // Lighting tab shows something reasonable before any
+                // device is selected. Fan out to per-device configs
+                // ONLY when this slot has zero per-device entries (a
+                // pre-v3.1 save where lighting was slot-wide); v3.1+
+                // saves are authoritative per-device.
+                if (padVm.DeviceConfig != null)
+                    ApplyDeviceSlotConfigData(padVm.DeviceConfig, cfgData);
+                if (!slotsWithPerDeviceEntries.Contains(idx))
+                {
+                    foreach (var devCfg in padVm.PerDeviceSlotConfigs.Values)
+                    {
+                        if (devCfg != null && !ReferenceEquals(devCfg, padVm.DeviceConfig))
+                            ApplyDeviceSlotConfigData(devCfg, cfgData);
+                    }
+                }
+            }
+        }
+
+        /// <summary>Writes the saved DTO fields into a single
+        /// DeviceSlotConfig instance. Extracted so the loader can
+        /// call it once per per-device entry, or once per slot when
+        /// fanning out a legacy slot-level entry to every device.</summary>
+        // Internal (not private) so the tests can drive the LightingRev
+        // migration below directly (InternalsVisibleTo PadForge.Tests).
+        internal static void ApplyDeviceSlotConfigData(ViewModels.DeviceSlotConfig cfg, ViewModels.DeviceSlotConfigData cfgData)
+        {
+            if (cfg == null) return;
+                    cfg.LeftTriggerMode = cfgData.LeftTriggerMode;
+                    cfg.RightTriggerMode = cfgData.RightTriggerMode;
+                    cfg.LeftStartPosition = cfgData.LeftStartPosition;
+                    cfg.LeftEndPosition = cfgData.LeftEndPosition;
+                    cfg.LeftStrength = cfgData.LeftStrength;
+                    cfg.LeftFrequency = cfgData.LeftFrequency;
+                    cfg.RightStartPosition = cfgData.RightStartPosition;
+                    cfg.RightEndPosition = cfgData.RightEndPosition;
+                    cfg.RightStrength = cfgData.RightStrength;
+                    cfg.RightFrequency = cfgData.RightFrequency;
+                    cfg.LightbarRed = cfgData.LightbarRed;
+                    cfg.LightbarGreen = cfgData.LightbarGreen;
+                    cfg.LightbarBlue = cfgData.LightbarBlue;
+                    cfg.LightbarEnabled = cfgData.LightbarEnabled;
+                    cfg.AudioPassthroughEnabled = cfgData.AudioPassthroughEnabled;
+                    cfg.AudioMirrorSourceId = cfgData.AudioMirrorSourceId ?? string.Empty;
+                    cfg.TouchpadSyntheticPressure = cfgData.TouchpadSyntheticPressure;
+                    cfg.TouchpadSyntheticTouchPercent = cfgData.TouchpadSyntheticTouchPercent;
+                    cfg.AudioMirrorEngageMode = cfgData.AudioMirrorEngageMode ?? "Always";
+                    cfg.AudioMirrorEngageDeviceGuid = cfgData.AudioMirrorEngageDeviceGuid ?? string.Empty;
+                    cfg.AudioMirrorEngageButton = cfgData.AudioMirrorEngageButton ?? string.Empty;
+                    cfg.AudioMirrorEngageReleaseMs = cfgData.AudioMirrorEngageReleaseMs;
+                    cfg.AudioToneFilterMode = cfgData.AudioToneFilterMode ?? "Off";
+                    cfg.AudioToneLimitHz = cfgData.AudioToneLimitHz;
+                    cfg.AudioCrossfeedLevel = cfgData.AudioCrossfeedLevel;
+                    cfg.AudioCrossfeedCutHz = cfgData.AudioCrossfeedCutHz;
+                    cfg.AudioCrossfeedFeedDb = cfgData.AudioCrossfeedFeedDb;
+                    cfg.AudioEqEnabled = cfgData.AudioEqEnabled;
+                    cfg.AudioEqBands = cfgData.AudioEqBands ?? string.Empty;
+                    cfg.AudioEqPreampDb = cfgData.AudioEqPreampDb;
+                    cfg.AudioLimiterEnabled = cfgData.AudioLimiterEnabled;
+                    cfg.AudioLimiterCeiling = cfgData.AudioLimiterCeiling;
+                    cfg.AudioPersonaHapticsEnabled = cfgData.AudioPersonaHapticsEnabled;
+                    cfg.AudioPersonaHapticsGain = cfgData.AudioPersonaHapticsGain;
+                    cfg.AudioTritonLowPassHz = cfgData.AudioTritonLowPassHz;
+                    // Migrate legacy MicLightOn to the new MicLedMode if
+                    // the new field hasn't been set explicitly.
+                    if (cfgData.MicLedMode != ViewModels.MicLedMode.Off)
+                        cfg.MicLedMode = cfgData.MicLedMode;
+                    else
+                        cfg.MicLightOn = cfgData.MicLightOn;
+                    cfg.MicLedFollowDeviceId = cfgData.MicLedFollowDeviceId ?? string.Empty;
+                    cfg.HeadphoneVolume = cfgData.HeadphoneVolume;
+                    cfg.Ds5AudioBufferLength = cfgData.Ds5AudioBufferLength;
+                    cfg.AudioOutputPath = cfgData.AudioOutputPath;
+                    cfg.PlayerLedMode = cfgData.PlayerLedMode;
+                    cfg.PlayerLedBrightness = cfgData.PlayerLedBrightness;
+                    cfg.GuideLedMode = cfgData.GuideLedMode;
+                    cfg.GuideLedBrightness = cfgData.GuideLedBrightness;
+                    cfg.AudioLightbarEnabled = cfgData.AudioLightbarEnabled;
+                    cfg.AudioLightbarSensitivity = cfgData.AudioLightbarSensitivity;
+                    cfg.AudioLightbarMode = cfgData.AudioLightbarMode;
+                    cfg.AudioLowR = cfgData.AudioLowR;
+                    cfg.AudioLowG = cfgData.AudioLowG;
+                    cfg.AudioLowB = cfgData.AudioLowB;
+                    cfg.AudioMidR = cfgData.AudioMidR;
+                    cfg.AudioMidG = cfgData.AudioMidG;
+                    cfg.AudioMidB = cfgData.AudioMidB;
+                    cfg.AudioHighR = cfgData.AudioHighR;
+                    cfg.AudioHighG = cfgData.AudioHighG;
+                    cfg.AudioHighB = cfgData.AudioHighB;
+                    cfg.AudioLowToMidPercent = cfgData.AudioLowToMidPercent;
+                    cfg.AudioMidToHighPercent = cfgData.AudioMidToHighPercent;
+                    cfg.AudioCrossFadePercent = cfgData.AudioCrossFadePercent;
+
+                    // Unified lightbar mode (v3.1.0+). Migrate from the
+                    // legacy bools when the saved value is at the default.
+                    // Rev-1 saves skip the fallback entirely: Off is a
+                    // deliberate hard-off there, and the legacy bools
+                    // round-trip stale (LightbarEnabled is never cleared
+                    // when the user changes modes), so consulting them
+                    // would resurrect Static over a chosen Off.
+                    cfg.LightbarMode = cfgData.LightingRev >= 1
+                        || cfgData.LightbarMode != ViewModels.LightbarMode.Off
+                        ? cfgData.LightbarMode
+                        : cfgData.AudioLightbarEnabled
+                            ? cfgData.AudioLightbarMode switch
+                            {
+                                ViewModels.AudioLightbarMode.Pulse      => ViewModels.LightbarMode.AudioPulse,
+                                ViewModels.AudioLightbarMode.Thresholds => ViewModels.LightbarMode.AudioThresholds,
+                                ViewModels.AudioLightbarMode.Gradient   => ViewModels.LightbarMode.AudioGradient,
+                                ViewModels.AudioLightbarMode.CrossFade  => ViewModels.LightbarMode.AudioCrossFade,
+                                _                                       => ViewModels.LightbarMode.AudioPulse,
+                            }
+                            : cfgData.LightbarEnabled
+                                ? ViewModels.LightbarMode.Static
+                                : ViewModels.LightbarMode.Off;
+                    cfg.LightbarPeriodMs = cfgData.LightbarPeriodMs;
+                    cfg.LightbarColorCycleSmooth = cfgData.LightbarColorCycleSmooth;
+                    cfg.LightbarRainbowBrightness = cfgData.LightbarRainbowBrightness;
+                    cfg.LightbarBatteryLowR  = cfgData.LightbarBatteryLowR;
+                    cfg.LightbarBatteryLowG  = cfgData.LightbarBatteryLowG;
+                    cfg.LightbarBatteryLowB  = cfgData.LightbarBatteryLowB;
+                    cfg.LightbarBatteryHighR = cfgData.LightbarBatteryHighR;
+                    cfg.LightbarBatteryHighG = cfgData.LightbarBatteryHighG;
+                    cfg.LightbarBatteryHighB = cfgData.LightbarBatteryHighB;
+                    if (cfgData.LightbarPalette != null && cfgData.LightbarPalette.Length > 0)
+                    {
+                        cfg.ReplaceLightbarPalette(cfgData.LightbarPalette
+                            .Select(e => new ViewModels.LightbarPaletteEntry(e.R, e.G, e.B)));
+                    }
+                    // InputReactive = Cycle now has its own palette. Pre-split saves don't carry
+                    // it (null), so seed it from the shared LightbarPalette to preserve existing
+                    // setups; once present it round-trips independently.
+                    if (cfgData.LightbarInputReactivePalette != null && cfgData.LightbarInputReactivePalette.Length > 0)
+                    {
+                        cfg.ReplaceLightbarInputReactivePalette(cfgData.LightbarInputReactivePalette
+                            .Select(e => new ViewModels.LightbarPaletteEntry(e.R, e.G, e.B)));
+                    }
+                    else if (cfgData.LightbarPalette != null && cfgData.LightbarPalette.Length > 0)
+                    {
+                        cfg.ReplaceLightbarInputReactivePalette(cfgData.LightbarPalette
+                            .Select(e => new ViewModels.LightbarPaletteEntry(e.R, e.G, e.B)));
+                    }
+                    cfg.LightbarInputHoldMs = cfgData.LightbarInputHoldMs;
+                    cfg.LightbarInputDecayMs = cfgData.LightbarInputDecayMs;
+                    cfg.InputReactiveR = cfgData.InputReactiveR;
+                    cfg.InputReactiveG = cfgData.InputReactiveG;
+                    cfg.InputReactiveB = cfgData.InputReactiveB;
+
+                    // v3.1.0 migration: the LightbarInputRandomize bool used
+                    // to gate cycle-vs-random in the InputReactive mode; now
+                    // each is its own LightbarMode entry. Old saves with the
+                    // bool at false flip to InputReactiveCycle.
+                    if (cfg.LightbarMode == ViewModels.LightbarMode.InputReactive
+                        && !cfgData.LightbarInputRandomize)
+                    {
+                        cfg.LightbarMode = ViewModels.LightbarMode.InputReactiveCycle;
+                    }
+
+                    // v3.2 migration: the InputReactive* values used to be
+                    // base-mode entries; they are now an OVERLAY layered on
+                    // top of the base. If the saved file already carries a
+                    // non-Off InputReactiveMode, honor it and leave the base
+                    // alone. Otherwise, translate any legacy InputReactive*
+                    // base-mode value into (LightbarMode = Off, overlay =
+                    // corresponding) so the visual result matches what users
+                    // had before — a black base with a reactive flash. Users
+                    // can re-pick a richer base mode under the overlay later.
+                    // Resolve the incoming overlay FIRST, Off included. An
+                    // incoming Off is an authored "no overlay", so applying
+                    // one config over another has to clear what the
+                    // destination carried. Leaving the assignment inside the
+                    // non-Off arm meant a current-format save with no overlay
+                    // matched none of the legacy cases below and silently kept
+                    // the previous profile's overlay.
+                    cfg.InputReactiveMode = cfgData.InputReactiveMode;
+                    if (cfgData.InputReactiveMode == ViewModels.InputReactiveMode.Off)
+                    {
+                        switch (cfg.LightbarMode)
+                        {
+                            case ViewModels.LightbarMode.InputReactive:
+                                cfg.InputReactiveMode = ViewModels.InputReactiveMode.Random;
+                                cfg.LightbarMode = ViewModels.LightbarMode.Off;
+                                break;
+                            case ViewModels.LightbarMode.InputReactiveCycle:
+                                cfg.InputReactiveMode = ViewModels.InputReactiveMode.Cycle;
+                                cfg.LightbarMode = ViewModels.LightbarMode.Off;
+                                break;
+                            case ViewModels.LightbarMode.InputReactiveFixed:
+                                cfg.InputReactiveMode = ViewModels.InputReactiveMode.Fixed;
+                                // Legacy InputReactiveFixed flashed
+                                // LightbarRed/G/B; preserve that color
+                                // intent on the new dedicated overlay
+                                // RGB so the per-press flash keeps its
+                                // configured color across migration.
+                                cfg.InputReactiveR = cfgData.LightbarRed;
+                                cfg.InputReactiveG = cfgData.LightbarGreen;
+                                cfg.InputReactiveB = cfgData.LightbarBlue;
+                                cfg.LightbarMode = ViewModels.LightbarMode.Off;
+                                break;
+                        }
+                    }
+
+                    // LightingRev 0 → 1 (#191 follow-up): before the
+                    // PlayerNumber default existed, Off doubled as
+                    // "unset". Every untouched slot serialized Off, so
+                    // lift those to the v4 default and upgraders get the
+                    // player-identity idle out of the box. Rev-1 saves
+                    // take Off literally: it means dark.
+                    //
+                    // Guard the lightbar lift on "no reactive overlay".
+                    // A slot with an active input-reactive overlay rested
+                    // on a dark base in every prior release (the v3.2
+                    // split parks the legacy InputReactive base at Off,
+                    // and #191 rendered that Off as black under the
+                    // flash). Lifting it to PlayerNumber would swap the
+                    // user's reactive-from-darkness effect for a
+                    // player-color glow that merely brightens on press.
+                    // Leave those dark; only genuinely-idle lightbars
+                    // (no overlay) inherit the floor. Pips carry no
+                    // overlay concept, so they always lift.
+                    if (cfgData.LightingRev < 1)
+                    {
+                        if (cfg.LightbarMode == ViewModels.LightbarMode.Off
+                            && cfg.InputReactiveMode == ViewModels.InputReactiveMode.Off)
+                            cfg.LightbarMode = ViewModels.LightbarMode.PlayerNumber;
+                        if (cfg.PlayerLedMode == ViewModels.PlayerLedMode.Off)
+                            cfg.PlayerLedMode = ViewModels.PlayerLedMode.PlayerNumber;
+                    }
+        }
+
+        /// <summary>
+        /// Applies per-slot MIDI configurations.
+        /// Only restores configs for slots that are currently created as MIDI.
+        /// </summary>
+        private void ApplyMidiConfigs(ViewModels.MidiSlotConfigData[] configs)
+        {
+            if (configs == null) return;
+            foreach (var cfgData in configs)
+            {
+                int idx = cfgData.SlotIndex;
+                if (idx >= 0 && idx < _mainVm.Pads.Count &&
+                    SettingsManager.SlotCreated[idx] &&
+                    _mainVm.Pads[idx].OutputType == Engine.VirtualControllerType.Midi)
+                {
+                    var cfg = _mainVm.Pads[idx].MidiConfig;
+                    cfg.Channel = cfgData.Channel;
+                    cfg.Velocity = cfgData.Velocity;
+                    cfg.StartCc = cfgData.StartCc;
+                    cfg.CcCount = cfgData.CcCount;
+                    cfg.StartNote = cfgData.StartNote;
+                    cfg.NoteCount = cfgData.NoteCount;
+                    _mainVm.Pads[idx].RebuildMappings();
+
+                    // A load, under the reload guard, so the grid's edit hooks
+                    // never read the saved descriptors as the user's binding.
+                    // Set after the rebuild, whose own refresh clears it.
+                    bool suppressed = InputService.SuppressMappingEditPush;
+                    InputService.SuppressMappingEditPush = true;
+                    try
+                    {
+                        lock (SettingsManager.UserSettings.SyncRoot)
+                        {
+                            foreach (var us in SettingsManager.UserSettings.Items)
+                            {
+                                if (us.MapTo != idx) continue;
+                                var ps = us.GetPadSetting();
+                                if (ps == null) continue;
+                                foreach (var mapping in _mainVm.Pads[idx].Mappings)
+                                {
+                                    string target = mapping.TargetSettingName;
+                                    string value = target.StartsWith("Midi", StringComparison.Ordinal)
+                                        ? ps.GetMidiMapping(target) : string.Empty;
+                                    if (!string.IsNullOrEmpty(value))
+                                        mapping.LoadDescriptor(value);
+                                    if (mapping.NegSettingName != null)
+                                    {
+                                        string negValue = mapping.NegSettingName.StartsWith("Midi", StringComparison.Ordinal)
+                                            ? ps.GetMidiMapping(mapping.NegSettingName) : string.Empty;
+                                        if (!string.IsNullOrEmpty(negValue))
+                                            mapping.LoadNegDescriptor(negValue);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    finally { InputService.SuppressMappingEditPush = suppressed; }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Restores KBM configurations for created slots, including settings
+        /// parked while a slot uses another output type.
+        /// </summary>
+        private void ApplyKbmConfigs(ViewModels.KbmSlotConfigData[] configs)
+        {
+            if (configs == null) return;
+            foreach (var cfgData in configs)
+            {
+                int idx = cfgData.SlotIndex;
+                if (idx >= 0 && idx < _mainVm.Pads.Count &&
+                    SettingsManager.SlotCreated[idx])
+                {
+                    var cfg = _mainVm.Pads[idx].KbmConfig;
+                    cfg.Surfaces = cfgData.Surfaces;
+                    cfg.SocdMode = cfgData.SocdMode;
+                    cfg.SocdPairs = cfgData.SocdPairs;
+                    // The mode narrows the mapping table, so the view has to
+                    // hear about a load, not just about the dropdown (#408).
+                    _mainVm.Pads[idx].NotifyKbmSurfacesChanged();
+                }
+            }
+        }
+
+        /// <summary>
+        /// For old settings files without SlotCreated: creates slots for any
+        /// indices that have device assignments.
+        /// </summary>
+        private static void AutoCreateSlotsFromExistingAssignments()
+        {
+            var settings = SettingsManager.UserSettings;
+            if (settings == null) return;
+
+            lock (settings.SyncRoot)
+            {
+                foreach (var us in settings.Items)
+                {
+                    int idx = us.MapTo;
+                    if (idx >= 0 && idx < InputManager.MaxPads)
+                    {
+                        SettingsManager.SlotCreated[idx] = true;
+                        SettingsManager.SlotEnabled[idx] = true;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Pushes per-pad settings to PadViewModels.
+        /// Only loads the first device encountered per slot — the user can switch
+        /// to other devices via the dropdown, which triggers a live swap.
+        /// </summary>
+        private void LoadPadSettings(UserSetting[] settings, PadSetting[] padSettings)
+        {
+            if (settings == null || padSettings == null)
+                return;
+
+            var loadedSlots = new System.Collections.Generic.HashSet<int>();
+
+            foreach (var us in settings)
+            {
+                int padIndex = us.MapTo;
+                if (padIndex < 0 || padIndex >= _mainVm.Pads.Count)
+                    continue;
+
+                // Only load the first device's PadSetting into the ViewModel per slot.
+                if (!loadedSlots.Add(padIndex))
+                    continue;
+
+                var padVm = _mainVm.Pads[padIndex];
+                var ps = us.GetPadSetting();
+                if (ps == null)
+                    continue;
+
+                // Load force feedback settings.
+                padVm.ForceOverallGain = TryParseInt(ps.ForceOverall, 100);
+                padVm.WheelRotationRange = TryParseInt(ps.RotationRange, 900);
+                padVm.WheelAutoCenter = TryParseInt(ps.AutoCenterStrength, 0);
+                padVm.WheelRpmLeds = ps.WheelRpmLeds == "1";
+                padVm.LeftMotorStrength = TryParseInt(ps.LeftMotorStrength, 100);
+                padVm.RightMotorStrength = TryParseInt(ps.RightMotorStrength, 100);
+                padVm.SwapMotors = ps.ForceSwapMotor == "1" ||
+                    (ps.ForceSwapMotor ?? "").Equals("true", StringComparison.OrdinalIgnoreCase);
+                padVm.TriggerRumbleFold = ps.TriggerRumbleFold == "1";
+
+                // Load impulse trigger settings (Xbox One+).
+                padVm.ImpulseOverallGain = TryParseInt(ps.ImpulseOverallGain, 100);
+                padVm.ImpulseLeftStrength = TryParseInt(ps.ImpulseLeftStrength, 100);
+                padVm.ImpulseRightStrength = TryParseInt(ps.ImpulseRightStrength, 100);
+                padVm.ImpulseSwapTriggers = ps.ImpulseSwapTriggers == "1" ||
+                    (ps.ImpulseSwapTriggers ?? "").Equals("true", StringComparison.OrdinalIgnoreCase);
+                padVm.AtVibrationToImpulse = ps.AtVibrationToImpulseEnabled == "1";
+                padVm.ConstantTriggerForceEnabled = ps.ConstantTriggerForceEnabled == "1";
+                padVm.ConstantTriggerForceLeft = TryParseDouble(ps.ConstantTriggerForceLeft, 0.0);
+                padVm.ConstantTriggerForceRight = TryParseDouble(ps.ConstantTriggerForceRight, 0.0);
+                padVm.AudioRumbleTriggersEnabled = ps.AudioRumbleTriggersEnabled == "1";
+                padVm.AudioRumbleTriggersSensitivity = TryParseDouble(ps.AudioRumbleTriggersSensitivity, 4.0);
+                padVm.AudioRumbleTriggersCutoffHz = TryParseDouble(ps.AudioRumbleTriggersCutoffHz, 80.0);
+                padVm.AudioRumbleLeftTrigger = TryParseInt(ps.AudioRumbleLeftTrigger, 100);
+                padVm.AudioRumbleRightTrigger = TryParseInt(ps.AudioRumbleRightTrigger, 100);
+
+                // Load gyro tuning (per-(device, slot)).
+                padVm.GyroSensitivityH = TryParseDouble(ps.GyroSensitivityH, 1.0);
+                padVm.GyroSensitivityV = TryParseDouble(ps.GyroSensitivityV, 1.0);
+                padVm.GyroDeadZoneDegPerSec = TryParseDouble(ps.GyroDeadZoneDegPerSec, 3.0);
+                padVm.GyroSmoothingAlpha = TryParseDouble(ps.GyroSmoothingAlpha, 0);
+                padVm.GyroAcceleration = TryParseDouble(ps.GyroAcceleration, 0);
+                padVm.GyroOutputCurve = string.IsNullOrEmpty(ps.GyroOutputCurve) ? "Linear" : ps.GyroOutputCurve;
+                padVm.GyroSensitivityUnits = string.IsNullOrEmpty(ps.GyroSensitivityUnits) ? "Multiplier" : ps.GyroSensitivityUnits;
+                padVm.GyroEasyAimStickThreshold = TryParseDouble(ps.GyroEasyAimStickThreshold, 0);
+                padVm.GyroEngageStickSide = string.IsNullOrEmpty(ps.GyroEngageStickSide) ? "Right" : ps.GyroEngageStickSide;
+                padVm.GyroEngageStickDirection = string.IsNullOrEmpty(ps.GyroEngageStickDirection) ? "Full" : ps.GyroEngageStickDirection;
+                padVm.IrSensorBarPos = TryParseInt(ps.IrSensorBarPos, 0);
+                padVm.IrSensorBarCompPercent = (int)Math.Round(TryParseDouble(ps.IrSensorBarComp, 0) * 100.0);
+                padVm.IrSmoothingPercent = (int)Math.Round(TryParseDouble(ps.IrSmoothing, 0) * 100.0);
+                padVm.PointerMode = string.IsNullOrEmpty(ps.PointerMode) ? "Mouse" : ps.PointerMode;
+                padVm.PointerFpsSpeed = TryParseInt(ps.PointerFpsSpeed, 35);
+
+                // Load JoyShockMapper-canongyro extensions.
+                padVm.GyroSpace = string.IsNullOrEmpty(ps.GyroSpace) ? "Local" : ps.GyroSpace;
+
+                // This is the SECOND loader of MotionGrip. The first,
+                // InputService.LoadPadSettingIntoViewModel, raises
+                // IsLoadingPadSetting so the MainWindow listener can tell a
+                // stored value from a user change of hold (#392). Without the
+                // same flag here, a settings reload while the engine runs read
+                // as a user edit and dropped every device's live gravity and
+                // shake estimate on the slot, which is what the flag exists
+                // to prevent.
+                bool wasLoadingGrip = padVm.IsLoadingPadSetting;
+                padVm.IsLoadingPadSetting = true;
+                try
+                {
+                    padVm.MotionGrip = string.IsNullOrEmpty(ps.MotionGrip) ? "Pointing" : ps.MotionGrip;
+                }
+                finally { padVm.IsLoadingPadSetting = wasLoadingGrip; }
+                padVm.GyroPlayerSpaceYawRelaxFactor = TryParseDouble(ps.GyroPlayerSpaceYawRelaxFactor, 1.41);
+                padVm.GyroWorldSpaceSideReductionThreshold = TryParseDouble(ps.GyroWorldSpaceSideReductionThreshold, 0.125);
+                padVm.GyroTighteningThresholdDegPerSec = TryParseDouble(ps.GyroTighteningThresholdDegPerSec, 3.0);
+                padVm.GyroSmoothingThresholdDegPerSec = TryParseDouble(ps.GyroSmoothingThresholdDegPerSec, 8.0);
+                padVm.GyroSmoothingWindowMs = TryParseDouble(ps.GyroSmoothingWindowMs, 50);
+                padVm.GyroRealWorldCalibration = TryParseDouble(ps.GyroRealWorldCalibration, 0);
+                padVm.GyroAimEngageButton = ps.GyroAimEngageButton ?? "";
+                padVm.GyroAimEngageDeviceGuid = ps.GyroAimEngageDeviceGuid ?? "";
+                padVm.GyroAimEngageMode = string.IsNullOrEmpty(ps.GyroAimEngageMode) ? "Hold" : ps.GyroAimEngageMode;
+                // The engine's reader (InputService.TryParseBoolPs), so a stored
+                // "true" shows checked where the engine runs it.
+                padVm.GyroInvertPitch = InputService.TryParseBoolPs(ps.GyroInvertPitch, false);
+                padVm.GyroCompassYaw = InputService.TryParseBoolPs(ps.GyroCompassYaw, false);
+                padVm.GyroSimulation = InputService.TryParseBoolPs(ps.GyroSimulation, false);
+                padVm.GyroSimulationSmoothingMs = TryParseDouble(ps.GyroSimulationSmoothingMs, PadForge.Engine.SimulatedGyro.DefaultSmoothingMs);
+                padVm.GyroInvertYaw = InputService.TryParseBoolPs(ps.GyroInvertYaw, false);
+                padVm.GyroInvertRoll = InputService.TryParseBoolPs(ps.GyroInvertRollEffective, false);
+                padVm.GyroApplyTuningToPassthrough = InputService.TryParseBoolPs(ps.GyroApplyTuningToPassthrough, false);
+
+                // Load Motion Steering tuning (per-(device, slot)) — settings for the
+                // "Motion Lean" input descriptor. The old Enabled/Target keys are gone
+                // (the input is mapped from the picker, never stamped onto a target);
+                // stale keys in old profiles are simply never read.
+                padVm.MotionSteerInnerDz = TryParseDouble(ps.GetRawMapping("MotionSteerInner"), 15);
+                padVm.MotionSteerOuterDz = TryParseDouble(ps.GetRawMapping("MotionSteerOuter"), 135);
+                padVm.SetMotionSteerOrient(ps.GetRawMapping("MotionSteerOrient"));
+                padVm.GyroTiltRangeDeg = TryParseDouble(ps.GetRawMapping("GyroTiltRange"), 25);
+                padVm.GyroTiltInnerDz = TryParseDouble(ps.GetRawMapping("GyroTiltInner"), 0);
+
+                // Load Flick Stick card tuning (#225), same per-(device, slot)
+                // extended-mapping bag; seeds from a Workshop import's flick
+                // source when the card was never stored.
+                LoadFlickStickCard(padVm, ps, us.InstanceGuid);
+
+                // Load audio bass rumble settings.
+                padVm.AudioRumbleEnabled = ps.AudioRumbleEnabled == "1";
+                padVm.AudioRumbleSensitivity = TryParseDouble(ps.AudioRumbleSensitivity, 4.0);
+                padVm.AudioRumbleCutoffHz = TryParseDouble(ps.AudioRumbleCutoffHz, 80.0);
+                padVm.AudioRumbleLeftMotor = TryParseInt(ps.AudioRumbleLeftMotor, 100);
+                padVm.AudioRumbleRightMotor = TryParseInt(ps.AudioRumbleRightMotor, 100);
+
+                // Load constant force settings.
+                padVm.ConstantForceEnabled = ps.ConstantForceEnabled == "1";
+                padVm.ConstantForceX = TryParseDouble(ps.ConstantForceX, 0.0);
+                padVm.ConstantForceY = TryParseDouble(ps.ConstantForceY, 0.0);
+
+                // Steering at-lock feedback (#94).
+                padVm.SteeringAngleRumbleEnabled = ps.SteeringAngleRumbleEnabled == "1";
+                padVm.SteeringAngleRumbleAxis = TryParseInt(ps.SteeringAngleRumbleAxis, 0);
+                padVm.SteeringAngleRumbleStrength = TryParseInt(ps.SteeringAngleRumbleStrength, 50);
+                padVm.SteeringAngleRumbleDeadzone = TryParseInt(ps.SteeringAngleRumbleDeadzone, 2);
+                padVm.SteeringLockRumbleEnabled = ps.SteeringLockRumbleEnabled == "1";
+                padVm.SteeringLockTriggerVibEnabled = ps.SteeringLockTriggerVibEnabled == "1";
+                padVm.SteeringLockLightbarEnabled = ps.SteeringLockLightbarEnabled == "1";
+                padVm.SteeringLockATResistanceEnabled = ps.SteeringLockATResistanceEnabled == "1";
+                padVm.SteeringLockPulseMs = TryParseDouble(ps.SteeringLockPulseMs, 80);
+                padVm.SteeringLockLightbarColor = string.IsNullOrWhiteSpace(ps.SteeringLockLightbarColor) ? "#FF0000" : ps.SteeringLockLightbarColor;
+                padVm.SteeringLockLightbarColorSource =
+                    Enum.TryParse<ViewModels.MacroLightbarColorSource>(ps.SteeringLockLightbarColorSource, out var slcs)
+                        ? slcs : ViewModels.MacroLightbarColorSource.Fixed;
+                padVm.SteeringLockLightbarPaletteCsv = ps.SteeringLockLightbarPaletteCsv ?? "";
+                padVm.SteeringLockLightbarHoldMs = TryParseDouble(ps.SteeringLockLightbarHoldMs, 80);
+                padVm.SteeringLockLightbarFadeMs = TryParseDouble(ps.SteeringLockLightbarFadeMs, 250);
+
+                // Trigger rumble routing (#102), mirroring the device-switch
+                // load in InputService.LoadPadSettingToViewModel so the first
+                // device per slot gets the same field set at startup.
+                padVm.LeftTriggerRouteSource = string.IsNullOrEmpty(ps.LeftTriggerRouteSource) ? "None" : ps.LeftTriggerRouteSource;
+                padVm.RightTriggerRouteSource = string.IsNullOrEmpty(ps.RightTriggerRouteSource) ? "None" : ps.RightTriggerRouteSource;
+                padVm.LeftTriggerRouteMode = string.IsNullOrEmpty(ps.LeftTriggerRouteMode) ? "Duplicate" : ps.LeftTriggerRouteMode;
+                padVm.RightTriggerRouteMode = string.IsNullOrEmpty(ps.RightTriggerRouteMode) ? "Duplicate" : ps.RightTriggerRouteMode;
+                padVm.LeftTriggerRouteScale = TryParseInt(ps.LeftTriggerRouteScale, 100);
+                padVm.RightTriggerRouteScale = TryParseInt(ps.RightTriggerRouteScale, 100);
+                padVm.LeftTriggerRouteActivator = ps.LeftTriggerRouteActivator ?? "";
+                padVm.RightTriggerRouteActivator = ps.RightTriggerRouteActivator ?? "";
+                padVm.LeftTriggerRouteActivatorDeviceGuid = ps.LeftTriggerRouteActivatorDeviceGuid ?? "";
+                padVm.RightTriggerRouteActivatorDeviceGuid = ps.RightTriggerRouteActivatorDeviceGuid ?? "";
+                padVm.LeftTriggerRouteActivatorMode = string.IsNullOrEmpty(ps.LeftTriggerRouteActivatorMode) ? "Hold" : ps.LeftTriggerRouteActivatorMode;
+                padVm.RightTriggerRouteActivatorMode = string.IsNullOrEmpty(ps.RightTriggerRouteActivatorMode) ? "Hold" : ps.RightTriggerRouteActivatorMode;
+
+                // Load deadzone settings (independent X/Y).
+                padVm.LeftDeadZoneShape = (int)InputManager.ParseDeadZoneShape(ps.LeftThumbDeadZoneShape);
+                padVm.LeftDeadZoneX = TryParseDouble(ps.LeftThumbDeadZoneX, 0);
+                padVm.LeftDeadZoneY = TryParseDouble(ps.LeftThumbDeadZoneY, 0);
+                padVm.RightDeadZoneShape = (int)InputManager.ParseDeadZoneShape(ps.RightThumbDeadZoneShape);
+                padVm.RightDeadZoneX = TryParseDouble(ps.RightThumbDeadZoneX, 0);
+                padVm.RightDeadZoneY = TryParseDouble(ps.RightThumbDeadZoneY, 0);
+                ps.MigrateAntiDeadZones();
+                padVm.LeftAntiDeadZoneX = TryParseDouble(ps.LeftThumbAntiDeadZoneX, 0);
+                padVm.LeftAntiDeadZoneY = TryParseDouble(ps.LeftThumbAntiDeadZoneY, 0);
+                padVm.RightAntiDeadZoneX = TryParseDouble(ps.RightThumbAntiDeadZoneX, 0);
+                padVm.RightAntiDeadZoneY = TryParseDouble(ps.RightThumbAntiDeadZoneY, 0);
+                padVm.LeftLinear = TryParseDouble(ps.LeftThumbLinear, 0);
+                padVm.RightLinear = TryParseDouble(ps.RightThumbLinear, 0);
+                padVm.LeftSensitivityCurveX = ps.LeftThumbSensitivityCurveX ?? "0,0;1,1";
+                padVm.LeftSensitivityCurveY = ps.LeftThumbSensitivityCurveY ?? "0,0;1,1";
+                padVm.RightSensitivityCurveX = ps.RightThumbSensitivityCurveX ?? "0,0;1,1";
+                padVm.RightSensitivityCurveY = ps.RightThumbSensitivityCurveY ?? "0,0;1,1";
+                padVm.LeftTriggerSensitivityCurve = ps.LeftTriggerSensitivityCurve ?? "0,0;1,1";
+                padVm.RightTriggerSensitivityCurve = ps.RightTriggerSensitivityCurve ?? "0,0;1,1";
+                padVm.LeftMaxRangeX = TryParseDouble(ps.LeftThumbMaxRangeX, 100);
+                padVm.LeftMaxRangeY = TryParseDouble(ps.LeftThumbMaxRangeY, 100);
+                padVm.RightMaxRangeX = TryParseDouble(ps.RightThumbMaxRangeX, 100);
+                padVm.RightMaxRangeY = TryParseDouble(ps.RightThumbMaxRangeY, 100);
+                ps.MigrateMaxRangeDirections();
+                padVm.LeftMaxRangeXNeg = TryParseDouble(ps.LeftThumbMaxRangeXNeg, 100);
+                padVm.LeftMaxRangeYNeg = TryParseDouble(ps.LeftThumbMaxRangeYNeg, 100);
+                padVm.RightMaxRangeXNeg = TryParseDouble(ps.RightThumbMaxRangeXNeg, 100);
+                padVm.RightMaxRangeYNeg = TryParseDouble(ps.RightThumbMaxRangeYNeg, 100);
+                padVm.LeftCenterOffsetX = TryParseDouble(ps.LeftThumbCenterOffsetX, 0);
+                padVm.LeftCenterOffsetY = TryParseDouble(ps.LeftThumbCenterOffsetY, 0);
+                padVm.RightCenterOffsetX = TryParseDouble(ps.RightThumbCenterOffsetX, 0);
+                padVm.RightCenterOffsetY = TryParseDouble(ps.RightThumbCenterOffsetY, 0);
+                // Stick boundary calibration maps (#174). MUST load here: the
+                // 30 Hz SaveViewModelToPadSetting writes ps.*BoundaryMap =
+                // padVm.*BoundaryMap on the selected device, so without this
+                // read-back the empty startup VM clobbers a persisted map on
+                // the first sync tick (the dirty-gate persistence trap).
+                padVm.LeftThumbBoundaryMap = ps.LeftThumbBoundaryMap ?? string.Empty;
+                padVm.RightThumbBoundaryMap = ps.RightThumbBoundaryMap ?? string.Empty;
+
+                // Load trigger deadzone settings.
+                padVm.LeftTriggerDeadZone = TryParseDouble(ps.LeftTriggerDeadZone, 0);
+                padVm.RightTriggerDeadZone = TryParseDouble(ps.RightTriggerDeadZone, 0);
+                padVm.LeftTriggerAntiDeadZone = TryParseDouble(ps.LeftTriggerAntiDeadZone, 0);
+                padVm.RightTriggerAntiDeadZone = TryParseDouble(ps.RightTriggerAntiDeadZone, 0);
+                padVm.LeftTriggerMaxRange = TryParseDouble(ps.LeftTriggerMaxRange, 100);
+                padVm.RightTriggerMaxRange = TryParseDouble(ps.RightTriggerMaxRange, 100);
+
+                // Sync dynamic stick/trigger config items from the loaded VM properties.
+                padVm.SyncAllConfigItemsFromVm();
+
+                // Load Extended custom stick/trigger settings for indices 2+ from dictionary.
+                foreach (var stick in padVm.StickConfigs)
+                {
+                    if (stick.Index < 2) continue;
+                    int g = stick.Index;
+                    stick.DeadZoneShape = InputManager.ParseDeadZoneShape(ps.GetRawMapping($"RawStick{g}DzShape"));
+                    stick.DeadZoneX = TryParseDouble(ps.GetRawMapping($"RawStick{g}DzX"), 0);
+                    stick.DeadZoneY = TryParseDouble(ps.GetRawMapping($"RawStick{g}DzY"), 0);
+                    stick.AntiDeadZoneX = TryParseDouble(ps.GetRawMapping($"RawStick{g}AdzX"), 0);
+                    stick.AntiDeadZoneY = TryParseDouble(ps.GetRawMapping($"RawStick{g}AdzY"), 0);
+                    stick.Linear = TryParseDouble(ps.GetRawMapping($"RawStick{g}Linear"), 0);
+                    // GetRawMapping returns "" (never null) for a missing
+                    // key, so a bare ?? default never fires (audit G4).
+                    string curveX = ps.GetRawMapping($"RawStick{g}CurveX");
+                    string curveY = ps.GetRawMapping($"RawStick{g}CurveY");
+                    stick.SensitivityCurveX = string.IsNullOrEmpty(curveX) ? "0,0;1,1" : curveX;
+                    stick.SensitivityCurveY = string.IsNullOrEmpty(curveY) ? "0,0;1,1" : curveY;
+                    stick.CenterOffsetX = TryParseDouble(ps.GetRawMapping($"RawStick{g}CofX"), 0);
+                    stick.CenterOffsetY = TryParseDouble(ps.GetRawMapping($"RawStick{g}CofY"), 0);
+                    stick.MaxRangeX = TryParseDouble(ps.GetRawMapping($"RawStick{g}MrX"), 100);
+                    stick.MaxRangeY = TryParseDouble(ps.GetRawMapping($"RawStick{g}MrY"), 100);
+                    stick.MaxRangeXNeg = TryParseDouble(ps.GetRawMapping($"RawStick{g}MrXN"), stick.MaxRangeX);
+                    stick.MaxRangeYNeg = TryParseDouble(ps.GetRawMapping($"RawStick{g}MrYN"), stick.MaxRangeY);
+                }
+                foreach (var trig in padVm.TriggerConfigs)
+                {
+                    if (trig.Index < 2) continue;
+                    int g = trig.Index;
+                    trig.DeadZone = TryParseDouble(ps.GetRawMapping($"RawTrigger{g}Dz"), 0);
+                    trig.AntiDeadZone = TryParseDouble(ps.GetRawMapping($"RawTrigger{g}Adz"), 0);
+                    trig.MaxRange = TryParseDouble(ps.GetRawMapping($"RawTrigger{g}Mr"), 100);
+                    string trigCurve = ps.GetRawMapping($"RawTrigger{g}Curve");
+                    trig.SensitivityCurve = string.IsNullOrEmpty(trigCurve) ? "0,0;1,1" : trigCurve;
+                }
+
+                // Steering is per assigned device (#94): the Sticks-tab card loads the
+                // SELECTED device's steering via InputService.LoadPadSettingToViewModel on
+                // device select, not the first device here. The engine reads each source's
+                // own device steering off the MappingSet (stamped per source in
+                // ApplySteeringKindToRow), so nothing per-device is loaded into the shared
+                // StickConfigs at profile-load time.
+
+                // Mappings are per-slot (live in SlotMappingSets), NOT per-device.
+                // Read from the authoritative MappingSet rather than the legacy
+                // per-device PadSetting fields. The legacy fields are stale
+                // whenever the row's primary lives on a device other than the
+                // SELECTED one (e.g. cross-device multi-source rows), and the
+                // save path's UpdatePadSettingsFromViewModels writes the primary
+                // descriptor into the SELECTED device's PadSetting without
+                // checking PrimarySourceDeviceGuid, so legacy fields can hold
+                // descriptors that don't belong to the device they're stored on,
+                // or get blanked out across save / load cycles. Reading
+                // SlotMappingSets here is what every other "refresh the Mappings
+                // tab" path already does — slot init was the missing call site.
+                InputService.RefreshMappingsToViewModel(padVm);
+            }
+        }
+
+        /// <summary>
+        /// Populates pad ViewModels with macros from serialized data.
+        /// </summary>
+        internal void LoadMacros(MacroData[] macros)
+        {
+            // Macro sounds are keyed to the MacroItem objects being replaced;
+            // a looping sound would have no owner left to stop it.
+            PadForge.Common.Input.SoundMacroService.StopAll();
+
+            // Clear existing macros on all pads.
+            foreach (var pad in _mainVm.Pads)
+                pad.Macros.Clear();
+
+            foreach (var md in macros)
+            {
+                if (md.PadIndex < 0 || md.PadIndex >= _mainVm.Pads.Count)
+                    continue;
+
+                // Ghost guard, sibling of MaskMappingSetsForUncreatedSlots:
+                // a save from before delete-time macro clearing can carry a
+                // deleted slot's macros, and loading them parks them on the
+                // pad VM for the next same-index VC to inherit. The gate is
+                // only as current as SlotCreated, so every caller must run
+                // after SlotCreated reflects the incoming state: the startup
+                // load after LoadProfiles, and ApplyProfile after it applies
+                // the profile's topology. The startup call once ran before
+                // LoadProfiles and judged the active profile's macros against
+                // the Default's topology (discussion #467).
+                if (md.PadIndex < SettingsManager.SlotCreated.Length
+                    && !SettingsManager.SlotCreated[md.PadIndex])
+                    continue;
+
+                var padVm = _mainVm.Pads[md.PadIndex];
+                var macro = LoadMacroFromData(md, padVm.OutputType, padVm.ExtendedConfig?.ButtonCount, padVm.ProfileId);
+                padVm.Macros.Add(macro);
+            }
+        }
+
+        /// <summary>Deserializes one <see cref="MacroData"/> DTO into a fresh
+        /// <see cref="MacroItem"/>, applying the target pad's button style and count.
+        /// Extracted from <see cref="LoadMacros"/> so Duplicate / Paste (#112) rebuild a
+        /// macro through the same mapping. The returned macro is not added to any pad.</summary>
+        public static MacroItem LoadMacroFromData(MacroData md, VirtualControllerType outputType, int? extendedButtonCount, string extendedProfileId = null)
+        {
+            var macro = new MacroItem
+            {
+                PadIndex = md.PadIndex,
+                Name = md.Name ?? "Macro",
+                IsEnabled = md.IsEnabled,
+                TriggerButtons = md.TriggerButtons,
+                TriggerCustomButtons = md.TriggerCustomButtons,
+                TriggerDeviceGuid = Guid.TryParse(md.TriggerDeviceGuid, out var parsedGuid)
+                    ? parsedGuid : Guid.Empty,
+                TriggerRawButtons = ParseRawButtonIndices(md.TriggerRawButtons),
+                TriggerSource = md.TriggerSource,
+                TriggerMode = md.TriggerMode,
+                TriggerHoldMs = md.TriggerHoldMs,
+                TriggerDoublePressMs = md.TriggerDoublePressMs,
+                LayerMask = md.LayerMask ?? "",
+                ConsumeTriggerButtons = md.ConsumeTriggerButtons,
+                RepeatMode = md.RepeatMode,
+                RepeatCount = md.RepeatCount,
+                RepeatDelayMs = md.RepeatDelayMs,
+                PairId = md.PairId,
+                ReleaseLingerMs = md.ReleaseLingerMs,
+                TriggerAxisTargetList = md.TriggerAxisTargets,
+                TriggerAxisDirectionList = md.TriggerAxisDirections,
+                TriggerAxisThreshold = md.TriggerAxisThreshold > 0 ? md.TriggerAxisThreshold : 50,
+                TriggerPovs = md.TriggerPovs ?? Array.Empty<string>(),
+                TriggerInputs = md.TriggerInputs,
+                TriggerExpression = md.TriggerExpression ?? "",
+                TriggerExpressionVariableSpecs = md.TriggerExpressionVariables
+            };
+
+            if (md.Actions != null)
+                foreach (var ad in md.Actions)
+                    macro.Actions.Add(BuildMacroAction(ad));
+
+            // Set after actions are populated so propagation reaches all of them.
+            // Callers pass the slot's profile id whatever its type, and on a
+            // PlayStation slot it picks the DualShock 3's labels or the
+            // DualShock 4's.
+            var style = MacroButtonNames.DeriveStyle(outputType, extendedProfileId);
+            int btnCount = (outputType is VirtualControllerType.Extended
+                or VirtualControllerType.Nintendo ? extendedButtonCount : null) ?? 11;
+            macro.CustomButtonCount = btnCount;
+            macro.ButtonStyle = style;
+            macro.RawProfileId =
+                outputType is VirtualControllerType.Extended
+                or VirtualControllerType.Nintendo ? extendedProfileId : null;
+            foreach (var action in macro.Actions)
+                action.CustomButtonCount = btnCount;
+
+            return macro;
+        }
+
+        /// <summary>Deserializes one <see cref="ActionData"/> DTO into a fresh
+        /// <see cref="MacroAction"/>. Extracted from <see cref="LoadMacros"/> so the
+        /// action Duplicate command (#112) reuses the same field mapping.</summary>
+        public static MacroAction BuildMacroAction(ActionData ad)
+        {
+            return new MacroAction
+            {
+                Type = ad.Type,
+                ButtonFlags = ad.ButtonFlags,
+                CustomButtons = ad.CustomButtons,
+                KeyCode = ad.KeyCode,
+                KeyString = !string.IsNullOrEmpty(ad.KeyString)
+                    ? ad.KeyString
+                    : (ad.KeyCode != 0 ? $"{{{(VirtualKey)ad.KeyCode}}}" : ""),
+                DurationMs = ad.DurationMs,
+                AxisValue = ad.AxisValue,
+                AxisTarget = ad.AxisTarget,
+                AxisSource = ad.AxisSource,
+                SourceDeviceGuid = Guid.TryParse(ad.SourceDeviceGuid, out var devGuid)
+                    ? devGuid : Guid.Empty,
+                SourceDeviceAxisIndex = ad.SourceDeviceAxisIndex,
+                ProcessName = ad.ProcessName ?? "",
+                VolumeLimit = ad.VolumeLimit > 0 ? ad.VolumeLimit : 100,
+                MouseSensitivity = ad.MouseSensitivity > 0 ? ad.MouseSensitivity : 10f,
+                MouseButton = ad.MouseButton,
+                InvertAxis = ad.InvertAxis,
+                WheelHorizontal = ad.WheelHorizontal,
+                ShowVolumeOsd = ad.ShowVolumeOsd,
+                LightbarR = ad.LightbarR,
+                LightbarG = ad.LightbarG,
+                LightbarB = ad.LightbarB,
+                LightbarHoldMode = ad.LightbarHoldMode,
+                LightbarColorSource = ad.LightbarColorSource,
+                LightbarHoldMs = Math.Clamp(ad.LightbarHoldMs, 0, 5000),
+                LightbarFadeMs = Math.Clamp(ad.LightbarFadeMs, 0, 5000),
+                LightbarPaletteCsv = ad.LightbarPaletteCsv ?? string.Empty,
+                LightbarTargetMode = ad.LightbarTargetMode,
+                LightbarCycleModesCsv = ad.LightbarCycleModesCsv,
+                PointerCycleModesCsv = ad.PointerCycleModesCsv,
+                PointerSetMode = ad.PointerSetMode ?? "Mouse",
+                SwitchLayerMask = ad.SwitchLayerMask ?? "Base",
+                GuideLedPercent = ad.GuideLedPercent,
+                SoundFilePath = ad.SoundFilePath ?? string.Empty,
+                // A saved 0 means muted and must survive. ActionData's own
+                // initializer supplies 100 when a legacy action omits the
+                // value, so nothing here needs to re-supply it.
+                SoundVolume = ad.SoundVolume,
+                SoundLoop = ad.SoundLoop,
+                SetGyroEngagedMode = ad.SetGyroEngagedMode,
+                RumbleHoldMode = ad.RumbleHoldMode,
+                RumbleStrengthLeft = ad.RumbleStrengthLeft,
+                RumbleStrengthRight = ad.RumbleStrengthRight,
+                RumbleHoldMs = ad.RumbleHoldMs,
+                RumbleFadeMs = ad.RumbleFadeMs,
+                CursorRecenterMode = ad.CursorRecenterMode,
+                CursorPinMode = ad.CursorPinMode,
+                CursorPinX = ad.CursorPinX,
+                CursorPinY = ad.CursorPinY,
+                MouseX = ad.MouseX,
+                MouseY = ad.MouseY,
+                NudgeDx = ad.NudgeDx,
+                NudgeDy = ad.NudgeDy,
+                CycleStepsCsv = ad.CycleStepsCsv ?? "",
+                CycleWrap = ad.CycleWrap,
+                IntervalMs = ad.IntervalMs,
+                PressureScaledRate = ad.PressureScaledRate,
+                SlowIntervalMs = ad.SlowIntervalMs,
+                TurboRateCurve = string.IsNullOrEmpty(ad.TurboRateCurve) ? "Linear" : ad.TurboRateCurve,
+                PressureStartPercent = ad.PressureStartPercent,
+                PressureEndPercent = ad.PressureEndPercent,
+                PulseWhileLatched = ad.PulseWhileLatched,
+                AxisYieldToPhysical = ad.AxisYieldToPhysical,
+                LatchDirection = ad.LatchDirection,
+                CursorClampMode = ad.CursorClampMode,
+                CursorClampInsetX = ad.CursorClampInsetX,
+                CursorClampInsetY = ad.CursorClampInsetY,
+                DisconnectTarget = ad.DisconnectTarget,
+                DisconnectDeviceGuid = Guid.TryParse(ad.DisconnectDeviceGuid, out Guid dcGuid)
+                    ? dcGuid : Guid.Empty,
+                ProgramPath = ad.ProgramPath ?? "",
+                ProgramArgs = ad.ProgramArgs ?? "",
+                ProgramWorkingDir = ad.ProgramWorkingDir ?? "",
+                TextContent = ad.TextContent ?? "",
+                TextPerCharDelayMs = ad.TextPerCharDelayMs,
+                DreamcastFrames = ad.DreamcastFrames ?? "",
+                DreamcastFrameMs = ad.DreamcastFrameMs,
+                DreamcastRepeat = ad.DreamcastRepeat
+            };
+        }
+
+        /// <summary>
+        /// Parses a comma-separated string of button indices (e.g. "13,14") into an int array.
+        /// Returns empty array for null/empty input.
+        /// </summary>
+        private static int[] ParseRawButtonIndices(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return Array.Empty<int>();
+            var parts = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var result = new System.Collections.Generic.List<int>(parts.Length);
+            foreach (var part in parts)
+            {
+                if (int.TryParse(part, out int idx))
+                    result.Add(idx);
+            }
+            return result.ToArray();
+        }
+
+        /// <summary>
+        /// Loads profiles from serialized data into SettingsManager and the ViewModel.
+        /// Internal (not private) so the cold-start tests can drive it with
+        /// plain DTOs: it takes no file handle, and the active-profile branch
+        /// below is the only lane that restores a named profile at startup, so
+        /// a gap in it is invisible to every runtime-switch test.
+        /// </summary>
+        internal void LoadProfiles(ProfileData[] profiles, AppSettingsData appSettings)
+        {
+            // Read the old FreeTrack preference before its master gate is applied.
+            bool legacyFreeTrack = appSettings?.HeadTrackingFreeTrack ?? _mainVm.Dashboard.HeadTrackingFreeTrack;
+            appSettings?.DefaultProfileSnapshot?.MigrateHeadTrackingInputs(legacyFreeTrack);
+            SettingsManager.Profiles.Clear();
+            _mainVm.Settings.ProfileItems.Clear();
+
+            // Always include the built-in Default profile at the top.
+            var defaultItem = new ViewModels.ProfileListItem
+            {
+                Id = ViewModels.ProfileListItem.DefaultProfileId,
+                Name = Strings.Instance.Profile_Default,
+            };
+            var slotTypes = Enumerable.Range(0, SettingsManager.SlotCreated.Length)
+                .Select(i => i < _mainVm.Pads.Count ? (int)_mainVm.Pads[i].OutputType : 0).ToArray();
+            UpdateTopologyCounts(defaultItem, SettingsManager.SlotCreated, slotTypes);
+            _mainVm.Settings.ProfileItems.Add(defaultItem);
+
+            if (profiles != null)
+            {
+                int maxPads = Common.Input.InputManager.MaxPads;
+                bool anyProfileCompacted = false;
+                foreach (var p in profiles)
+                {
+                    p?.MigrateHeadTrackingInputs(legacyFreeTrack);
+                    SlotAppearancePersistence.ResolveProfile(p, _mainVm.Pads);
+                    // Compact gappy profile snapshots in place so the file
+                    // heals itself. Profiles saved before compaction-on-delete
+                    // can have non-contiguous slot indices; rewriting them as
+                    // contiguous fixes the source data, not just the runtime
+                    // view of it.
+                    //
+                    // NOT the active profile. Its topology is the ROOT
+                    // topology: the active branch below Array.Copy's
+                    // p.SlotCreated straight into SettingsManager.SlotCreated,
+                    // while UserSettings.MapTo, SlotMappingSets, the pad
+                    // ViewModels, the macros and the per-slot sound volumes all
+                    // hydrate from this same file at the OLD indices. Compacting
+                    // it here would move only the created-slot flags and leave
+                    // every one of those mirrors behind.
+                    //
+                    // The healer for exactly that already exists and is already
+                    // wired: InputService.Start calls CompactSlotsForGaps right
+                    // after load, which snapshots the whole live state, shifts
+                    // every slot-indexed field through one map, and drives the
+                    // PadViewModel rebuild through ApplyProfile. It arms itself
+                    // off SettingsManager.SlotCreated, so compacting the active
+                    // profile here is precisely what disarmed it: root came up
+                    // contiguous, the healer saw no gap, and the mappings stayed
+                    // at the old indices with the slot created and empty.
+                    //
+                    // Leaving the active profile gappy keeps every mirror
+                    // mutually consistent until that healer runs, and its
+                    // MarkDirty + UpdateActiveProfileSnapshot then persist the
+                    // compacted layout back into this profile, so the gap is
+                    // gone on the next load. Do NOT hand-move the root mirrors
+                    // instead: that list is exactly the set of lanes the rebuild
+                    // exists to keep in one place, and a hand list silently
+                    // omitted the ViewModels the 250 ms autosave rebuilds from,
+                    // which then cleared the rows it had just moved.
+                    bool isActive = !string.IsNullOrEmpty(appSettings?.ActiveProfileId)
+                        && string.Equals(p.Id, appSettings.ActiveProfileId, StringComparison.Ordinal);
+                    var (map, needs) = InputService.BuildCompactionMap(p);
+                    if (needs && !isActive)
+                    {
+                        InputService.CompactProfileDataInPlace(p, map, maxPads);
+                        anyProfileCompacted = true;
+                    }
+                    SettingsManager.Profiles.Add(p);
+                    var item = new ViewModels.ProfileListItem
+                    {
+                        Id = p.Id,
+                        Name = p.Name,
+                        Executables = InputService.FormatExePaths(p.ExecutableNames),
+                        ExecutablePaths = p.ExecutableNames,
+                    };
+                    UpdateTopologyCounts(item, p.SlotCreated, p.SlotControllerTypes);
+                    _mainVm.Settings.ProfileItems.Add(item);
+                }
+                // Record it; do NOT rely on MarkDirty here. Both callers
+                // of LoadFromFile clear IsDirty immediately afterwards, so
+                // the 250 ms autosave timer never saw this and the gappy
+                // profile data was re-compacted in memory on every launch
+                // while the FILE never healed, contradicting this block's
+                // own "fixes the source data, not just the view" comment
+                // (round 34). The callers re-arm from this flag after their
+                // clear.
+                if (anyProfileCompacted)
+                    _profilesCompactedOnLoad = true;
+            }
+
+            // Update active profile display.
+            string activeId = appSettings?.ActiveProfileId;
+            var active = SettingsManager.Profiles.Find(p => p.Id == activeId);
+            _mainVm.Settings.ActiveProfileInfo = active?.Name ?? Strings.Instance.Profile_Default;
+
+            // If a named profile was active at shutdown, snapshot the default
+            // profile's state (loaded by LoadAppSettings) before overwriting with
+            // the active profile's topology. InputService.Start uses this snapshot
+            // so switching back to Default restores the correct state.
+            if (active != null)
+            {
+                // Restore the default profile snapshot from the XML. This was
+                // persisted by BuildAppSettings when a named profile was active,
+                // and contains the default's full state (slots, device assignments,
+                // configs). The runtime state at this point has the named profile's
+                // device assignments (loaded by LoadPadSettings), so we can't build
+                // the default snapshot from runtime — it must come from the XML.
+                SettingsManager.PendingDefaultSnapshot = appSettings?.DefaultProfileSnapshot;
+
+                if (active.SlotCreated != null)
+                {
+                    int count = Math.Min(active.SlotCreated.Length, SettingsManager.SlotCreated.Length);
+                    Array.Copy(active.SlotCreated, SettingsManager.SlotCreated, count);
+                }
+
+                if (active.SlotEnabled != null)
+                {
+                    int count = Math.Min(active.SlotEnabled.Length, SettingsManager.SlotEnabled.Length);
+                    Array.Copy(active.SlotEnabled, SettingsManager.SlotEnabled, count);
+                }
+
+                if (active.SlotControllerTypes != null)
+                {
+                    for (int i = 0; i < _mainVm.Pads.Count && i < active.SlotControllerTypes.Length; i++)
+                    {
+                        if (SettingsManager.SlotCreated[i] &&
+                            Enum.IsDefined(typeof(Engine.VirtualControllerType), active.SlotControllerTypes[i]))
+                            _mainVm.Pads[i].OutputType = (Engine.VirtualControllerType)active.SlotControllerTypes[i];
+                    }
+                }
+
+                if (active.SlotProfileIds != null)
+                {
+                    for (int i = 0; i < _mainVm.Pads.Count && i < active.SlotProfileIds.Length; i++)
+                    {
+                        if (SettingsManager.SlotCreated[i])
+                        {
+                            // The apply already installed this profile's
+                            // mapping sets; stamp their wire before the VM
+                            // assignment so the setter's translation stands
+                            // down instead of treating the incoming data as
+                            // the OUTGOING profile's (see StampNintendoWire).
+                            SettingsManager.StampNintendoWire(i, active.SlotProfileIds[i]);
+                            _mainVm.Pads[i].ProfileId = active.SlotProfileIds[i];
+                        }
+                    }
+                }
+
+                SlotAppearancePersistence.Apply(_mainVm.Pads,
+                    SlotAppearancePersistence.ResolveProfile(active, _mainVm.Pads));
+
+                // Reconcile per-group order lists from the profile's saved
+                // arrays against the just-applied topology. Same shape as the
+                // app-load reconcile above.
+                SettingsManager.SlotOrders.RebuildFromCurrentTopology(
+                    pi => _mainVm.Pads[pi].OutputType,
+                    active.XboxSlotOrder,
+                    active.PlayStationSlotOrder,
+                    active.ExtendedSlotOrder,
+                    active.KeyboardMouseSlotOrder,
+                    active.MidiSlotOrder,
+                    active.NintendoSlotOrder,
+                    active.VrSlotOrder);
+
+                // Now that SlotCreated and OutputType are restored, apply Extended/MIDI/device
+                // configs from the profile's own snapshot.
+                ApplyExtendedConfigs(active.ExtendedConfigs);
+                ApplyDeviceSlotConfigs(active.DeviceSlotConfigs);
+                ApplyMidiConfigs(active.MidiConfigs);
+                ApplyKbmConfigs(active.KbmConfigs);
+
+                // The profile's OWN gesture catalog, overriding the default's
+                // that LoadAppSettings staged a moment ago. ApplyProfile never
+                // runs on the cold path, so without this the default's catalog
+                // stayed live under a named profile AND the first autosave
+                // wrote it back over the profile's stored gestures, destroying
+                // them. The default's copy survives in
+                // AppSettings.DefaultProfileSnapshot.TouchpadGestures, which
+                // PendingDefaultSnapshot (above) carries to the switch-back.
+                ApplyOrStageTouchpadGestures(active.TouchpadGestures);
+
+                // Apply DSU/Web/overlay settings from the active profile.
+                _mainVm.Dashboard.EnableDsuMotionServer = active.EnableDsuMotionServer;
+                if (active.DsuMotionServerPort >= 1024 && active.DsuMotionServerPort <= 65535)
+                    _mainVm.Dashboard.DsuMotionServerPort = active.DsuMotionServerPort;
+                _mainVm.Dashboard.EnableWebController = active.EnableWebController;
+                if (active.WebControllerPort >= 1024 && active.WebControllerPort <= 65535)
+                    _mainVm.Dashboard.WebControllerPort = active.WebControllerPort;
+                _mainVm.Dashboard.EnableTouchpadOverlay = active.EnableTouchpadOverlay;
+                _mainVm.Dashboard.EnableMenuOverlay = active.EnableMenuOverlay;
+                _mainVm.Dashboard.EnableShiftLayerFlyout = active.EnableShiftLayerFlyout;
+                _mainVm.Dashboard.EnableProfileOverlay = active.EnableProfileOverlay;
+                _mainVm.Dashboard.TouchpadOverlayOpacity = active.TouchpadOverlayOpacity;
+                _mainVm.Dashboard.TouchpadOverlayMonitor = active.TouchpadOverlayMonitor;
+                _mainVm.Dashboard.TouchpadOverlayLeft = active.TouchpadOverlayLeft;
+                _mainVm.Dashboard.TouchpadOverlayTop = active.TouchpadOverlayTop;
+                _mainVm.Dashboard.TouchpadOverlayWidth = active.TouchpadOverlayWidth > 0
+                    ? active.TouchpadOverlayWidth : 500;
+                _mainVm.Dashboard.TouchpadOverlayHeight = active.TouchpadOverlayHeight > 0
+                    ? active.TouchpadOverlayHeight : 250;
+                // The service toggles ride profiles too, as nullable
+                // legs: only a profile with an opinion moves the toggle.
+                ApplyProfileServiceToggles(active);
+            }
+        }
+
+        /// <summary>True while this service itself writes the service
+        /// toggles on the Dashboard VM (global load, profile apply), so
+        /// <see cref="OnDashboardServiceToggleChanged"/> records only what
+        /// the USER changed.</summary>
+        private bool _applyingServiceToggles;
+
+        /// <summary>Applies a profile's opinion on the service toggles
+        /// (Razer Chroma #373, Logitech LIGHTSYNC #382, Razer Sensa #374,
+        /// head tracking #355) to the Dashboard VM, whose PropertyChanged
+        /// starts or stops the service (the head tracking setter writes the
+        /// runtime flag the engine sweep reads). A null leg leaves the
+        /// toggle where it is: the global AppSettings value, or whatever the
+        /// last opinionated profile set. The nullable contract mirrors
+        /// <see cref="ProfileData.PollingRateOverrideMs"/> (0 there, null
+        /// here) and is why a plain bool was the wrong shape: it read as
+        /// false in every pre-existing profile and the first profile switch
+        /// turned the mirror off. Runs on the cold path beside the six
+        /// plain-bool legs and belongs at the same spot on the runtime
+        /// switch lane (InputService.ApplyProfile). The default snapshot
+        /// never carries an opinion (no snapshot builder sets these), so a
+        /// switch back to Default leaves the toggles alone.</summary>
+        internal void ApplyProfileServiceToggles(ProfileData profile)
+        {
+            if (profile == null) return;
+            // Old standalone imports use the current FreeTrack preference.
+            // File loading converts all stored profiles using the original preference.
+            profile.MigrateHeadTrackingInputs(_mainVm.Dashboard.HeadTrackingFreeTrack);
+            _applyingServiceToggles = true;
+            try
+            {
+                if (profile.EnableChromaLightbar is bool chroma)
+                    _mainVm.Dashboard.EnableChromaLightbar = chroma;
+                if (profile.EnableLightsyncLightbar is bool lightsync)
+                    _mainVm.Dashboard.EnableLightsyncLightbar = lightsync;
+                if (profile.EnableSensaHaptics is bool sensa)
+                    _mainVm.Dashboard.EnableSensaHaptics = sensa;
+                if (profile.EnableHeadTracking is bool headTracking)
+                    _mainVm.Dashboard.HeadTrackingEnabled = headTracking;
+                if (profile.EnableHeadTrackingFreeTrack is bool freeTrack)
+                    _mainVm.Dashboard.HeadTrackingFreeTrack = freeTrack;
+            }
+            finally { _applyingServiceToggles = false; }
+        }
+
+        /// <summary>The AUTHORING leg: a user change of one of the
+        /// service toggles while a named profile is active becomes that
+        /// profile's opinion, in memory at once (so a foreground switch
+        /// inside the autosave window still carries it) and on disk at the
+        /// next save. With no named profile active the change is the global
+        /// value alone. Writes made by this service (global load, profile
+        /// apply) are skipped through <see cref="_applyingServiceToggles"/>,
+        /// so a profile with no opinion keeps none until the user gives it
+        /// one.</summary>
+        private void OnDashboardServiceToggleChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+        {
+            if (_applyingServiceToggles) return;
+            string activeId = SettingsManager.ActiveProfileId;
+            if (string.IsNullOrEmpty(activeId)) return;
+            var profile = SettingsManager.Profiles?.Find(p => p.Id == activeId);
+            if (profile == null) return;
+            switch (e.PropertyName)
+            {
+                case nameof(DashboardViewModel.EnableChromaLightbar):
+                    profile.EnableChromaLightbar = _mainVm.Dashboard.EnableChromaLightbar;
+                    break;
+                case nameof(DashboardViewModel.EnableLightsyncLightbar):
+                    profile.EnableLightsyncLightbar = _mainVm.Dashboard.EnableLightsyncLightbar;
+                    break;
+                case nameof(DashboardViewModel.EnableSensaHaptics):
+                    profile.EnableSensaHaptics = _mainVm.Dashboard.EnableSensaHaptics;
+                    break;
+                case nameof(DashboardViewModel.HeadTrackingEnabled):
+                    profile.HeadTrackingIndependentInputs = true;
+                    profile.EnableHeadTracking = _mainVm.Dashboard.HeadTrackingEnabled;
+                    break;
+                case nameof(DashboardViewModel.HeadTrackingFreeTrack):
+                    profile.HeadTrackingIndependentInputs = true;
+                    profile.EnableHeadTrackingFreeTrack = _mainVm.Dashboard.HeadTrackingFreeTrack;
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// If a profile is currently active, updates its stored snapshot from
+        /// the current runtime state so that edits made while the profile was
+        /// active are persisted back to it. Called during Save after checksums
+        /// have been recomputed.
+        /// </summary>
+        // Internal (not private) so the mirror tests can drive it directly.
+        // It is one of the three runtime-state mirrors named on ProfileData,
+        // and the only one Save() reaches, so an untested gap here is invisible
+        // until an export ships stale data.
+        internal void UpdateActiveProfileSnapshot()
+        {
+            string activeId = SettingsManager.ActiveProfileId;
+            if (string.IsNullOrEmpty(activeId))
+                return;
+
+            var profile = SettingsManager.Profiles.Find(p => p.Id == activeId);
+            if (profile == null)
+                return;
+
+            var entries = new System.Collections.Generic.List<ProfileEntry>();
+            var padSettings = new System.Collections.Generic.List<PadSetting>();
+            var seen = new System.Collections.Generic.HashSet<string>();
+
+            lock (SettingsManager.UserSettings.SyncRoot)
+            {
+                foreach (var us in SettingsManager.UserSettings.Items)
+                {
+                    var ps = us.GetPadSetting();
+                    if (ps == null) continue;
+
+                    entries.Add(new ProfileEntry
+                    {
+                        InstanceGuid = us.InstanceGuid,
+                        ProductGuid = us.ProductGuid,
+                        MapTo = us.MapTo,
+                        PadSettingChecksum = ps.PadSettingChecksum,
+                        BlissBoxOwed = us.BlissBoxOwed,
+                        BlissBoxKeptTargets = us.BlissBoxKeptTargets,
+                    });
+
+                    if (seen.Add(ps.PadSettingChecksum))
+                        padSettings.Add(ps.CloneDeep());
+                }
+            }
+
+            profile.Entries = entries.ToArray();
+            profile.PadSettings = padSettings.ToArray();
+            // Mapping sets ride the autosave like every other runtime field.
+            // Without this leg the stored profile keeps whatever mappings it
+            // had at activation: switching away repairs it via
+            // SaveActiveProfileState, but Export reads the STORED object
+            // (MainWindow.ExportProfile), so exporting the active profile
+            // without switching away shipped its pre-edit mappings. Deep-cloned
+            // for the same reason SnapshotCurrentProfile clones: a reference
+            // copy lets later live edits mutate the stored snapshot.
+            profile.SlotMappingSets = Enumerable
+                .Range(0, SettingsManager.SlotMappingSets.Length)
+                .Select(s => InputService.CloneMappingSetDeep(SettingsManager.SlotMappingSets[s]))
+                .ToArray();
+            profile.SlotCreated = (bool[])SettingsManager.SlotCreated.Clone();
+            profile.SlotEnabled = (bool[])SettingsManager.SlotEnabled.Clone();
+            profile.SlotControllerTypes = Enumerable.Range(0, _mainVm.Pads.Count)
+                .Select(i => (int)_mainVm.Pads[i].OutputType).ToArray();
+            profile.SlotProfileIds = Enumerable.Range(0, _mainVm.Pads.Count)
+                .Select(i => _mainVm.Pads[i].ProfileId).ToArray();
+            profile.SlotModel3DAppearances = SlotAppearancePersistence.Capture(_mainVm.Pads);
+            profile.ExtendedConfigs = BuildExtendedConfigSnapshot();
+            profile.DeviceSlotConfigs = BuildDeviceConfigSnapshot();
+            profile.MidiConfigs = BuildMidiConfigSnapshot();
+            profile.KbmConfigs = BuildKbmConfigSnapshot();
+            // Macros ride profiles: edits made while this profile is active
+            // persist into it, so switching away and back keeps them, and a
+            // .pfprofile export carries them (with their sound packages).
+            profile.Macros = BuildMacroData();
+            profile.XboxSlotOrder          = SettingsManager.XboxSlotOrder.ToArray();
+            profile.PlayStationSlotOrder   = SettingsManager.PlayStationSlotOrder.ToArray();
+            profile.NintendoSlotOrder      = SettingsManager.NintendoSlotOrder.ToArray();
+            profile.ExtendedSlotOrder      = SettingsManager.ExtendedSlotOrder.ToArray();
+            profile.KeyboardMouseSlotOrder = SettingsManager.KeyboardMouseSlotOrder.ToArray();
+            profile.MidiSlotOrder          = SettingsManager.MidiSlotOrder.ToArray();
+            profile.VrSlotOrder            = SettingsManager.VrSlotOrder.ToArray();
+            profile.EnableDsuMotionServer = _mainVm.Dashboard.EnableDsuMotionServer;
+            profile.DsuMotionServerPort = _mainVm.Dashboard.DsuMotionServerPort;
+            profile.EnableWebController = _mainVm.Dashboard.EnableWebController;
+            profile.WebControllerPort = _mainVm.Dashboard.WebControllerPort;
+            profile.EnableTouchpadOverlay = _mainVm.Dashboard.EnableTouchpadOverlay;
+            profile.EnableMenuOverlay = _mainVm.Dashboard.EnableMenuOverlay;
+            profile.EnableShiftLayerFlyout = _mainVm.Dashboard.EnableShiftLayerFlyout;
+            profile.EnableProfileOverlay = _mainVm.Dashboard.EnableProfileOverlay;
+            // The service toggles are AUTHORED nullable legs (see
+            // ProfileData.EnableChromaLightbar): refresh a recorded opinion
+            // from the live value, never invent one here. The live value
+            // already equals the opinion after apply or record-on-change,
+            // so this only closes the window between the two.
+            if (profile.EnableChromaLightbar != null)
+                profile.EnableChromaLightbar = _mainVm.Dashboard.EnableChromaLightbar;
+            if (profile.EnableLightsyncLightbar != null)
+                profile.EnableLightsyncLightbar = _mainVm.Dashboard.EnableLightsyncLightbar;
+            if (profile.EnableSensaHaptics != null)
+                profile.EnableSensaHaptics = _mainVm.Dashboard.EnableSensaHaptics;
+            if (profile.EnableHeadTracking != null)
+                profile.EnableHeadTracking = _mainVm.Dashboard.HeadTrackingEnabled;
+            if (profile.EnableHeadTrackingFreeTrack != null)
+                profile.EnableHeadTrackingFreeTrack = _mainVm.Dashboard.HeadTrackingFreeTrack;
+            profile.TouchpadOverlayOpacity = _mainVm.Dashboard.TouchpadOverlayOpacity;
+            profile.TouchpadOverlayMonitor = _mainVm.Dashboard.TouchpadOverlayMonitor;
+            profile.TouchpadOverlayLeft = _mainVm.Dashboard.TouchpadOverlayLeft;
+            profile.TouchpadOverlayTop = _mainVm.Dashboard.TouchpadOverlayTop;
+            profile.TouchpadOverlayWidth = _mainVm.Dashboard.TouchpadOverlayWidth;
+            profile.TouchpadOverlayHeight = _mainVm.Dashboard.TouchpadOverlayHeight;
+
+            // Custom touchpad gestures live in InputService's working
+            // list; pull through the provider hook so the 250 ms
+            // autosave path captures them the same way SnapshotCurrentProfile
+            // does. Without this, gestures recorded while a named
+            // profile is active vanish at the next save / reload.
+            var tg = TouchpadGesturesProvider?.Invoke();
+            profile.TouchpadGestures = (tg != null && tg.Length > 0) ? tg : null;
+
+            // Identity members (Id, Name, ExecutableNames, WorkshopSource) are
+            // intentionally NOT rewritten here. This mirror copies runtime
+            // state only. Assigning identity members from runtime would null
+            // the Workshop provenance on every autosave.
+        }
+
+        /// <summary>
+        /// Formats a profile's topology into a compact label like "2x Xbox, 1x PlayStation".
+        /// Returns the localized no-slots label when there is no topology data.
+        /// </summary>
+        internal static string FormatTopologyLabel(bool[] slotCreated, int[] slotControllerTypes)
+        {
+            CountTopology(slotCreated, slotControllerTypes, out int xbox, out int playstation, out int extendedCount, out int midi, out int kbm, out int nintendo, out int vr);
+            var parts = new System.Collections.Generic.List<string>();
+            if (xbox > 0) parts.Add($"{xbox}x Xbox");
+            if (playstation > 0) parts.Add($"{playstation}x PlayStation");
+            if (nintendo > 0) parts.Add($"{nintendo}x Nintendo");
+            if (extendedCount > 0) parts.Add($"{extendedCount}x Extended");
+            if (midi > 0) parts.Add($"{midi}x MIDI");
+            if (kbm > 0) parts.Add($"{kbm}x KB+M");
+            if (vr > 0) parts.Add($"{vr}x VR");
+            return parts.Count > 0 ? string.Join(", ", parts) : Strings.Instance.Profiles_NoSlots;
+        }
+
+        internal static void UpdateTopologyCounts(ViewModels.ProfileListItem item,
+            bool[] slotCreated, int[] slotControllerTypes)
+        {
+            CountTopology(slotCreated, slotControllerTypes, out int xbox, out int playstation, out int extendedCount, out int midi, out int kbm, out int nintendo, out int vr);
+            item.XboxCount = xbox;
+            item.PlayStationCount = playstation;
+            item.ExtendedCount = extendedCount;
+            item.MidiCount = midi;
+            item.KbmCount = kbm;
+            item.NintendoCount = nintendo;
+            item.VrCount = vr;
+            item.TopologyLabel = FormatTopologyLabel(slotCreated, slotControllerTypes);
+        }
+
+        private static void CountTopology(bool[] slotCreated, int[] slotControllerTypes,
+            out int xbox, out int playstation, out int extendedCount, out int midi, out int kbm,
+            out int nintendo, out int vr)
+        {
+            xbox = 0; playstation = 0; extendedCount = 0; midi = 0; kbm = 0; nintendo = 0; vr = 0;
+            if (slotCreated == null) return;
+            for (int i = 0; i < slotCreated.Length; i++)
+            {
+                if (!slotCreated[i]) continue;
+                int type = (slotControllerTypes != null && i < slotControllerTypes.Length)
+                    ? slotControllerTypes[i] : 0;
+                switch (type)
+                {
+                    case 1: playstation++; break;
+                    case 2: extendedCount++; break;
+                    case 3: midi++; break;
+                    case 4: kbm++; break;
+                    // Nintendo is VirtualControllerType 5. Without this case
+                    // it fell through to default and was counted as Xbox, so
+                    // a Switch Pro slot showed up as "1x Xbox" in the profile
+                    // topology label and count (round 34).
+                    case 5: nintendo++; break;
+                    // VR is VirtualControllerType 6, and it repeated the exact
+                    // mistake the Nintendo comment above describes: no case, so
+                    // it fell to default and a VR profile read "1x Xbox".
+                    // Anything added to VirtualControllerType needs a case HERE,
+                    // a count property, a label part, and a badge. Four places.
+                    case 6: vr++; break;
+                    default: xbox++; break;
+                }
+            }
+        }
+
+        /// <summary>
+
+        /// <summary>Set when LoadProfiles compacted gappy profile slot data
+        /// in memory. The post-load IsDirty clear would otherwise discard the
+        /// intent to write the repaired data back.</summary>
+        private bool _profilesCompactedOnLoad;
+
+        /// <summary>Set when the loaded file had no usable web access code,
+        /// so the one in use is not on disk. Re-armed after the same post-load
+        /// clear, or a fresh code would be minted, and every link to it broken,
+        /// on each launch.</summary>
+        private bool _accessCodeUnsavedOnLoad;
+
+        // ─────────────────────────────────────────────
+        //  Save
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Saves current settings to the active settings file. True when the
+        /// file was written.
+        /// </summary>
+        public bool Save() => SaveToFile(_settingsFilePath);
+
+        private int _saveCount;
+
+        /// <summary>How many times a save has written a settings file, so a
+        /// caller can tell a later write from its own (the Bliss-Box picture
+        /// copy, #469). A reload clears <see cref="IsDirty"/> without one.</summary>
+        public int SaveCount => System.Threading.Volatile.Read(ref _saveCount);
+
+        /// <summary>The autosave's full persist now rather than after its
+        /// quiet time, with the same follow-up: <see cref="AutoSaved"/>, which
+        /// a direct <see cref="Save"/> would have kept the timer from raising
+        /// for edits made just before. True when the file was written. For
+        /// state that must not wait: the only copy of a Bliss-Box adapter's
+        /// own picture (#469).</summary>
+        public bool SaveNow()
+        {
+            if (!Save()) return false;
+            AutoSaved?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        /// <summary>
+        /// Saves all settings to the specified XML file. True when it was
+        /// written. A failure shows in the status line.
+        /// </summary>
+        /// <param name="filePath">Output file path.</param>
+        public bool SaveToFile(string filePath)
+        {
+            try
+            {
+                var data = new SettingsFileData();
+
+                // Push ViewModel values to PadSetting objects FIRST,
+                // before collecting data for serialization.
+                UpdatePadSettingsFromViewModels();
+
+                // Flush Extended mappings from in-memory dictionaries to serializable arrays,
+                // then recompute checksums for ALL PadSettings and sync to UserSettings.
+                lock (SettingsManager.UserSettings.SyncRoot)
+                {
+                    foreach (var us in SettingsManager.UserSettings.Items)
+                    {
+                        var ps = us.GetPadSetting();
+                        if (ps != null)
+                        {
+                            ps.FlushRawMappings();
+                            ps.FlushMidiMappings();
+                            ps.FlushKbmMappings();
+                            ps.FlushVrMappings();
+                            ps.FlushMappingDeadZones();
+                            ps.FlushMappingBidirectional();
+                            ps.UpdateChecksum();
+                            us.PadSettingChecksum = ps.PadSettingChecksum;
+                        }
+                    }
+                }
+
+                // If a profile is currently active, update its snapshot so
+                // any edits made while the profile was active are persisted.
+                UpdateActiveProfileSnapshot();
+
+                // Collect devices.
+                lock (SettingsManager.UserDevices.SyncRoot)
+                {
+                    data.Devices = SettingsManager.UserDevices.Items.ToArray();
+                }
+
+                // Collect user settings and unique pad settings (deduplicated by checksum).
+                lock (SettingsManager.UserSettings.SyncRoot)
+                {
+                    data.Settings = SettingsManager.UserSettings.Items.ToArray();
+
+                    var seen = new System.Collections.Generic.HashSet<string>();
+                    var uniquePadSettings = new System.Collections.Generic.List<PadSetting>();
+                    foreach (var us in SettingsManager.UserSettings.Items)
+                    {
+                        var ps = us.GetPadSetting();
+                        if (ps != null && seen.Add(ps.PadSettingChecksum))
+                            uniquePadSettings.Add(ps);
+                    }
+                    data.PadSettings = uniquePadSettings.ToArray();
+                }
+
+                // Phase 2C — push per-row ExtraSources / CombineMode /
+                // CombineExpression from the live PadViewModels into the
+                // in-memory SlotMappingSets so the merge below has the
+                // user's multi-source edits to preserve.
+                PushUiExtraSourcesIntoSlotMappingSets();
+
+                // Issue #61 Phase 6 ShiftActivator UI push reverted —
+                // multi-source UI must complete first per recipe order.
+
+                // Issue #61: do NOT run MergeMappingSetsFromLegacy in
+                // SaveToFile. The merge appends rebuilt sources from each
+                // device's PadSetting fields to existing rows — useful
+                // when a NEW device gets assigned to a slot (auto-map
+                // surfacing), but at save-time it re-injects auto-mapped
+                // descriptors that the user has explicitly DELETED from
+                // ExtraSources. Symptom: user removes a duplicate-looking
+                // extra source on a multi-device slot, save fires, merge
+                // re-adds the same (DeviceGuid, Descriptor) pair as an
+                // extra. The PushUi step above is now authoritative for
+                // save-time MappingSet state; the merge stays wired to
+                // the device-assign paths (DeviceService.RefreshMappingSetsFromLegacy)
+                // where its job actually is.
+                data.SlotMappingSets = SettingsManager.SlotMappingSets;
+
+                // Collect app settings from ViewModel.
+                data.AppSettings = BuildAppSettings();
+
+                // Collect macros from all pad ViewModels.
+                data.Macros = BuildMacroData();
+
+                // Collect profiles.
+                if (SettingsManager.Profiles.Count > 0)
+                    data.Profiles = SettingsManager.Profiles.ToArray();
+
+                // Serialize to an in-memory buffer first so a serializer
+                // crash mid-write never truncates the on-disk file. The old
+                // File.Create path truncated to 0 bytes before serialize
+                // ran, which turned any XmlSerializer exception (e.g. an
+                // embedded-null device name sneaking past the sanitizer)
+                // into catastrophic settings loss at whatever byte was last
+                // flushed (issue #53).
+                var serializer = s_settingsSerializer;
+                string dir = Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                byte[] serializedBytes;
+                using (var ms = new System.IO.MemoryStream())
+                {
+                    serializer.Serialize(ms, data);
+                    serializedBytes = ms.ToArray();
+                }
+                File.WriteAllBytes(filePath, serializedBytes);
+
+                IsDirty = false;
+                System.Threading.Interlocked.Increment(ref _saveCount);
+                _mainVm.Settings.HasUnsavedChanges = false;
+                _mainVm.StatusText = string.Format(Strings.Instance.Status_SettingsSaved_Format, Path.GetFileName(filePath));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _mainVm.SetStatus(string.Format(Strings.Instance.Status_ErrorSavingSettings_Format, ex.Message), persist: true);
+                return false;
+            }
+        }
+
+        /// <summary>The access code last read or written with its encrypted
+        /// form. DPAPI output differs on every call, so reusing it keeps an
+        /// unchanged code from rewriting its element on every save.</summary>
+        private (string Code, string Protected) _protectedAccessCode;
+
+        private string ProtectAccessCode(string code)
+        {
+            var cached = _protectedAccessCode;
+            if (cached.Code != null && cached.Code == code) return cached.Protected;
+            string protectedCode = WebControllerAccess.ProtectForStorage(code);
+            if (protectedCode != null) _protectedAccessCode = (code, protectedCode);
+            return protectedCode;
+        }
+
+        /// <summary>
+        /// Builds an AppSettingsData from the current SettingsViewModel state.
+        /// </summary>
+        private AppSettingsData BuildAppSettings()
+        {
+            var vm = _mainVm.Settings;
+            var soundPackages = PadForge.Common.SoundPackageManager.SaveRegistry()
+                .Select(p => new SoundPackageData { Name = p.Name, Path = p.Path })
+                .ToArray();
+            var iconPackages = PadForge.Common.IconPackageManager.SaveRegistry()
+                .Select(p => new IconPackageData { Name = p.Name, Path = p.Path })
+                .ToArray();
+            var nfcTags = PadForge.Common.Input.NfcTagRegistry.SaveRegistry()
+                .Select(t => new NfcTagData { Uid = t.Uid, Name = t.Name, Button = t.Button })
+                .ToArray();
+            var voicePhrases = PadForge.Common.Input.VoicePhraseRegistry.SaveRegistry()
+                .Select(v => new VoicePhraseData { Phrase = v.Phrase, Name = v.Name, Button = v.Button })
+                .ToArray();
+            // Sync the ViewModel toggle to the static state.
+            SettingsManager.EnableAutoProfileSwitching = vm.EnableAutoProfileSwitching;
+            SettingsManager.EnableExternalControl = vm.EnableExternalControl;
+
+            // Collect per-slot controller types and HIDMaestro profile slugs.
+            var slotTypes = new int[_mainVm.Pads.Count];
+            var slotProfileIds = new string[_mainVm.Pads.Count];
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                slotTypes[i] = (int)_mainVm.Pads[i].OutputType;
+                slotProfileIds[i] = _mainVm.Pads[i].ProfileId;
+            }
+
+            // Collect per-slot Extended configurations. Only persist for
+            // slots that are actually Extended — Xbox / PlayStation /
+            // KbM / MIDI slots don't read this and shouldn't carry stale
+            // ExtendedConfig state in the XML.
+            var extendedConfigs = new System.Collections.Generic.List<ViewModels.ExtendedSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                if (!SettingsManager.SlotCreated[i] ||
+                    _mainVm.Pads[i].OutputType != Engine.VirtualControllerType.Extended)
+                    continue;
+                var cfg = _mainVm.Pads[i].ExtendedConfig;
+                extendedConfigs.Add(new ViewModels.ExtendedSlotConfigData
+                {
+                    SlotIndex = i,
+                    ThumbstickCount = cfg.ThumbstickCount,
+                    TriggerCount = cfg.TriggerCount,
+                    PovCount = cfg.PovCount,
+                    ButtonCount = cfg.ButtonCount,
+                    OemNameOverride = cfg.OemNameOverride,
+                    ProductString = cfg.ProductString,
+                    VendorId = cfg.VendorId,
+                    ProductId = cfg.ProductId,
+                    Customize = cfg.Customize,
+                    ForceFeedbackEnabled = cfg.ForceFeedbackEnabled
+                });
+            }
+
+            // Collect the per-(slot, device) configurations.
+            // Lighting tab is per-device — different physical devices
+            // mapped to the same slot can have different mode / colors
+            // / palette. We write:
+            //   1. ONE slot-level entry (DeviceGuid = Empty) holding
+            //      the slot's anchor DeviceConfig — this is a
+            //      pre-v3.1 compat row so older PadForge installs
+            //      reading the new XML still get a usable default.
+            //   2. ONE per-device entry per dict entry, INCLUDING the
+            //      one whose instance the anchor currently references.
+            //
+            // Do NOT dedup the active-device's per-device entry against
+            // the anchor by reference equality — they're the same
+            // instance in memory but the saved per-device entry is
+            // what gets reapplied to dict[active device's GUID] on
+            // reload. Without it, the active device's settings live
+            // ONLY in the slot-level entry, and ApplyDeviceSlotConfigs's
+            // fan-out skip (which prevents the slot-level entry from
+            // bleeding into other devices' dict entries) leaves the
+            // active device's dict entry at defaults. Result: user's
+            // Lighting tab edits don't survive an app restart.
+            var deviceSlotConfigs = new System.Collections.Generic.List<ViewModels.DeviceSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                var padVm = _mainVm.Pads[i];
+                if (padVm.DeviceConfig != null)
+                    deviceSlotConfigs.Add(BuildDeviceSlotConfigData(padVm.DeviceConfig, i, Guid.Empty));
+                foreach (var kvp in padVm.PerDeviceSlotConfigs)
+                {
+                    if (kvp.Key == Guid.Empty || kvp.Value == null) continue;
+                    deviceSlotConfigs.Add(BuildDeviceSlotConfigData(kvp.Value, i, kvp.Key));
+                }
+            }
+
+            // AppSettings always stores the DEFAULT profile's per-slot state.
+            // When a named profile is active, use the saved default snapshot
+            // so the named profile's state doesn't contaminate the default.
+            var defaultSnap = SettingsManager.PendingDefaultSnapshot;
+            bool isDefault = string.IsNullOrEmpty(SettingsManager.ActiveProfileId)
+                          || defaultSnap == null;
+
+            string[] pickerHidden = null;
+            try
+            {
+                var pads = _mainVm?.Pads;
+                if (pads != null && pads.Count > 0)
+                {
+                    pickerHidden = new string[pads.Count];
+                    for (int i = 0; i < pads.Count; i++)
+                        pickerHidden[i] = pads[i]?.GetHiddenPickerDeviceKeysJoined() ?? "";
+                }
+            }
+            catch { /* view preference; never blocks a save */ }
+
+            return new AppSettingsData
+            {
+                SoundPackages = soundPackages,
+                IconPackages = iconPackages,
+                NfcTags = nfcTags,
+                MappingPickerHiddenDevices = pickerHidden,
+                PsMoveCalibrations = PadForge.Common.Input.PsMoveCalibrationRegistry.SaveRegistry(),
+                VoicePhrases = voicePhrases,
+                VoiceMacrosEnabled = PadForge.Services.VoiceMacroService.Enabled,
+                HandheldButtons = PadForge.Common.Input.HandheldButtonRegistry.SaveRegistry()
+                    .Select(HandheldButtonData.From).ToArray(),
+                HandheldMachineKey = PadForge.Common.Input.HandheldButtonRegistry.MachineKey,
+                HandheldButtonsEnabled = vm.HandheldButtonsEnabled,
+                VoiceMinConfidence = PadForge.Services.VoiceMacroService.MinConfidence,
+                VoiceListeningMode = PadForge.Services.VoiceMacroService.ListeningMode,
+                HeadsetTrackerAddresses = PadForge.Common.Input.SonyHeadsetMotionRuntime.SavePersistedAddresses(),
+                // Remote Link (issue #138): persist the identity + trust list from
+                // the runtime holder (set on load / updated on pairing + revocation).
+                RemoteLinkIdentityPrivate = RemoteLink?.ProtectedPrivateBase64 ?? "",
+                RemoteLinkIdentityPublic = RemoteLink?.PublicBase64 ?? "",
+                RemoteLinkIdentityProtection = (RemoteLink?.IdentityProtection ?? PadForge.Engine.RemoteLink.IdentityProtectionMode.Secure).ToString(),
+                RemoteLinkPeers = RemoteLink?.Trust?.Peers?.ToArray(),
+                AutoStartEngine = vm.AutoStartEngine,
+                MinimizeToTray = vm.MinimizeToTray,
+                CloseToTray = vm.CloseToTray,
+                AlwaysShowTrayIcon = vm.AlwaysShowTrayIcon,
+                CheckForUpdatesAutomatically = vm.CheckForUpdatesAutomatically,
+                InstallUpdatesAutomatically = vm.InstallUpdatesAutomatically,
+                IncludePreReleaseUpdates = vm.IncludePreReleaseUpdates,
+                BatteryNotifyEnabled = vm.BatteryNotifyEnabled,
+                BatteryNotifyThreshold = vm.BatteryNotifyThreshold,
+                BatteryNotifyVibrate = vm.BatteryNotifyVibrate,
+                AssignOfferNewDevice = vm.AssignOfferNewDevice,
+                AssignOfferEmptySlot = vm.AssignOfferEmptySlot,
+                StartMinimized = vm.StartMinimized,
+                DiagnosticsLoggingEnabled = vm.DiagnosticsLoggingEnabled,
+                StartAtLogin = vm.StartAtLogin,
+                EnablePollingOnFocusLoss = vm.EnablePollingOnFocusLoss,
+                PollingRateMs = vm.PollingRateMs,
+                HmInactivityDestroyTimeoutSeconds = vm.HmInactivityDestroyTimeoutSeconds,
+                ThemeIndex = vm.SelectedThemeIndex,
+                Language = vm.LanguageCode,
+                EnableAutoProfileSwitching = vm.EnableAutoProfileSwitching,
+                EnableExternalControl = vm.EnableExternalControl,
+                EnableCommunityConfigLookup = vm.EnableCommunityConfigLookup,
+                ShowLegacyWorkshopConfigs = vm.ShowLegacyWorkshopConfigs,
+                ActiveProfileId = SettingsManager.ActiveProfileId,
+                GlobalMacros = SettingsManager.GlobalMacros,
+                SlotControllerTypes = isDefault ? slotTypes : defaultSnap.SlotControllerTypes,
+                SlotProfileIds = isDefault ? slotProfileIds : defaultSnap.SlotProfileIds,
+                SlotModel3DAppearances = isDefault
+                    ? SlotAppearancePersistence.Capture(_mainVm.Pads)
+                    : SlotAppearancePersistence.ResolveProfile(defaultSnap),
+                SlotSoundVolumes = _mainVm.Pads.Select(p => p.SoundMasterVolume).ToArray(),
+                SlotCreated = isDefault
+                    ? (bool[])SettingsManager.SlotCreated.Clone()
+                    : defaultSnap.SlotCreated,
+                SlotEnabled = isDefault
+                    ? (bool[])SettingsManager.SlotEnabled.Clone()
+                    : defaultSnap.SlotEnabled,
+                EnableDsuMotionServer = _mainVm.Dashboard.EnableDsuMotionServer,
+                DsuMotionServerPort = _mainVm.Dashboard.DsuMotionServerPort,
+                EnableWebController = _mainVm.Dashboard.EnableWebController,
+                EnableChromaLightbar = _mainVm.Dashboard.EnableChromaLightbar,
+                EnableLightsyncLightbar = _mainVm.Dashboard.EnableLightsyncLightbar,
+                EnableSensaHaptics = _mainVm.Dashboard.EnableSensaHaptics,
+                HeadTrackingEnabled = _mainVm.Dashboard.HeadTrackingEnabled,
+                HeadTrackingIndependentInputs = true,
+                HeadTrackingUdpPort = _mainVm.Dashboard.HeadTrackingUdpPort,
+                HeadTrackingFreeTrack = _mainVm.Dashboard.HeadTrackingFreeTrack,
+                HeadTrackingOpenXr = _mainVm.Dashboard.HeadTrackingOpenXr,
+                HeadTrackingAxisRanges = new[]
+                {
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(0),
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(1),
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(2),
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(3),
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(4),
+                    PadForge.Common.Input.HeadTrackingRuntime.GetAxisRangeOverride(5),
+                },
+                HeadTrackingOpenXrRuntime = PadForge.Common.Input.HeadTrackingRuntime.OpenXrRuntimeManifest,
+                HeadTrackingRotationRange = _mainVm.Dashboard.HeadTrackingRotationRange,
+                HeadTrackingTranslationRange = _mainVm.Dashboard.HeadTrackingTranslationRange,
+                WebControllerPort = _mainVm.Dashboard.WebControllerPort,
+                EnableWebControllerPlainHttp = _mainVm.Dashboard.EnableWebControllerPlainHttp,
+                WebControllerPlainHttpPort = _mainVm.Dashboard.WebControllerPlainHttpPort,
+                WebControllerPlainHttpLocalOnly = _mainVm.Dashboard.WebControllerPlainHttpLocalOnly,
+                WebControllerAccessCodeProtected = ProtectAccessCode(_mainVm.Dashboard.WebControllerAccessCode),
+                WebCustomLayoutsJson = PadForge.Services.WebCustomLayoutStore.Json,
+                EnableRemoteLink = _mainVm.Dashboard.EnableRemoteLink,
+                RemoteLinkAutoReconnect = _mainVm.Dashboard.AutoReconnect,
+                RemoteLinkPort = _mainVm.Dashboard.RemoteLinkPort,
+                EnableTouchpadOverlay = _mainVm.Dashboard.EnableTouchpadOverlay,
+                EnableMenuOverlay = _mainVm.Dashboard.EnableMenuOverlay,
+                EnableShiftLayerFlyout = _mainVm.Dashboard.EnableShiftLayerFlyout,
+                EnableProfileOverlay = _mainVm.Dashboard.EnableProfileOverlay,
+                TouchpadOverlayOpacity = _mainVm.Dashboard.TouchpadOverlayOpacity,
+                TouchpadOverlayMonitor = _mainVm.Dashboard.TouchpadOverlayMonitor,
+                TouchpadOverlayLeft = _mainVm.Dashboard.TouchpadOverlayLeft,
+                TouchpadOverlayTop = _mainVm.Dashboard.TouchpadOverlayTop,
+                TouchpadOverlayWidth = _mainVm.Dashboard.TouchpadOverlayWidth,
+                TouchpadOverlayHeight = _mainVm.Dashboard.TouchpadOverlayHeight,
+                MainWindowLeft = vm.MainWindowLeft,
+                MainWindowTop = vm.MainWindowTop,
+                MainWindowWidth = vm.MainWindowWidth,
+                MainWindowHeight = vm.MainWindowHeight,
+                MainWindowState = vm.MainWindowState,
+                MainWindowFullScreen = vm.MainWindowFullScreen,
+                Use2DControllerView = vm.Use2DControllerView,
+                LegacyDriverCleanupOffered = vm.LegacyDriverCleanupOffered,
+                FirstRunTourCompleted = vm.FirstRunTourCompleted,
+                EnableInputHiding = vm.EnableInputHiding,
+                KeepHidHideCloaksBetweenLaunches = vm.KeepHidHideCloaksBetweenLaunches,
+                FlydigiEnhancedProtocol = vm.FlydigiEnhancedProtocol,
+                GKeysEnabled = vm.GKeysEnabled,
+                AnalogKeyboardsEnabled = vm.AnalogKeyboardsEnabled,
+                BlissBoxEnabled = vm.BlissBoxEnabled,
+                BlissBoxPorts = vm.BlissBoxPorts.Count > 0 ? vm.BlissBoxPorts.ToArray() : null,
+                DefaultProfileDreamcastPicture = string.IsNullOrEmpty(vm.DefaultProfileDreamcastPicture)
+                    ? null : vm.DefaultProfileDreamcastPicture,
+                // Default profile's custom gestures. When a named profile is
+                // active, defaultSnap.TouchpadGestures carries the gestures
+                // recorded on the default; when default is active, pull
+                // straight from InputService's working list via the provider
+                // so saves of the default profile's gestures round-trip too.
+                TouchpadGestures = isDefault
+                    ? (TouchpadGesturesProvider?.Invoke() is { Length: > 0 } liveTg ? liveTg : null)
+                    : defaultSnap.TouchpadGestures,
+                HidHideWhitelistPaths = vm.HidHideWhitelistPaths.Count > 0
+                    ? vm.HidHideWhitelistPaths.ToArray()
+                    : null,
+                SerialControllers = vm.SerialControllers.Count > 0
+                    ? vm.SerialControllers.ToArray()
+                    : null,
+                WinUsbOptIns = vm.WinUsbOptIns.Count > 0
+                    ? vm.WinUsbOptIns.ToArray()
+                    : null,
+                ICadePads = vm.ICadePads.Count > 0
+                    ? vm.ICadePads.ToArray()
+                    : null,
+                DjiRemoteHosts = vm.DjiRemoteHosts.Count > 0
+                    ? vm.DjiRemoteHosts.ToArray()
+                    : null,
+                UsioLayout = vm.UsioLayout == PadForge.Common.Input.InputManager.UsioTekken
+                    ? PadForge.Common.Input.InputManager.UsioTekken
+                    : null,
+                ExtendedConfigs = isDefault ? extendedConfigs.ToArray() : defaultSnap.ExtendedConfigs,
+                DeviceSlotConfigs = isDefault ? deviceSlotConfigs.ToArray() : defaultSnap.DeviceSlotConfigs,
+                UserProfiles = _userProfiles.Count > 0 ? _userProfiles.ToArray() : null,
+                MidiConfigs = isDefault ? BuildMidiConfigs() : defaultSnap.MidiConfigs,
+                KbmConfigs = isDefault ? BuildKbmConfigs() : defaultSnap.KbmConfigs,
+                XboxSlotOrder          = isDefault ? SettingsManager.XboxSlotOrder.ToArray()          : defaultSnap.XboxSlotOrder,
+                PlayStationSlotOrder   = isDefault ? SettingsManager.PlayStationSlotOrder.ToArray()   : defaultSnap.PlayStationSlotOrder,
+                NintendoSlotOrder      = isDefault ? SettingsManager.NintendoSlotOrder.ToArray()      : defaultSnap.NintendoSlotOrder,
+                ExtendedSlotOrder      = isDefault ? SettingsManager.ExtendedSlotOrder.ToArray()      : defaultSnap.ExtendedSlotOrder,
+                KeyboardMouseSlotOrder = isDefault ? SettingsManager.KeyboardMouseSlotOrder.ToArray() : defaultSnap.KeyboardMouseSlotOrder,
+                MidiSlotOrder          = isDefault ? SettingsManager.MidiSlotOrder.ToArray()          : defaultSnap.MidiSlotOrder,
+                VrSlotOrder            = isDefault ? SettingsManager.VrSlotOrder.ToArray()            : defaultSnap.VrSlotOrder,
+                DefaultProfileSnapshot = isDefault ? null : defaultSnap
+            };
+        }
+
+        /// <summary>
+        /// Snapshots Extended configs for only created Extended slots (for profile storage).
+        /// </summary>
+        private ViewModels.ExtendedSlotConfigData[] BuildExtendedConfigSnapshot()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.ExtendedSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                if (!SettingsManager.SlotCreated[i] ||
+                    _mainVm.Pads[i].OutputType != Engine.VirtualControllerType.Extended)
+                    continue;
+                var cfg = _mainVm.Pads[i].ExtendedConfig;
+                list.Add(new ViewModels.ExtendedSlotConfigData
+                {
+                    SlotIndex = i,
+                    ThumbstickCount = cfg.ThumbstickCount,
+                    TriggerCount = cfg.TriggerCount,
+                    PovCount = cfg.PovCount,
+                    ButtonCount = cfg.ButtonCount,
+                    OemNameOverride = cfg.OemNameOverride,
+                    ProductString = cfg.ProductString,
+                    VendorId = cfg.VendorId,
+                    ProductId = cfg.ProductId,
+                    Customize = cfg.Customize,
+                    ForceFeedbackEnabled = cfg.ForceFeedbackEnabled
+                });
+            }
+            return list.Count > 0 ? list.ToArray() : null;
+        }
+
+        /// <summary>
+        /// Snapshots device configs for every slot for profile
+        /// storage. One DTO per slot's anchor (DeviceGuid empty) plus
+        /// one per (slot, device) entry. Mirrors the load path's
+        /// per-device handling.
+        /// <para>Internal: the profile snapshot lanes (SnapshotCurrentProfile
+        /// in InputService, UpdateActiveProfileSnapshot here) reuse it so a
+        /// runtime profile switch captures lighting / adaptive triggers
+        /// through the same converter as the main settings file.</para>
+        /// </summary>
+        internal ViewModels.DeviceSlotConfigData[] BuildDeviceConfigSnapshot()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.DeviceSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                var padVm = _mainVm.Pads[i];
+                if (padVm.DeviceConfig != null)
+                    list.Add(BuildDeviceSlotConfigData(padVm.DeviceConfig, i, Guid.Empty));
+                // Always emit every per-device entry. See the comment
+                // in BuildAppSettingsForActiveProfile's main collector
+                // for why we don't dedup against the anchor — the
+                // active device's per-device entry is what reloads
+                // back into its dict slot on next launch.
+                foreach (var kvp in padVm.PerDeviceSlotConfigs)
+                {
+                    if (kvp.Key == Guid.Empty || kvp.Value == null) continue;
+                    list.Add(BuildDeviceSlotConfigData(kvp.Value, i, kvp.Key));
+                }
+            }
+            return list.Count > 0 ? list.ToArray() : null;
+        }
+
+        /// <summary>Encodes a single <see cref="ViewModels.DeviceSlotConfig"/>
+        /// into a <see cref="ViewModels.DeviceSlotConfigData"/> tagged with
+        /// the (slot index, device GUID) pair. Empty <paramref name="deviceGuid"/>
+        /// produces a legacy slot-level entry.</summary>
+        private static ViewModels.DeviceSlotConfigData BuildDeviceSlotConfigData(
+            ViewModels.DeviceSlotConfig cfg, int slotIndex, Guid deviceGuid)
+        {
+            return new ViewModels.DeviceSlotConfigData
+            {
+                SlotIndex = slotIndex,
+                DeviceGuid = deviceGuid,
+                // PlayerNumber-aware writer: Off below is deliberate,
+                // never the pre-#191 "unset" sentinel.
+                LightingRev = 1,
+                LeftTriggerMode = cfg.LeftTriggerMode,
+                RightTriggerMode = cfg.RightTriggerMode,
+                LeftStartPosition = cfg.LeftStartPosition,
+                LeftEndPosition = cfg.LeftEndPosition,
+                LeftStrength = cfg.LeftStrength,
+                LeftFrequency = cfg.LeftFrequency,
+                RightStartPosition = cfg.RightStartPosition,
+                RightEndPosition = cfg.RightEndPosition,
+                RightStrength = cfg.RightStrength,
+                RightFrequency = cfg.RightFrequency,
+                LightbarRed = cfg.LightbarRed,
+                LightbarGreen = cfg.LightbarGreen,
+                LightbarBlue = cfg.LightbarBlue,
+                LightbarEnabled = cfg.LightbarEnabled,
+                AudioPassthroughEnabled = cfg.AudioPassthroughEnabled,
+                AudioMirrorSourceId = cfg.AudioMirrorSourceId ?? string.Empty,
+                TouchpadSyntheticPressure = cfg.TouchpadSyntheticPressure,
+                TouchpadSyntheticTouchPercent = cfg.TouchpadSyntheticTouchPercent,
+                AudioMirrorEngageMode = cfg.AudioMirrorEngageMode ?? "Always",
+                AudioMirrorEngageDeviceGuid = cfg.AudioMirrorEngageDeviceGuid ?? string.Empty,
+                AudioMirrorEngageButton = cfg.AudioMirrorEngageButton ?? string.Empty,
+                AudioMirrorEngageReleaseMs = cfg.AudioMirrorEngageReleaseMs,
+                AudioToneFilterMode = cfg.AudioToneFilterMode ?? "Off",
+                AudioToneLimitHz = cfg.AudioToneLimitHz,
+                AudioCrossfeedLevel = cfg.AudioCrossfeedLevel,
+                AudioCrossfeedCutHz = cfg.AudioCrossfeedCutHz,
+                AudioCrossfeedFeedDb = cfg.AudioCrossfeedFeedDb,
+                AudioEqEnabled = cfg.AudioEqEnabled,
+                AudioEqBands = cfg.AudioEqBands ?? string.Empty,
+                AudioEqPreampDb = cfg.AudioEqPreampDb,
+                AudioLimiterEnabled = cfg.AudioLimiterEnabled,
+                AudioLimiterCeiling = cfg.AudioLimiterCeiling,
+                AudioPersonaHapticsEnabled = cfg.AudioPersonaHapticsEnabled,
+                AudioPersonaHapticsGain = cfg.AudioPersonaHapticsGain,
+                AudioTritonLowPassHz = cfg.AudioTritonLowPassHz,
+                HeadphoneVolume = cfg.HeadphoneVolume,
+                Ds5AudioBufferLength = cfg.Ds5AudioBufferLength,
+                AudioOutputPath = cfg.AudioOutputPath,
+                MicLedMode = cfg.MicLedMode,
+                MicLedFollowDeviceId = cfg.MicLedFollowDeviceId ?? string.Empty,
+                MicLightOn = cfg.MicLightOn,
+                PlayerLedMode = cfg.PlayerLedMode,
+                PlayerLedBrightness = cfg.PlayerLedBrightness,
+                GuideLedMode = cfg.GuideLedMode,
+                GuideLedBrightness = cfg.GuideLedBrightness,
+                AudioLightbarEnabled = cfg.AudioLightbarEnabled,
+                AudioLightbarSensitivity = cfg.AudioLightbarSensitivity,
+                AudioLightbarMode = cfg.AudioLightbarMode,
+                AudioLowR = cfg.AudioLowR,
+                AudioLowG = cfg.AudioLowG,
+                AudioLowB = cfg.AudioLowB,
+                AudioMidR = cfg.AudioMidR,
+                AudioMidG = cfg.AudioMidG,
+                AudioMidB = cfg.AudioMidB,
+                AudioHighR = cfg.AudioHighR,
+                AudioHighG = cfg.AudioHighG,
+                AudioHighB = cfg.AudioHighB,
+                AudioLowToMidPercent = cfg.AudioLowToMidPercent,
+                AudioMidToHighPercent = cfg.AudioMidToHighPercent,
+                AudioCrossFadePercent = cfg.AudioCrossFadePercent,
+                LightbarMode = cfg.LightbarMode,
+                LightbarPeriodMs = cfg.LightbarPeriodMs,
+                LightbarColorCycleSmooth = cfg.LightbarColorCycleSmooth,
+                LightbarRainbowBrightness = cfg.LightbarRainbowBrightness,
+                LightbarBatteryLowR  = cfg.LightbarBatteryLowR,
+                LightbarBatteryLowG  = cfg.LightbarBatteryLowG,
+                LightbarBatteryLowB  = cfg.LightbarBatteryLowB,
+                LightbarBatteryHighR = cfg.LightbarBatteryHighR,
+                LightbarBatteryHighG = cfg.LightbarBatteryHighG,
+                LightbarBatteryHighB = cfg.LightbarBatteryHighB,
+                LightbarPalette = cfg.LightbarPalette
+                    .Select(e => new ViewModels.LightbarPaletteEntryData { R = e.R, G = e.G, B = e.B })
+                    .ToArray(),
+                LightbarInputReactivePalette = cfg.LightbarInputReactivePalette
+                    .Select(e => new ViewModels.LightbarPaletteEntryData { R = e.R, G = e.G, B = e.B })
+                    .ToArray(),
+                LightbarInputHoldMs = cfg.LightbarInputHoldMs,
+                LightbarInputDecayMs = cfg.LightbarInputDecayMs,
+                InputReactiveMode = cfg.InputReactiveMode,
+                InputReactiveR = cfg.InputReactiveR,
+                InputReactiveG = cfg.InputReactiveG,
+                InputReactiveB = cfg.InputReactiveB,
+            };
+        }
+
+        /// <summary>
+        /// Snapshots MIDI configs for only created MIDI slots (for profile storage).
+        /// </summary>
+        private ViewModels.MidiSlotConfigData[] BuildMidiConfigSnapshot()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.MidiSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                if (!SettingsManager.SlotCreated[i] ||
+                    _mainVm.Pads[i].OutputType != Engine.VirtualControllerType.Midi)
+                    continue;
+                var cfg = _mainVm.Pads[i].MidiConfig;
+                list.Add(new ViewModels.MidiSlotConfigData
+                {
+                    SlotIndex = i,
+                    Channel = cfg.Channel,
+                    Velocity = cfg.Velocity,
+                    CcCount = cfg.CcCount,
+                    StartCc = cfg.StartCc,
+                    NoteCount = cfg.NoteCount,
+                    StartNote = cfg.StartNote
+                });
+            }
+            return list.Count > 0 ? list.ToArray() : null;
+        }
+
+        private ViewModels.MidiSlotConfigData[] BuildMidiConfigs()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.MidiSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                var cfg = _mainVm.Pads[i].MidiConfig;
+                list.Add(new ViewModels.MidiSlotConfigData
+                {
+                    SlotIndex = i,
+                    Channel = cfg.Channel,
+                    Velocity = cfg.Velocity,
+                    CcCount = cfg.CcCount,
+                    StartCc = cfg.StartCc,
+                    NoteCount = cfg.NoteCount,
+                    StartNote = cfg.StartNote
+                });
+            }
+            return list.ToArray();
+        }
+
+        /// <summary>
+        /// Snapshots KBM (SOCD) configs for only created KeyboardMouse slots
+        /// (for profile storage).
+        /// </summary>
+        private ViewModels.KbmSlotConfigData[] BuildKbmConfigSnapshot()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.KbmSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                // Every CREATED slot, whatever its current type. A slot that
+                // is not Keyboard and Mouse right now can still hold parked
+                // surface and SOCD settings, and the reader restores them for
+                // any created slot, so filtering here dropped them from a
+                // named-profile save and lost them on the next load.
+                if (!SettingsManager.SlotCreated[i]) continue;
+                var cfg = _mainVm.Pads[i].KbmConfig;
+                list.Add(new ViewModels.KbmSlotConfigData
+                {
+                    SlotIndex = i,
+                    Surfaces = cfg.Surfaces,
+                    SocdMode = cfg.SocdMode,
+                    SocdPairs = cfg.SocdPairs
+                });
+            }
+            return list.Count > 0 ? list.ToArray() : null;
+        }
+
+        private ViewModels.KbmSlotConfigData[] BuildKbmConfigs()
+        {
+            var list = new System.Collections.Generic.List<ViewModels.KbmSlotConfigData>();
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                var cfg = _mainVm.Pads[i].KbmConfig;
+                list.Add(new ViewModels.KbmSlotConfigData
+                {
+                    SlotIndex = i,
+                    Surfaces = cfg.Surfaces,
+                    SocdMode = cfg.SocdMode,
+                    SocdPairs = cfg.SocdPairs
+                });
+            }
+            return list.ToArray();
+        }
+
+        /// <summary>
+        /// Collects macro data from all pad ViewModels for serialization.
+        /// Internal: the profile snapshot lanes (SnapshotCurrentProfile in
+        /// InputService, UpdateActiveProfileSnapshot here) reuse it so
+        /// profiles carry macros through the same converter as the main
+        /// settings file.
+        /// <para>Returns EMPTY, never null, when no pad has a macro. On
+        /// ProfileData, null Macros is the legacy sentinel for "saved before
+        /// macros rode profiles, leave the live set alone" (see
+        /// InputService.ApplyProfile). Emitting null for a profile the user
+        /// authored with zero macros made it claim to be pre-macros-era, so
+        /// switching to it kept the OUTGOING profile's macros live and
+        /// firing. Only genuinely old XML, where the element is absent, still
+        /// deserializes to null and keeps the legacy behavior.</para>
+        /// </summary>
+        internal MacroData[] BuildMacroData()
+        {
+            var list = new System.Collections.Generic.List<MacroData>();
+
+            for (int i = 0; i < _mainVm.Pads.Count; i++)
+            {
+                var padVm = _mainVm.Pads[i];
+                foreach (var macro in padVm.Macros)
+                    list.Add(BuildMacroDataForMacro(macro, i));
+            }
+
+            return list.ToArray();
+        }
+
+        /// <summary>Serializes one <see cref="MacroItem"/> into its
+        /// <see cref="MacroData"/> DTO. Extracted from <see cref="BuildMacroData"/>
+        /// so the macro Duplicate / Copy / Paste commands (#112) can round-trip a
+        /// single macro through the same mapping the save path uses.</summary>
+        public static MacroData BuildMacroDataForMacro(MacroItem macro, int padIndex)
+        {
+            return new MacroData
+            {
+                PadIndex = padIndex,
+                Name = macro.Name,
+                IsEnabled = macro.IsEnabled,
+                TriggerButtons = macro.TriggerButtons,
+                TriggerDeviceGuid = macro.TriggerDeviceGuid != Guid.Empty
+                    ? macro.TriggerDeviceGuid.ToString("N") : null,
+                TriggerRawButtons = macro.TriggerRawButtons.Length > 0
+                    ? string.Join(",", macro.TriggerRawButtons) : null,
+                TriggerSource = macro.TriggerSource,
+                TriggerMode = macro.TriggerMode,
+                TriggerHoldMs = macro.TriggerHoldMs,
+                TriggerDoublePressMs = macro.TriggerDoublePressMs,
+                LayerMask = macro.LayerMask,
+                ConsumeTriggerButtons = macro.ConsumeTriggerButtons,
+                RepeatMode = macro.RepeatMode,
+                RepeatCount = macro.RepeatCount,
+                RepeatDelayMs = macro.RepeatDelayMs,
+                PairId = macro.PairId,
+                ReleaseLingerMs = macro.ReleaseLingerMs,
+                TriggerCustomButtons = macro.TriggerCustomButtons,
+                TriggerAxisTargets = macro.TriggerAxisTargetList,
+                TriggerAxisDirections = macro.TriggerAxisDirectionList,
+                TriggerAxisThreshold = macro.TriggerAxisThreshold,
+                TriggerPovs = macro.TriggerPovs?.Length > 0 ? macro.TriggerPovs : null,
+                TriggerInputs = string.IsNullOrEmpty(macro.TriggerInputs) ? null : macro.TriggerInputs,
+                TriggerExpression = string.IsNullOrEmpty(macro.TriggerExpression) ? null : macro.TriggerExpression,
+                TriggerExpressionVariables = macro.TriggerExpressionVariableSpecs,
+                Actions = macro.Actions.Select(BuildActionData).ToArray()
+            };
+        }
+
+        /// <summary>Serializes one <see cref="MacroAction"/> into its
+        /// <see cref="ActionData"/> DTO. Extracted from <see cref="BuildMacroData"/>
+        /// so the action Duplicate command (#112) reuses the same field mapping.</summary>
+        public static ActionData BuildActionData(MacroAction a)
+        {
+            return new ActionData
+            {
+                Type = a.Type,
+                ButtonFlags = a.ButtonFlags,
+                CustomButtons = a.CustomButtons,
+                KeyCode = a.ParsedKeyCodes.Length > 0 ? a.ParsedKeyCodes[0] : a.KeyCode,
+                KeyString = a.KeyString,
+                DurationMs = a.DurationMs,
+                AxisValue = a.AxisValue,
+                AxisTarget = a.AxisTarget,
+                AxisSource = a.AxisSource,
+                SourceDeviceGuid = a.SourceDeviceGuid != Guid.Empty
+                    ? a.SourceDeviceGuid.ToString("N") : null,
+                SourceDeviceAxisIndex = a.SourceDeviceAxisIndex,
+                ProcessName = a.ProcessName,
+                VolumeLimit = a.VolumeLimit,
+                MouseSensitivity = a.MouseSensitivity,
+                MouseButton = a.MouseButton,
+                InvertAxis = a.InvertAxis,
+                WheelHorizontal = a.WheelHorizontal,
+                ShowVolumeOsd = a.ShowVolumeOsd,
+                LightbarR = a.LightbarR,
+                LightbarG = a.LightbarG,
+                LightbarB = a.LightbarB,
+                LightbarHoldMode = a.LightbarHoldMode,
+                LightbarColorSource = a.LightbarColorSource,
+                LightbarHoldMs = a.LightbarHoldMs,
+                LightbarFadeMs = a.LightbarFadeMs,
+                LightbarPaletteCsv = a.LightbarPaletteCsv,
+                LightbarTargetMode = a.LightbarTargetMode,
+                LightbarCycleModesCsv = a.LightbarCycleModesCsv,
+                PointerCycleModesCsv = a.PointerCycleModesCsv,
+                PointerSetMode = a.PointerSetMode,
+                SwitchLayerMask = a.SwitchLayerMask,
+                GuideLedPercent = a.GuideLedPercent,
+                SoundFilePath = string.IsNullOrEmpty(a.SoundFilePath) ? null : a.SoundFilePath,
+                SoundVolume = a.SoundVolume,
+                SoundLoop = a.SoundLoop,
+                SetGyroEngagedMode = a.SetGyroEngagedMode,
+                RumbleHoldMode = a.RumbleHoldMode,
+                RumbleStrengthLeft = a.RumbleStrengthLeft,
+                RumbleStrengthRight = a.RumbleStrengthRight,
+                RumbleHoldMs = a.RumbleHoldMs,
+                RumbleFadeMs = a.RumbleFadeMs,
+                CursorRecenterMode = a.CursorRecenterMode,
+                CursorPinMode = a.CursorPinMode,
+                CursorPinX = a.CursorPinX,
+                CursorPinY = a.CursorPinY,
+                MouseX = a.MouseX,
+                MouseY = a.MouseY,
+                NudgeDx = a.NudgeDx,
+                NudgeDy = a.NudgeDy,
+                CycleStepsCsv = string.IsNullOrEmpty(a.CycleStepsCsv) ? null : a.CycleStepsCsv,
+                CycleWrap = a.CycleWrap,
+                IntervalMs = a.IntervalMs,
+                PressureScaledRate = a.PressureScaledRate,
+                SlowIntervalMs = a.SlowIntervalMs,
+                TurboRateCurve = a.TurboRateCurve,
+                PressureStartPercent = a.PressureStartPercent,
+                PressureEndPercent = a.PressureEndPercent,
+                PulseWhileLatched = a.PulseWhileLatched,
+                AxisYieldToPhysical = a.AxisYieldToPhysical,
+                LatchDirection = a.LatchDirection,
+                CursorClampMode = a.CursorClampMode,
+                CursorClampInsetX = a.CursorClampInsetX,
+                CursorClampInsetY = a.CursorClampInsetY,
+                DisconnectTarget = a.DisconnectTarget,
+                DisconnectDeviceGuid = a.DisconnectDeviceGuid == Guid.Empty
+                    ? null : a.DisconnectDeviceGuid.ToString(),
+                ProgramPath = string.IsNullOrEmpty(a.ProgramPath) ? null : a.ProgramPath,
+                ProgramArgs = string.IsNullOrEmpty(a.ProgramArgs) ? null : a.ProgramArgs,
+                ProgramWorkingDir = string.IsNullOrEmpty(a.ProgramWorkingDir) ? null : a.ProgramWorkingDir,
+                TextContent = string.IsNullOrEmpty(a.TextContent) ? null : a.TextContent,
+                TextPerCharDelayMs = a.TextPerCharDelayMs,
+                DreamcastFrames = string.IsNullOrEmpty(a.DreamcastFrames) ? null : a.DreamcastFrames,
+                DreamcastFrameMs = a.DreamcastFrameMs,
+                DreamcastRepeat = a.DreamcastRepeat
+            };
+        }
+
+        /// <summary>JSON envelope for the macro clipboard (#112).</summary>
+        public sealed class MacroClipboardEnvelope
+        {
+            public string Type { get; set; }
+            public int Version { get; set; }
+            public MacroData[] Macros { get; set; }
+        }
+
+        private const string MacroClipboardType = "PadForgeMacro";
+
+        /// <summary>Serializes macros into the clipboard envelope JSON (#112).</summary>
+        public static string SerializeMacrosToClipboard(MacroData[] macros)
+            => System.Text.Json.JsonSerializer.Serialize(new MacroClipboardEnvelope
+            {
+                Type = MacroClipboardType,
+                Version = 1,
+                Macros = macros,
+            });
+
+        /// <summary>Parses a clipboard string into a macro envelope, or null when the
+        /// text is not a PadForge macro envelope (#112). Never throws.</summary>
+        public static MacroClipboardEnvelope TryParseMacroClipboard(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return null;
+            try
+            {
+                var env = System.Text.Json.JsonSerializer.Deserialize<MacroClipboardEnvelope>(json);
+                return env != null
+                    && string.Equals(env.Type, MacroClipboardType, StringComparison.Ordinal)
+                    && env.Macros != null
+                    ? env : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Commits hydrated edits before a device or slot changes.</summary>
+        internal void FlushPendingDeviceEdits()
+        {
+            if (InputService.VmMappingsStale || InputService.SuppressMappingEditPush) return;
+            UpdatePadSettingsFromViewModelsCore(hydratedOnly: true);
+        }
+
+        /// <summary>
+        /// Pushes tuning to each slot's selected device and projects stored Base
+        /// mappings into the owning devices' legacy fields.
+        /// </summary>
+        // Internal so a test can drive the real save-side ViewModel push
+        // (round twelve): the device-pin re-key is only correct if it
+        // survives THIS, and asserting on the in-memory PadSetting alone
+        // is what let two rounds ship a fix the next save undid.
+        internal void UpdatePadSettingsFromViewModels()
+            => UpdatePadSettingsFromViewModelsCore(hydratedOnly: false);
+
+        private void UpdatePadSettingsFromViewModelsCore(bool hydratedOnly)
+        {
+            // Same self-guard as PushUiExtraSourcesIntoSlotMappingSets, for
+            // the same reason: mid-profile-swap the ViewModels still hold the
+            // OUTGOING profile's tuning while the PadSettings already belong
+            // to the incoming one, so a push landing inside that window
+            // writes stale values over the freshly installed profile. The
+            // window is a synchronous UI block today, but this writer now
+            // also runs on the 250 ms tier-1 tick (#331), and the recorded
+            // rule from the clobber this family already shipped is that the
+            // writer guards ITSELF so every present and future caller
+            // inherits it. Skipping here is always safe: the next tick, or
+            // the save's own call after the swap completes, pushes fresh
+            // values.
+            if (InputService.VmMappingsStale || InputService.SuppressMappingEditPush) return;
+            PushUiExtraSourcesIntoSlotMappingSets();
+
+            lock (SettingsManager.UserSettings.SyncRoot)
+            {
+                for (int i = 0; i < _mainVm.Pads.Count; i++)
+                {
+                    var padVm = _mainVm.Pads[i];
+                    if (hydratedOnly && (!padVm.MappingsViewLoaded || !SettingsManager.SlotCreated[i])) continue;
+                    var selected = padVm.SelectedMappedDevice;
+                    LegacyBaseMappingProjection.Write(padVm, selected?.InstanceGuid ?? Guid.Empty);
+                    if (selected == null || selected.InstanceGuid == Guid.Empty)
+                        continue;
+
+                    var us = SettingsManager.FindSettingByInstanceGuidAndSlot(selected.InstanceGuid, i);
+                    if (us == null) continue;
+
+                    var ps = us.GetPadSetting();
+                    if (ps == null) continue;
+
+                    // Write force feedback settings.
+                    ps.ForceOverall = padVm.ForceOverallGain.ToString();
+                    ps.RotationRange = padVm.WheelRotationRange.ToString();
+                    ps.AutoCenterStrength = padVm.WheelAutoCenter.ToString();
+                    ps.WheelRpmLeds = padVm.WheelRpmLeds ? "1" : "0";
+                    ps.LeftMotorStrength = padVm.LeftMotorStrength.ToString();
+                    ps.RightMotorStrength = padVm.RightMotorStrength.ToString();
+                    ps.ForceSwapMotor = padVm.SwapMotors ? "1" : "0";
+                    ps.TriggerRumbleFold = padVm.TriggerRumbleFold ? "1" : "0";
+
+                    // Write impulse trigger settings.
+                    ps.ImpulseOverallGain = padVm.ImpulseOverallGain.ToString();
+                    ps.ImpulseLeftStrength = padVm.ImpulseLeftStrength.ToString();
+                    ps.ImpulseRightStrength = padVm.ImpulseRightStrength.ToString();
+                    ps.ImpulseSwapTriggers = padVm.ImpulseSwapTriggers ? "1" : "0";
+                    ps.AtVibrationToImpulseEnabled = padVm.AtVibrationToImpulse ? "1" : "0";
+                    ps.ConstantTriggerForceEnabled = padVm.ConstantTriggerForceEnabled ? "1" : "0";
+                    ps.AudioRumbleTriggersEnabled = padVm.AudioRumbleTriggersEnabled ? "1" : "0";
+                    ps.AudioRumbleLeftTrigger = padVm.AudioRumbleLeftTrigger.ToString();
+                    ps.AudioRumbleRightTrigger = padVm.AudioRumbleRightTrigger.ToString();
+
+                    // Issue #50: all double→string conversions MUST use InvariantCulture.
+                    // WARNING: if you add a new double property below, use .ToString(ic)
+                    // — NOT bare .ToString(). See InputService.SaveViewModelToPadSetting
+                    // for the full explanation of the locale data-loss bug.
+                    var ic = System.Globalization.CultureInfo.InvariantCulture;
+                    ps.ConstantTriggerForceLeft = padVm.ConstantTriggerForceLeft.ToString("F4", ic);
+                    ps.ConstantTriggerForceRight = padVm.ConstantTriggerForceRight.ToString("F4", ic);
+                    ps.AudioRumbleTriggersSensitivity = padVm.AudioRumbleTriggersSensitivity.ToString("F1", ic);
+                    ps.AudioRumbleTriggersCutoffHz = padVm.AudioRumbleTriggersCutoffHz.ToString("F0", ic);
+
+                    // Write gyro tuning (per-(device, slot)).
+                    ps.GyroSensitivityH = padVm.GyroSensitivityH.ToString(ic);
+                    ps.GyroSensitivityV = padVm.GyroSensitivityV.ToString(ic);
+                    ps.GyroDeadZoneDegPerSec = padVm.GyroDeadZoneDegPerSec.ToString(ic);
+                    ps.GyroSmoothingAlpha = padVm.GyroSmoothingAlpha.ToString(ic);
+                    ps.GyroAcceleration = padVm.GyroAcceleration.ToString(ic);
+                    ps.GyroOutputCurve = padVm.GyroOutputCurve ?? "Linear";
+                    ps.GyroSensitivityUnits = padVm.GyroSensitivityUnits ?? "Multiplier";
+                    ps.GyroEasyAimStickThreshold = padVm.GyroEasyAimStickThreshold.ToString(ic);
+                    ps.GyroEngageStickSide = string.IsNullOrEmpty(padVm.GyroEngageStickSide) ? "Right" : padVm.GyroEngageStickSide;
+                    ps.GyroEngageStickDirection = string.IsNullOrEmpty(padVm.GyroEngageStickDirection) ? "Full" : padVm.GyroEngageStickDirection;
+                    ps.IrSensorBarPos = padVm.IrSensorBarPos.ToString(ic);
+                    ps.IrSensorBarComp = (padVm.IrSensorBarCompPercent / 100.0).ToString(ic);
+                    ps.IrSmoothing = (padVm.IrSmoothingPercent / 100.0).ToString(ic);
+                    ps.PointerMode = string.IsNullOrEmpty(padVm.PointerMode) ? "Mouse" : padVm.PointerMode;
+                    ps.PointerFpsSpeed = padVm.PointerFpsSpeed.ToString(ic);
+
+                    // Write JoyShockMapper-canongyro extensions.
+                    ps.GyroSpace = padVm.GyroSpace ?? "Local";
+                    ps.MotionGrip = padVm.MotionGrip ?? "Pointing";
+                    ps.GyroPlayerSpaceYawRelaxFactor = padVm.GyroPlayerSpaceYawRelaxFactor.ToString(ic);
+                    ps.GyroWorldSpaceSideReductionThreshold = padVm.GyroWorldSpaceSideReductionThreshold.ToString(ic);
+                    ps.GyroTighteningThresholdDegPerSec = padVm.GyroTighteningThresholdDegPerSec.ToString(ic);
+                    ps.GyroSmoothingThresholdDegPerSec = padVm.GyroSmoothingThresholdDegPerSec.ToString(ic);
+                    ps.GyroSmoothingWindowMs = padVm.GyroSmoothingWindowMs.ToString(ic);
+                    ps.GyroRealWorldCalibration = padVm.GyroRealWorldCalibration.ToString(ic);
+                    ps.GyroAimEngageButton = padVm.GyroAimEngageButton ?? "";
+                    ps.GyroAimEngageDeviceGuid = padVm.GyroAimEngageDeviceGuid ?? "";
+                    ps.GyroAimEngageMode = string.IsNullOrEmpty(padVm.GyroAimEngageMode) ? "Hold" : padVm.GyroAimEngageMode;
+                    ps.GyroInvertPitch = padVm.GyroInvertPitch ? "1" : "0";
+                    ps.GyroCompassYaw = padVm.GyroCompassYaw ? "1" : "0";
+                    ps.GyroSimulation = padVm.GyroSimulation ? "1" : "0";
+                    ps.GyroSimulationSmoothingMs = padVm.GyroSimulationSmoothingMs.ToString(ic);
+                    ps.GyroInvertYaw = padVm.GyroInvertYaw ? "1" : "0";
+                    ps.GyroInvertRoll = padVm.GyroInvertRoll ? "1" : "0";
+                    ps.GyroApplyTuningToPassthrough = padVm.GyroApplyTuningToPassthrough ? "1" : "0";
+
+                    // Write Motion Steering tuning (per-(device, slot)) — settings for
+                    // the "Motion Lean" input descriptor. No Enabled/Target keys: the
+                    // input is mapped from the picker, never stamped onto a target.
+                    ps.SetRawMapping("MotionSteerInner", padVm.MotionSteerInnerDz.ToString(ic));
+                    ps.SetRawMapping("MotionSteerOuter", padVm.MotionSteerOuterDz.ToString(ic));
+                    ps.SetRawMapping("MotionSteerOrient", padVm.MotionSteerOrient);
+                    ps.SetRawMapping("GyroTiltRange", padVm.GyroTiltRangeDeg.ToString(ic));
+                    ps.SetRawMapping("GyroTiltInner", padVm.GyroTiltInnerDz.ToString(ic));
+
+                    // Write Flick Stick card tuning (#225), same bag.
+                    SaveFlickStickCard(padVm, ps);
+
+                    // Write audio bass rumble settings.
+                    ps.AudioRumbleEnabled = padVm.AudioRumbleEnabled ? "1" : "0";
+                    ps.AudioRumbleSensitivity = padVm.AudioRumbleSensitivity.ToString("F1", ic);
+                    ps.AudioRumbleCutoffHz = padVm.AudioRumbleCutoffHz.ToString("F0", ic);
+                    ps.AudioRumbleLeftMotor = padVm.AudioRumbleLeftMotor.ToString();
+                    ps.AudioRumbleRightMotor = padVm.AudioRumbleRightMotor.ToString();
+
+                    // Write constant force settings.
+                    ps.ConstantForceEnabled = padVm.ConstantForceEnabled ? "1" : "0";
+                    ps.ConstantForceX = padVm.ConstantForceX.ToString("F4", ic);
+                    ps.ConstantForceY = padVm.ConstantForceY.ToString("F4", ic);
+
+                    // Steering at-lock feedback (#94).
+                    ps.SteeringAngleRumbleEnabled = padVm.SteeringAngleRumbleEnabled ? "1" : "0";
+                    ps.SteeringAngleRumbleAxis = padVm.SteeringAngleRumbleAxis.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    ps.SteeringAngleRumbleStrength = padVm.SteeringAngleRumbleStrength.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    ps.SteeringAngleRumbleDeadzone = padVm.SteeringAngleRumbleDeadzone.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    ps.SteeringLockRumbleEnabled = padVm.SteeringLockRumbleEnabled ? "1" : "0";
+                    ps.SteeringLockTriggerVibEnabled = padVm.SteeringLockTriggerVibEnabled ? "1" : "0";
+                    ps.SteeringLockLightbarEnabled = padVm.SteeringLockLightbarEnabled ? "1" : "0";
+                    ps.SteeringLockATResistanceEnabled = padVm.SteeringLockATResistanceEnabled ? "1" : "0";
+                    ps.SteeringLockPulseMs = ((int)padVm.SteeringLockPulseMs).ToString(ic);
+                    ps.SteeringLockLightbarColor = padVm.SteeringLockLightbarColor ?? "#FF0000";
+                    ps.SteeringLockLightbarColorSource = padVm.SteeringLockLightbarColorSource.ToString();
+                    ps.SteeringLockLightbarPaletteCsv = padVm.SteeringLockLightbarPaletteCsv ?? "";
+                    ps.SteeringLockLightbarHoldMs = ((int)padVm.SteeringLockLightbarHoldMs).ToString(ic);
+                    ps.SteeringLockLightbarFadeMs = ((int)padVm.SteeringLockLightbarFadeMs).ToString(ic);
+
+                    // Trigger rumble routing (#102), mirroring
+                    // InputService.SaveViewModelToPadSetting so the autosave
+                    // writer covers the same fields as the 30 Hz sync.
+                    ps.LeftTriggerRouteSource = string.IsNullOrEmpty(padVm.LeftTriggerRouteSource) ? "None" : padVm.LeftTriggerRouteSource;
+                    ps.RightTriggerRouteSource = string.IsNullOrEmpty(padVm.RightTriggerRouteSource) ? "None" : padVm.RightTriggerRouteSource;
+                    ps.LeftTriggerRouteMode = string.IsNullOrEmpty(padVm.LeftTriggerRouteMode) ? "Duplicate" : padVm.LeftTriggerRouteMode;
+                    ps.RightTriggerRouteMode = string.IsNullOrEmpty(padVm.RightTriggerRouteMode) ? "Duplicate" : padVm.RightTriggerRouteMode;
+                    ps.LeftTriggerRouteScale = padVm.LeftTriggerRouteScale.ToString();
+                    ps.RightTriggerRouteScale = padVm.RightTriggerRouteScale.ToString();
+                    ps.LeftTriggerRouteActivator = padVm.LeftTriggerRouteActivator ?? "";
+                    ps.RightTriggerRouteActivator = padVm.RightTriggerRouteActivator ?? "";
+                    ps.LeftTriggerRouteActivatorDeviceGuid = padVm.LeftTriggerRouteActivatorDeviceGuid ?? "";
+                    ps.RightTriggerRouteActivatorDeviceGuid = padVm.RightTriggerRouteActivatorDeviceGuid ?? "";
+                    ps.LeftTriggerRouteActivatorMode = string.IsNullOrEmpty(padVm.LeftTriggerRouteActivatorMode) ? "Hold" : padVm.LeftTriggerRouteActivatorMode;
+                    ps.RightTriggerRouteActivatorMode = string.IsNullOrEmpty(padVm.RightTriggerRouteActivatorMode) ? "Hold" : padVm.RightTriggerRouteActivatorMode;
+
+                    // Write deadzone settings (independent X/Y).
+                    ps.LeftThumbDeadZoneShape = padVm.LeftDeadZoneShape.ToString();
+                    ps.LeftThumbDeadZoneX = padVm.LeftDeadZoneX.ToString(ic);
+                    ps.LeftThumbDeadZoneY = padVm.LeftDeadZoneY.ToString(ic);
+                    ps.RightThumbDeadZoneShape = padVm.RightDeadZoneShape.ToString();
+                    ps.RightThumbDeadZoneX = padVm.RightDeadZoneX.ToString(ic);
+                    ps.RightThumbDeadZoneY = padVm.RightDeadZoneY.ToString(ic);
+                    ps.LeftThumbAntiDeadZoneX = padVm.LeftAntiDeadZoneX.ToString(ic);
+                    ps.LeftThumbAntiDeadZoneY = padVm.LeftAntiDeadZoneY.ToString(ic);
+                    ps.RightThumbAntiDeadZoneX = padVm.RightAntiDeadZoneX.ToString(ic);
+                    ps.RightThumbAntiDeadZoneY = padVm.RightAntiDeadZoneY.ToString(ic);
+                    ps.LeftThumbLinear = padVm.LeftLinear.ToString(ic);
+                    ps.RightThumbLinear = padVm.RightLinear.ToString(ic);
+                    ps.LeftThumbSensitivityCurveX = padVm.LeftSensitivityCurveX;
+                    ps.LeftThumbSensitivityCurveY = padVm.LeftSensitivityCurveY;
+                    ps.RightThumbSensitivityCurveX = padVm.RightSensitivityCurveX;
+                    ps.RightThumbSensitivityCurveY = padVm.RightSensitivityCurveY;
+                    ps.LeftTriggerSensitivityCurve = padVm.LeftTriggerSensitivityCurve;
+                    ps.RightTriggerSensitivityCurve = padVm.RightTriggerSensitivityCurve;
+                    ps.LeftThumbMaxRangeX = padVm.LeftMaxRangeX.ToString(ic);
+                    ps.LeftThumbMaxRangeY = padVm.LeftMaxRangeY.ToString(ic);
+                    ps.RightThumbMaxRangeX = padVm.RightMaxRangeX.ToString(ic);
+                    ps.RightThumbMaxRangeY = padVm.RightMaxRangeY.ToString(ic);
+                    ps.LeftThumbMaxRangeXNeg = padVm.LeftMaxRangeXNeg.ToString(ic);
+                    ps.LeftThumbMaxRangeYNeg = padVm.LeftMaxRangeYNeg.ToString(ic);
+                    ps.RightThumbMaxRangeXNeg = padVm.RightMaxRangeXNeg.ToString(ic);
+                    ps.RightThumbMaxRangeYNeg = padVm.RightMaxRangeYNeg.ToString(ic);
+                    ps.LeftThumbCenterOffsetX = padVm.LeftCenterOffsetX.ToString(ic);
+                    ps.LeftThumbCenterOffsetY = padVm.LeftCenterOffsetY.ToString(ic);
+                    ps.RightThumbCenterOffsetX = padVm.RightCenterOffsetX.ToString(ic);
+                    ps.RightThumbCenterOffsetY = padVm.RightCenterOffsetY.ToString(ic);
+                    // Boundary calibration maps (#174). This flush mirrors the
+                    // 30 Hz SaveViewModelToPadSetting, but it also runs when the
+                    // engine is stopped (SaveToFile calls it first), so without
+                    // these a boundary reset or recalibration made while stopped
+                    // would not persist (the 30 Hz writer is gated on IsRunning).
+                    ps.LeftThumbBoundaryMap = padVm.LeftThumbBoundaryMap ?? string.Empty;
+                    ps.RightThumbBoundaryMap = padVm.RightThumbBoundaryMap ?? string.Empty;
+
+                    // Write trigger deadzone settings.
+                    ps.LeftTriggerDeadZone = padVm.LeftTriggerDeadZone.ToString(ic);
+                    ps.RightTriggerDeadZone = padVm.RightTriggerDeadZone.ToString(ic);
+                    ps.LeftTriggerAntiDeadZone = padVm.LeftTriggerAntiDeadZone.ToString(ic);
+                    ps.RightTriggerAntiDeadZone = padVm.RightTriggerAntiDeadZone.ToString(ic);
+                    ps.LeftTriggerMaxRange = padVm.LeftTriggerMaxRange.ToString(ic);
+                    ps.RightTriggerMaxRange = padVm.RightTriggerMaxRange.ToString(ic);
+
+                    // Write Extended custom stick/trigger settings for indices 2+ to dictionary.
+                    foreach (var stick in padVm.StickConfigs)
+                    {
+                        if (stick.Index < 2) continue;
+                        int g = stick.Index;
+                        ps.SetRawMapping($"RawStick{g}DzShape", ((int)stick.DeadZoneShape).ToString());
+                        ps.SetRawMapping($"RawStick{g}DzX", stick.DeadZoneX.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}DzY", stick.DeadZoneY.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}AdzX", stick.AntiDeadZoneX.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}AdzY", stick.AntiDeadZoneY.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}Linear", stick.Linear.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}CurveX", stick.SensitivityCurveX);
+                        ps.SetRawMapping($"RawStick{g}CurveY", stick.SensitivityCurveY);
+                        ps.SetRawMapping($"RawStick{g}CofX", stick.CenterOffsetX.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}CofY", stick.CenterOffsetY.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}MrX", stick.MaxRangeX.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}MrY", stick.MaxRangeY.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}MrXN", stick.MaxRangeXNeg.ToString(ic));
+                        ps.SetRawMapping($"RawStick{g}MrYN", stick.MaxRangeYNeg.ToString(ic));
+                    }
+                    // Per-stick steering mode + tunables (#94), every stick index. The
+                    // engine reads Kind off the MappingSet rows (stamped in
+                    // SaveViewModelToMappingSet), but the settings persist here too so
+                    // the Sticks-tab card can reload them.
+                    foreach (var stick in padVm.StickConfigs)
+                    {
+                        int g = stick.Index;
+                        if (g < 0) continue;
+                        ps.SetRawMapping($"Stick{g}SteerKind", stick.SteeringKind);
+                        ps.SetRawMapping($"Stick{g}SteerWindRange", stick.WindRangeDeg.ToString(ic));
+                        ps.SetRawMapping($"Stick{g}SteerWindPower", stick.WindPower.ToString(ic));
+                        ps.SetRawMapping($"Stick{g}SteerWindUnwind", stick.WindUnwindRate.ToString(ic));
+                        ps.SetRawMapping($"Stick{g}SteerAngleInner", stick.AngleInnerDz.ToString(ic));
+                        ps.SetRawMapping($"Stick{g}SteerAngleOuter", stick.AngleOuterDz.ToString(ic));
+                    }
+
+                    foreach (var trig in padVm.TriggerConfigs)
+                    {
+                        if (trig.Index < 2) continue;
+                        int g = trig.Index;
+                        ps.SetRawMapping($"RawTrigger{g}Dz", trig.DeadZone.ToString(ic));
+                        ps.SetRawMapping($"RawTrigger{g}Adz", trig.AntiDeadZone.ToString(ic));
+                        ps.SetRawMapping($"RawTrigger{g}Mr", trig.MaxRange.ToString(ic));
+                        ps.SetRawMapping($"RawTrigger{g}Curve", trig.SensitivityCurve);
+                    }
+
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Reset
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Resets all settings to defaults. Clears all mappings and device records.
+        /// </summary>
+        public void ResetToDefaults()
+        {
+            InvalidateAssignmentSnapshot();
+            // Closure by construction, not by hand-list. The old body
+            // enumerated fields one by one and rotted as features landed
+            // (user-confirmed: the HidHide toggles and whitelist, the
+            // touchpad overlay group, gyro / steering / wheel / trigger
+            // routing / touchpad-gesture tuning, and the mapping extras
+            // all survived a reset). The rebuild leans on the two load
+            // mirrors that normal persistence already keeps complete:
+            // a fresh AppSettingsData carries every app-level default,
+            // and a blank PadSetting carries every per-pad tuning
+            // default. Anything a future feature persists through the
+            // save/load chain is then reset automatically.
+
+            // 1. Stores. Devices (including per-device HidHideEnabled
+            //    records), slot bindings + their PadSettings, per-slot
+            //    mapping sets (multi-source extras, shift layers), any
+            //    pending default-profile snapshot, and imported
+            //    HIDMaestro profile JSONs.
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                SettingsManager.UserDevices.Items.Clear();
+            }
+
+            lock (SettingsManager.UserSettings.SyncRoot)
+            {
+                SettingsManager.UserSettings.Items.Clear();
+            }
+
+            SettingsManager.SlotMappingSets =
+                new Engine.Data.MappingSet[Common.Input.InputManager.MaxPads];
+            SettingsManager.PendingDefaultSnapshot = null;
+            // Sibling contract from RemoveUserProfile: every _userProfiles
+            // mutation reloads the HM catalog, or the Extended profile
+            // dropdown keeps serving the wiped imports for the session.
+            _userProfiles.Clear();
+            Common.Input.HMaestroProfileCatalog.Reload();
+
+            // 2. Per-pad surfaces. ResetAllSettings covers what the load
+            //    mirror can't reach (macros, sensitivity-curve items,
+            //    dead-zone shapes, per-device configs), the
+            //    blank-PadSetting load resets every writer-mirrored
+            //    tuning field to its canonical default, and the mapping
+            //    refresh rebuilds every row from the now-empty mapping
+            //    set (descriptors, extra sources, per-mapping dead zones,
+            //    combine modes all clear in one pass).
+            foreach (var padVm in _mainVm.Pads)
+            {
+                padVm.ResetAllSettings();
+                InputService.LoadPadSettingIntoViewModel(padVm, new Engine.Data.PadSetting());
+                padVm.SoundMasterVolume = 100;
+                // In place, never by instance replacement: MainWindow's
+                // MarkDirty autosave hook subscribes to these objects'
+                // PropertyChanged once at startup, and replacing them
+                // would silently sever Extended-config persistence for
+                // the rest of the session.
+                padVm.ExtendedConfig.ResetToDefaults();
+                padVm.MidiConfig.ResetToDefaults();
+                padVm.KbmConfig.ResetToDefaults();
+                // The reset put the surface mode back to Both. Without this
+                // the chip's TwoWay target keeps the old value, and re-picking
+                // what it already displays raises no SelectionChanged, so the
+                // user cannot correct the display from the chip.
+                padVm.NotifyKbmSurfacesChanged();
+                // The reset replaced the slot's whole raw surface, so no
+                // wire owns it any more; clear the stamp and let the next
+                // Nintendo profile adopt (translate nothing).
+                SettingsManager.StampNintendoWire(padVm.PadIndex, null);
+                padVm.OutputType = Engine.VirtualControllerType.Xbox;
+                padVm.ProfileId = Common.Input.InputManager.GetDefaultProfileId(padVm.OutputType);
+                padVm.ActiveLayerMask = "Base";
+                // Sibling of ApplyProfile's sequence: without the rebuild
+                // the old shift-layer tab strip ghosts over the emptied
+                // mapping set until an engine restart.
+                padVm.RebuildLayerTabs(null);
+                InputService.RefreshMappingsToViewModel(padVm);
+            }
+
+            // 3. App-level surface: Settings page (HidHide toggles +
+            //    whitelist, language, theme, engine options, 2D view),
+            //    Dashboard page (DSU / web controller / Remote Link /
+            //    touchpad overlay), Remote Link identity + trusted
+            //    peers, sound-package and NFC registries, global macro
+            //    shortcuts, window placement. A fresh AppSettingsData's
+            //    initializers ARE the fresh-install defaults, and
+            //    LoadAppSettings pushes every one of them through the
+            //    same setters startup uses (so side effects like the
+            //    start-at-login scheduled task and the live DSU / web
+            //    server toggles apply themselves).
+            _mainVm.Settings.ProfileShortcuts.Clear();
+            LoadAppSettings(new AppSettingsData
+            {
+                SlotModel3DAppearances = SlotAppearancePersistence.Empty(),
+                // The Bliss-Box adapters' own Dreamcast pictures (#469) are
+                // the adapters' state, not settings: each is the only copy of
+                // a picture PadForge replaced, and the next time the switch is
+                // on, the port's default Adapter mode writes it back.
+                BlissBoxPorts = BlissBoxPortData.KeepAdapterPictures(_mainVm.Settings.BlissBoxPorts),
+            });
+            // LoadAppSettings can't reset the language: a fresh
+            // AppSettingsData carries Language = "" and
+            // SetLanguageFromCode no-ops on the empty code. Fresh-install
+            // state is "no explicit selection, follow the OS display
+            // language", which takes its own path.
+            _mainVm.Settings.ResetLanguageToSystemDefault();
+
+            // 4. Profiles: back to the single built-in Default entry.
+            var settingsVm = _mainVm.Settings;
+            SettingsManager.EnableAutoProfileSwitching = false;
+            SettingsManager.EnableExternalControl = false;
+            SettingsManager.ExternalProfilePinActive = false;
+            SettingsManager.ActiveProfileId = null;
+            SettingsManager.Profiles.Clear();
+            settingsVm.ProfileItems.Clear();
+            settingsVm.ProfileItems.Add(new ViewModels.ProfileListItem
+            {
+                Id = ViewModels.ProfileListItem.DefaultProfileId,
+                Name = Strings.Instance.Profile_Default,
+            });
+            settingsVm.ActiveProfileInfo = Strings.Instance.Profile_Default;
+
+            // MarkDirty, not a bare IsDirty write: only MarkDirty arms
+            // the autosave debounce, and nothing else in this method is
+            // guaranteed to (store clears and collection Clears fire no
+            // watched property changes). Without it a reset could sit
+            // unsaved until app close and resurrect on a crash.
+            MarkDirty();
+            settingsVm.HasUnsavedChanges = true;
+            _mainVm.StatusText = Strings.Instance.Status_SettingsResetDefaults;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Reload
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Reloads settings from disk, discarding any unsaved changes.
+        /// </summary>
+        public void Reload()
+        {
+            if (File.Exists(_settingsFilePath))
+            {
+                LoadFromFile(_settingsFilePath);
+                _mainVm.StatusText = Strings.Instance.Status_SettingsReloaded;
+            }
+            else
+            {
+                _mainVm.SetStatus(Strings.Instance.Status_NoSettingsFile, persist: true);
+            }
+
+            IsDirty = false;
+            _mainVm.Settings.HasUnsavedChanges = false;
+            if (_profilesCompactedOnLoad) { _profilesCompactedOnLoad = false; MarkDirty(); }
+            if (_accessCodeUnsavedOnLoad) { _accessCodeUnsavedOnLoad = false; MarkDirty(); }
+        }
+
+        /// <summary>
+        /// Snapshot of the current user-profile store for UI presentation
+        /// in the Manage Profiles dialog. Returns id + display name pairs
+        /// (the name is pulled from each profile's JSON "name" field,
+        /// which already carries the "(User Generated)" suffix applied on
+        /// import).
+        /// </summary>
+        public IReadOnlyList<Views.ManageProfilesDialog.ImportedProfileRow> GetUserProfileRows()
+        {
+            var list = new List<Views.ManageProfilesDialog.ImportedProfileRow>();
+            foreach (var p in _userProfiles)
+            {
+                if (p == null || string.IsNullOrWhiteSpace(p.Json)) continue;
+                string name = p.Id;
+                try
+                {
+                    var root = System.Text.Json.Nodes.JsonNode.Parse(p.Json)?.AsObject();
+                    var n = root?["name"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(n)) name = n;
+                }
+                catch { }
+                list.Add(new Views.ManageProfilesDialog.ImportedProfileRow
+                {
+                    Id = p.Id,
+                    Name = name,
+                });
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// Remove a user-imported profile from the store by id. Any slot
+        /// whose ProfileId matched the deleted entry gets reset to the
+        /// synthetic padforge-custom entry so no slot points at a missing
+        /// profile after the delete lands.
+        ///
+        /// UI-thread only. Callers are ManageProfilesDialog button
+        /// handlers, which own modal focus for the duration of the call,
+        /// so the slot-reset loop cannot race with a user-driven slot edit
+        /// or a polling-thread read of ProfileId.
+        /// </summary>
+        public void RemoveUserProfile(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return;
+            int removed = _userProfiles.RemoveAll(p =>
+                string.Equals(p?.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (removed == 0) return;
+
+            // Reset any slot that was using the deleted profile so the
+            // dropdown doesn't land on a now-missing id. padforge-custom
+            // is the Extended category's default per
+            // InputManager.GetDefaultProfileId; Xbox and PlayStation
+            // slots have fixed catalog defaults and don't accept user
+            // imports in the first place, so this reset only ever fires
+            // for Extended slots.
+            foreach (var padVm in _mainVm.Pads)
+            {
+                if (string.Equals(padVm?.ProfileId, id, StringComparison.OrdinalIgnoreCase))
+                    padVm.ProfileId = Common.Input.HMaestroProfileCatalog.CustomProfileId;
+            }
+
+            Common.Input.HMaestroProfileCatalog.Reload();
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// Write a user-imported profile's JSON to the given file path.
+        /// Caller is responsible for prompting the user for the file
+        /// location. Throws on failure so the dialog can surface the
+        /// error.
+        /// </summary>
+        public void ExportUserProfile(string id, string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(filePath))
+                return;
+            var entry = _userProfiles.FirstOrDefault(p =>
+                string.Equals(p?.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (entry == null || string.IsNullOrWhiteSpace(entry.Json))
+                throw new InvalidOperationException($"User profile '{id}' not found.");
+
+            // Pretty-print the JSON on export — the stored form is compact
+            // to keep PadForge.xml tight, but files written for contribution
+            // / inspection are more useful with indentation.
+            string pretty = entry.Json;
+            try
+            {
+                var root = System.Text.Json.Nodes.JsonNode.Parse(entry.Json);
+                if (root != null)
+                    pretty = root.ToJsonString(
+                        new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            }
+            catch { }
+            System.IO.File.WriteAllText(filePath, pretty);
+        }
+
+        /// <summary>
+        /// Persist a newly-extracted HIDMaestro profile JSON into the user
+        /// profile store. Applies the "-user" id suffix and the
+        /// " (User Generated)" name suffix (forcing uniqueness against the
+        /// built-in catalog), deduplicates by Id so re-importing the same
+        /// device overwrites the prior capture, triggers a catalog reload
+        /// so the Extended dropdown picks up the new entry, and marks
+        /// settings dirty. Returns the suffixed id so the caller can set
+        /// the current slot's ProfileId directly.
+        /// </summary>
+        public string AddUserProfile(string extractedJson)
+        {
+            if (string.IsNullOrWhiteSpace(extractedJson)) return null;
+
+            string suffixed;
+            try
+            {
+                var root = System.Text.Json.Nodes.JsonNode.Parse(extractedJson)?.AsObject();
+                if (root == null) return null;
+
+                string baseId = root["id"]?.GetValue<string>();
+                string baseName = root["name"]?.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(baseId)) return null;
+
+                if (!baseId.EndsWith("-user", StringComparison.OrdinalIgnoreCase))
+                    baseId += "-user";
+                if (!string.IsNullOrEmpty(baseName) && !baseName.Contains("(User Generated)"))
+                    baseName = $"{baseName} (User Generated)";
+
+                root["id"] = baseId;
+                if (baseName != null) root["name"] = baseName;
+                suffixed = root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
+            }
+            catch
+            {
+                return null;
+            }
+
+            string id;
+            try
+            {
+                var root = System.Text.Json.Nodes.JsonNode.Parse(suffixed)?.AsObject();
+                id = root?["id"]?.GetValue<string>();
+            }
+            catch { id = null; }
+            if (string.IsNullOrWhiteSpace(id)) return null;
+
+            _userProfiles.RemoveAll(p =>
+                string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
+            _userProfiles.Add(new UserProfileData { Id = id, Json = suffixed });
+
+            Common.Input.HMaestroProfileCatalog.Reload();
+            MarkDirty();
+            return id;
+        }
+
+        /// <summary>
+        /// Marks settings as dirty (unsaved changes) and schedules an autosave
+        /// after a 250 ms debounce period. Safe from any thread: a
+        /// DispatcherTimer constructed on a non-pumping threadpool thread
+        /// never ticks, and the first caller can be a worker (gyro
+        /// auto-calibration persists via this method), which would have left
+        /// autosave dead for the whole session (audit F8). The dirty flags
+        /// are set immediately; the timer work marshals to the UI dispatcher.
+        /// </summary>
+        public void MarkDirty()
+        {
+            InvalidateAssignmentSnapshot();
+            IsDirty = true;
+
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null) return; // shutdown: OnClosing's dirty-gated save covers it
+            if (!dispatcher.CheckAccess())
+            {
+                dispatcher.BeginInvoke(new Action(MarkDirtyOnUiThread));
+                return;
+            }
+            MarkDirtyOnUiThread();
+        }
+
+        /// <summary>TickCount64 of the most recent MarkDirty. The persist
+        /// tier waits for this to go quiet.</summary>
+        private long _lastDirtyTickMs;
+
+        /// <summary>Quiet time after the last change before the full
+        /// serialize-and-write runs. See MarkDirtyOnUiThread.</summary>
+        private const int PersistQuietMs = 2000;
+
+        private void MarkDirtyOnUiThread()
+        {
+            _mainVm.Settings.HasUnsavedChanges = true;
+            _lastDirtyTickMs = Environment.TickCount64;
+
+            // Two-tier autosave (#331). The engine reads PadSetting, and the
+            // only routine ViewModel-to-PadSetting push used to live inside
+            // Save(), so a tuning change reached the engine only after the
+            // full serialize-and-write completed. On capable hardware that
+            // chain runs in tens of milliseconds and reads as live; on a
+            // low-end CPU with slow storage it runs in seconds, ON THE UI
+            // THREAD, once per debounce gap, so every adjustment cost a
+            // freeze and the behavioral change waited behind it.
+            //
+            // Tier 1 (every 250 ms while dirty): push the ViewModels into
+            // the PadSettings and the slot MappingSets. Direct property
+            // writes, no serialization, no disk. The engine reflects an
+            // adjustment within ~250 ms regardless of hardware.
+            //
+            // Tier 2 (after 2 s of quiet): the full Save with checksums,
+            // profile snapshot, XML serialization and the disk write. One
+            // save per editing burst instead of one per adjustment.
+            //
+            // The timer deliberately STARTS but never RESTARTS here: a
+            // restart on every change would starve tier 1 for as long as
+            // the user keeps dragging, which is the exact debounce-starves-
+            // the-apply shape this replaces. Direct Save() callers
+            // (OnClosing, profile operations) are unchanged and synchronous.
+            if (_autoSaveTimer == null)
+            {
+                _autoSaveTimer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(250)
+                };
+                _autoSaveTimer.Tick += (s, e) =>
+                {
+                    try
+                    {
+                        // Tier 1: engine-visible push.
+                        UpdatePadSettingsFromViewModels();
+                        PushUiExtraSourcesIntoSlotMappingSets();
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            "Tier-1 settings push failed: " + ex.Message);
+                    }
+
+                    if (Environment.TickCount64 - _lastDirtyTickMs < PersistQuietMs)
+                        return; // keep ticking; the user is still editing
+
+                    _autoSaveTimer.Stop();
+                    if (IsDirty)
+                    {
+                        // Tier 2: the full persist.
+                        Save();
+                        AutoSaved?.Invoke(this, EventArgs.Empty);
+                    }
+                };
+            }
+
+            if (!_autoSaveTimer.IsEnabled)
+                _autoSaveTimer.Start();
+        }
+
+        // ─────────────────────────────────────────────
+        //  PadSetting reflection helpers
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Sets a string property value on a PadSetting by property name.
+        /// For keys starting with "Extended", uses the dictionary-based Extended mapping system.
+        /// </summary>
+        internal static void SetPadSettingProperty(PadSetting ps, string propertyName, string value)
+        {
+            if (ps == null || string.IsNullOrEmpty(propertyName))
+                return;
+
+            // Raw-surface mappings use dictionary-based storage.
+            if (propertyName.StartsWith("Raw", StringComparison.Ordinal))
+            {
+                ps.SetRawMapping(propertyName, value ?? string.Empty);
+                return;
+            }
+
+            // MIDI mappings use dictionary-based storage
+            if (propertyName.StartsWith("Midi", StringComparison.Ordinal))
+            {
+                ps.SetMidiMapping(propertyName, value ?? string.Empty);
+                return;
+            }
+
+            // KBM mappings use dictionary-based storage
+            if (propertyName.StartsWith("Kbm", StringComparison.Ordinal))
+            {
+                ps.SetKbmMapping(propertyName, value ?? string.Empty);
+                return;
+            }
+
+            // VR mappings use dictionary-based storage
+            if (propertyName.StartsWith("Vr", StringComparison.Ordinal))
+            {
+                ps.SetVrMapping(propertyName, value ?? string.Empty);
+                return;
+            }
+
+            var prop = typeof(PadSetting).GetProperty(propertyName);
+            if (prop == null || prop.PropertyType != typeof(string) || !prop.CanWrite)
+                return;
+
+            prop.SetValue(ps, value ?? string.Empty);
+        }
+
+        // ─────────────────────────────────────────────
+        //  Parse helper
+        // ─────────────────────────────────────────────
+
+        private static int TryParseInt(string value, int defaultValue)
+        {
+            if (string.IsNullOrEmpty(value))
+                return defaultValue;
+            return int.TryParse(value, out int result) ? result : defaultValue;
+        }
+
+        /// <summary>An invariant parse of a stored setting. NaN and infinity
+        /// read as unreadable, as in InputService.TryParseDouble.</summary>
+        private static double TryParseDouble(string value, double defaultValue)
+        {
+            if (string.IsNullOrEmpty(value))
+                return defaultValue;
+            return double.TryParse(value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double result)
+                && double.IsFinite(result) ? result : defaultValue;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  Serialization data classes
+    // ─────────────────────────────────────────────────────────────────
+
+    /// <summary>One registered sound package (issue #83 follow-up).</summary>
+    public class SoundPackageData
+    {
+        [XmlAttribute]
+        public string Name { get; set; }
+
+        /// <summary>Exe-relative when under the application directory.</summary>
+        [XmlAttribute]
+        public string Path { get; set; }
+    }
+
+    /// <summary>One registered menu icon pack (#390), the sound-package
+    /// shape.</summary>
+    public class IconPackageData
+    {
+        [XmlAttribute]
+        public string Name { get; set; }
+
+        /// <summary>Exe-relative when under the application directory.</summary>
+        [XmlAttribute]
+        public string Path { get; set; }
+    }
+
+    /// <summary>A registered NFC tag (issue #150): UID (uppercase hex), name, and
+    /// the stable raw-button index it occupies (so saved macro bindings survive).</summary>
+    public class NfcTagData
+    {
+        [XmlAttribute]
+        public string Uid { get; set; }
+
+        [XmlAttribute]
+        public string Name { get; set; }
+
+        [XmlAttribute]
+        public int Button { get; set; }
+    }
+
+    /// <summary>A learned handheld hidden button (issue #343): its name, its
+    /// stable raw-button index, and whichever delivery paths it has: a
+    /// keyboard chord (Keys, comma-joined codes) and/or a vendor report
+    /// field (Collection VID:PID:PAGE:USAGE, report id, byte, mask or
+    /// value, kind 0 = bit, 1 = value).</summary>
+    public class HandheldButtonData
+    {
+        [XmlAttribute] public string Name { get; set; }
+        [XmlAttribute] public int Button { get; set; } = -1;
+        [XmlAttribute] public string Keys { get; set; }
+        [XmlAttribute] public string Collection { get; set; }
+        [XmlAttribute] public byte ReportId { get; set; }
+        [XmlAttribute] public int ByteIndex { get; set; }
+        [XmlAttribute] public byte Mask { get; set; }
+        [XmlAttribute] public byte Value { get; set; }
+        [XmlAttribute] public int Kind { get; set; }
+        [XmlAttribute] public string WmiClass { get; set; }
+        [XmlAttribute] public string WmiProperty { get; set; }
+        [XmlAttribute] public string WmiValue { get; set; }
+
+        public static HandheldButtonData From(PadForge.Common.Input.HandheldButtonRegistry.Entry e) => new HandheldButtonData
+        {
+            Name = e.Name,
+            Button = e.Button,
+            Keys = e.HasChord ? string.Join(",", e.Keys) : null,
+            Collection = e.HasReport ? e.Collection : null,
+            ReportId = e.ReportId,
+            ByteIndex = e.ByteIndex,
+            Mask = e.Mask,
+            Value = e.Value,
+            Kind = (int)e.ValueKind,
+            WmiClass = e.HasWmi ? e.WmiClass : null,
+            WmiProperty = e.HasWmi ? e.WmiProperty : null,
+            WmiValue = e.HasWmi ? e.WmiValue : null,
+        };
+
+        public PadForge.Common.Input.HandheldButtonRegistry.Entry ToEntry()
+        {
+            int[] keys = null;
+            if (!string.IsNullOrWhiteSpace(Keys))
+            {
+                var list = new System.Collections.Generic.List<int>();
+                foreach (var tok in Keys.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    if (int.TryParse(tok, out int k)) list.Add(k);
+                if (list.Count > 0) keys = list.ToArray();
+            }
+            return new PadForge.Common.Input.HandheldButtonRegistry.Entry
+            {
+                Name = Name,
+                Button = Button,
+                Keys = keys,
+                Collection = string.IsNullOrWhiteSpace(Collection) ? null : Collection,
+                ReportId = ReportId,
+                ByteIndex = ByteIndex,
+                Mask = Mask,
+                Value = Value,
+                ValueKind = Kind == 1 ? PadForge.Engine.Common.VendorButtonKind.Value : PadForge.Engine.Common.VendorButtonKind.Bit,
+                WmiClass = string.IsNullOrWhiteSpace(WmiClass) ? null : WmiClass,
+                WmiProperty = string.IsNullOrWhiteSpace(WmiProperty) ? null : WmiProperty,
+                WmiValue = WmiValue ?? string.Empty,
+            };
+        }
+    }
+
+    /// <summary>A registered voice phrase (issue #317): normalized text,
+    /// display name, and the stable raw-button index it occupies (so saved
+    /// bindings survive).</summary>
+    public class VoicePhraseData
+    {
+        [XmlAttribute]
+        public string Phrase { get; set; }
+
+        [XmlAttribute]
+        public string Name { get; set; }
+
+        [XmlAttribute]
+        public int Button { get; set; }
+    }
+
+    /// <summary>
+    /// Root element for the PadForge settings XML file.
+    /// </summary>
+    [XmlRoot("PadForgeSettings")]
+    public class SettingsFileData
+    {
+        [XmlArray("Devices")]
+        [XmlArrayItem("Device")]
+        public UserDevice[] Devices { get; set; }
+
+        [XmlArray("UserSettings")]
+        [XmlArrayItem("Setting")]
+        public UserSetting[] Settings { get; set; }
+
+        [XmlArray("PadSettings")]
+        [XmlArrayItem("PadSetting")]
+        public PadSetting[] PadSettings { get; set; }
+
+        /// <summary>Per-slot mapping tables (Issue #61 multi-source / shift
+        /// layer). One entry per VC slot. Phase 1a (this commit) only
+        /// round-trips the data; the legacy <see cref="PadSetting"/>
+        /// per-field mapping descriptors stay authoritative until Commit
+        /// 1c flips Step 3 over to read from here.</summary>
+        [XmlArray("SlotMappingSets")]
+        [XmlArrayItem("MappingSet")]
+        public MappingSet[] SlotMappingSets { get; set; }
+
+        /// <summary>Per-device tuning data (deadzones, sensitivity curves,
+        /// FFB gains, audio rumble). Phase 1a placeholder; Commit 1b
+        /// migrates the relevant fields off <see cref="PadSetting"/>.</summary>
+        [XmlArray("DeviceTunings")]
+        [XmlArrayItem("DeviceTuning")]
+        public DeviceTuning[] DeviceTunings { get; set; }
+
+        [XmlElement("AppSettings")]
+        public AppSettingsData AppSettings { get; set; }
+
+        [XmlArray("Macros")]
+        [XmlArrayItem("Macro")]
+        public MacroData[] Macros { get; set; }
+
+        [XmlArray("Profiles")]
+        [XmlArrayItem("Profile")]
+        public ProfileData[] Profiles { get; set; }
+
+        /// <summary>Migrates pre-v4.x element spellings forward after
+        /// deserialization: the per-(slot, device) config arrays were
+        /// written as PlayStationConfigs / ProfilePlayStationConfigs before
+        /// the bag was genericized. New saves emit only the new names; the
+        /// legacy properties exist for reading old files and are cleared
+        /// here so nothing re-serializes them.</summary>
+        public void MigrateLegacySchema()
+        {
+            AppSettings?.MigrateLegacySchema();
+            if (Profiles != null)
+                foreach (var p in Profiles)
+                    p?.MigrateLegacySchema();
+        }
+    }
+
+    /// <summary>
+    /// Application-level settings stored in the XML file.
+    /// </summary>
+    public class AppSettingsData
+    {
+        /// <summary>Registered sound packages (issue #83 follow-up):
+        /// Name + stored path (exe-relative when the package sits in the
+        /// application directory, for portable kits).</summary>
+        [XmlArray("SoundPackages")]
+        [XmlArrayItem("Package")]
+        public SoundPackageData[] SoundPackages { get; set; }
+
+        /// <summary>Registered menu icon packs (#390): Name + stored path
+        /// (exe-relative when the pack sits in the application directory,
+        /// for portable kits).</summary>
+        [XmlArray("IconPackages")]
+        [XmlArrayItem("Package")]
+        public IconPackageData[] IconPackages { get; set; }
+
+        /// <summary>Registered NFC tags (issue #150): each UID + chosen name,
+        /// exposed by the NFC reader device as a named, bindable button.</summary>
+        [XmlArray("NfcTags")]
+        [XmlArrayItem("Tag")]
+        public NfcTagData[] NfcTags { get; set; }
+
+        /// <summary>Per-slot hidden picker device keys (#322): index =
+        /// slot, value = semicolon-joined device guids plus the "any"
+        /// token for the device-agnostic group. A view preference, so it
+        /// lives here in the settings root and never in profiles.</summary>
+        [XmlArray("MappingPickerHiddenDevices")]
+        [XmlArrayItem("Slot")]
+        public string[] MappingPickerHiddenDevices { get; set; }
+
+        /// <summary>PS Move per-pad calibration blobs (#277): "mac=hex" entries
+        /// captured over USB at pair time, consumed by the Bluetooth lane for
+        /// sensor scaling (psmoveapi's cache-for-BT architecture).</summary>
+        [XmlArray("PsMoveCalibrations")]
+        [XmlArrayItem("Pad")]
+        public string[] PsMoveCalibrations { get; set; }
+
+        /// <summary>Registered voice phrases (issue #317), exposed as
+        /// buttons on the devices that carry the microphones.</summary>
+        [XmlArray("VoicePhrases")]
+        [XmlArrayItem("Phrase")]
+        public VoicePhraseData[] VoicePhrases { get; set; }
+
+        /// <summary>Voice macros (issue #317) master switch.</summary>
+        [XmlElement]
+        public bool VoiceMacrosEnabled { get; set; }
+
+        /// <summary>Learned handheld hidden buttons (issue #343), exposed
+        /// as named buttons on the per-machine Hidden Buttons row.</summary>
+        [XmlArray("HandheldButtons")]
+        [XmlArrayItem("Button")]
+        public HandheldButtonData[] HandheldButtons { get; set; }
+
+        /// <summary>DMI key of the machine the handheld buttons were learned on.</summary>
+        [XmlElement]
+        public string HandheldMachineKey { get; set; } = "";
+
+        /// <summary>Handheld PC Buttons (issue #343) master switch. Off by
+        /// default: no device rows, hooks, vendor handles, or sensor
+        /// subscription unless the user turns it on.</summary>
+        [XmlElement]
+        public bool HandheldButtonsEnabled { get; set; }
+
+        /// <summary>UDP head-tracking input. Older files use this as the master
+        /// switch until HeadTrackingIndependentInputs is written. A profile's
+        /// authored EnableHeadTracking value overrides this input only after migration.</summary>
+        [XmlElement]
+        public bool HeadTrackingEnabled { get; set; }
+
+        /// <summary>Distinguishes independent inputs from the old master switch.</summary>
+        [XmlElement]
+        public bool HeadTrackingIndependentInputs { get; set; }
+
+        /// <summary>UDP port OpenTrack's "UDP over network" output sends to.</summary>
+        [XmlElement]
+        public int HeadTrackingUdpPort { get; set; } = 4242;
+
+        /// <summary>FreeTrack input. The initializer preserves the old file default.
+        /// Legacy load applies the old master gate. New saves write the independent value.</summary>
+        [XmlElement]
+        public bool HeadTrackingFreeTrack { get; set; } = true;
+
+        /// <summary>OpenXR headset input (issue #403). Off by default: it
+        /// loads a runtime library and brings up a session, which nobody who
+        /// has not asked for it should pay for.</summary>
+        [XmlElement]
+        public bool HeadTrackingOpenXr { get; set; }
+
+        /// <summary>Logitech G-keys through the G-key SDK (issue #454). Off by
+        /// default: it loads a third-party library and opens a session with
+        /// the Logitech software.</summary>
+        [XmlElement]
+        public bool GKeysEnabled { get; set; }
+
+        /// <summary>Analog keyboards read over their vendor HID interface
+        /// (issue #468). Off by default: the polled families share their
+        /// configurator's channel.</summary>
+        [XmlElement]
+        public bool AnalogKeyboardsEnabled { get; set; }
+
+        /// <summary>Bliss-Box adapters driven through their API (issue #469).
+        /// Off by default: it talks to the adapter over the channel the
+        /// Bliss-Box API Tool and DeviceBuddy use.</summary>
+        [XmlElement]
+        public bool BlissBoxEnabled { get; set; }
+
+        /// <summary>Each Bliss-Box port's own choices (#469), by the port's
+        /// device. Null when there are none.</summary>
+        [XmlArray("BlissBoxPorts")]
+        [XmlArrayItem("Port")]
+        public BlissBoxPortData[] BlissBoxPorts { get; set; }
+
+        /// <summary>The Default profile's Dreamcast screen picture (#469),
+        /// 192 bytes in image order as base64. Named profiles keep theirs on
+        /// <see cref="ProfileData.DreamcastPicture"/>.</summary>
+        [XmlElement]
+        public string DefaultProfileDreamcastPicture { get; set; }
+
+        /// <summary>Per-axis ranges in HeadPose's order (yaw, pitch, roll, X,
+        /// Y, Z). Zero means the axis follows its family's shared range, which
+        /// is what every axis does until a user pins one, so an older file
+        /// with none of these keeps behaving exactly as it did.</summary>
+        [XmlElement]
+        public int[] HeadTrackingAxisRanges { get; set; }
+
+        /// <summary>Manifest of the OpenXR runtime to read the headset from,
+        /// or empty for the machine's default.</summary>
+        [XmlElement]
+        public string HeadTrackingOpenXrRuntime { get; set; } = string.Empty;
+
+        /// <summary>Degrees of head rotation at full axis deflection.</summary>
+        [XmlElement]
+        public int HeadTrackingRotationRange { get; set; } = 90;
+
+        /// <summary>Centimeters of head travel at full axis deflection.</summary>
+        [XmlElement]
+        public int HeadTrackingTranslationRange { get; set; } = 30;
+
+        /// <summary>Confidence floor a recognition must clear, 0..1.</summary>
+        [XmlElement]
+        public float VoiceMinConfidence { get; set; } = 0.80f;
+
+        /// <summary>0 = always listening, 1 = push-to-talk.</summary>
+        [XmlElement]
+        public int VoiceListeningMode { get; set; }
+
+        /// <summary>Bluetooth addresses (12-hex, comma-joined) of headsets
+        /// that ever qualified as Android Head Trackers (#188). Lets the
+        /// sweep re-request a dropped tracker's HID service after an app
+        /// restart, when no live node exists to re-qualify from.</summary>
+        [XmlElement]
+        public string HeadsetTrackerAddresses { get; set; } = "";
+
+        // ── Remote Link (issue #138) — global (per-machine), not per-profile ──
+        /// <summary>This instance's static identity private key, DPAPI-protected
+        /// (base64). Empty until the first Remote Link use mints one.</summary>
+        [XmlElement]
+        public string RemoteLinkIdentityPrivate { get; set; } = "";
+
+        /// <summary>This instance's static identity public key (base64). Not secret.</summary>
+        [XmlElement]
+        public string RemoteLinkIdentityPublic { get; set; } = "";
+
+        /// <summary>How the private key is wrapped at rest: Secure (machine-bound, default),
+        /// PortablePassword, or PortableOpen. Drives thumb-drive portability (issue #138).</summary>
+        [XmlElement]
+        public string RemoteLinkIdentityProtection { get; set; } = "Secure";
+
+        /// <summary>Trusted paired peers. Old files lack this element and load as null.</summary>
+        [XmlArray("RemoteLinkPeers")]
+        [XmlArrayItem("Peer")]
+        public PadForge.Engine.RemoteLink.PeerTrust[] RemoteLinkPeers { get; set; }
+
+        /// <summary>Whether the Remote Link server listens. Global, not per-profile.</summary>
+        [XmlElement]
+        public bool EnableRemoteLink { get; set; }
+
+        /// <summary>Auto-reconnect: when a paired PC is seen on the LAN, establish the link
+        /// without a click (issue #138). Default on.</summary>
+        [XmlElement]
+        public bool RemoteLinkAutoReconnect { get; set; } = true;
+
+        [XmlElement]
+        public int RemoteLinkPort { get; set; } = 27500;
+
+        [XmlElement]
+        public bool AutoStartEngine { get; set; } = true;
+
+        [XmlElement]
+        public bool MinimizeToTray { get; set; }
+
+        [XmlElement]
+        public bool CloseToTray { get; set; }
+
+        /// <summary>Keep the tray icon up while the window is open (#439).</summary>
+        [XmlElement]
+        public bool AlwaysShowTrayIcon { get; set; }
+
+        /// <summary>In-app updates (#457). On by default: the check reads one
+        /// public GitHub API response and changes nothing on its own.</summary>
+        [XmlElement]
+        public bool CheckForUpdatesAutomatically { get; set; } = true;
+
+        /// <summary>Download a found update in the background and install it
+        /// at the next launch (#457).</summary>
+        [XmlElement]
+        public bool InstallUpdatesAutomatically { get; set; }
+
+        /// <summary>Offer the rolling dev build instead of releases (#457).</summary>
+        [XmlElement]
+        public bool IncludePreReleaseUpdates { get; set; }
+
+        /// <summary>Low-battery notification (#293): edge-triggered balloon +
+        /// status line, optional identify buzz on the device.</summary>
+        [XmlElement] public bool BatteryNotifyEnabled { get; set; } = true;
+        [XmlElement] public int BatteryNotifyThreshold { get; set; } = 15;
+        [XmlElement] public bool BatteryNotifyVibrate { get; set; }
+
+        /// <summary>Assignment Prompts (discussion with Xaklse, 2026-08-23):
+        /// offer a connecting device to the virtual controller whose page is
+        /// open. NewDevice = only devices never seen before. EmptySlot = any
+        /// connecting device when the open slot has no devices assigned.
+        /// Both default on. Nothing is ever assigned without a click.</summary>
+        [XmlElement] public bool AssignOfferNewDevice { get; set; } = true;
+        [XmlElement] public bool AssignOfferEmptySlot { get; set; } = true;
+
+        [XmlElement]
+        public bool StartMinimized { get; set; }
+
+        /// <summary>Diagnostics logging (#303): persistent mirror of the
+        /// engine event ring to diagnostics.log beside the exe, for
+        /// auto-started sessions where a launch flag cannot help.</summary>
+        [XmlElement]
+        public bool DiagnosticsLoggingEnabled { get; set; }
+
+        [XmlElement]
+        public bool StartAtLogin { get; set; }
+
+        [XmlElement]
+        public bool EnablePollingOnFocusLoss { get; set; } = true;
+
+        [XmlElement]
+        public int PollingRateMs { get; set; } = 1;
+
+        /// <summary>
+        /// Seconds an HM virtual controller waits for any mapped device to
+        /// come back online before destroying itself. 0 disables (HM VCs
+        /// survive arbitrary offline windows, legacy behavior). Default 60.
+        /// When triggered, the slot is removed entirely (same shape as
+        /// user-driven delete) and surviving Xbox HM VCs in the same
+        /// group bubble down via InputService.OnSlotDeleted so xinputhid
+        /// kernel slots stay contiguous. Slots in other groups are not
+        /// touched.
+        /// </summary>
+        [XmlElement]
+        public int HmInactivityDestroyTimeoutSeconds { get; set; } = 60;
+
+        [XmlElement]
+        public int ThemeIndex { get; set; }
+
+        [XmlElement]
+        public string Language { get; set; } = "";
+
+        [XmlElement]
+        public bool EnableAutoProfileSwitching { get; set; }
+
+        /// <summary>Opt-in for the external-control named pipe (#366): a
+        /// launcher or script can activate and deactivate profiles from
+        /// outside PadForge. Default false. Every pre-#366 settings file
+        /// deserializes to false, so the pipe stays off until the user asks.</summary>
+        [XmlElement]
+        public bool EnableExternalControl { get; set; }
+
+        /// <summary>
+        /// Master opt-in for the Steam Workshop community-config feature
+        /// (issue #9). Default false: PadForge sends nothing to Steam until
+        /// the user flips this in Settings or in the browse dialog's
+        /// cold-forge state.
+        /// </summary>
+        [XmlElement]
+        public bool EnableCommunityConfigLookup { get; set; }
+
+        /// <summary>
+        /// Sub-toggle: surface 2016-era Workshop configs that have no CDN
+        /// file (Legacy badge + Steam-subscribe fallback). Default false.
+        /// </summary>
+        [XmlElement]
+        public bool ShowLegacyWorkshopConfigs { get; set; }
+
+        [XmlElement]
+        public string ActiveProfileId { get; set; }
+
+        /// <summary>
+        /// Per-slot virtual controller output types.
+        /// Array of ints matching VirtualControllerType enum values.
+        /// </summary>
+        [XmlArray("SlotControllerTypes")]
+        [XmlArrayItem("Type")]
+        public int[] SlotControllerTypes { get; set; }
+
+        /// <summary>Per-slot master volume for macro sounds (0-100).</summary>
+        [XmlArray("SlotSoundVolumes")]
+        [XmlArrayItem("Volume")]
+        public int[] SlotSoundVolumes { get; set; }
+
+        /// <summary>
+        /// Per-slot HIDMaestro profile slug (e.g. "xbox-360-wired",
+        /// "dualsense", "logitech-g920"). Empty string falls back to a
+        /// category-appropriate default in the engine. Added in v3.0.0.
+        /// </summary>
+        [XmlArray("SlotProfileIds")]
+        [XmlArrayItem("Id")]
+        public string[] SlotProfileIds { get; set; }
+
+        /// <summary>Per-slot model appearances. Null permits legacy PadSetting migration.</summary>
+        [XmlArray("SlotModel3DAppearances")]
+        [XmlArrayItem("Appearance")]
+        public string[] SlotModel3DAppearances { get; set; }
+
+        /// <summary>
+        /// Which virtual controller slots have been explicitly created.
+        /// Null on old settings files — auto-populated from existing assignments.
+        /// </summary>
+        [XmlArray("SlotCreated")]
+        [XmlArrayItem("Created")]
+        public bool[] SlotCreated { get; set; }
+
+        /// <summary>
+        /// Which virtual controller slots are enabled for output.
+        /// Null on old settings files, defaults to all true.
+        /// </summary>
+        [XmlArray("SlotEnabled")]
+        [XmlArrayItem("Enabled")]
+        public bool[] SlotEnabled { get; set; }
+
+        /// <summary>
+        /// Per-group ordered list of pad indices in user-facing visual order.
+        /// Null on settings predating the per-group ordering refactor; load
+        /// reconstructs ascending pad-index defaults via
+        /// <c>SettingsManager.SlotOrders.RebuildFromCurrentTopology</c>.
+        /// </summary>
+        // XmlArray name kept as "MicrosoftSlotOrder" for v2/early-v3
+        // PadForge.xml back-compat. The C# property name follows the
+        // user-facing "Xbox" family naming.
+        [XmlArray("MicrosoftSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] XboxSlotOrder { get; set; }
+
+        [XmlArray("PlayStationSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] PlayStationSlotOrder { get; set; }
+
+        [XmlArray("NintendoSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] NintendoSlotOrder { get; set; }
+
+        [XmlArray("ExtendedSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] ExtendedSlotOrder { get; set; }
+
+        [XmlArray("KeyboardMouseSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] KeyboardMouseSlotOrder { get; set; }
+
+        [XmlArray("MidiSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] MidiSlotOrder { get; set; }
+
+        [XmlArray("VrSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] VrSlotOrder { get; set; }
+
+        [XmlElement]
+        public bool EnableDsuMotionServer { get; set; }
+
+        [XmlElement]
+        public int DsuMotionServerPort { get; set; } = 26760;
+
+        [XmlElement]
+        public bool EnableWebController { get; set; }
+
+        /// <summary>Razer Chroma lightbar mirror opt-in (#373), the GLOBAL
+        /// leg. Default false: PadForge registers nothing with Synapse until
+        /// the user turns the mirror on. This is the value that stands when
+        /// the active profile has no opinion. The per-profile leg is the
+        /// nullable <see cref="ProfileData.EnableChromaLightbar"/>: a plain
+        /// bool there read as false in every pre-existing profile and the
+        /// first profile switch turned the mirror off, which the CHROMA diag
+        /// lines traced.</summary>
+        [XmlElement]
+        public bool EnableChromaLightbar { get; set; }
+
+        /// <summary>Razer Sensa HD haptics translation opt-in (#374), the
+        /// GLOBAL leg. Default false. Per-profile leg:
+        /// <see cref="ProfileData.EnableSensaHaptics"/>.</summary>
+        [XmlElement]
+        public bool EnableSensaHaptics { get; set; }
+
+        /// <summary>Logitech LIGHTSYNC lightbar mirror opt-in (#382), the
+        /// GLOBAL leg. Default false. Per-profile leg:
+        /// <see cref="ProfileData.EnableLightsyncLightbar"/>.</summary>
+        [XmlElement]
+        public bool EnableLightsyncLightbar { get; set; }
+
+        [XmlElement]
+        public int WebControllerPort { get; set; } = 8080;
+
+        /// <summary>Also serve the web controller over plain HTTP on its own
+        /// port, behind the access code. The plain address settings are
+        /// machine-scoped like Remote Link's and never ride profiles: a
+        /// foreground profile switch should not open or close a port.</summary>
+        [XmlElement]
+        public bool EnableWebControllerPlainHttp { get; set; }
+
+        [XmlElement]
+        public int WebControllerPlainHttpPort { get; set; } = WebControllerServer.DefaultPlainPort;
+
+        /// <summary>Admit only this PC on the plain address, for a tunnel or
+        /// reverse proxy running here.</summary>
+        [XmlElement]
+        public bool WebControllerPlainHttpLocalOnly { get; set; }
+
+        /// <summary>The plain address's access code, encrypted for this
+        /// machine by <see cref="WebControllerAccess.ProtectForStorage"/>.
+        /// Missing, damaged or foreign, it is replaced by a fresh code.</summary>
+        [XmlElement]
+        public string WebControllerAccessCodeProtected { get; set; }
+
+        /// <summary>Custom web-controller layouts built in the browser (#296
+        /// phase 4), as a JSON array. Machine-scoped by design (a custom pad
+        /// is this machine's hardware definition, not profile content).</summary>
+        [XmlElement]
+        public string WebCustomLayoutsJson { get; set; } = "[]";
+
+        [XmlElement]
+        public bool EnableTouchpadOverlay { get; set; }
+
+        /// <summary>Radial / touch menu overlay (#9 B-17). Default on;
+        /// menus still hover and commit blind when disabled.</summary>
+        [XmlElement]
+        public bool EnableMenuOverlay { get; set; } = true;
+
+        /// <summary>Whether the shift-layer flyout appears while a slot is on a
+        /// non-Base layer. Default on. Display only, the layer still engages.</summary>
+        [XmlElement]
+        public bool EnableShiftLayerFlyout { get; set; } = true;
+
+        /// <summary>Whether the profile-switch overlay appears on a profile
+        /// change. Default on. The switch still happens when off.</summary>
+        [XmlElement]
+        public bool EnableProfileOverlay { get; set; } = true;
+
+        /// <summary>Default profile's custom touchpad gestures.
+        /// Named profiles store theirs under each profile's
+        /// <c>ProfileData.TouchpadGestures</c>; when the default profile
+        /// is active there's no ProfileData being saved alongside, so
+        /// the active gesture catalog lives here directly. Round-trips
+        /// via the SettingsService load + save paths and re-seeds
+        /// InputService._activeTouchpadGestures at startup.</summary>
+        [XmlArray("DefaultProfileTouchpadGestures")]
+        [XmlArrayItem("Gesture")]
+        public PadForge.Engine.Touchpad.TouchpadCustomGesture[] TouchpadGestures { get; set; }
+
+        [XmlElement]
+        public double TouchpadOverlayOpacity { get; set; } = 0.25;
+
+        [XmlElement]
+        public int TouchpadOverlayMonitor { get; set; }
+
+        [XmlElement]
+        public double TouchpadOverlayLeft { get; set; } = -1;
+
+        [XmlElement]
+        public double TouchpadOverlayTop { get; set; } = -1;
+
+        [XmlElement]
+        public double TouchpadOverlayWidth { get; set; } = 500;
+
+        [XmlElement]
+        public double TouchpadOverlayHeight { get; set; } = 250;
+
+        [XmlElement]
+        public double MainWindowLeft { get; set; } = -1;
+
+        [XmlElement]
+        public double MainWindowTop { get; set; } = -1;
+
+        [XmlElement]
+        public double MainWindowWidth { get; set; } = 1100;
+
+        [XmlElement]
+        public double MainWindowHeight { get; set; } = 720;
+
+        [XmlElement]
+        public int MainWindowState { get; set; } // 0=Normal, 2=Maximized
+
+        [XmlElement]
+        public bool MainWindowFullScreen { get; set; }
+
+        [XmlElement]
+        public bool Use2DControllerView { get; set; }
+
+        /// <summary>
+        /// True after the v3 first-run cleanup wizard has been shown to the
+        /// user, regardless of whether they accepted or declined. Prevents
+        /// the dialog from re-prompting on every launch. Defaults to false
+        /// on v2.x settings files (so v2 → v3 upgraders see the prompt
+        /// once); v3 fresh-install settings files start true since there
+        /// are no legacy drivers to clean up.
+        /// </summary>
+        [XmlElement]
+        public bool LegacyDriverCleanupOffered { get; set; }
+
+        /// <summary>
+        /// True once the first-run welcome tour has been completed or
+        /// skipped. Replaces the pre-v4 PadForge.firstrun marker file
+        /// beside the exe: all persisted state lives in this single
+        /// settings file.
+        /// </summary>
+        [XmlElement]
+        public bool FirstRunTourCompleted { get; set; }
+
+        /// <summary>
+        /// Global master switch for device hiding (HidHide + input hooks).
+        /// When false, no HidHide blacklisting or hook suppression occurs
+        /// regardless of per-device toggles.
+        /// </summary>
+        [XmlElement]
+        public bool EnableInputHiding { get; set; } = true;
+
+        /// <summary>
+        /// When true, PadForge keeps its HidHide-managed cloaks asserted
+        /// across shutdowns instead of clearing them on Stop. Lets
+        /// non-PadForge sessions still see the physicals cloaked (e.g.
+        /// Steam scanning controllers after PadForge exits). Default
+        /// false matches the previous shutdown-decloak behavior.
+        /// </summary>
+        [XmlElement]
+        public bool KeepHidHideCloaksBetweenLaunches { get; set; } = false;
+
+        /// <summary>SDL's Flydigi HIDAPI driver (#395). On by default. Off
+        /// leaves Flydigi pads on their XInput view so Flydigi Space Station
+        /// can keep sight of the pad without the two fighting over its
+        /// vendor interface. Absent in older files = on, the shipped behavior.</summary>
+        [XmlElement]
+        public bool FlydigiEnhancedProtocol { get; set; } = true;
+
+        /// <summary>
+        /// User-specified application paths to whitelist in HidHide.
+        /// These are regular Windows paths (e.g. C:\Games\emulator.exe),
+        /// converted to DOS device paths at runtime.
+        /// </summary>
+        [XmlArray("HidHideWhitelistPaths")]
+        [XmlArrayItem("Path")]
+        public string[] HidHideWhitelistPaths { get; set; }
+
+        /// <summary>Controllers on COM ports the user added in the pairing
+        /// dialog (hifihedgehog/SDL#33), handed to SDL as SDL_JOYSTICK_SERIAL.
+        /// Null when there are none.</summary>
+        [XmlArray("SerialControllers")]
+        [XmlArrayItem("Controller")]
+        public PadForge.Common.Input.SerialControllerEntry[] SerialControllers { get; set; }
+
+        /// <summary>IDs of the devices the user moved to PadForge's WinUSB
+        /// driver from the Devices page (hifihedgehog/SDL#33 Part 15), so
+        /// each start can say when Windows put one back. Null when there are
+        /// none.</summary>
+        [XmlArray("WinUsbOptIns")]
+        [XmlArrayItem("Id")]
+        public string[] WinUsbOptIns { get; set; }
+
+        /// <summary>Pads in iCade mode the user marked on the Devices page
+        /// (hifihedgehog/SDL#33 Part 16), handed to SDL as
+        /// SDL_JOYSTICK_ICADE_DEVICES. Null when there are none.</summary>
+        [XmlArray("ICadePads")]
+        [XmlArrayItem("Pair")]
+        public string[] ICadePads { get; set; }
+
+        /// <summary>DJI RC and RC 2 remotes the user added by address in the
+        /// pairing dialog (hifihedgehog/SDL#33 Part 6), handed to SDL as
+        /// SDL_JOYSTICK_DJI_REMOTE_TCP_HOSTS. Null when there are none.</summary>
+        [XmlArray("DjiRemoteHosts")]
+        [XmlArrayItem("Host")]
+        public string[] DjiRemoteHosts { get; set; }
+
+        /// <summary>The Namco USIO's layout (hifihedgehog/SDL#33 Part 14):
+        /// "tekken", or null for the fork's default, Taiko.</summary>
+        [XmlElement]
+        public string UsioLayout { get; set; }
+
+        /// <summary>
+        /// Per-slot Extended configuration (preset, axis/button counts).
+        /// Null on old settings files — uses Xbox360 preset defaults.
+        /// </summary>
+        [XmlArray("ExtendedConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.ExtendedSlotConfigData[] ExtendedConfigs { get; set; }
+
+        /// <summary>
+        /// Per-(slot, device) configuration (adaptive triggers, lighting,
+        /// audio, tone filter) for ANY hardware on any slot type. Null on
+        /// settings files older than v3.1.0, where slots fall back to
+        /// out-of-the-box defaults (all triggers Off, lightbar disabled,
+        /// audio neutral) so the schema add is a clean no-op for legacy
+        /// files. Written as DeviceSlotConfigs since the v4.x schema
+        /// rename; older files spelled it PlayStationConfigs (see
+        /// <see cref="LegacyDeviceSlotConfigs"/>).
+        /// </summary>
+        [XmlArray("DeviceSlotConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.DeviceSlotConfigData[] DeviceSlotConfigs { get; set; }
+
+        /// <summary>Read-only compatibility spelling. Files saved before the
+        /// v4.x schema rename carry the bag as PlayStationConfigs, a name
+        /// that predates the config growing Xbox / Nintendo / generic
+        /// device features. <see cref="MigrateLegacySchema"/> moves it into
+        /// <see cref="DeviceSlotConfigs"/> on load, and ShouldSerialize
+        /// keeps it out of every save, so one load-save cycle modernizes
+        /// the file.</summary>
+        [XmlArray("PlayStationConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.DeviceSlotConfigData[] LegacyDeviceSlotConfigs { get; set; }
+        public bool ShouldSerializeLegacyDeviceSlotConfigs() => false;
+
+        /// <summary>Adopts the legacy spelling when the new one is absent
+        /// (new wins if a hand-edited file somehow carries both), then
+        /// clears the legacy slot so nothing downstream sees two copies.
+        /// Also migrates <see cref="DefaultProfileSnapshot"/>: it is a full
+        /// ProfileData, so an old file's snapshot can carry the legacy
+        /// profile-level spelling too.</summary>
+        public void MigrateLegacySchema()
+        {
+            if ((DeviceSlotConfigs == null || DeviceSlotConfigs.Length == 0)
+                && LegacyDeviceSlotConfigs != null && LegacyDeviceSlotConfigs.Length > 0)
+                DeviceSlotConfigs = LegacyDeviceSlotConfigs;
+            LegacyDeviceSlotConfigs = null;
+            DefaultProfileSnapshot?.MigrateLegacySchema();
+        }
+
+        /// <summary>
+        /// User-imported HIDMaestro profile JSONs, captured via
+        /// HMDeviceExtractor from controllers the user owns. Each entry is
+        /// the full profile JSON (as emitted by HMDeviceExtractor.ToJson)
+        /// stored verbatim so no in-app serializer has to know the
+        /// schema — HIDMaestro parses them through its own loader on
+        /// startup. Appear in the Extended dropdown alongside the built-in
+        /// catalog after the next catalog reload.
+        /// </summary>
+        [XmlArray("UserProfiles")]
+        [XmlArrayItem("Profile")]
+        public UserProfileData[] UserProfiles { get; set; }
+
+        /// <summary>
+        /// Per-slot MIDI configuration (port, channel, CC/note mappings).
+        /// Null on old settings files — uses defaults.
+        /// </summary>
+        [XmlArray("MidiConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.MidiSlotConfigData[] MidiConfigs { get; set; }
+
+        /// <summary>
+        /// Per-slot keyboard + mouse configuration (SOCD / Snap Tap,
+        /// discussion #205). Null on old settings files, which use defaults.
+        /// </summary>
+        [XmlArray("KbmConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.KbmSlotConfigData[] KbmConfigs { get; set; }
+
+        /// <summary>
+        /// Full snapshot of the default profile's state, saved when a named
+        /// profile is active so the default can be restored on restart.
+        /// Null when the default profile is active (its state is in the
+        /// global UserSettings/SlotCreated/etc. fields).
+        /// </summary>
+        [XmlElement("DefaultProfileSnapshot")]
+        public ProfileData DefaultProfileSnapshot { get; set; }
+
+        /// <summary>
+        /// Global macros for profile shortcuts and other app-wide actions.
+        /// Null on old settings files — no shortcuts configured.
+        /// </summary>
+        [XmlArray("GlobalMacros")]
+        [XmlArrayItem("GlobalMacro")]
+        public GlobalMacroData[] GlobalMacros { get; set; }
+
+    }
+
+    /// <summary>
+    /// Serializable DTO for a macro. Stored per pad slot.
+    /// </summary>
+    public class MacroData
+    {
+        [XmlAttribute]
+        public int PadIndex { get; set; }
+
+        [XmlElement]
+        public string Name { get; set; } = "New Macro";
+
+        [XmlElement]
+        public bool IsEnabled { get; set; } = true;
+
+        [XmlElement]
+        public ushort TriggerButtons { get; set; }
+
+        /// <summary>
+        /// GUID of the device whose raw buttons are the trigger source (string form).
+        /// Null/empty = use legacy Xbox bitmask path.
+        /// </summary>
+        [XmlElement]
+        public string TriggerDeviceGuid { get; set; }
+
+        /// <summary>
+        /// Comma-separated raw button indices, e.g. "13,14".
+        /// Null/empty = not using raw trigger path.
+        /// </summary>
+        [XmlElement]
+        public string TriggerRawButtons { get; set; }
+
+        [XmlElement]
+        public MacroTriggerSource TriggerSource { get; set; }
+
+        [XmlElement]
+        public MacroTriggerMode TriggerMode { get; set; }
+
+        /// <summary>Continuous-hold threshold in ms for
+        /// <see cref="MacroTriggerMode.HoldForMs"/> (issue #9 wave 1b).
+        /// Default 500 so profiles saved before the mode existed load with
+        /// the same value a fresh macro gets.</summary>
+        [XmlElement]
+        public int TriggerHoldMs { get; set; } = 500;
+
+        /// <summary>Double-press window in ms for
+        /// <see cref="MacroTriggerMode.DoublePress"/> (translator v17).
+        /// Default 442, matching a fresh macro (Valve's own controller_base
+        /// templates author "double_tap_time" "442").</summary>
+        [XmlElement]
+        public int TriggerDoublePressMs { get; set; } = 442;
+
+        /// <summary>Shift-layer gate (translator v25, Steam's
+        /// always_on_action): when non-empty and not "Base", the macro's
+        /// trigger only counts as active while this layer is the slot's
+        /// engaged layer. Empty (default, and every pre-v25 profile) =
+        /// ungated.</summary>
+        [XmlElement]
+        public string LayerMask { get; set; } = "";
+
+        [XmlElement]
+        public bool ConsumeTriggerButtons { get; set; } = true;
+
+        [XmlElement]
+        public MacroRepeatMode RepeatMode { get; set; }
+
+        [XmlElement]
+        public int RepeatCount { get; set; } = 1;
+
+        [XmlElement]
+        public int RepeatDelayMs { get; set; } = 100;
+
+        /// <summary>Nonzero links the two legs of a materialized hold pair
+        /// (audit #2 M4/M6). See <see cref="ViewModels.MacroItem.PairId"/>.
+        /// Default 0 = unpaired, so profiles saved before the field
+        /// existed load unchanged.</summary>
+        [XmlElement]
+        public int PairId { get; set; }
+
+        /// <summary>Release linger in ms for UntilRelease macros (translator
+        /// v22, Steam's activator delay_end on autofire). See
+        /// <see cref="ViewModels.MacroItem.ReleaseLingerMs"/>. Default 0 =
+        /// stop at release, so profiles saved before the field existed load
+        /// unchanged.</summary>
+        [XmlElement]
+        public int ReleaseLingerMs { get; set; }
+
+        /// <summary>Hex-encoded custom Extended trigger button words (e.g. "00000003,00000000,00000000,00000000").</summary>
+        [XmlElement]
+        public string TriggerCustomButtons { get; set; }
+
+        /// <summary>Comma-separated axis targets (e.g. "LeftStickX,LeftTrigger").</summary>
+        [XmlElement]
+        public string TriggerAxisTargets { get; set; }
+
+        /// <summary>Comma-separated per-axis direction filters (Any/Positive/
+        /// Negative), parallel to <see cref="TriggerAxisTargets"/> (#154).
+        /// Null means Any for every axis, which is also the pre-#154 shape.</summary>
+        [XmlElement]
+        public string TriggerAxisDirections { get; set; }
+
+        /// <summary>Axis trigger threshold percentage (1-100).</summary>
+        [XmlElement]
+        public int TriggerAxisThreshold { get; set; } = 50;
+
+        /// <summary>POV triggers stored as "povIndex:centidegrees" entries.</summary>
+        [XmlArray("TriggerPovs")]
+        [XmlArrayItem("Pov")]
+        public string[] TriggerPovs { get; set; }
+
+        /// <summary>Pipe-separated <see cref="MacroItem.TriggerInputEntry.Spec"/>
+        /// entries for the multi-device trigger combo (cross-device button +
+        /// POV combos, e.g. controller-X + keyboard-A + mouse-Left). When
+        /// non-empty, this is authoritative over the single-device legacy
+        /// fields above. Null / empty on macros saved by older PadForge
+        /// versions that pre-dated multi-device support — the runtime
+        /// migrates from the legacy fields on first access.</summary>
+        [XmlElement]
+        public string TriggerInputs { get; set; }
+
+        /// <summary>Custom-expression formula (used when
+        /// <see cref="TriggerMode"/> is <c>CustomExpression</c>). Empty / null
+        /// when the macro uses one of the legacy trigger modes.</summary>
+        [XmlElement]
+        public string TriggerExpression { get; set; }
+
+        /// <summary>Pipe-separated <see cref="MacroExpressionVariable.Spec"/> entries
+        /// in a/b/c/... order. Empty entries are preserved so indexing remains
+        /// stable across a load even if some variables are still unbound.</summary>
+        [XmlElement]
+        public string TriggerExpressionVariables { get; set; }
+
+        [XmlArray("Actions")]
+        [XmlArrayItem("Action")]
+        public ActionData[] Actions { get; set; }
+    }
+
+    /// <summary>
+    /// Serializable DTO for a single macro action.
+    /// </summary>
+    public class ActionData
+    {
+        [XmlElement]
+        public MacroActionType Type { get; set; }
+
+        [XmlElement]
+        public ushort ButtonFlags { get; set; }
+
+        /// <summary>Hex-encoded custom Extended button words for this action.</summary>
+        [XmlElement]
+        public string CustomButtons { get; set; }
+
+        [XmlElement]
+        public int KeyCode { get; set; }
+
+        /// <summary>
+        /// Multi-key combo in "{Key1}{Key2}..." format. Takes precedence over KeyCode.
+        /// </summary>
+        [XmlElement]
+        public string KeyString { get; set; }
+
+        [XmlElement]
+        public int DurationMs { get; set; } = 50;
+
+        [XmlElement]
+        public short AxisValue { get; set; }
+
+        [XmlElement]
+        public MacroAxisTarget AxisTarget { get; set; }
+
+        [XmlElement]
+        public MacroAxisSource AxisSource { get; set; }
+
+        /// <summary>GUID of the source device for InputDevice axis source (string form).</summary>
+        [XmlElement]
+        public string SourceDeviceGuid { get; set; }
+
+        [XmlElement]
+        public int SourceDeviceAxisIndex { get; set; }
+
+        /// <summary>Process name for AppVolume action (e.g., "firefox", "spotify").</summary>
+        [XmlElement]
+        public string ProcessName { get; set; }
+
+        /// <summary>Maximum volume percentage (1-100) for SystemVolume/AppVolume. Default 100 (no limit).</summary>
+        [XmlElement]
+        public int VolumeLimit { get; set; } = 100;
+
+        /// <summary>Pixels/scroll units per frame at full deflection for MouseMove/MouseScroll.</summary>
+        [XmlElement]
+        public float MouseSensitivity { get; set; } = 10f;
+
+        /// <summary>Which mouse button for MouseButtonPress/MouseButtonRelease.</summary>
+        [XmlElement]
+        public MacroMouseButton MouseButton { get; set; }
+
+        /// <summary>When true, invert the axis value (0→1 becomes 1→0).</summary>
+        [XmlElement]
+        public bool InvertAxis { get; set; }
+
+        /// <summary>MouseWheelTap (v15): tick the horizontal
+        /// (MOUSEEVENTF_HWHEEL) lane instead of the vertical wheel.</summary>
+        [XmlElement]
+        public bool WheelHorizontal { get; set; }
+
+        /// <summary>MouseNudge (v16): signed X pixel delta per fire,
+        /// screen frame (+x right).</summary>
+        [XmlElement]
+        public int NudgeDx { get; set; }
+
+        /// <summary>MouseNudge (v16): signed Y pixel delta per fire,
+        /// screen frame (+y down).</summary>
+        [XmlElement]
+        public int NudgeDy { get; set; }
+
+        /// <summary>CycleTapList (v16): the ordered step list
+        /// (MacroAction.CycleStepsCsv vocabulary).</summary>
+        [XmlElement]
+        public string CycleStepsCsv { get; set; }
+
+        /// <summary>CycleTapList (v16): wrap past the last step back to
+        /// the first.</summary>
+        [XmlElement]
+        public bool CycleWrap { get; set; }
+
+        /// <summary>Toggle latches (v18): pulse the latched contribution
+        /// on the turbo square wave (period IntervalMs) instead of holding
+        /// solid, composing Steam's toggle + hold_repeats.</summary>
+        [XmlElement]
+        public bool PulseWhileLatched { get; set; }
+
+        /// <summary>Absolute axis holds (#237): suppress the macro's
+        /// write for the rest of the activation once the physical input
+        /// moves the target past the yield threshold.</summary>
+        [XmlElement]
+        public bool AxisYieldToPhysical { get; set; }
+
+        /// <summary>Latch write mode for ToggleKey / ToggleMouseButton
+        /// (audit #2 M4): Toggle flips, On sets, Off clears. Default
+        /// Toggle preserves the pre-field behavior on old profiles.</summary>
+        [XmlElement]
+        public ViewModels.MacroLatchDirection LatchDirection { get; set; } = ViewModels.MacroLatchDirection.Toggle;
+
+        /// <summary>When true, show the Windows volume flyout OSD on volume changes.</summary>
+        [XmlElement]
+        public bool ShowVolumeOsd { get; set; } = true;
+
+        /// <summary>Lightbar override RGB for
+        /// MacroActionType.LightbarColor with ColorSource = Fixed (or
+        /// any Sticky hold). Default white so a freshly-added action
+        /// produces a visible flash on first test fire.</summary>
+        [XmlElement] public byte LightbarR { get; set; } = 0xFF;
+        [XmlElement] public byte LightbarG { get; set; } = 0xFF;
+        [XmlElement] public byte LightbarB { get; set; } = 0xFF;
+        /// <summary>Reactive (decay-fade) or Sticky hold for
+        /// LightbarColor.</summary>
+        [XmlElement] public ViewModels.MacroLightbarHoldMode LightbarHoldMode { get; set; } = ViewModels.MacroLightbarHoldMode.Reactive;
+        /// <summary>Color source for Reactive holds (Fixed / RandomHue /
+        /// PaletteStep). Sticky always uses Fixed.</summary>
+        [XmlElement] public ViewModels.MacroLightbarColorSource LightbarColorSource { get; set; } = ViewModels.MacroLightbarColorSource.Fixed;
+        /// <summary>Hold window for Reactive holds, ms (full intensity
+        /// for this duration before fade begins).</summary>
+        [XmlElement] public int LightbarHoldMs { get; set; } = 0;
+        /// <summary>Fade window for Reactive holds, ms (linear fade
+        /// from full to off after the hold elapses).</summary>
+        [XmlElement] public int LightbarFadeMs { get; set; } = 600;
+        /// <summary>CSV of "RRGGBB" hex triplets for the per-macro
+        /// palette used by PaletteStep. Empty falls back to the slot's
+        /// own LightbarPalette.</summary>
+        [XmlElement] public string LightbarPaletteCsv { get; set; } = string.Empty;
+        /// <summary>Target mode for LightbarModeSet.</summary>
+        [XmlElement] public ViewModels.LightbarMode LightbarTargetMode { get; set; } = ViewModels.LightbarMode.Static;
+        /// <summary>CSV of LightbarMode int values for LightbarModeCycle.</summary>
+        [XmlElement] public string LightbarCycleModesCsv { get; set; } = "1,2,3,4,11,12,13";
+        [XmlElement] public string PointerCycleModesCsv { get; set; } = "Mouse,FpsMouse,Mouse43,Mouse169";
+        /// <summary>Target mode name for PointerModeSet (issue #203 follow-up).</summary>
+        [XmlElement] public string PointerSetMode { get; set; } = "Mouse";
+        /// <summary>Target layer mask for SwitchLayer (#377).</summary>
+        [XmlElement] public string SwitchLayerMask { get; set; } = "Base";
+        /// <summary>Brightness percent for GuideLedBrightness (#209).</summary>
+        [XmlElement] public int GuideLedPercent { get; set; } = 100;
+
+        /// <summary>Sound file path for PlaySound (issue #83). Null when unset.</summary>
+        [XmlElement]
+        public string SoundFilePath { get; set; }
+
+        /// <summary>Per-action sound volume percentage (0-100). Default 100.
+        /// Zero is muted and must survive a load: the initializer is what
+        /// supplies 100 to a legacy action that omits the element.</summary>
+        [XmlElement]
+        public int SoundVolume { get; set; } = 100;
+
+        /// <summary>Loop the sound until SoundStop / trigger release.</summary>
+        [XmlElement]
+        public bool SoundLoop { get; set; }
+
+        /// <summary>Write mode for SetGyroEngaged (Toggle / On / Off).</summary>
+        [XmlElement] public ViewModels.MacroSetGyroEngagedMode SetGyroEngagedMode { get; set; } = ViewModels.MacroSetGyroEngagedMode.Toggle;
+
+        /// <summary>Reactive / Sticky hold for Rumble and RumbleTrigger (issue #102).</summary>
+        [XmlElement] public ViewModels.MacroRumbleHoldMode RumbleHoldMode { get; set; } = ViewModels.MacroRumbleHoldMode.Reactive;
+        /// <summary>Left (heavy) motor strength 0..100 for Rumble / RumbleTrigger.</summary>
+        [XmlElement] public int RumbleStrengthLeft { get; set; } = 100;
+        /// <summary>Right (light) motor strength 0..100 for Rumble / RumbleTrigger.</summary>
+        [XmlElement] public int RumbleStrengthRight { get; set; } = 100;
+        /// <summary>Full-strength hold window for Reactive rumble, ms.</summary>
+        [XmlElement] public int RumbleHoldMs { get; set; } = 100;
+        /// <summary>Fade-out window for Reactive rumble, ms.</summary>
+        [XmlElement] public int RumbleFadeMs { get; set; } = 200;
+
+        /// <summary>Which axes a MouseRecenter action snaps to center (issue #108).</summary>
+        [XmlElement] public ViewModels.CursorRecenterMode CursorRecenterMode { get; set; } = ViewModels.CursorRecenterMode.XAndY;
+
+        /// <summary>Which axes a MouseFixPosition action pins (issue #109).</summary>
+        [XmlElement] public ViewModels.CursorPinMode CursorPinMode { get; set; } = ViewModels.CursorPinMode.XAndY;
+        /// <summary>Pin target X in primary-monitor pixels (issue #109).</summary>
+        [XmlElement] public int CursorPinX { get; set; }
+        /// <summary>Pin target Y in primary-monitor pixels (issue #109).</summary>
+        [XmlElement] public int CursorPinY { get; set; }
+
+        /// <summary>MoveMouseToScreenPosition target X in primary-monitor pixels (issue #9).</summary>
+        [XmlElement] public int MouseX { get; set; }
+        /// <summary>MoveMouseToScreenPosition target Y in primary-monitor pixels (issue #9).</summary>
+        [XmlElement] public int MouseY { get; set; }
+        /// <summary>Turbo interval in milliseconds (issue #9): the
+        /// RepeatKeyWhileHeld pulse period, shared by the wave-1b
+        /// RepeatVcButtonWhileHeld square wave. The wave-1b actions add no
+        /// DTO fields of their own: the VC-button pair targets via the
+        /// existing ButtonFlags / CustomButtons above (the ButtonPress
+        /// addressing pair) and ToggleKey targets via KeyCode / KeyString,
+        /// so this element plus those carry the whole family.</summary>
+        [XmlElement] public int IntervalMs { get; set; } = 100;
+
+        /// <summary>Pressure-scaled turbo master gate (#290): while on, the
+        /// repeat rate follows the action's analog source between
+        /// SlowIntervalMs (light press) and IntervalMs (full press).</summary>
+        [XmlElement] public bool PressureScaledRate { get; set; }
+        /// <summary>Light-press period in milliseconds for the pressure-scaled
+        /// turbo (#290).</summary>
+        [XmlElement] public int SlowIntervalMs { get; set; } = 500;
+        /// <summary>Response curve shaping the 0..1 pressure before the rate
+        /// interpolation (#290): Linear, Aggressive, Relaxed, Wide, ExtraWide.</summary>
+        [XmlElement] public string TurboRateCurve { get; set; } = "Linear";
+        /// <summary>Pressure percent where the turbo ramp leaves the slow rate.</summary>
+        [XmlElement] public int PressureStartPercent { get; set; }
+        /// <summary>Pressure percent where the turbo ramp reaches the fast rate.</summary>
+        [XmlElement] public int PressureEndPercent { get; set; } = 100;
+
+        /// <summary>Which axes a MouseLimitRegion action clamps (issue #110).</summary>
+        [XmlElement] public ViewModels.CursorClampMode CursorClampMode { get; set; } = ViewModels.CursorClampMode.XAndY;
+        /// <summary>Per-edge X inset for the region clamp, pixels (issue #110).</summary>
+        [XmlElement] public int CursorClampInsetX { get; set; } = 50;
+        /// <summary>Per-edge Y inset for the region clamp, pixels (issue #110).</summary>
+        [XmlElement] public int CursorClampInsetY { get; set; } = 50;
+
+        /// <summary>Target mode for a DisconnectController action (issue #162).</summary>
+        [XmlElement] public ViewModels.MacroDisconnectTarget DisconnectTarget { get; set; } = ViewModels.MacroDisconnectTarget.TriggeringDevice;
+        /// <summary>Victim device GUID for Specific-device mode (issue #162).</summary>
+        [XmlElement] public string DisconnectDeviceGuid { get; set; }
+
+        /// <summary>Program/file path for a RunProgram action (user request).</summary>
+        [XmlElement] public string ProgramPath { get; set; }
+        /// <summary>Command-line arguments for a RunProgram action.</summary>
+        [XmlElement] public string ProgramArgs { get; set; }
+        /// <summary>Working folder for a RunProgram action.</summary>
+        [XmlElement] public string ProgramWorkingDir { get; set; }
+
+        /// <summary>Plain text a TextBlock action types out (issue #201). No
+        /// packing or delimiter rules apply: this is a discrete XML element.
+        /// The MacroAction.TextContent setter normalizes line endings to LF and
+        /// strips C0 control characters before the value ever reaches this DTO,
+        /// because XmlSerializer throws on C0 characters and the XML parser
+        /// normalizes CR to LF on load (verified both ways).</summary>
+        [XmlElement] public string TextContent { get; set; }
+        /// <summary>Milliseconds between typed characters for a TextBlock
+        /// action. 0 = the whole text in one batched call.</summary>
+        [XmlElement] public int TextPerCharDelayMs { get; set; }
+
+        /// <summary>Show Dreamcast Screen (#469): the pictures in the order
+        /// they show, each 192 bytes in image order as base64, joined by
+        /// commas.</summary>
+        [XmlElement] public string DreamcastFrames { get; set; }
+        /// <summary>How long each picture shows, ms. The action holds it to
+        /// a second at least, the adapter's EEPROM guard.</summary>
+        [XmlElement] public int DreamcastFrameMs { get; set; } = 1000;
+        /// <summary>How many times the pictures play, 1 at least.</summary>
+        [XmlElement] public int DreamcastRepeat { get; set; } = 1;
+    }
+
+    /// <summary>
+    /// A single user-imported HIDMaestro profile stored in PadForge.xml.
+    /// Id is the stable profile slug (dedup key across imports); Json is
+    /// the full HMProfile JSON as emitted by HMDeviceExtractor.ToJson. The
+    /// JSON is stored verbatim as element text so HIDMaestro's own loader
+    /// parses it, letting us avoid a parallel schema in PadForge.
+    /// </summary>
+    public class UserProfileData
+    {
+        [XmlAttribute] public string Id { get; set; } = string.Empty;
+        [XmlText] public string Json { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Steam Workshop provenance stamped on a profile when it is imported
+    /// through Browse Community Configs (#9). Update detection compares the
+    /// stored <see cref="TimeUpdated"/> against a fresh
+    /// GetPublishedFileDetails read to flag profiles whose Workshop item
+    /// changed since import.
+    /// </summary>
+    public class SteamWorkshopSource
+    {
+        /// <summary>Workshop published-file id the profile was translated from.</summary>
+        [XmlElement] public ulong PublishedFileId { get; set; }
+
+        /// <summary>Steam app the config targets.</summary>
+        [XmlElement] public int AppId { get; set; }
+
+        /// <summary>Game name at import time, for update-result display.</summary>
+        [XmlElement] public string GameName { get; set; }
+
+        /// <summary>Workshop item title at import time.</summary>
+        [XmlElement] public string Title { get; set; }
+
+        /// <summary>The Workshop item's time_updated (unix seconds) at import time.</summary>
+        [XmlElement] public long TimeUpdated { get; set; }
+
+        /// <summary>UTC timestamp of the import.</summary>
+        [XmlElement] public DateTime ImportedAt { get; set; }
+
+        /// <summary>TranslationReport.ToSummaryString() digest of the import run.</summary>
+        [XmlElement] public string TranslationSummary { get; set; }
+    }
+
+    /// <summary>
+    /// A named profile that stores per-device PadSettings and macros.
+    /// When auto-switching is enabled, profiles activate when a matching
+    /// executable's window comes to the foreground.
+    /// </summary>
+    public class ProfileData
+    {
+        [XmlAttribute]
+        public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
+        [XmlElement]
+        public string Name { get; set; } = "New Profile";
+
+        /// <summary>
+        /// Pipe-separated full executable paths (e.g. "C:\Games\game.exe|D:\Other\game2.exe").
+        /// Case-insensitive matching against the foreground window's process path.
+        /// </summary>
+        [XmlElement]
+        public string ExecutableNames { get; set; } = string.Empty;
+
+        /// <summary>Per-profile polling interval override in milliseconds
+        /// (#365, asked in discussion #362). SENTINEL CONTRACT: 0 means "no
+        /// opinion, follow the global Settings value", which is also what
+        /// every profile saved before this field deserializes to. Valid
+        /// overrides are 1..16 like the global knob. AUTHORED, not
+        /// snapshotted: SaveActiveProfileState's field copy deliberately
+        /// skips it (like Name and ExecutableNames) so a state save never
+        /// clobbers it, and the default profile never carries one, since
+        /// the default profile IS the global setting's home.</summary>
+        [XmlElement]
+        public int PollingRateOverrideMs { get; set; }
+
+        /// <summary>The profile's Dreamcast screen picture (#469), 192 bytes
+        /// in image order as base64, shown by a Bliss-Box port set to Profile
+        /// Picture. AUTHORED like the name: no state save copies it.</summary>
+        [XmlElement]
+        public string DreamcastPicture { get; set; }
+
+        [XmlArray("Entries")]
+        [XmlArrayItem("Entry")]
+        public ProfileEntry[] Entries { get; set; }
+
+        [XmlArray("ProfilePadSettings")]
+        [XmlArrayItem("PadSetting")]
+        public PadSetting[] PadSettings { get; set; }
+
+        /// <summary>
+        /// Per-VC mapping tables captured with this profile (Issue #61).
+        /// One <see cref="MappingSet"/> per slot. Null on profiles
+        /// captured before multi-source landed — ApplyProfile falls back
+        /// to per-device PadSetting in that case via the legacy migrator.
+        /// </summary>
+        [XmlArray("ProfileSlotMappingSets")]
+        [XmlArrayItem("MappingSet")]
+        public MappingSet[] SlotMappingSets { get; set; }
+
+        [XmlArray("ProfileMacros")]
+        [XmlArrayItem("Macro")]
+        public MacroData[] Macros { get; set; }
+
+        /// <summary>Custom touchpad gestures recorded by the user.
+        /// Per-profile so different games can use different gesture
+        /// catalogs. Each entry compiles to a
+        /// <see cref="PadForge.Engine.Touchpad.ShapeTemplate"/> at
+        /// profile load and joins the active in-box catalog the
+        /// gesture engine evaluates against. Null on profiles captured
+        /// before v3.3 — the in-box catalog still applies; just no
+        /// custom gestures.</summary>
+        [XmlArray("TouchpadGestures")]
+        [XmlArrayItem("Gesture")]
+        public PadForge.Engine.Touchpad.TouchpadCustomGesture[] TouchpadGestures { get; set; }
+
+        /// <summary>
+        /// Which virtual controller slots were created when this profile was saved.
+        /// Null on old profiles — topology application is skipped.
+        /// </summary>
+        [XmlArray("ProfileSlotCreated")]
+        [XmlArrayItem("Created")]
+        public bool[] SlotCreated { get; set; }
+
+        /// <summary>
+        /// Which virtual controller slots were enabled when this profile was saved.
+        /// Null on old profiles — topology application is skipped.
+        /// </summary>
+        [XmlArray("ProfileSlotEnabled")]
+        [XmlArrayItem("Enabled")]
+        public bool[] SlotEnabled { get; set; }
+
+        /// <summary>
+        /// Per-slot virtual controller output types (VirtualControllerType enum cast to int).
+        /// Null on old profiles — topology application is skipped.
+        /// </summary>
+        [XmlArray("ProfileSlotControllerTypes")]
+        [XmlArrayItem("Type")]
+        public int[] SlotControllerTypes { get; set; }
+
+        /// <summary>
+        /// Per-slot HIDMaestro profile slug saved with this profile. Added
+        /// in v3.0.0; null on profiles saved by v2.x.
+        /// </summary>
+        [XmlArray("ProfileSlotProfileIds")]
+        [XmlArrayItem("Id")]
+        public string[] SlotProfileIds { get; set; }
+
+        /// <summary>Per-slot model appearances. Null permits legacy PadSetting migration.</summary>
+        [XmlArray("ProfileSlotModel3DAppearances")]
+        [XmlArrayItem("Appearance")]
+        public string[] SlotModel3DAppearances { get; set; }
+
+        /// <summary>Per-slot Extended configurations saved with this profile.</summary>
+        [XmlArray("ProfileExtendedConfigs")]
+        [XmlArrayItem("ExtendedConfig")]
+        public ViewModels.ExtendedSlotConfigData[] ExtendedConfigs { get; set; }
+
+        /// <summary>Per-(slot, device) configurations (adaptive triggers,
+        /// lighting, audio, tone filter) saved with this profile. Null on
+        /// profiles predating v3.1.0, where defaults apply on load. Written as
+        /// ProfileDeviceSlotConfigs since the v4.x schema rename; older
+        /// files and exported profile.xml archives spelled it
+        /// ProfilePlayStationConfigs (see
+        /// <see cref="LegacyDeviceSlotConfigs"/>).</summary>
+        [XmlArray("ProfileDeviceSlotConfigs")]
+        [XmlArrayItem("Config")]
+        public ViewModels.DeviceSlotConfigData[] DeviceSlotConfigs { get; set; }
+
+        /// <summary>Read-only compatibility spelling for files and profile
+        /// exports saved before the v4.x schema rename. Same contract as
+        /// AppSettingsData.LegacyDeviceSlotConfigs: migrated forward on
+        /// load, never serialized.</summary>
+        [XmlArray("ProfilePlayStationConfigs")]
+        [XmlArrayItem("PlayStationConfig")]
+        public ViewModels.DeviceSlotConfigData[] LegacyDeviceSlotConfigs { get; set; }
+        public bool ShouldSerializeLegacyDeviceSlotConfigs() => false;
+
+        /// <summary>Adopts the legacy spelling when the new one is absent,
+        /// then clears it. Called by SettingsFileData.MigrateLegacySchema
+        /// on settings load and by ProfileTransfer.Import for standalone
+        /// profile archives.</summary>
+        public void MigrateLegacySchema()
+        {
+            if ((DeviceSlotConfigs == null || DeviceSlotConfigs.Length == 0)
+                && LegacyDeviceSlotConfigs != null && LegacyDeviceSlotConfigs.Length > 0)
+                DeviceSlotConfigs = LegacyDeviceSlotConfigs;
+            LegacyDeviceSlotConfigs = null;
+        }
+
+        /// <summary>
+        /// Per-group ordered list of pad indices in user-facing visual order
+        /// at profile-save time. Null on profiles predating the per-group
+        /// ordering refactor; activation reconstructs ascending pad-index
+        /// defaults via <c>SettingsManager.SlotOrders.RebuildFromCurrentTopology</c>.
+        /// </summary>
+        // XmlArray name kept as "ProfileMicrosoftSlotOrder" for v2/early-v3
+        // PadForge.xml back-compat. The C# property name follows the
+        // user-facing "Xbox" family naming.
+        [XmlArray("ProfileMicrosoftSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] XboxSlotOrder { get; set; }
+
+        [XmlArray("ProfilePlayStationSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] PlayStationSlotOrder { get; set; }
+
+        [XmlArray("ProfileNintendoSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] NintendoSlotOrder { get; set; }
+
+        [XmlArray("ProfileExtendedSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] ExtendedSlotOrder { get; set; }
+
+        [XmlArray("ProfileKeyboardMouseSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] KeyboardMouseSlotOrder { get; set; }
+
+        [XmlArray("ProfileMidiSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] MidiSlotOrder { get; set; }
+
+        [XmlArray("ProfileVrSlotOrder")]
+        [XmlArrayItem("PadIndex")]
+        public int[] VrSlotOrder { get; set; }
+
+        /// <summary>Per-slot MIDI configurations saved with this profile.</summary>
+        [XmlArray("ProfileMidiConfigs")]
+        [XmlArrayItem("MidiConfig")]
+        public ViewModels.MidiSlotConfigData[] MidiConfigs { get; set; }
+
+        /// <summary>Per-slot KBM (SOCD) configurations saved with this profile.</summary>
+        [XmlArray("ProfileKbmConfigs")]
+        [XmlArrayItem("KbmConfig")]
+        public ViewModels.KbmSlotConfigData[] KbmConfigs { get; set; }
+
+        /// <summary>Whether the DSU motion server was enabled in this profile.</summary>
+        [XmlElement]
+        public bool EnableDsuMotionServer { get; set; }
+
+        /// <summary>DSU motion server port for this profile.</summary>
+        [XmlElement]
+        public int DsuMotionServerPort { get; set; } = 26760;
+
+        /// <summary>Whether the web controller server was enabled in this profile.</summary>
+        [XmlElement]
+        public bool EnableWebController { get; set; }
+
+        /// <summary>Web controller server port for this profile.</summary>
+        [XmlElement]
+        public int WebControllerPort { get; set; } = 8080;
+
+        [XmlElement]
+        public bool EnableTouchpadOverlay { get; set; }
+
+        /// <summary>Radial / touch menu overlay (#9 B-17), per-profile
+        /// copy. Default on.</summary>
+        [XmlElement]
+        public bool EnableMenuOverlay { get; set; } = true;
+
+        /// <summary>Whether the shift-layer flyout appears while a slot is on a
+        /// non-Base layer. Default on. Display only, the layer still engages.</summary>
+        [XmlElement]
+        public bool EnableShiftLayerFlyout { get; set; } = true;
+
+        /// <summary>Whether the profile-switch overlay appears on a profile
+        /// change. Default on. The switch still happens when off.</summary>
+        [XmlElement]
+        public bool EnableProfileOverlay { get; set; } = true;
+
+        /// <summary>Razer Chroma lightbar mirror (#373), the profile's leg.
+        /// NULLABLE CONTRACT, the same shape as <see cref="PollingRateOverrideMs"/>
+        /// (0 there, null here): null means "no opinion, the toggle keeps
+        /// its current value", which is also what every profile saved
+        /// before this field deserializes to. A plain bool read as false in
+        /// every pre-existing profile and the first profile switch turned
+        /// the mirror off (commit 087568bd went global-only for exactly
+        /// that, which was the wrong fix). AUTHORED: the profile records a
+        /// value when the user changes the Dashboard toggle while it is
+        /// active (SettingsService.OnDashboardServiceToggleChanged), and no
+        /// snapshot builder invents one, so the default snapshot and a
+        /// Save As copy start with no opinion.</summary>
+        [XmlElement]
+        public bool? EnableChromaLightbar { get; set; }
+
+        /// <summary>Logitech LIGHTSYNC lightbar mirror (#382), the profile's
+        /// leg. Same nullable, authored contract as
+        /// <see cref="EnableChromaLightbar"/>.</summary>
+        [XmlElement]
+        public bool? EnableLightsyncLightbar { get; set; }
+
+        /// <summary>Razer Sensa HD haptics translation (#374), the profile's
+        /// leg. Same nullable, authored contract as
+        /// <see cref="EnableChromaLightbar"/>.</summary>
+        [XmlElement]
+        public bool? EnableSensaHaptics { get; set; }
+
+        /// <summary>The authored UDP input opinion. Null leaves the current value alone.
+        /// Older profiles used this as a master switch and are converted once.</summary>
+        [XmlElement]
+        public bool? EnableHeadTracking { get; set; }
+
+        /// <summary>The authored FreeTrack input opinion. Null leaves it unchanged.</summary>
+        [XmlElement]
+        public bool? EnableHeadTrackingFreeTrack { get; set; }
+
+        [XmlElement]
+        public bool HeadTrackingIndependentInputs { get; set; }
+
+        internal void MigrateHeadTrackingInputs(bool legacyFreeTrack)
+        {
+            if (HeadTrackingIndependentInputs) return;
+            if (EnableHeadTrackingFreeTrack == null && EnableHeadTracking is bool enabled)
+                EnableHeadTrackingFreeTrack = enabled && legacyFreeTrack;
+            HeadTrackingIndependentInputs = true;
+        }
+
+        [XmlElement]
+        public double TouchpadOverlayOpacity { get; set; } = 0.25;
+
+        [XmlElement]
+        public int TouchpadOverlayMonitor { get; set; }
+
+        [XmlElement]
+        public double TouchpadOverlayLeft { get; set; } = -1;
+
+        [XmlElement]
+        public double TouchpadOverlayTop { get; set; } = -1;
+
+        [XmlElement]
+        public double TouchpadOverlayWidth { get; set; } = 500;
+
+        [XmlElement]
+        public double TouchpadOverlayHeight { get; set; } = 250;
+
+        /// <summary>Steam Workshop provenance for profiles imported via
+        /// Browse Community Configs (#9). Null on every other profile.
+        /// Identity-scoped like <see cref="Name"/> and <see cref="Id"/>:
+        /// the runtime-state mirrors (InputService.SnapshotCurrentProfile,
+        /// SaveActiveProfileState, SettingsService.UpdateActiveProfileSnapshot)
+        /// intentionally leave it alone, because it describes where the
+        /// profile came from, not what state it holds. Slot compaction
+        /// (CompactProfileDataInPlace) mutates in place and never touches it.</summary>
+        [XmlElement("SteamWorkshopSource")]
+        public SteamWorkshopSource WorkshopSource { get; set; }
+    }
+
+    /// <summary>
+    /// Links a device (by instance GUID) to a slot and PadSetting within a profile.
+    /// ProductGuid enables fallback matching when InstanceGuid changes (BT reconnect).
+    /// </summary>
+    public class ProfileEntry
+    {
+        [XmlElement]
+        public Guid InstanceGuid { get; set; }
+
+        [XmlElement]
+        public Guid ProductGuid { get; set; }
+
+        [XmlElement]
+        public int MapTo { get; set; }
+
+        [XmlElement]
+        public string PadSettingChecksum { get; set; }
+
+        /// <summary>What a Bliss-Box port still owes this assignment
+        /// (<see cref="UserSetting.BlissBoxOwed"/>).</summary>
+        [XmlElement]
+        [System.ComponentModel.DefaultValue(BlissBoxOwedMapping.None)]
+        public BlissBoxOwedMapping BlissBoxOwed { get; set; }
+
+        /// <summary>The targets that request leaves as the user left them
+        /// (<see cref="UserSetting.BlissBoxKeptTargets"/>).</summary>
+        [XmlArray]
+        [XmlArrayItem("Target")]
+        public string[] BlissBoxKeptTargets { get; set; }
+    }
+
+    /// <summary>
+    /// A global macro that runs regardless of which profile is active.
+    /// Currently used for profile shortcuts; future uses include overlay
+    /// toggles, global volume, etc.
+    /// </summary>
+    public class GlobalMacroData
+    {
+        [XmlAttribute]
+        public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
+        [XmlElement]
+        public SwitchProfileMode SwitchMode { get; set; }
+
+        /// <summary>For Specific mode: target profile ID. Null for Next/Previous.</summary>
+        [XmlElement]
+        public string TargetProfileId { get; set; }
+
+        /// <summary>
+        /// Per-button trigger entries. Each entry has a button index, the device instance
+        /// GUID it was recorded from, and the product GUID for same-type matching.
+        /// Supports cross-device combos (e.g., Shift on keyboard + Start on gamepad).
+        /// </summary>
+        [XmlArray("TriggerEntries")]
+        [XmlArrayItem("Entry")]
+        public TriggerButtonEntry[] TriggerEntries { get; set; }
+
+        /// <summary>Legacy: flat button index array from old XML. Migrated on load.</summary>
+        [XmlArray("TriggerButtons")]
+        [XmlArrayItem("Index")]
+        public int[] LegacyTriggerRawButtons { get; set; }
+
+        /// <summary>Legacy: single device GUID from old XML.</summary>
+        [XmlElement]
+        public Guid TriggerDeviceGuid { get; set; }
+
+        /// <summary>Runtime-only: previous frame trigger state for edge detection.</summary>
+        [XmlIgnore]
+        public bool WasTriggerActive { get; set; }
+
+        /// <summary>True if this macro has any trigger buttons configured.</summary>
+        [XmlIgnore]
+        public bool HasTrigger => TriggerEntries != null && TriggerEntries.Length > 0;
+
+        /// <summary>
+        /// Migrates legacy flat button array to per-button entries.
+        /// Called once during settings load.
+        /// </summary>
+        public void MigrateLegacyTrigger()
+        {
+            if (TriggerEntries != null || LegacyTriggerRawButtons == null)
+                return;
+
+            TriggerEntries = new TriggerButtonEntry[LegacyTriggerRawButtons.Length];
+            for (int i = 0; i < LegacyTriggerRawButtons.Length; i++)
+            {
+                TriggerEntries[i] = new TriggerButtonEntry
+                {
+                    ButtonIndex = LegacyTriggerRawButtons[i],
+                    DeviceInstanceGuid = TriggerDeviceGuid,
+                    DeviceProductGuid = System.Guid.Empty
+                };
+            }
+            LegacyTriggerRawButtons = null; // Clear so next save uses new format.
+        }
+    }
+
+    /// <summary>
+    /// A single button in a global macro trigger combo. Each button tracks
+    /// which device it was recorded from, enabling cross-device combos.
+    /// </summary>
+    public class TriggerButtonEntry
+    {
+        /// <summary>Raw button index on the source device (when IsAxis=false).</summary>
+        [XmlElement]
+        public int ButtonIndex { get; set; }
+
+        /// <summary>True if this entry represents an axis threshold, not a button.</summary>
+        [XmlElement]
+        public bool IsAxis { get; set; }
+
+        /// <summary>Raw axis index on the source device (when IsAxis=true).</summary>
+        [XmlElement]
+        public int AxisIndex { get; set; }
+
+        /// <summary>
+        /// Axis threshold as normalized value (0.0–1.0). The axis must exceed this
+        /// value to be considered active. Default 0.5 (50%).
+        /// </summary>
+        [XmlElement]
+        public float AxisThreshold { get; set; } = 0.5f;
+
+        /// <summary>
+        /// Axis direction: Positive (axis > threshold) or Negative (axis &lt; 1-threshold).
+        /// </summary>
+        [XmlElement]
+        public AxisTriggerDirection AxisDirection { get; set; }
+
+        /// <summary>Instance GUID of the device this entry was recorded from.</summary>
+        [XmlElement]
+        public Guid DeviceInstanceGuid { get; set; }
+
+        /// <summary>Product GUID for same-type device matching in "Any Device" mode.</summary>
+        [XmlElement]
+        public Guid DeviceProductGuid { get; set; }
+    }
+
+    public enum AxisTriggerDirection
+    {
+        Positive, // Axis value above threshold (e.g., stick right, trigger pulled)
+        Negative  // Axis value below 1-threshold (e.g., stick left)
+    }
+
+    public enum SwitchProfileMode
+    {
+        Specific,
+        Next,
+        Previous,
+        ToggleWindow,
+        ToggleVCsDisabled,
+    }
+}

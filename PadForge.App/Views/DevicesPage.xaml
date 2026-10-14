@@ -1,0 +1,2137 @@
+﻿<UserControl x:Class="PadForge.Views.DevicesPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:common="clr-namespace:PadForge.Common"
+             xmlns:local="clr-namespace:PadForge.Views"
+             xmlns:strings="clr-namespace:PadForge.Resources.Strings"
+             xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="po"
+             xmlns:reset="clr-namespace:PadForge.Controls">
+
+    <UserControl.Resources>
+        <!-- Ember (#175): list-row meta segments render cold mono. Liveness
+             reads as emphasis on both grounds: online rows carry the themed
+             cold at full strength, offline rows dim the same cold to 0.55. -->
+        <Style x:Key="DeviceMetaText" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource TelemetryFontFamily}"/>
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+            <Setter Property="Opacity" Value="0.55"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsOnline}" Value="True">
+                    <Setter Property="Opacity" Value="1.0"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <!-- Ember (#175): section eyebrows. Mono, small, tertiary.
+             Uppercasing is display-only via UpperConverter. -->
+        <Style x:Key="SectionEyebrow" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource TelemetryFontFamily}"/>
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextFillColorTertiaryBrush}"/>
+        </Style>
+        <!-- Type facet chips (#175 phase 2 item 13): mono 10.5 letterspaced
+             tokens on a rounded-14 pill, ember-tinted when active, steel
+             otherwise. Tokens are locale-neutral literals per the DZ / PEAK
+             precedent. The token TextBlock sets no Foreground so it inherits
+             the chip Border's TextElement.Foreground (ChipCold idiom); the
+             count stays cold like every telemetry counter. -->
+        <Style x:Key="FacetChipBase" TargetType="Border">
+            <Setter Property="CornerRadius" Value="14"/>
+            <Setter Property="Padding" Value="10,3"/>
+            <Setter Property="Margin" Value="0,0,6,4"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Background" Value="{DynamicResource SteelGroundBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource SteelLineBrush}"/>
+            <Setter Property="TextElement.Foreground" Value="{DynamicResource TextFillColorTertiaryBrush}"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="FacetToken" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource TelemetryFontFamily}"/>
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style x:Key="FacetCount" TargetType="TextBlock" BasedOn="{StaticResource FacetToken}">
+            <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+            <!-- Wider than the token's intra-letter hair-spacing, so the
+                 count reads as its own word (user report 2026-07-06). -->
+            <Setter Property="Margin" Value="10,0,0,0"/>
+        </Style>
+        <!-- Ember (#175): Raw Input State cluster. Dark recessed cells,
+             cold lit outline when pressed (outline lit, not solid). -->
+        <Style x:Key="RawCellBorder" TargetType="Border">
+            <Setter Property="Background" Value="{DynamicResource SteelGroundBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource SteelLineBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsPressed}" Value="True">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ColdBrush}"/>
+                    <Setter Property="Effect">
+                        <Setter.Value>
+                            <DropShadowEffect Color="#58B6E4" BlurRadius="10" ShadowDepth="0" Opacity="0.45"/>
+                        </Setter.Value>
+                    </Setter>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <!-- NFC tag rows light on IsActive instead of IsPressed. Deliberately
+             NOT BasedOn RawCellBorder: inheritance carried the base style's
+             IsPressed trigger along, and NfcTagDisplayItem has no IsPressed,
+             so every NFC row realization logged a BINDERR pair. Base setters
+             are duplicated instead. -->
+        <Style x:Key="RawCellBorderActive" TargetType="Border">
+            <Setter Property="Background" Value="{DynamicResource SteelGroundBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource SteelLineBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ColdBrush}"/>
+                    <Setter Property="Effect">
+                        <Setter.Value>
+                            <DropShadowEffect Color="#58B6E4" BlurRadius="10" ShadowDepth="0" Opacity="0.45"/>
+                        </Setter.Value>
+                    </Setter>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <!-- Glow sweep (#175): shared cold bloom for pressed touch dots
+             and POV needles. Static, frozen, never animated. -->
+        <DropShadowEffect x:Key="ColdDotGlow" Color="#58B6E4" BlurRadius="8" ShadowDepth="0" Opacity="0.45"/>
+        <!-- Hover glow (#175): hover color changes carry a hue-matched
+             bloom. Every hover shift on this page is neutral steel, so the
+             glow is the faint ember signature. Frozen shared static effect,
+             set from triggers only, never animated. -->
+        <DropShadowEffect x:Key="NeutralHoverGlow" po:Freeze="True" Color="#FF6B2C" ShadowDepth="0" BlurRadius="10" Opacity="0.30"/>
+        <!-- Hover glow sweep (#175): stock-chrome classes bloom in the same
+             moment their hover fill shifts. BasedOn the WPF-UI defaults so
+             theme brushes survive. The two inline Button styles below
+             (Submit Mapping, Manage NFC Tags) chain into the Button
+             implicit via their BasedOn {x:Type Button}. -->
+        <Style TargetType="Button" BasedOn="{StaticResource DefaultButtonStyle}">
+            <!-- MinHeight mirrors the App.xaml implicit Button style (32px
+                 grid), which this page-local implicit replaces. -->
+            <Setter Property="MinHeight" Value="32"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="CheckBox" BasedOn="{StaticResource DefaultCheckBoxStyle}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="TextBox" BasedOn="{StaticResource DefaultTextBoxStyle}">
+            <!-- Selection setters mirror the App.xaml implicit TextBox
+                 style, which this page-local implicit replaces. -->
+            <Setter Property="SelectionBrush" Value="{DynamicResource EmberBrush}"/>
+            <Setter Property="SelectionOpacity" Value="0.35"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="RawCellLabel" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{StaticResource TelemetryFontFamily}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextFillColorTertiaryBrush}"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsPressed}" Value="True">
+                    <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+
+    <Grid Margin="24,16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+            <TextBlock Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                       VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <TextBlock Text="{Binding Devices_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
+            <ui:Button Style="{StaticResource EmberIconButton}" Margin="16,0,0,0"
+                       VerticalAlignment="Center"
+                       Command="{Binding RefreshCommand}"
+                       ToolTip="{Binding Common_Refresh, Source={x:Static strings:Strings.Instance}}">
+                <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+            </ui:Button>
+            <ui:Button Style="{StaticResource EmberIconButton}" Margin="8,0,0,0"
+                       VerticalAlignment="Center"
+                       Command="{Binding PairCommand}"
+                       ToolTip="{Binding Devices_Pair, Source={x:Static strings:Strings.Instance}}">
+                <TextBlock Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+            </ui:Button>
+            <!-- Telemetry counter (#175 typography): counts mono cold,
+                 labels mono tertiary, same treatment as the status bar
+                 and the Dashboard device counter. -->
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0">
+                <TextBlock Foreground="{DynamicResource ColdBrush}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="12" Text="{Binding OnlineCount, Mode=OneWay}"/>
+                <TextBlock Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="12" Text="{Binding Devices_OnlineTotal, Source={x:Static strings:Strings.Instance}}"/>
+                <TextBlock Foreground="{DynamicResource ColdBrush}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="12" Text="{Binding TotalCount, Mode=OneWay}"/>
+                <TextBlock Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="12" Text="{Binding Devices_Total, Source={x:Static strings:Strings.Instance}}"/>
+            </StackPanel>
+        </StackPanel>
+
+        <!-- Main content: Card list + Detail -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="340"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- ═══════════════════════════════════════════ -->
+            <!--  Left: Device card list                    -->
+            <!-- ═══════════════════════════════════════════ -->
+            <Grid Margin="0,0,12,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- Type facet chips (#175 phase 2 item 13): filter the list
+                     by type family. GAMEPAD is gamepad, first person, and
+                     supplemental only. Joysticks and flight sticks bucket
+                     under JOYSTICK and wheels under WHEEL, per the
+                     2026-07-06 split. KEYBOARD and MOUSE stand alone and
+                     OTHER takes the rest. Tokens are
+                     hair-space letterspaced literals; counts come from the
+                     VM on the same cadence as the header counter. -->
+                <WrapPanel Margin="6,0,0,4">
+                    <Border Tag="ALL" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="ALL">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="A&#8202;L&#8202;L" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding TotalCount, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="GAMEPAD" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="GAMEPAD">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="G&#8202;A&#8202;M&#8202;E&#8202;P&#8202;A&#8202;D" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountGamepad, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="JOYSTICK" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="JOYSTICK">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="J&#8202;O&#8202;Y&#8202;S&#8202;T&#8202;I&#8202;C&#8202;K" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountJoystick, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="WHEEL" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="WHEEL">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="W&#8202;H&#8202;E&#8202;E&#8202;L" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountWheel, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="KEYBOARD" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="KEYBOARD">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="K&#8202;E&#8202;Y&#8202;B&#8202;O&#8202;A&#8202;R&#8202;D" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountKeyboard, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="MOUSE" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="MOUSE">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="M&#8202;O&#8202;U&#8202;S&#8202;E" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountMouse, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Tag="OTHER" MouseLeftButtonUp="FacetChip_Click">
+                        <Border.Style>
+                            <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedFacet}" Value="OTHER">
+                                        <Setter Property="Background" Value="{DynamicResource EmberTintBrush}"/>
+                                        <Setter Property="BorderBrush" Value="#66FF6B2C"/>
+                                        <Setter Property="TextElement.Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="O&#8202;T&#8202;H&#8202;E&#8202;R" Style="{StaticResource FacetToken}"/>
+                            <TextBlock Text="{Binding FacetCountOther, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
+                        </StackPanel>
+                    </Border>
+                </WrapPanel>
+
+            <ListBox Grid.Row="1"
+                     ItemsSource="{Binding Devices}"
+                     SelectedItem="{Binding SelectedDevice, Mode=TwoWay}"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     BorderThickness="0" Background="Transparent">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Border Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                                CornerRadius="8" Padding="12,10" Margin="0,0,0,4"
+                                PreviewMouseLeftButtonDown="DeviceCard_MouseDown"
+                                PreviewMouseMove="DeviceCard_MouseMove"
+                                PreviewMouseLeftButtonUp="DeviceCard_MouseUp">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <!-- Row 0: Status dot + Device name. A Grid, not a
+                                     StackPanel: horizontal StackPanels measure their
+                                     children unbounded, so the name's ellipsis never
+                                     engaged and long names clipped at the card edge
+                                     when the window narrowed. -->
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Path Margin="0,0,8,0" VerticalAlignment="Center">
+                                        <Path.Style>
+                                            <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsOnline}" Value="True">
+                                                        <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                        <Setter Property="Stroke" Value="{x:Null}"/>
+                                                        <Setter Property="Effect">
+                                                            <Setter.Value>
+                                                                <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                            </Setter.Value>
+                                                        </Setter>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Path.Style>
+                                    </Path>
+                                    <TextBlock Grid.Column="1" Text="{Binding DeviceName}" FontWeight="SemiBold"
+                                               FontSize="13" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding DeviceName}"
+                                               VerticalAlignment="Center">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsOnline}" Value="False">
+                                                        <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Grid>
+
+                                <!-- Slot badges (right, row 0–1, wraps if many). The
+                                     WrapPanel needs the MaxWidth to actually wrap: in
+                                     an Auto-sized column it measures unbounded, laid
+                                     every badge on one line, and starved the name
+                                     column until badges clipped at narrow widths. -->
+                                <StackPanel Grid.Column="1" Grid.RowSpan="2"
+                                            VerticalAlignment="Center" Margin="8,0,0,0">
+                                    <ItemsControl ItemsSource="{Binding SlotBadges}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <WrapPanel MaxWidth="118" HorizontalAlignment="Right"/>
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <!-- The forge moment (#175): these badges only render
+                                                     when assigned, so the ember treatment is
+                                                     unconditional. Mirrors the right-pane slot pill. -->
+                                                <Border CornerRadius="4" Padding="5,2"
+                                                        Margin="0,0,4,3">
+                                                    <Border.Background>
+                                                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                                            <GradientStop Color="#FF6B2C" Offset="0"/>
+                                                            <GradientStop Color="#C43D0C" Offset="1"/>
+                                                        </LinearGradientBrush>
+                                                    </Border.Background>
+                                                    <Border.Effect>
+                                                        <DropShadowEffect Color="#FF6B2C" BlurRadius="10" ShadowDepth="0" Opacity="0.35"/>
+                                                    </Border.Effect>
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <!-- Branded family mark (#175 phase 2 item 12):
+                                                             the slot's VC type icon, the same
+                                                             Xbox/PS/Extended geometries the sidebar
+                                                             cards wear (Common.ControllerIcons). MIDI
+                                                             and KbM have no vector logo anywhere in the
+                                                             app and keep their MDL2 glyphs, mirroring
+                                                             the nav rail's type pill. -->
+                                                        <Grid VerticalAlignment="Center">
+                                                            <Path Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
+                                                                  Stretch="Uniform" Fill="#FFFFF3E8"/>
+                                                            <TextBlock Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
+                                                                       FontSize="10" Foreground="#FFFFF3E8"
+                                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                       Visibility="{Binding TypeGlyph, Converter={StaticResource StringToVisibility}}"/>
+                                                        </Grid>
+                                                        <!-- Slot number is a chip token: mono, like the
+                                                             PadPage tier-strip slot pill. -->
+                                                        <TextBlock Text="{Binding SlotNumber}" FontFamily="{StaticResource TelemetryFontFamily}"
+                                                                   FontSize="10" Foreground="#FFFFF3E8" Margin="3,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <!-- No unassigned fallback pill (#175 phase 2 item 9):
+                                         absence encodes unassigned; the ember slot badge is
+                                         the only assignment signal. -->
+                                </StackPanel>
+
+                                <!-- Delete button (upper-right). Hover-revealed
+                                     (#175 phase 2 item 1b): opacity, not
+                                     visibility, so it stays in the tab order.
+                                     Keyboard focus reveals it too. The click
+                                     routes through the shared ConfirmDialog in
+                                     code-behind before anything is deleted. -->
+                                <ui:Button Grid.Column="2" Grid.RowSpan="2"
+                                           ToolTip="{Binding Devices_RemoveTooltip, Source={x:Static strings:Strings.Instance}}"
+                                           VerticalAlignment="Top"
+                                           Click="RemoveDevice_Click">
+                                    <ui:Button.Style>
+                                        <Style TargetType="{x:Type ui:Button}" BasedOn="{StaticResource EmberIconButtonHot}">
+                                            <Setter Property="Opacity" Value="0"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                                                    <Setter Property="Opacity" Value="1"/>
+                                                </DataTrigger>
+                                                <Trigger Property="IsKeyboardFocused" Value="True">
+                                                    <Setter Property="Opacity" Value="1"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </ui:Button.Style>
+                                    <TextBlock Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                </ui:Button>
+
+                                <!-- Row 1: Type | VID:PID | Capabilities. A WrapPanel
+                                     scoped to the name column (no ColumnSpan): the old
+                                     single-line StackPanel spanned under the badges and
+                                     clipped its tail at narrow widths; now segments wrap
+                                     to further lines and stay clear of the badge zone. -->
+                                <WrapPanel Grid.Row="1" Margin="16,3,0,0">
+                                    <TextBlock Text="{Binding DeviceType, Converter={StaticResource UpperConverter}}" Style="{StaticResource DeviceMetaText}"/>
+                                    <!-- VID:PID renders only when the device reports one
+                                         (#175 phase 2 item 17): virtual and merged sources
+                                         surface 0000:0000, which is noise, not identity.
+                                         Same absent-fact gating as the dossier lines. -->
+                                    <StackPanel Orientation="Horizontal"
+                                                Visibility="{Binding HasVidPid, Converter={StaticResource BoolToVisibilityConverter}}">
+                                        <TextBlock Text=" &#x2022; " Style="{StaticResource DeviceMetaText}"/>
+                                        <TextBlock Style="{StaticResource DeviceMetaText}" Text="{Binding VendorIdHex, Mode=OneWay}"/>
+                                        <TextBlock Style="{StaticResource DeviceMetaText}" Text=":"/>
+                                        <TextBlock Style="{StaticResource DeviceMetaText}" Text="{Binding ProductIdHex, Mode=OneWay}"/>
+                                    </StackPanel>
+                                    <TextBlock Text=" &#x2022; " Style="{StaticResource DeviceMetaText}"/>
+                                    <TextBlock Text="{Binding CapabilitiesSummary, Converter={StaticResource UpperConverter}}" Style="{StaticResource DeviceMetaText}"
+                                               TextWrapping="Wrap"/>
+                                    <!-- Battery (issue #167): shown only when the device reports one -->
+                                    <StackPanel Orientation="Horizontal"
+                                                Visibility="{Binding HasBattery, Converter={StaticResource BoolToVisibilityConverter}}">
+                                        <TextBlock Text=" &#x2022; " Style="{StaticResource DeviceMetaText}"/>
+                                        <TextBlock Text="{Binding BatteryGlyph}" Style="{StaticResource DeviceMetaText}" FontFamily="Segoe MDL2 Assets"
+                                                   VerticalAlignment="Center"/>
+                                        <TextBlock Text="{Binding BatteryText}" Style="{StaticResource DeviceMetaText}"
+                                                   Margin="4,0,0,0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </WrapPanel>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                        <Setter Property="Padding" Value="0"/>
+                        <Setter Property="Margin" Value="0"/>
+                        <Setter Property="Background" Value="Transparent"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListBoxItem">
+                                    <Grid x:Name="RowRoot">
+                                        <!-- Hover lift (#175): element-level transform so
+                                             the trigger storyboard animates per row. -->
+                                        <Grid.RenderTransform>
+                                            <TranslateTransform/>
+                                        </Grid.RenderTransform>
+                                        <!-- Selection accent bar (left edge) -->
+                                        <Border x:Name="SelectionBar" Width="4"
+                                                HorizontalAlignment="Left" CornerRadius="2"
+                                                Background="{DynamicResource SystemAccentColorSecondaryBrush}"
+                                                Visibility="Collapsed" Margin="0,2"/>
+                                        <ContentPresenter Margin="6,0,0,0"/>
+                                    </Grid>
+                                    <ControlTemplate.Triggers>
+                                        <!-- Hover glow + lift (#175): the row card is
+                                             clickable, selectable, and draggable but had no
+                                             hover feedback. Hover before IsSelected;
+                                             selection only drives the bar, so no Effect
+                                             fight. Static effect; only the transform
+                                             animates. -->
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                                            <Trigger.EnterActions>
+                                                <BeginStoryboard>
+                                                    <Storyboard>
+                                                        <DoubleAnimation Storyboard.TargetName="RowRoot"
+                                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.Y)"
+                                                                         To="-2" Duration="0:0:0.13">
+                                                            <DoubleAnimation.EasingFunction>
+                                                                <CubicEase EasingMode="EaseOut"/>
+                                                            </DoubleAnimation.EasingFunction>
+                                                        </DoubleAnimation>
+                                                    </Storyboard>
+                                                </BeginStoryboard>
+                                            </Trigger.EnterActions>
+                                            <Trigger.ExitActions>
+                                                <BeginStoryboard>
+                                                    <Storyboard>
+                                                        <DoubleAnimation Storyboard.TargetName="RowRoot"
+                                                                         Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.Y)"
+                                                                         To="0" Duration="0:0:0.25">
+                                                            <DoubleAnimation.EasingFunction>
+                                                                <CubicEase EasingMode="EaseIn"/>
+                                                            </DoubleAnimation.EasingFunction>
+                                                        </DoubleAnimation>
+                                                    </Storyboard>
+                                                </BeginStoryboard>
+                                            </Trigger.ExitActions>
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter TargetName="SelectionBar" Property="Visibility" Value="Visible"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </ListBox.ItemContainerStyle>
+            </ListBox>
+
+                <!-- Drag disclosure (#175 phase 2 item 17): the card drag to
+                     the sidebar controller cards is otherwise invisible. One
+                     tertiary line, always on. -->
+                <TextBlock Grid.Row="2"
+                           Text="{Binding Devices_DragAssignHint, Source={x:Static strings:Strings.Instance}}"
+                           FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                           TextWrapping="Wrap" Margin="6,6,0,0"/>
+            </Grid>
+
+            <!-- ═══════════════════════════════════════════ -->
+            <!--  Right: Detail panel                       -->
+            <!-- ═══════════════════════════════════════════ -->
+            <Border Grid.Column="1"
+                    Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                    CornerRadius="8" Padding="14,12">
+                <Grid>
+
+                <!-- Empty state (#175): steel schematic watermark + one cold
+                     sentence, matching the Macros empty-state grammar. -->
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <StackPanel.Style>
+                        <Style TargetType="StackPanel">
+                            <Setter Property="Visibility" Value="Visible"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding HasSelectedDevice}" Value="True">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </StackPanel.Style>
+                    <TextBlock Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="34"
+                               Foreground="{DynamicResource SteelLineBrush}"
+                               HorizontalAlignment="Center"/>
+                    <TextBlock Text="{Binding Devices_EmptyHint, Source={x:Static strings:Strings.Instance}}"
+                               Foreground="{DynamicResource ColdBrush}"
+                               Margin="0,12,0,0" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="260"/>
+                </StackPanel>
+
+                <ScrollViewer VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Disabled"
+                              Padding="0,0,14,0"
+                              Visibility="{Binding HasSelectedDevice, Converter={StaticResource BoolToVisibilityConverter}}">
+                    <StackPanel>
+
+                        <!-- Device identity: the detail card's title, so it
+                             wears the shared CardTitle (display face) instead
+                             of a bespoke body-face heading. -->
+                        <TextBlock Text="{Binding SelectedDevice.DeviceName}"
+                                   Style="{StaticResource CardTitle}"
+                                   TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                        <!-- ─── Device Dossier (#175 competitor item 7) ─── -->
+                        <!-- One dossier, at the top, per user report: the old
+                             identity block up here and the dossier card down
+                             by the inspector repeated VID:PID and split the
+                             identity in two. The recessed mono card now
+                             carries every identity field the engine holds in
+                             one token grammar. Token labels stay locale-
+                             neutral literals per the VID:PID precedent (the
+                             localized Devices_Product/Type/AppGUID/SdlGUID/
+                             InstancePath/VIDPID labels are no longer
+                             referenced here). Lines whose fact is absent (no
+                             SDL GUID, no HidHide path, no BT link, no serial,
+                             no battery) collapse instead of showing
+                             placeholders. No per-device measured poll Hz
+                             exists (only the global forge rate), so the
+                             dossier carries no HZ line. -->
+                        <Grid Margin="0,0,0,6">
+                            <TextBlock Text="{Binding Devices_Dossier, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                       Style="{StaticResource SectionEyebrow}" VerticalAlignment="Center"/>
+                            <ui:Button Style="{StaticResource EmberIconButton}" HorizontalAlignment="Right"
+                                       Click="CopyDossier_Click"
+                                       ToolTip="{Binding Common_Copy, Source={x:Static strings:Strings.Instance}}">
+                                <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                            </ui:Button>
+                        </Grid>
+                        <Border Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1" CornerRadius="6" Padding="10,8" Margin="0,0,0,2">
+                            <StackPanel>
+                                <Grid Margin="0,0,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="PRODUCT" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Top" Margin="0,1,0,0"/>
+                                    <TextBlock Grid.Column="1" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" TextWrapping="Wrap" Text="{Binding SelectedDevice.ProductName, Mode=OneWay}"/>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,2">
+                                    <TextBlock Text="TYPE" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" Text="{Binding SelectedDevice.DeviceType, Mode=OneWay}"/>
+                                </StackPanel>
+                                <!-- The capabilities summary keeps its wrapped
+                                     prose form, just re-homed onto a token row. -->
+                                <Grid Margin="0,0,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="CAPS" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Top" Margin="0,1,0,0"/>
+                                    <TextBlock Grid.Column="1" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" TextWrapping="Wrap" Text="{Binding SelectedDevice.CapabilitiesSummary, Mode=OneWay}"/>
+                                </Grid>
+                                <!-- GUID / path hashes: same marquee mechanics as
+                                     the old identity block (clipping border, the
+                                     text scrolls to reveal overflow), same
+                                     presence gates. -->
+                                <Grid Margin="0,0,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="APP GUID" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <Border Grid.Column="1" ClipToBounds="True" Padding="0,1">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}"
+                                                       common:MarqueeBehavior.IsEnabled="True"
+                                                       Text="{Binding SelectedDevice.InstanceGuid, Mode=OneWay}"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <Grid Margin="0,0,0,2"
+                                      Visibility="{Binding SelectedDevice.SdlGuid, Converter={StaticResource StringToVisibility}}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="SDL GUID" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <Border Grid.Column="1" ClipToBounds="True" Padding="0,1">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}"
+                                                       common:MarqueeBehavior.IsEnabled="True"
+                                                       Text="{Binding SelectedDevice.SdlGuid, Mode=OneWay}"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <Grid Margin="0,0,0,2"
+                                      Visibility="{Binding SelectedDevice.HidHideInstancePath, Converter={StaticResource StringToVisibility}}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="PATH" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <Border Grid.Column="1" ClipToBounds="True" Padding="0,1">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}"
+                                                       common:MarqueeBehavior.IsEnabled="True"
+                                                       Text="{Binding SelectedDevice.HidHideInstancePath, Mode=OneWay}"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <!-- Connection path for a bridged device whose SDL path is
+                                     empty but that connects over a real interface (the DS3
+                                     over BthPS3 / WinUSB). Shows only when the HidHide PATH
+                                     row above is absent, so the two never both render. -->
+                                <Grid Margin="0,0,0,2"
+                                      Visibility="{Binding SelectedDevice.DossierConnectionPath, Converter={StaticResource StringToVisibility}}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="PATH" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <Border Grid.Column="1" ClipToBounds="True" Padding="0,1">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}"
+                                                       common:MarqueeBehavior.IsEnabled="True"
+                                                       Text="{Binding SelectedDevice.DossierConnectionPath, Mode=OneWay}"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,2">
+                                    <TextBlock Text="VID:PID" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" Text="{Binding SelectedDevice.VendorIdHex, Mode=OneWay}"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" Text=":"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" Text="{Binding SelectedDevice.ProductIdHex, Mode=OneWay}"/>
+                                </StackPanel>
+                                <!-- Transport renders only when Bluetooth is a
+                                     positive fact (same path predicate as the
+                                     disconnect gates and the item 9 slot-card
+                                     glyph). A non-BT path may be USB, a dongle,
+                                     or a virtual source, so no transport is
+                                     claimed there. -->
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,2"
+                                            Visibility="{Binding SelectedDevice.IsBluetoothLink, Converter={StaticResource BoolToVisibilityConverter}}">
+                                    <TextBlock Text="LINK" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                                    <TextBlock Text="BT" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center"/>
+                                </StackPanel>
+                                <!-- Serial as SDL reports it (BT MAC on most
+                                     wireless pads). Hidden when unreported. -->
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,2"
+                                            Visibility="{Binding SelectedDevice.SerialNumber, Converter={StaticResource StringToVisibility}}">
+                                    <TextBlock Text="SERIAL" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" Text="{Binding SelectedDevice.SerialNumber, Mode=OneWay}"/>
+                                </StackPanel>
+                                <!-- Battery (#167 canon): glyph + percent, only
+                                     when the device reports one. -->
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,2"
+                                            Visibility="{Binding SelectedDevice.HasBattery, Converter={StaticResource BoolToVisibilityConverter}}">
+                                    <TextBlock Text="BATT" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="{Binding SelectedDevice.BatteryGlyph}" FontFamily="Segoe MDL2 Assets" FontSize="11" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                                    <TextBlock Text="{Binding SelectedDevice.BatteryText}" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center"/>
+                                </StackPanel>
+                                <!-- Capability row: the established capability
+                                     glyphs (FFB card E877, Gyro tab E7AD,
+                                     Touchpad tab EFA5), ember-lit, present-only.
+                                     CapabilitiesSummary never lists absent
+                                     capabilities, so no cold placeholders here
+                                     either. Accel has no established glyph in
+                                     the app and stays text-only above. -->
+                                <StackPanel Visibility="{Binding SelectedDevice.HasCapabilityIcons, Converter={StaticResource BoolToVisibilityConverter}}">
+                                    <Border Height="1" Background="{DynamicResource SteelLineSoftBrush}" Margin="0,6,0,6"/>
+                                    <WrapPanel>
+                                        <!-- Rumble chip = identify button (#293): the
+                                             capability badge doubles as the action, so
+                                             nothing extra sits in the chip row (owner
+                                             direction 2026-08-12). Clicking it vibrates
+                                             the selected device; the tooltip carries
+                                             both facts. -->
+                                        <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
+                                                CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
+                                                Cursor="Hand"
+                                                ToolTip="{Binding Devices_IdentifyTooltip, Source={x:Static strings:Strings.Instance}}"
+                                                Visibility="{Binding SelectedDevice.HasRumble, Converter={StaticResource BoolToVisibilityConverter}}"
+                                                MouseLeftButtonUp="IdentifyChip_Click">
+                                            <TextBlock Text="&#xE877;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                        </Border>
+                                        <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
+                                                CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
+                                                ToolTip="{Binding Devices_Gyro, Source={x:Static strings:Strings.Instance}}"
+                                                Visibility="{Binding SelectedDevice.HasGyro, Converter={StaticResource BoolToVisibilityConverter}}">
+                                            <TextBlock Text="&#xE7AD;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                        </Border>
+                                        <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
+                                                CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
+                                                ToolTip="{Binding Btn_Touchpad, Source={x:Static strings:Strings.Instance}}"
+                                                Visibility="{Binding SelectedDevice.ShowTouchpadCapability, Converter={StaticResource BoolToVisibilityConverter}}">
+                                            <TextBlock Text="&#xEFA5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                        </Border>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Submit mapping (joysticks only, not gamepads, mice, or keyboards) -->
+                        <Button Content="{Binding Devices_SubmitMapping, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="SubmitMapping_Click"
+                                Visibility="{Binding SelectedDevice.ShowSubmitMapping, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+
+                        <!-- Register / manage NFC tags (NFC readers only, issue #150) -->
+                        <Button Content="{Binding Nfc_ManageButton, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="RegisterNfcTag_Click"
+                                Visibility="{Binding SelectedDevice.ShowRegisterNfcTag, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+
+                        <!-- Manage voice phrases + settings (issue #317): standalone
+                             microphone rows, and Bluetooth DualSense pads whose embedded
+                             mic carries the phrases on the pad itself. -->
+                        <Button Content="{Binding Voice_ManageButton, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="ManageVoicePhrases_Click"
+                                Visibility="{Binding SelectedDevice.ShowManageVoicePhrases, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+
+                        <!-- Learn / manage handheld hidden buttons (issue #343):
+                             the per-machine Hidden Buttons row only. -->
+                        <Button Content="{Binding Handheld_ManageButton, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="LearnHandheldButton_Click"
+                                Visibility="{Binding SelectedDevice.ShowLearnHandheldButton, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <!-- Opt-in driver switch (hifihedgehog/SDL#33 Part 15): the
+                             Xbox 360 pads and receiver, the Intel base station and
+                             the Prodikeys, whose WinUSB binding takes something
+                             from Windows, move only on request, and move back. -->
+                        <Button Content="{Binding DriverBindText}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="DriverBind_Click"
+                                Visibility="{Binding ShowDriverBind, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_DriverRestore, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="DriverRestore_Click"
+                                Visibility="{Binding ShowDriverRestore, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <!-- Pads in iCade mode (hifihedgehog/SDL#33 Part 16): such a
+                             pad pairs as a Bluetooth keyboard under IDs no source
+                             publishes. Marking the keyboard lists its IDs for the
+                             fork's iCade driver, and the pad's row, or the
+                             keyboard's while the pad is away, turns it back. -->
+                        <Button Content="{Binding Devices_ReadAsICade, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="ReadAsICade_Click"
+                                ToolTip="{Binding Devices_ReadAsICadeTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowReadAsICade, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_ReadAsKeyboard, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="ReadAsKeyboard_Click"
+                                Visibility="{Binding SelectedDevice.ShowReadAsKeyboard, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <!-- Namco USIO layout (hifihedgehog/SDL#33 Part 14): one board
+                             ID serves Taiko no Tatsujin and Tekken cabinets, so
+                             the board's rows switch it between the two. -->
+                        <Button Content="{Binding Devices_UsioTekken, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="UsioTekken_Click"
+                                ToolTip="{Binding Devices_UsioLayoutTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowUsioTekken, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_UsioTaiko, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="UsioTaiko_Click"
+                                ToolTip="{Binding Devices_UsioLayoutTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowUsioTaiko, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <!-- Bliss-Box port (#469): the controller in the port and the
+                             adapter's firmware, then the port's actions. -->
+                        <TextBlock Text="{Binding SelectedDevice.BlissBoxLine}" TextWrapping="Wrap"
+                                   FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,8"
+                                   Visibility="{Binding SelectedDevice.BlissBoxLine, Converter={StaticResource StringToVisibility}}"/>
+                        <Button Content="{Binding Devices_BlissBoxPlayer, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="BlissBoxPlayer_Click"
+                                IsEnabled="{Binding SelectedDevice.BlissBoxIdle}"
+                                ToolTip="{Binding Devices_BlissBoxPlayerTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowBlissBoxPlayer, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_DreamcastScreen, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="DreamcastScreen_Click"
+                                IsEnabled="{Binding SelectedDevice.BlissBoxIdle}"
+                                ToolTip="{Binding Devices_DreamcastScreenTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowDreamcastScreen, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_PakBackup, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="PakBackup_Click"
+                                IsEnabled="{Binding SelectedDevice.BlissBoxIdle}"
+                                ToolTip="{Binding Devices_PakBackupTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowControllerPak, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <Button Content="{Binding Devices_PakRestore, Source={x:Static strings:Strings.Instance}}" Margin="0,6,0,8"
+                                Padding="8,4" HorizontalAlignment="Left"
+                                Click="PakRestore_Click"
+                                IsEnabled="{Binding SelectedDevice.BlissBoxIdle}"
+                                ToolTip="{Binding Devices_PakRestoreTooltip, Source={x:Static strings:Strings.Instance}}"
+                                Visibility="{Binding SelectedDevice.ShowControllerPak, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+                            </Button.Style>
+                        </Button>
+                        <DockPanel LastChildFill="True" Margin="0,6,0,8"
+                                   Visibility="{Binding SelectedDevice.ShowNativeArrows, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="BlissBoxNativeArrows" SettingLabel="{Binding Devices_NativeArrows, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_BlissBoxNativeArrows_1005"/>
+                            <CheckBox Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      IsChecked="{Binding SelectedDevice.BlissBoxNativeArrows, Mode=TwoWay}"
+                                      Click="NativeArrows_Click"
+                                      ToolTip="{Binding Devices_NativeArrowsTooltip, Source={x:Static strings:Strings.Instance}}">
+                                <TextBlock Text="{Binding Devices_NativeArrows, Source={x:Static strings:Strings.Instance}}"
+                                           TextWrapping="Wrap"/>
+                            </CheckBox>
+                        </DockPanel>
+                        <!-- Vendor daemon notice (#343): the vendor's own tool keeps
+                             reacting to these buttons until it is stopped. -->
+                        <TextBlock Text="{Binding SelectedDevice.HandheldDaemonWarning}" TextWrapping="Wrap"
+                                   FontSize="11" Foreground="{DynamicResource EmberBrush}" Margin="0,0,0,8"
+                                   Visibility="{Binding SelectedDevice.HasHandheldDaemonWarning, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <!-- Flydigi Space Station notice (#395): the service and
+                             SDL's Flydigi driver both drive the pad's vendor
+                             interface, and the pad re-enumerated in a loop while
+                             the service could reach it. -->
+                        <TextBlock Text="{Binding SelectedDevice.FlydigiServiceWarning}" TextWrapping="Wrap"
+                                   FontSize="11" Foreground="{DynamicResource EmberBrush}" Margin="0,0,0,8"
+                                   Visibility="{Binding SelectedDevice.HasFlydigiServiceWarning, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <!-- Head tracker source line (#355): which source is live,
+                             or why nothing arrives. Bound to the TEXT, not to the
+                             row type: a peer's shared head-tracker row is a
+                             HeadTracker without a local device to ask, so the
+                             status is empty there and an empty line would still
+                             hold its margin open. -->
+                        <TextBlock Text="{Binding HeadTrackerStatus}" TextWrapping="Wrap"
+                                   FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,8"
+                                   Visibility="{Binding HeadTrackerStatus, Converter={StaticResource StringToVisibility}}"/>
+
+                        <Separator Margin="0,2,0,6"/>
+
+                        <!-- Assign to slot -->
+                        <TextBlock Text="{Binding Devices_VCAssignment, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                   Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"/>
+                        <WrapPanel Margin="0,0,0,6">
+                            <ItemsControl ItemsSource="{Binding ActiveSlotItems}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <ToggleButton IsChecked="{Binding IsAssigned, Mode=OneWay}"
+                                                      Command="{Binding DataContext.ToggleSlotCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                      CommandParameter="{Binding PadIndex}"
+                                                      Margin="0,0,3,3" Padding="5,3"
+                                                      ToolTip="{Binding Devices_ToggleAssignment, Source={x:Static strings:Strings.Instance}}">
+                                            <ToggleButton.Style>
+                                                <!-- The forge moment (#175): an assigned pill fills
+                                                     with the ember gradient and glows. -->
+                                                <Style TargetType="ToggleButton" BasedOn="{StaticResource {x:Type ToggleButton}}">
+                                                    <Style.Triggers>
+                                                        <!-- Hover glow (#175): neutral hover, faint ember.
+                                                             Before IsChecked so the assigned pill's own
+                                                             ember glow wins while checked. -->
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                                                        </Trigger>
+                                                        <Trigger Property="IsChecked" Value="True">
+                                                            <Setter Property="Foreground" Value="#FFFFF3E8"/>
+                                                            <Setter Property="Background">
+                                                                <Setter.Value>
+                                                                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                                                        <GradientStop Color="#FF6B2C" Offset="0"/>
+                                                                        <GradientStop Color="#C43D0C" Offset="1"/>
+                                                                    </LinearGradientBrush>
+                                                                </Setter.Value>
+                                                            </Setter>
+                                                            <Setter Property="Effect">
+                                                                <Setter.Value>
+                                                                    <DropShadowEffect Color="#FF6B2C" BlurRadius="10" ShadowDepth="0" Opacity="0.35"/>
+                                                                </Setter.Value>
+                                                            </Setter>
+                                                        </Trigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </ToggleButton.Style>
+                                            <StackPanel Orientation="Horizontal">
+                                                <!-- Branded family mark (#175 phase 2 item 12):
+                                                     same treatment as the list-card badge. The
+                                                     Path fill tracks the pill's Foreground so
+                                                     the checked ember swap recolors it with the
+                                                     glyph and number. -->
+                                                <Grid VerticalAlignment="Center">
+                                                    <Path Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
+                                                          Stretch="Uniform"
+                                                          Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}"/>
+                                                    <TextBlock Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
+                                                               FontSize="10" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                               Visibility="{Binding TypeGlyph, Converter={StaticResource StringToVisibility}}"/>
+                                                </Grid>
+                                                <!-- Chip token: mono, mirrors the list-card badge. -->
+                                                <TextBlock Text="{Binding SlotNumber}" FontFamily="{StaticResource TelemetryFontFamily}"
+                                                           FontSize="10" VerticalAlignment="Center" Margin="3,0,0,0"/>
+                                            </StackPanel>
+                                        </ToggleButton>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </WrapPanel>
+
+                        <!-- Empty-section hint (#175 phase 2 item 17): with no
+                             created slots the pill row renders nothing, which
+                             read as a dead end. Points at the Dashboard;
+                             presence-gated on the slot list the VM already
+                             holds. -->
+                        <TextBlock Text="{Binding Devices_NoSlotsHint, Source={x:Static strings:Strings.Instance}}"
+                                   FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" Margin="0,0,0,6">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding ActiveSlotItems.Count}" Value="0">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <Separator Margin="0,2,0,8"
+                                   Visibility="{Binding SelectedDevice.ShowInputModeOrHidingSection, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <!-- ─── Input Mode (real gamepads only — virtual web/overlay sources skip) ─── -->
+                        <StackPanel Visibility="{Binding SelectedDevice.ShowInputModeSection, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <TextBlock Text="{Binding Devices_InputMode, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                       Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"/>
+
+                            <DockPanel LastChildFill="True" Margin="0,0,0,4">
+                                <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="ForceRawJoystickMode" SettingLabel="{Binding Devices_ForceRaw, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_ForceRawJoystickMode_1004"/>
+                                <CheckBox Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                          IsChecked="{Binding SelectedDevice.ForceRawJoystickMode, Mode=TwoWay}"
+                                          Click="HidingToggle_Click"
+                                          ToolTip="{Binding Devices_ForceRawTooltip, Source={x:Static strings:Strings.Instance}}">
+                                    <TextBlock Text="{Binding Devices_ForceRaw, Source={x:Static strings:Strings.Instance}}"
+                                               TextWrapping="Wrap"/>
+                                </CheckBox>
+                            </DockPanel>
+
+                            <Separator Margin="0,2,0,8"/>
+                        </StackPanel>
+
+                        <!-- ─── Input Hiding ─── -->
+                        <TextBlock Text="{Binding Devices_InputHiding, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                   Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"
+                                   Visibility="{Binding SelectedDevice.ShowInputHidingSection, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4" Visibility="{Binding SelectedDevice.ShowHidHideToggle, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <CheckBox VerticalAlignment="Center" Content="{Binding Devices_HideFromGames, Source={x:Static strings:Strings.Instance}}"
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      IsChecked="{Binding SelectedDevice.HidHideEnabled, Mode=TwoWay}"
+                                      IsEnabled="{Binding SelectedDevice.IsHidHideAvailable}"
+                                      Click="HidingToggle_Click"
+                                      ToolTipService.ShowOnDisabled="True">
+                                <CheckBox.ToolTip>
+                                    <TextBlock>
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Text" Value="{Binding Devices_HideTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding SelectedDevice.IsTabletDevice}" Value="True">
+                                                        <Setter Property="Text" Value="{Binding Tablet_HideHelp, Source={x:Static strings:Strings.Instance}}"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding SelectedDevice.IsHidHideAvailable}" Value="False">
+                                                        <Setter Property="Text" Value="{Binding Devices_HideTooltipInstall, Source={x:Static strings:Strings.Instance}}"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </CheckBox.ToolTip>
+                            </CheckBox>
+                            <reset:SettingResetButton Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="HidHideEnabled" IsEnabled="{Binding SelectedDevice.IsHidHideAvailable}" SettingLabel="{Binding Devices_HideFromGames, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_HidHideEnabled_1024"/>
+                        </StackPanel>
+
+                        <TextBlock Text="{Binding SelectedDevice.TabletInputStatus}"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Visibility="{Binding SelectedDevice.ShowTabletCaptureStatus, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <StackPanel Orientation="Horizontal" Visibility="{Binding Visibility, ElementName=ResetInput1054}" Margin="0,0,0,4">
+                            <CheckBox VerticalAlignment="Center" x:Name="ResetInput1054" Content="{Binding Devices_ConsumeMapped, Source={x:Static strings:Strings.Instance}}"
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      IsChecked="{Binding SelectedDevice.ConsumeInputEnabled, Mode=TwoWay}"
+                                      Click="HidingToggle_Click"
+                                      ToolTip="{Binding Devices_ConsumeTooltip, Source={x:Static strings:Strings.Instance}}">
+                                <CheckBox.Style>
+                                    <Style TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding SelectedDevice.ShowConsumeToggle}" Value="True">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </CheckBox.Style>
+                            </CheckBox>
+                            <reset:SettingResetButton Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="ConsumeInputEnabled" SettingLabel="{Binding Devices_ConsumeMapped, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_ConsumeInputEnabled_1054" Visibility="{Binding Visibility, ElementName=ResetInput1054}"/>
+                        </StackPanel>
+
+                        <!-- Follows the section it divides. A bare separator sat
+                             visible on devices where every control above it was
+                             hidden, drawing a rule under nothing. -->
+                        <Separator Margin="0,4,0,8"
+                                   Visibility="{Binding SelectedDevice.ShowInputModeOrHidingSection, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <!-- ─── Power (#162, wireless controllers only) ───
+                             The section draws when either of its controls
+                             does. Each control carries its own gate: the idle
+                             countdown needs a disconnect target, and Quick
+                             Charge (#372) also shows on a Sony record the USB
+                             cable rebound to its wired path, which is not a
+                             disconnect target and is exactly when the feature
+                             fires. Behind the section gate alone, the checkbox
+                             vanished the moment the pad was plugged in. -->
+                        <StackPanel Visibility="{Binding SelectedDevice.ShowPowerSection, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <TextBlock Text="{Binding Devices_Power, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                       Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"/>
+
+                            <!-- Same shape as the Quick Charge row below: the
+                                 reset button docks at the pane's right edge and
+                                 the unit text fills what is left and wraps. As a
+                                 horizontal StackPanel the text had unbounded
+                                 width, so the reset button added in a31fda39
+                                 pushed "minutes (0 = never)" past the edge, where
+                                 the pane clipped it mid-word. -->
+                            <DockPanel LastChildFill="True" Margin="0,0,0,4"
+                                       Visibility="{Binding SelectedDevice.ShowIdleDisconnect, Converter={StaticResource BoolToVisibilityConverter}}"
+                                       ToolTip="{Binding Devices_IdleDisconnectTooltip, Source={x:Static strings:Strings.Instance}}">
+                                <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="IdleDisconnectMinutes" SettingLabel="{Binding Devices_IdleDisconnect, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_IdleDisconnectMinutes_1094" Margin="8,0,0,0"/>
+                                <TextBlock DockPanel.Dock="Left" Text="{Binding Devices_IdleDisconnect, Source={x:Static strings:Strings.Instance}}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"
+                                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                <TextBox DockPanel.Dock="Left" Text="{Binding SelectedDevice.IdleDisconnectMinutes, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
+                                         Width="60" VerticalAlignment="Center"
+                                         LostFocus="IdleDisconnect_LostFocus"/>
+                                <TextBlock Text="{Binding Devices_IdleDisconnectMinutes, Source={x:Static strings:Strings.Instance}}"
+                                           TextWrapping="Wrap"
+                                           VerticalAlignment="Center" Margin="8,0,0,0" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                            </DockPanel>
+
+                            <!-- Quick Charge (#372): its own container, gated on
+                                 ShowQuickCharge (see the section comment). Click,
+                                 not Checked, so the persistence handler never
+                                 fires on the binding-driven refresh when the
+                                 selection changes (the #161 lesson). -->
+                            <StackPanel Visibility="{Binding SelectedDevice.ShowQuickCharge, Converter={StaticResource BoolToVisibilityConverter}}">
+                                <DockPanel LastChildFill="True" Margin="0,0,0,4">
+                                    <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="QuickChargeEnabled" SettingLabel="{Binding Devices_QuickCharge, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_QuickChargeEnabled_1108"/>
+                                    <CheckBox Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                              IsChecked="{Binding SelectedDevice.QuickChargeEnabled, Mode=TwoWay}"
+                                              Click="QuickCharge_Click"
+                                              ToolTip="{Binding Devices_QuickChargeTooltip, Source={x:Static strings:Strings.Instance}}">
+                                        <!-- Wrapped content, not a bare string: the label
+                                             is longer than the panel and the default
+                                             single-line presenter clipped it mid-word. -->
+                                        <TextBlock Text="{Binding Devices_QuickCharge, Source={x:Static strings:Strings.Instance}}"
+                                                   TextWrapping="Wrap"/>
+                                    </CheckBox>
+                                </DockPanel>
+                            </StackPanel>
+
+                        </StackPanel>
+
+                        <!-- ─── Light Gun (GunCon 2, hifihedgehog/SDL#33 Part 9, and a
+                             Wii Remote with an IR camera, #485) ───
+                             The gun's aim window: the beam counts at the
+                             picture's edges, or a remote's pointer counts,
+                             kept per device. Calibrate runs the four-target
+                             screen, which needs the gun connected to this PC.
+                             The divider above follows
+                             the same rule as the one above Raw Input State:
+                             drawn when Power drew right above, or when
+                             nothing above did. -->
+                        <StackPanel Visibility="{Binding SelectedDevice.ShowGunCalibration, Converter={StaticResource BoolToVisibilityConverter}}">
+                            <Separator Margin="0,2,0,8"
+                                       Visibility="{Binding SelectedDevice.ShowGunCalibrationDivider, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                            <TextBlock Text="{Binding Devices_LightGun, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                       Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"/>
+                            <TextBlock Text="{Binding SelectedDevice.GunCalibrationStatus}"
+                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                       TextWrapping="Wrap" Margin="0,0,0,6"/>
+                            <DockPanel LastChildFill="False" Margin="0,0,0,4">
+                                <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSelectedDeviceSettingCommand}" CommandParameter="GunCalibration" SettingLabel="{Binding Devices_GunCalibration, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DeviceRowViewModel_GunCalibration"/>
+                                <ui:Button DockPanel.Dock="Left"
+                                           Content="{Binding Devices_GunCalibrate, Source={x:Static strings:Strings.Instance}}"
+                                           IsEnabled="{Binding SelectedDevice.CanCalibrateGun}"
+                                           ToolTip="{Binding SelectedDevice.GunCalibrateTooltip}"
+                                           ToolTipService.ShowOnDisabled="True"
+                                           Click="GunCalibrate_Click"/>
+                            </DockPanel>
+                        </StackPanel>
+
+                        <!-- The divider before the Raw Input State header sits
+                             OUTSIDE the Power panel above, deliberately: that
+                             panel is gated on ShowPowerSection, and a divider
+                             inside it vanished for every device without a Power
+                             section (NFC readers, microphones), leaving the
+                             assignment elements flush against the header.
+                             It is not unconditional either, or it drew flush
+                             under the divider above whenever a device had an
+                             Input Mode or Hiding section and no Power section.
+                             ShowRawInputDivider carries that whole rule. -->
+                        <Separator Margin="0,2,0,8"
+                                   Visibility="{Binding SelectedDevice.ShowRawInputDivider, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+                        <!-- ─── Raw Input State (Visual) ─── -->
+                        <TextBlock Text="{Binding Devices_RawInputState, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
+                                   Style="{StaticResource SectionEyebrow}" Margin="0,0,0,8"/>
+
+                        <!-- Axes label (joysticks/gamepads only) -->
+                        <TextBlock Text="{Binding Devices_Axes, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="{Binding HasRawData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsTouchpadDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMidiDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsAnalogKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsNfcDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMicrophoneDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsConsumerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadsetMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding ShowNamedButtons}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsSystemMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <!-- Axes: progress bars (joysticks/gamepads only) -->
+                        <ItemsControl ItemsSource="{Binding RawAxes}" Margin="0,0,0,8">
+                            <ItemsControl.Style>
+                                <Style TargetType="ItemsControl">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsTouchpadDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMidiDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsAnalogKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsNfcDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMicrophoneDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsConsumerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadsetMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding ShowNamedButtons}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsSystemMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </ItemsControl.Style>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,1">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="48"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="44"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Name}" FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                                   FontFamily="{StaticResource TelemetryFontFamily}"
+                                                   VerticalAlignment="Center"/>
+                                        <!-- Cold (#175): raw hardware truth on the shared
+                                             instrument tray (recessed SteelGround + hairline). -->
+                                        <ProgressBar Grid.Column="1" Minimum="0" Maximum="1"
+                                                     Value="{Binding NormalizedValue, Mode=OneWay}"
+                                                     Style="{StaticResource InstrumentBarRaw}"
+                                                     Foreground="{DynamicResource ColdBrush}"
+                                                     Margin="4,0"/>
+                                        <TextBlock Grid.Column="2" FontSize="9" Foreground="{DynamicResource ColdBrush}"
+                                                   FontFamily="{StaticResource TelemetryFontFamily}" VerticalAlignment="Center"
+                                                   HorizontalAlignment="Right"
+                                                   Text="{Binding RawValue}"/>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <!-- Buttons label and grid: shown for any device that exposes
+                             button slots (gamepads, joysticks, touchpads with a
+                             click button). Keyboards / mice have their own
+                             dedicated visual previews instead. -->
+                        <TextBlock Text="{Binding Devices_Buttons, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="{Binding HasRawData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMidiDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsAnalogKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsNfcDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMicrophoneDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsConsumerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadsetMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding ShowNamedButtons}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsSystemMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadTrackerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <ItemsControl ItemsSource="{Binding RawButtons}" Margin="0,0,0,8">
+                            <ItemsControl.Style>
+                                <Style TargetType="ItemsControl">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMidiDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsAnalogKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsNfcDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsMicrophoneDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsConsumerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadsetMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding ShowNamedButtons}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsSystemMotionDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding IsHeadTrackerDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </ItemsControl.Style>
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <WrapPanel/>
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <!-- ToolTip is object-typed, so a StringFormat on the
+                                         attribute form is IGNORED and the tooltip rendered the
+                                         bare number. Hosting a TextBlock puts the format on a
+                                         string target where it applies, and lets the word come
+                                         from resources instead of a hardcoded English literal
+                                         (round 34). -->
+                                    <Border Width="24" Height="24" CornerRadius="12" Margin="1"
+                                            Style="{StaticResource RawCellBorder}">
+                                        <Border.ToolTip>
+                                            <TextBlock>
+                                                <Run Text="{Binding Pad_Shift_KindButton, Source={x:Static strings:Strings.Instance}, Mode=OneWay}"/><Run Text=" "/><Run Text="{Binding DisplayNumber, Mode=OneWay}"/>
+                                            </TextBlock>
+                                        </Border.ToolTip>
+                                        <TextBlock Text="{Binding DisplayNumber}" FontSize="8"
+                                                   Style="{StaticResource RawCellLabel}"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <!-- NFC: named tag list (issue #150). Shown for NFC readers in
+                             place of the numbered button grid; each registered tag (and
+                             "Any NFC Tag") lights up when its tag is tapped. -->
+                        <StackPanel Visibility="{Binding IsNfcDevice, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Nfc_Title, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <ItemsControl ItemsSource="{Binding NfcTags}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="0,1" Padding="8,5"
+                                                Style="{StaticResource RawCellBorderActive}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="{Binding Name}" FontSize="12" VerticalAlignment="Center"
+                                                           TextTrimming="CharacterEllipsis">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                                                                    <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                                <TextBlock Grid.Column="1" Text="{Binding Uid}" FontFamily="{StaticResource TelemetryFontFamily}"
+                                                           FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"
+                                                           Margin="8,0,0,0"/>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+
+                        <!-- Consumer Control: named button chips (issue #168). Shown for
+                             consumer collections in place of the numbered grid and the
+                             empty axes section; each canonical button ("Play/Pause",
+                             "Voice Command", the OK button) lights while held. -->
+                        <StackPanel Visibility="{Binding IsConsumerDevice, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Devices_Buttons, Source={x:Static strings:Strings.Instance}}"
+                                       FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <ItemsControl ItemsSource="{Binding ConsumerButtons}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="2" Padding="8,4"
+                                                Style="{StaticResource RawCellBorder}">
+                                            <TextBlock Text="{Binding Name}" FontSize="11"
+                                                       Style="{StaticResource RawCellLabel}"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <!-- Analog keyboard (issue #468): a chip per key the keyboard has
+                             reported since it was selected, lit while down, with its
+                             depth as a bar and a percent. Replaces the axes and the
+                             numbered grid, which an analog keyboard does not use. -->
+                        <StackPanel Visibility="{Binding IsAnalogKeyboardDevice, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Devices_AnalogKeys, Source={x:Static strings:Strings.Instance}}"
+                                       FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <TextBlock Text="{Binding Devices_AnalogKeysHint, Source={x:Static strings:Strings.Instance}}"
+                                       FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                       Visibility="{Binding HasAnalogKeys, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}"/>
+                            <ItemsControl ItemsSource="{Binding AnalogKeys}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="2" Padding="6,4" Width="84"
+                                                Style="{StaticResource RawCellBorder}">
+                                            <StackPanel>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding Name}" FontSize="11" TextTrimming="CharacterEllipsis"
+                                                               Style="{StaticResource RawCellLabel}" VerticalAlignment="Center"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding DepthText}" FontSize="9" Margin="4,0,0,0"
+                                                               FontFamily="{StaticResource TelemetryFontFamily}" VerticalAlignment="Center"
+                                                               Foreground="{DynamicResource ColdBrush}"/>
+                                                </Grid>
+                                                <ProgressBar Minimum="0" Maximum="1" Height="3" Margin="0,3,0,0"
+                                                             Value="{Binding Depth, Mode=OneWay}"
+                                                             Style="{StaticResource InstrumentBarRaw}"
+                                                             Foreground="{DynamicResource ColdBrush}"/>
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <!-- DualShock 2 in a Bliss-Box port (issue #469): its twelve
+                             pressure buttons as chips, the key depth chips' parts,
+                             each with its pressure as a bar and a percent. The name
+                             has the chip's first line to itself: German "Steuerkreuz
+                             Rechts" is 116 DIP in Cascadia Code at 11 px, and at 118
+                             DIP with the percent beside it all four German D-pad
+                             chips trimmed to the same "Steuerkreuz …". At 136 DIP, 140
+                             with the margins, two chips still fit a row of the detail
+                             column, as two 118 DIP chips did. -->
+                        <StackPanel Visibility="{Binding HasBlissBoxPressure, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Devices_BlissBoxPressure, Source={x:Static strings:Strings.Instance}}"
+                                       FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <ItemsControl ItemsSource="{Binding BlissBoxPressure}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="2" Padding="6,4" Width="136"
+                                                Style="{StaticResource RawCellBorder}">
+                                            <StackPanel>
+                                                <TextBlock Text="{Binding Name}" FontSize="11" TextTrimming="CharacterEllipsis"
+                                                           Style="{StaticResource RawCellLabel}"/>
+                                                <Grid Margin="0,2,0,0">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <ProgressBar Minimum="0" Maximum="1" Height="3" VerticalAlignment="Center"
+                                                                 Value="{Binding Depth, Mode=OneWay}"
+                                                                 Style="{StaticResource InstrumentBarRaw}"
+                                                                 Foreground="{DynamicResource ColdBrush}"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding DepthText}" FontSize="9" Margin="6,0,0,0"
+                                                               FontFamily="{StaticResource TelemetryFontFamily}" VerticalAlignment="Center"
+                                                               Foreground="{DynamicResource ColdBrush}"/>
+                                                </Grid>
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <!-- Keyboard: visual QWERTY layout -->
+                        <TextBlock Text="{Binding Devices_Keyboard, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <Viewbox Stretch="Uniform" HorizontalAlignment="Left" Margin="0,0,0,8"
+                                 StretchDirection="DownOnly">
+                            <Viewbox.Style>
+                                <Style TargetType="Viewbox">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Viewbox.Style>
+                            <ItemsControl ItemsSource="{Binding KeyboardKeys}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <Canvas Width="556" Height="136"/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemContainerStyle>
+                                    <Style TargetType="ContentPresenter">
+                                        <Setter Property="Canvas.Left" Value="{Binding X}"/>
+                                        <Setter Property="Canvas.Top" Value="{Binding Y}"/>
+                                    </Style>
+                                </ItemsControl.ItemContainerStyle>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Width="{Binding KeyWidth}" Height="{Binding KeyHeight}"
+                                                CornerRadius="3"
+                                                Style="{StaticResource RawCellBorder}"
+                                                ToolTip="{Binding Label}">
+                                            <TextBlock Text="{Binding Label}" FontSize="8"
+                                                       Style="{StaticResource RawCellLabel}"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center" TextTrimming="None"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Viewbox>
+
+                        <!-- Mouse: visual mouse graphic -->
+                        <TextBlock Text="{Binding Devices_Mouse, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <Viewbox Stretch="Uniform" HorizontalAlignment="Left" Margin="0,0,0,8"
+                                 StretchDirection="DownOnly" MaxHeight="280">
+                            <Viewbox.Style>
+                                <Style TargetType="Viewbox">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsMouseDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Viewbox.Style>
+                            <local:MousePreviewControl/>
+                        </Viewbox>
+
+                        <!-- MIDI: same piano + CC visual as the Pad page MIDI
+                             preview, full 0-127 range (issue #128). Notes and
+                             CCs are separate previews so their section titles
+                             are normal-size headers OUTSIDE the scaling Viewbox.
+                             BindInput is wired in code-behind on selection. -->
+                        <StackPanel Margin="0,0,0,8">
+                            <StackPanel.Style>
+                                <Style TargetType="StackPanel">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsMidiDevice}" Value="True">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </StackPanel.Style>
+
+                            <TextBlock Text="{Binding Preview_NoteOutputs, Source={x:Static strings:Strings.Instance}}"
+                                       FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <local:MidiPreviewView x:Name="MidiNotesPreview" Height="230" Margin="0,0,0,12"
+                                                   HorizontalAlignment="Stretch"/>
+
+                            <TextBlock Text="{Binding Preview_CCOutputs, Source={x:Static strings:Strings.Instance}}"
+                                       FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <local:MidiPreviewView x:Name="MidiCcPreview" Height="230"
+                                                   HorizontalAlignment="Stretch"/>
+                        </StackPanel>
+
+                        <!-- POV Hats: compass indicators -->
+                        <TextBlock Text="{Binding Devices_DPadPOV, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                   Margin="0,0,0,3">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding RawPovs.Count}" Value="0">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <ItemsControl ItemsSource="{Binding RawPovs}" Margin="0,0,0,8">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal"/>
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,12,0">
+                                        <Canvas Width="36" Height="36">
+                                            <!-- Background circle -->
+                                            <Ellipse Width="36" Height="36"
+                                                     Fill="{DynamicResource SteelGroundBrush}" Stroke="{DynamicResource SteelLineBrush}"
+                                                     StrokeThickness="1"/>
+                                            <!-- Center dot -->
+                                            <Ellipse Width="4" Height="4" Canvas.Left="16" Canvas.Top="16"
+                                                     Fill="{DynamicResource SteelLineBrush}"/>
+                                            <!-- Direction indicator line -->
+                                            <Line X1="18" Y1="18" X2="18" Y2="5"
+                                                  Stroke="{DynamicResource ColdBrush}"
+                                                  StrokeThickness="2.5" StrokeEndLineCap="Round"
+                                                  Effect="{StaticResource ColdDotGlow}">
+                                                <Line.Style>
+                                                    <Style TargetType="Line">
+                                                        <Setter Property="Visibility" Value="Visible"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsCentered}" Value="True">
+                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Line.Style>
+                                                <Line.RenderTransform>
+                                                    <RotateTransform Angle="{Binding AngleDegrees}"
+                                                                     CenterX="18" CenterY="18"/>
+                                                </Line.RenderTransform>
+                                            </Line>
+                                        </Canvas>
+                                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="6,0,0,0">
+                                            <TextBlock FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="{Binding Devices_POV, Source={x:Static strings:Strings.Instance}}"/>
+                                            <TextBlock FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="{Binding Index, Mode=OneWay}"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <!-- Gyroscope -->
+                        <TextBlock Text="{Binding Devices_Gyroscope, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasGyroData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border Visibility="{Binding HasGyroData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1" CornerRadius="6" Padding="10,6" Margin="0,0,0,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="X" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroX, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="Y" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroY, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Z" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroZ, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Accelerometer -->
+                        <TextBlock Text="{Binding Devices_Accelerometer, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasAccelData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border Visibility="{Binding HasAccelData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1" CornerRadius="6" Padding="10,6" Margin="0,0,0,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="X" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelX, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="Y" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelY, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Z" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelZ, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Aux accelerometer (#199): the Nunchuk's own sensor /
+                             the left Joy-Con of a combined pair. -->
+                        <TextBlock Text="{Binding Devices_AccelAux, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasAccelAuxData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border Visibility="{Binding HasAccelAuxData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1" CornerRadius="6" Padding="10,6" Margin="0,0,0,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="X" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelAuxX, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="Y" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelAuxY, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Z" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding AccelAuxZ, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Aux gyro preview (#252): the left Joy-Con of a
+                             combined pair. Sits beside the aux accel so the
+                             two halves' readouts read together. -->
+                        <TextBlock Text="{Binding Devices_GyroAux, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasGyroAuxData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border Visibility="{Binding HasGyroAuxData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1" CornerRadius="6" Padding="10,6" Margin="0,0,0,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="X" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroAuxX, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="Y" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroAuxY, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Z" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center"/>
+                                    <TextBlock FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" HorizontalAlignment="Center"
+                                               Text="{Binding GyroAuxZ, StringFormat='{}{0:F3}'}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Touchpad preview -->
+                        <TextBlock Text="{Binding TouchpadLabel}"
+                                   FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasTouchpadData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border x:Name="TouchpadPreviewBorder"
+                                Visibility="{Binding HasTouchpadData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6" Margin="0,0,0,8"
+                                Height="100" ClipToBounds="True">
+                            <Canvas>
+                                <!-- Up to 5 simultaneous touchpad contacts.
+                                     SDL gamepad pads typically expose 1-2;
+                                     Windows PTP can deliver up to 5. Each
+                                     dot's visibility binds to its own
+                                     TouchpadDownN flag so unused slots
+                                     stay hidden on devices that don't
+                                     report that many contacts. -->
+                                <Ellipse x:Name="TouchpadDot0" Width="14" Height="14" Fill="#CCFF6600"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding TouchpadDown0, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="TouchpadDot1" Width="14" Height="14" Fill="#CC0066FF"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding TouchpadDown1, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="TouchpadDot2" Width="14" Height="14" Fill="#CC4CAF50"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding TouchpadDown2, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="TouchpadDot3" Width="14" Height="14" Fill="#CCBA68C8"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding TouchpadDown3, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="TouchpadDot4" Width="14" Height="14" Fill="#CCFFEB3B"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding TouchpadDown4, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                            </Canvas>
+                        </Border>
+
+                        <!-- Second touchpad preview — shown only for multi-pad devices
+                             (Steam Controller 2026 / Steam Deck / original Steam Controller). -->
+                        <TextBlock Text="{Binding Touchpad2Label}"
+                                   FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"
+                                   Visibility="{Binding HasSecondTouchpadData, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Border x:Name="Touchpad2PreviewBorder"
+                                Visibility="{Binding HasSecondTouchpadData, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6" Margin="0,0,0,8"
+                                Height="100" ClipToBounds="True">
+                            <Canvas>
+                                <Ellipse x:Name="Pad2Dot0" Width="14" Height="14" Fill="#CCFF6600"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding Pad2Down0, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="Pad2Dot1" Width="14" Height="14" Fill="#CC0066FF"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding Pad2Down1, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="Pad2Dot2" Width="14" Height="14" Fill="#CC4CAF50"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding Pad2Down2, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="Pad2Dot3" Width="14" Height="14" Fill="#CCBA68C8"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding Pad2Down3, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                <Ellipse x:Name="Pad2Dot4" Width="14" Height="14" Fill="#CCFFEB3B"
+                                         Effect="{StaticResource ColdDotGlow}"
+                                         Visibility="{Binding Pad2Down4, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                            </Canvas>
+                        </Border>
+
+                        <!-- Handheld: learned hidden-button list (issue #343), the NFC
+                             tag list's shape. Each row lights while its button is down. -->
+                        <StackPanel Visibility="{Binding ShowNamedButtons, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Handheld_Title, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <TextBlock Text="{Binding Handheld_NoneLearned, Source={x:Static strings:Strings.Instance}}" FontSize="11"
+                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}" TextWrapping="Wrap" Margin="0,0,0,4">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding HandheldButtons.Count}" Value="0">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <ItemsControl ItemsSource="{Binding HandheldButtons}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="0,1" Padding="8,5"
+                                                Style="{StaticResource RawCellBorderActive}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="{Binding Name}" FontSize="12" VerticalAlignment="Center"
+                                                           TextTrimming="CharacterEllipsis">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                                                                    <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                                <TextBlock Grid.Column="1" Text="{Binding Uid}" FontFamily="{StaticResource TelemetryFontFamily}"
+                                                           FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"
+                                                           Margin="8,0,0,0" MaxWidth="220" TextTrimming="CharacterEllipsis"/>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <!-- Voice Macros (issue #317): named phrase rows, the voice twin
+                             of the NFC Tags section. Shown for devices that carry the
+                             phrases: microphone rows and Bluetooth DualSense pads. Each
+                             row lights while its phrase button pulses. -->
+                        <StackPanel Visibility="{Binding ShowVoicePhrases, Converter={StaticResource BoolToVisibilityConverter}}"
+                                    Margin="0,0,0,8">
+                            <TextBlock Text="{Binding Voice_Title, Source={x:Static strings:Strings.Instance}}" FontFamily="{StaticResource TelemetryFontFamily}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,0,0,3"/>
+                            <ItemsControl ItemsSource="{Binding VoicePhrases}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Margin="0,1" Padding="8,5"
+                                                Style="{StaticResource RawCellBorderActive}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="{Binding Name}" FontSize="12" VerticalAlignment="Center"
+                                                           TextTrimming="CharacterEllipsis">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsActive}" Value="True">
+                                                                    <Setter Property="Foreground" Value="{DynamicResource ColdBrush}"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                                <TextBlock Grid.Column="1" Text="{Binding Uid}" FontFamily="{StaticResource TelemetryFontFamily}"
+                                                           FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"
+                                                           Margin="8,0,0,0"/>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                    </StackPanel>
+                </ScrollViewer>
+
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</UserControl>

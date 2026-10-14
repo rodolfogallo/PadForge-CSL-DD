@@ -1,0 +1,370 @@
+﻿using System;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
+using System.Windows.Threading;
+using PadForge.Common.Input;
+using PadForge.Services;
+using PadForge.ViewModels;
+
+namespace PadForge.Views
+{
+    public partial class ProfilesPage : UserControl
+    {
+        public ProfilesPage()
+        {
+            InitializeComponent();
+        }
+
+        private void ProfileList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            if (DataContext is SettingsViewModel vm &&
+                vm.LoadProfileCommand.CanExecute(null))
+            {
+                vm.LoadProfileCommand.Execute(null);
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Drop-zone import (#175)
+        // ─────────────────────────────────────────────
+
+        /// <summary>Set by MainWindow: consumes a dropped .pfprofile through
+        /// the same code path as the Import button.</summary>
+        internal Action<string> ImportProfileFile { get; set; }
+
+        /// <summary>True when the drag carries at least one .pfprofile.</summary>
+        private static bool IsProfileFileDrag(DragEventArgs e)
+        {
+            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return false;
+            return e.Data.GetData(DataFormats.FileDrop) is string[] files &&
+                   files.Any(f => f != null && f.EndsWith(
+                       PadForge.Common.ProfileTransfer.FileExtension,
+                       StringComparison.OrdinalIgnoreCase));
+        }
+
+        private void ProfileList_DragEnter(object sender, DragEventArgs e)
+        {
+            bool valid = IsProfileFileDrag(e);
+            e.Effects = valid ? DragDropEffects.Copy : DragDropEffects.None;
+            ProfileDropOverlay.Visibility = valid ? Visibility.Visible : Visibility.Collapsed;
+            e.Handled = true;
+        }
+
+        private void ProfileList_DragOver(object sender, DragEventArgs e)
+        {
+            e.Effects = IsProfileFileDrag(e) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Handled = true;
+        }
+
+        private void ProfileList_DragLeave(object sender, DragEventArgs e)
+        {
+            ProfileDropOverlay.Visibility = Visibility.Collapsed;
+        }
+
+        private void ProfileList_Drop(object sender, DragEventArgs e)
+        {
+            ProfileDropOverlay.Visibility = Visibility.Collapsed;
+            if (e.Data.GetData(DataFormats.FileDrop) is not string[] files) return;
+            foreach (var file in files)
+            {
+                if (file != null && file.EndsWith(
+                        PadForge.Common.ProfileTransfer.FileExtension,
+                        StringComparison.OrdinalIgnoreCase))
+                    ImportProfileFile?.Invoke(file);
+            }
+            e.Handled = true;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Profile shortcuts
+        // ─────────────────────────────────────────────
+
+        /// <summary>Set by MainWindow to enable shortcut recording.</summary>
+        internal InputService InputService { get; set; }
+
+        /// <summary>Set by MainWindow to trigger settings save on shortcut changes.</summary>
+        internal Action OnShortcutsChanged { get; set; }
+
+        private void AddShortcut_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not SettingsViewModel vm) return;
+
+            var data = new GlobalMacroData { SwitchMode = SwitchProfileMode.Next };
+            var shortcut = new ProfileShortcutViewModel(data, OnDeleteShortcut, OnShortcutChanged);
+            vm.ProfileShortcuts.Add(shortcut);
+            SaveShortcutsToSettings(vm);
+        }
+
+        private void OnDeleteShortcut(ProfileShortcutViewModel shortcut)
+        {
+            if (DataContext is not SettingsViewModel vm) return;
+            vm.ProfileShortcuts.Remove(shortcut);
+            SaveShortcutsToSettings(vm);
+        }
+
+        private void OnShortcutChanged(ProfileShortcutViewModel _)
+        {
+            if (DataContext is SettingsViewModel vm)
+                SaveShortcutsToSettings(vm);
+        }
+
+        private void SaveShortcutsToSettings(SettingsViewModel vm)
+        {
+            SettingsManager.GlobalMacros = vm.ProfileShortcuts
+                .Select(s => s.Data)
+                .ToArray();
+            OnShortcutsChanged?.Invoke();
+        }
+
+        // Persistent ProfileChoices / DeviceChoices stay alive across the
+        // shortcut row's lifetime; rebuild on DropDownOpened so newly-saved
+        // profiles / newly-connected devices surface without needing a
+        // shortcut row teardown. Mirrors the pattern used elsewhere (e.g.
+        // MicLedDevicePicker_DropDownOpened in PadPage.xaml.cs).
+        private void ProfileChoices_DropDownOpened(object sender, EventArgs e)
+        {
+            if (sender is FrameworkElement fe && fe.DataContext is ProfileShortcutViewModel shortcut)
+                shortcut.RebuildProfileChoices();
+        }
+
+        private void DeviceChoices_DropDownOpened(object sender, EventArgs e)
+        {
+            if (sender is FrameworkElement fe && fe.DataContext is ProfileShortcutViewModel shortcut)
+                shortcut.RebuildDeviceChoices();
+        }
+
+        // ─────────────────────────────────────────────
+        //  Shortcut button recording
+        // ─────────────────────────────────────────────
+
+        private ProfileShortcutViewModel _recordingShortcut;
+        private DispatcherTimer _recordTimer;
+        private TriggerButtonEntry[] _lastRecordedEntries;
+        /// <summary>The combo that was on the shortcut before recording began.
+        /// Starting a Learn clears TriggerEntries so the capture starts from
+        /// empty, and without this the existing combo was simply destroyed:
+        /// canceling or timing out left the shortcut with no trigger at all.</summary>
+        private TriggerButtonEntry[] _preRecordEntries;
+        private Dictionary<Guid, int[]> _recordAxisBaselines;
+        private const float AxisRecordDeltaThreshold = 0.25f;
+        private DateTime _recordStartTime;
+        private const double RecordTimeoutSeconds = 5;
+
+        private void ShortcutLearn_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not FrameworkElement fe || fe.DataContext is not ProfileShortcutViewModel shortcut)
+                return;
+
+            if (shortcut.IsRecording)
+            {
+                // Stop control (#175 item 8): a click during recording ends
+                // the capture through the same path the timeout takes, so it
+                // keeps the last-held combo (or cancels when nothing was
+                // pressed yet) instead of dead-returning.
+                if (_recordingShortcut == shortcut)
+                    StopRecording();
+                else
+                    shortcut.CancelRecording(); // Stale flag, no live session.
+                return;
+            }
+
+            // Cancel any in-progress recording on another shortcut.
+            if (_recordingShortcut != null)
+                CancelRecording();
+
+            _recordingShortcut = shortcut;
+            _lastRecordedEntries = null;
+            _preRecordEntries = shortcut.Data.TriggerEntries;
+            shortcut.IsRecording = true;
+            shortcut.Data.TriggerEntries = null;
+
+            // Capture axis baselines for all devices so we detect movement, not resting position.
+            _recordAxisBaselines = new Dictionary<Guid, int[]>();
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices != null)
+            {
+                lock (SettingsManager.UserDevices.SyncRoot)
+                {
+                    foreach (var ud in devices)
+                    {
+                        if (ud.IsOnline && ud.InputState?.Axis != null)
+                            _recordAxisBaselines[ud.InstanceGuid] = (int[])ud.InputState.Axis.Clone();
+                    }
+                }
+            }
+
+            _recordStartTime = DateTime.UtcNow;
+            InputService?.SetSuppressGlobalMacros(true);
+
+            _recordTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+            _recordTimer.Tick += RecordTimer_Tick;
+            _recordTimer.Start();
+        }
+
+        private void StopRecording()
+        {
+            _recordTimer?.Stop();
+            if (_recordingShortcut != null && _lastRecordedEntries != null && _lastRecordedEntries.Length > 0)
+            {
+                _recordingShortcut.SetLearnedButtons(_lastRecordedEntries);
+            }
+            else
+            {
+                // Sibling of the restore in CancelRecording, and the one that
+                // actually fires most often: this is the TIMEOUT path, where
+                // the user pressed nothing. Learn cleared TriggerEntries at
+                // start, so without putting the backup back the shortcut is
+                // left with no trigger at all.
+                if (_recordingShortcut != null
+                    && (_recordingShortcut.Data.TriggerEntries == null
+                        || _recordingShortcut.Data.TriggerEntries.Length == 0))
+                {
+                    _recordingShortcut.Data.TriggerEntries = _preRecordEntries;
+                }
+                _recordingShortcut?.CancelRecording();
+            }
+            _preRecordEntries = null;
+            _recordingShortcut = null;
+            _lastRecordedEntries = null;
+            _recordAxisBaselines = null;
+            InputService?.SetSuppressGlobalMacros(false);
+        }
+
+        private void RecordTimer_Tick(object sender, EventArgs e)
+        {
+            if (_recordingShortcut == null)
+            {
+                _recordTimer?.Stop();
+                return;
+            }
+
+            // Auto-stop after timeout — saves last-held combo.
+            double elapsed = (DateTime.UtcNow - _recordStartTime).TotalSeconds;
+            if (elapsed >= RecordTimeoutSeconds)
+            {
+                StopRecording();
+                return;
+            }
+
+            // Show countdown in the combo display.
+            int remaining = (int)Math.Ceiling(RecordTimeoutSeconds - elapsed);
+            _recordingShortcut.RecordingCountdown = remaining;
+
+            // Scan devices for pressed buttons and update the live display.
+            var devices = SettingsManager.UserDevices?.Items;
+            if (devices == null) return;
+
+            var filterGuid = _recordingShortcut.Data.TriggerDeviceGuid;
+            var entries = new System.Collections.Generic.List<TriggerButtonEntry>();
+
+            lock (SettingsManager.UserDevices.SyncRoot)
+            {
+                foreach (var ud in devices)
+                {
+                    if (!ud.IsOnline || ud.InputState == null) continue;
+                    if (filterGuid != Guid.Empty && ud.InstanceGuid != filterGuid) continue;
+                    // Skip merged/aggregate devices when scanning "Any Device" — they
+                    // duplicate child device buttons. But allow if explicitly selected.
+                    if (filterGuid == Guid.Empty && ud.DevicePath != null && ud.DevicePath.StartsWith("aggregate://")) continue;
+
+                    // Detect pressed buttons.
+                    var buttons = ud.InputState.Buttons;
+                    for (int i = 0; i < buttons.Length; i++)
+                    {
+                        if (buttons[i])
+                        {
+                            entries.Add(new TriggerButtonEntry
+                            {
+                                ButtonIndex = i,
+                                DeviceInstanceGuid = ud.InstanceGuid,
+                                DeviceProductGuid = ud.ProductGuid
+                            });
+                        }
+                    }
+
+                    // Detect axes that moved significantly from their baseline.
+                    var axes = ud.InputState.Axis;
+                    if (axes != null && _recordAxisBaselines != null
+                        && _recordAxisBaselines.TryGetValue(ud.InstanceGuid, out var baseline))
+                    {
+                        // Scan the slots the pad actually populates. The count
+                        // alone stopped being a valid upper bound once the axis
+                        // list went sparse: a Move Navigation reports ten axes
+                        // whose highest slot is 15, so a dense 0..count-1 scan
+                        // would miss its L1 and every d-pad pressure axis.
+                        var axisSlots = ud.CapAxisIndices;
+                        int axisCount = axisSlots != null && axisSlots.Length > 0
+                            ? axisSlots.Length
+                            : (ud.CapAxeCount > 0 ? Math.Min(ud.CapAxeCount, axes.Length) : axes.Length);
+                        for (int n = 0; n < axisCount; n++)
+                        {
+                            int i = axisSlots != null && axisSlots.Length > 0 ? axisSlots[n] : n;
+                            if (i >= axes.Length || i >= baseline.Length) continue;
+                            float rawDelta = (axes[i] - baseline[i]) / 65535f;
+                            float absDelta = Math.Abs(rawDelta);
+                            if (absDelta >= AxisRecordDeltaThreshold)
+                            {
+                                // Determine direction from baseline movement.
+                                var direction = rawDelta > 0
+                                    ? AxisTriggerDirection.Positive
+                                    : AxisTriggerDirection.Negative;
+
+                                float currentNormalized = axes[i] / 65535f;
+                                // For positive: threshold is slightly below recorded position.
+                                // For negative: threshold is slightly above recorded position.
+                                // This ensures the center rest position (~0.5) doesn't trigger.
+                                float triggerThreshold = direction == AxisTriggerDirection.Positive
+                                    ? Math.Max(0.6f, currentNormalized - 0.05f)   // Must be well above center
+                                    : Math.Min(0.4f, currentNormalized + 0.05f);  // Must be well below center
+
+                                entries.Add(new TriggerButtonEntry
+                                {
+                                    IsAxis = true,
+                                    AxisIndex = i,
+                                    AxisThreshold = triggerThreshold,
+                                    AxisDirection = direction,
+                                    DeviceInstanceGuid = ud.InstanceGuid,
+                                    DeviceProductGuid = ud.ProductGuid
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update live display if buttons are pressed.
+            if (entries.Count > 0)
+            {
+                _lastRecordedEntries = entries.ToArray();
+                // Temporarily set entries for display, but don't save yet.
+                _recordingShortcut.Data.TriggerEntries = _lastRecordedEntries;
+                _recordingShortcut.NotifyComboChanged();
+            }
+        }
+
+        private void CancelRecording()
+        {
+            _recordTimer?.Stop();
+            // Put back what Learn cleared. Both exits from a recording that
+            // captured nothing, the explicit cancel and the timeout, land
+            // here, and neither restored the combo the user already had.
+            if (_recordingShortcut != null
+                && (_recordingShortcut.Data.TriggerEntries == null
+                    || _recordingShortcut.Data.TriggerEntries.Length == 0))
+            {
+                _recordingShortcut.Data.TriggerEntries = _preRecordEntries;
+            }
+            _preRecordEntries = null;
+            _recordingShortcut?.CancelRecording();
+            _recordingShortcut = null;
+            _recordAxisBaselines = null;
+            InputService?.SetSuppressGlobalMacros(false);
+        }
+    }
+}

@@ -1,0 +1,1921 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using HIDMaestro;
+using PadForge.Engine;
+using PadForge.Services;
+
+namespace PadForge.Common.Input
+{
+    /// <summary>
+    /// Unified virtual controller backed by HIDMaestro. Replaces the v2
+    /// Xbox360VirtualController, DS4VirtualController, and ExtendedVirtualController
+    /// classes — one IVirtualController implementation handles every preset
+    /// and custom HID descriptor through a single SDK surface.
+    ///
+    /// The Type property reports the user-facing category (Xbox / PlayStation /
+    /// Extended) so existing per-type counting logic in InputService keeps
+    /// working. The actual HIDMaestro profile is supplied at construction.
+    /// </summary>
+    internal sealed class HMaestroVirtualController : IVirtualController
+    {
+        private readonly HMContext _ctx;
+        private readonly HMProfile _profile;
+        private readonly System.Collections.Generic.IReadOnlyList<HIDMaestro.HMSimpleStick> _cachedProfileSticks;
+        private readonly System.Collections.Generic.IReadOnlyList<HIDMaestro.HMSimpleTrigger> _cachedProfileTriggers;
+        private readonly VirtualControllerType _type;
+        private HMController _controller;
+        private HMaestroFfbDecoder _ffbDecoder;
+        private Vibration[] _fbVibrationStates; // for the per-tick FFB re-evaluation
+        private DualSensePassthroughDispatcher _ds5Dispatcher;
+        private UserEffectsDispatcher _userEffectsDispatcher;
+        // Guards _userEffectsDispatcher against the attach/teardown race:
+        // AttachDeviceConfig runs on the UI thread (InputService's
+        // DevicesUpdated handler) while Disconnect runs on the poll thread's
+        // destroy pass, and nothing else orders them.
+        private readonly object _dispatcherLock = new();
+        private bool _disposed;
+
+        // ── Inbound game-feedback pack (issue #236) ──
+        // Controller-LOCAL storage for the raw rumble the game sent THIS
+        // virtual controller, packed per LfeOutputState. Keyed by the VC
+        // instance, never by pad index: the slot-reorder reroute re-points
+        // _virtualControllers[] and the pack travels with its VC, so a
+        // swap can never land slot A's rumble on slot B the way the
+        // captured FeedbackPadIndex could. The poll thread's feedback
+        // lane reads it through the CURRENT array position each tick.
+        // Provenance-clean by construction: only the game-write callbacks
+        // below fill it (never test rumble, macro rumble, or any
+        // per-physical-device projection), which is what lets the
+        // rumble-to-audio path read it without feedback loops.
+        private long _inboundRumblePack;
+
+        /// <summary>Last logged XUSB SET_STATE shape (length + leading
+        /// bytes), so the FFBXIN evidence line fires per dialect change
+        /// rather than per packet.</summary>
+        private int _lastXusbTraceSig;
+        private int _lastFfbAnyTraceSig;
+
+        /// <summary>The packed inbound game-feedback state (see
+        /// <see cref="PadForge.Engine.Common.LfeOutputState"/>). Written
+        /// by the HM output callbacks, read by the poll thread's feedback
+        /// lane. A fresh VC reads 0, so create / recreate starts silent.</summary>
+        public long InboundRumblePack => System.Threading.Volatile.Read(ref _inboundRumblePack);
+
+        // DualSense / DualSense Edge VID/PID — used to gate the
+        // DS5 effect message pass-through dispatcher.  Both USB and BT
+        // variants of each profile share the same VID/PID; the profile
+        // ID slug differs but doesn't matter for the gating decision.
+        private const ushort SonyVid = 0x054C;
+        private const ushort DualSensePid = 0x0CE6;
+        private const ushort DualSenseEdgePid = 0x0DF2;
+        // Nintendo family: the virtual Switch Pro (HM v1.3.18, HM#33)
+        // decodes its rumble outputs onto OutputDecoded like Sony.
+        private const ushort NintendoVid = 0x057E;
+
+        private bool IsDualSenseVirtual =>
+            _profile.VendorId == SonyVid
+            && (_profile.ProductId == DualSensePid || _profile.ProductId == DualSenseEdgePid);
+
+        public VirtualControllerType Type => _type;
+        public bool IsConnected { get; private set; }
+        public int FeedbackPadIndex { get; set; }
+        public string ProfileId => _profile.Id;
+        public ushort ProfileVendorId => _profile.VendorId;
+        public ushort ProfileProductId => _profile.ProductId;
+
+        /// <summary>The composite persona's audio surfaces (HM v1.4.0,
+        /// HM#39): game-rendered speaker+haptic PCM out, microphone in,
+        /// UAC volume/mute control writes. Null on every UMDF2 profile
+        /// and until <see cref="Connect"/> has bound the controller.</summary>
+        public HIDMaestro.HMUsbAudio UsbAudio => _controller?.UsbAudio;
+
+        // Cached HMAxis keys for the active profile's first two sticks +
+        // first two triggers, resolved once at construction so the 1 kHz
+        // SubmitGamepadState hot path doesn't repeatedly walk
+        // _profile.Sticks / _profile.Triggers (each property access
+        // allocates a fresh List). HMAxis.None means "this slot doesn't
+        // exist on the profile" (e.g. wheels with no second stick); the
+        // hot path skips writes to such slots.
+        //
+        // The standard 6-slot canonical surface maps to whatever HID
+        // usages the active profile actually uses — Sony's Z=right-stick
+        // and Rx=left-trigger axisMap overrides resolve through
+        // _profile.Sticks/_profile.Triggers automatically, so callers
+        // pass XInput-convention LX/LY/RX/RY/LT/RT and the profile's
+        // simple-view derivation lands them on the right wire axes.
+        private HMAxis _axLeftStickX, _axLeftStickY;
+        private HMAxis _axRightStickX, _axRightStickY;
+        private HMAxis _axLeftTrigger, _axRightTrigger;
+        // The trigger rows' wire-field keys when they differ from the
+        // canonical positions above (X360: canonical Z/Rz, fields Vx/Vy).
+        // HM's lanes disagree across SDK generations about which position
+        // they read triggers from — v1.3.9-1.3.16 HID lane: field key;
+        // v1.3.17 HID lane: canonical-first with field fallback; v1.3.17
+        // GIP/XUSB lane (XInput / WGI consumers): field key only. Mirror
+        // every trigger write to both positions so all lanes of whichever
+        // SDK is bundled read live values instead of the 0.5 extras seed
+        // (which pinned XInput/WGI triggers at 50%, discussion #130).
+        private HMAxis _axLeftTriggerField, _axRightTriggerField;
+
+        // Per-call axes scratch dict, allocated once and reused across
+        // every SubmitGamepadState / SubmitRawHidState frame to
+        // keep the 1 kHz hot path allocation-free. HMGamepadState.Axes
+        // is a Dictionary<HMAxis, float>; the encoder consumes the dict
+        // by key lookup and is fine with reused references.
+        private readonly Dictionary<HMAxis, float> _axesScratch = new();
+
+        // Idle dedup state for the plain SubmitGamepadState path (in
+        // practice Xbox slots: every Extended slot is custom and uses
+        // SubmitRawHidState, and Sony rides the extended overload).
+        // See the contract note at the skip site.
+        //
+        // 16 ms, NOT longer: the GIP companion's stale watchdog counts
+        // READS (companion.c ReadGipData, incremented by the 8 ms pump AND
+        // by every IOCTL_XUSB_GET_STATE), and at >500 unchanged-SeqNo reads
+        // it tears the mapping down and zeroes the XInput state. A 250 ms
+        // keepalive let any consumer mix totaling ~2 000 reads/sec force
+        // repeated one-frame releases of held inputs (audit
+        // 2026-07-16). 16 ms tolerates ~31 000 reads/sec, which matches the
+        // watchdog margin the slowest configurable baseline poll interval
+        // (16 ms) already had, and still cuts idle submits ~94% at the
+        // default 1 kHz poll.
+        private Gamepad _lastSubmittedGp;
+        private long _lastSubmitTick;
+        private bool _hasSubmitted;
+        private const int SubmitKeepaliveMs = 16;
+
+        /// <summary>True for a profile whose inbound feedback is decoded here
+        /// rather than read off a PID block in its descriptor. A gate that
+        /// only inspects the descriptor cannot see these, and hiding the
+        /// feature for them hides something that works.
+        ///
+        /// <para>Declared beside the decode it names so the two cannot drift
+        /// apart: the Deck persona's vendor feature commands are handled in
+        /// this file's output path.</para></summary>
+        public static bool DecodesFeedbackWithoutPidBlock(string profileId) =>
+            string.Equals(profileId, "steam-deck-composite", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>The identity key handed to HIDMaestro for a virtual
+        /// controller (HIDMaestro 1.8.0, HM#60). Every device path, the
+        /// container id and, for USB/IP personas, the USB serial derive from
+        /// it, so the pad comes back at the same paths after a PadForge
+        /// restart, a reboot or a driver upgrade, and a program that stored a
+        /// binding against the path keeps it (ChasePlane in #395 keys on a
+        /// hash of the path).
+        ///
+        /// <para>The key names the VISUAL POSITION and the controller family,
+        /// not the profile and not the pad index. Pad index is data identity
+        /// and moves on a reorder, while the visual position is the anchor the
+        /// reorder rotates data around (rules b and c at the top of
+        /// InputManager.Step5.VirtualDevices.cs). Keyed on the pad index, a
+        /// reorder that reused the controller at one position and rebuilt
+        /// another left the rebuilt one asking for a key the reused one still
+        /// held, and left every pad that moved answering to paths derived from
+        /// the index it used to sit at.</para>
+        ///
+        /// <para>A different profile at the same key keeps the identity and
+        /// refreshes the descriptor, which is what switching among Extended
+        /// profiles on one slot needs. Two families at one position never
+        /// overlap (Pass 2 waits for a retiring pad), and their creation paths
+        /// differ, so the family in the key only keeps the derived container
+        /// ids apart.</para></summary>
+        /// <param name="visualPosition">The controller's position within its
+        /// own family's order list, which is the kernel-slot anchor.</param>
+        internal static string IdentityKeyFor(int visualPosition, VirtualControllerType type)
+            => "padforge:slot"
+               + visualPosition.ToString(System.Globalization.CultureInfo.InvariantCulture)
+               + ":" + type.ToString();
+
+        /// <summary>The identity key for the pad at <paramref name="padIndex"/>,
+        /// resolved through <paramref name="groupOrder"/>, its family's order
+        /// list. The pad's index within that list is its visual position.
+        ///
+        /// <para>A pad the list does not carry has no visual position and so no
+        /// anchor. It falls back to a key of its own namespace rather than to
+        /// its pad index, because a pad index spent as a position number would
+        /// collide with whichever pad actually sits at that position.</para>
+        /// </summary>
+        internal static string IdentityKeyForPad(int padIndex, VirtualControllerType type,
+            IReadOnlyList<int> groupOrder)
+        {
+            if (groupOrder != null)
+            {
+                for (int v = 0; v < groupOrder.Count; v++)
+                    if (groupOrder[v] == padIndex) return IdentityKeyFor(v, type);
+            }
+            return "padforge:pad"
+                   + padIndex.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                   + ":" + type.ToString();
+        }
+
+        private readonly string _identityKey;
+
+        public HMaestroVirtualController(HMContext ctx, HMProfile profile, VirtualControllerType type,
+            string identityKey = null)
+        {
+            _ctx = ctx ?? throw new ArgumentNullException(nameof(ctx));
+            _profile = profile ?? throw new ArgumentNullException(nameof(profile));
+            _type = type;
+            _identityKey = string.IsNullOrWhiteSpace(identityKey) ? null : identityKey;
+
+            // Resolve the 6-slot canonical axis keys via the profile's
+            // AxisMap, which maps wire HMAxis → semantic role string
+            // ("leftStickX", "rightStickX", "leftTrigger", etc.). For Sony
+            // profiles, AxisMap declares HMAxis.Z → "rightStickX",
+            // HMAxis.Rx → "leftTrigger", HMAxis.Ry → "rightTrigger",
+            // HMAxis.Rz → "rightStickY" — the inverse of the XInput
+            // convention StandardAxes ships (rightStick=Rx/Ry, triggers=
+            // Z/Rz). Walking AxisMap directly lands each role on the wire
+            // byte the consumer expects.
+            //
+            // Trusting HMGamepadStateHelpers.StandardAxes for this routing
+            // was the bug behind the phantom 50% L2/R2 on every PlayStation
+            // virtual output: it routed rightStickX (which idles at center
+            // = 0.5) onto HMAxis.Rx — the wire position Sony declares as
+            // the L2 trigger — so the OS read byte 4 = 0x80 = 50% trigger
+            // pull, which auto-asserts the coupled L2 digital button
+            // (DInput button 7), with the same flip on Ry → R2.
+            // AxisMap is Dictionary<string, string>: key = hex HID usage
+            // code ("0x32" for HMAxis.Z), value = role name ("rightStickX").
+            // HMAxis is a ushort enum whose values are full HID usage
+            // codes (page << 8 | usage) — HMAxis.Z = 0x0132, HMAxis.Rx =
+            // 0x0133, etc. AxisMap stores only the low usage byte, so
+            // a 2-digit key must be promoted to page-1 (Generic Desktop)
+            // before casting. 4-digit keys carry the page byte already.
+            var axisMap = _profile.AxisMap;
+            HMAxis ResolveAxisByRole(string role, HMAxis defaultAxis)
+            {
+                if (axisMap == null) return defaultAxis;
+                foreach (var kvp in axisMap)
+                {
+                    if (!string.Equals(kvp.Value, role, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    string keyHex = kvp.Key ?? "";
+                    if (keyHex.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                        keyHex = keyHex.Substring(2);
+                    if (!int.TryParse(keyHex,
+                            System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out int axisCode))
+                        continue;
+                    if (axisCode <= 0xFF) axisCode |= 0x0100;
+                    return (HMAxis)axisCode;
+                }
+                return defaultAxis;
+            }
+            _axLeftStickX  = ResolveAxisByRole("leftStickX",  HMAxis.X);
+            _axLeftStickY  = ResolveAxisByRole("leftStickY",  HMAxis.Y);
+            _axRightStickX = ResolveAxisByRole("rightStickX", HMAxis.Rx);
+            _axRightStickY = ResolveAxisByRole("rightStickY", HMAxis.Ry);
+            _axLeftTrigger  = ResolveAxisByRole("leftTrigger",  HMAxis.Z);
+            _axRightTrigger = ResolveAxisByRole("rightTrigger", HMAxis.Rz);
+
+            // Mirror targets: the trigger rows' own wire-field keys, None
+            // when they coincide with the canonical position (Sony, where
+            // the axisMap already lands the role on the wire field).
+            // Ctor-cached layout lists: HMProfile.Sticks/Triggers are
+            // computed properties that allocate a fresh List plus record
+            // instances per ACCESS (the SDK caches them internally for the
+            // same reason, HMController.cs "audit 1n"), and the raw submit
+            // path read both per 1 kHz tick (~115 KB/s in the allocation
+            // trace). Layout is immutable per profile.
+            var extSpec = _profile.ExtendedReport;
+            _extendedFrameCarriesItsOwnId =
+                extSpec != null && extSpec.AlwaysArmed && extSpec.ReportIdByte != 0;
+
+            _cachedProfileSticks = _profile.Sticks;
+            _cachedProfileTriggers = _profile.Triggers;
+
+            var profTriggers = _cachedProfileTriggers;
+            _axLeftTriggerField  = (profTriggers != null && profTriggers.Count > 0)
+                ? profTriggers[0].Axis : HMAxis.None;
+            _axRightTriggerField = (profTriggers != null && profTriggers.Count > 1)
+                ? profTriggers[1].Axis : HMAxis.None;
+            if (_axLeftTriggerField  == _axLeftTrigger)  _axLeftTriggerField  = HMAxis.None;
+            if (_axRightTriggerField == _axRightTrigger) _axRightTriggerField = HMAxis.None;
+
+            // Seed the hot-path scratch dict so HM's encoder receives
+            // sensible rest values for every declared axis. Sticks center
+            // at 0.5, triggers release at 0. Any HMAxis from
+            // AvailableAxes that we don't recognize as a stick or trigger
+            // defaults to 0.5 (safe stick-like rest) so unhandled extras
+            // don't manifest as phantom presses on their wire bytes.
+            var availableAxes = _profile.AvailableAxes;
+            if (availableAxes != null)
+            {
+                foreach (var hmAxis in availableAxes)
+                {
+                    float rest = (hmAxis == _axLeftTrigger || hmAxis == _axRightTrigger
+                               || hmAxis == _axLeftTriggerField || hmAxis == _axRightTriggerField) ? 0f : 0.5f;
+                    _axesScratch[hmAxis] = rest;
+                }
+            }
+        }
+
+        public void Connect()
+        {
+            if (IsConnected) return;
+            // The key makes the pad's paths durable across lives (HM#60);
+            // a null key falls back to HIDMaestro's controller index.
+            _controller = _ctx.CreateController(_profile, _identityKey);
+
+            // Fresh HMController = fresh shared section. Reset the idle-dedup
+            // memory so the first frame always submits instead of waiting out
+            // a keepalive window against the previous controller's state.
+            _hasSubmitted = false;
+
+            // Publish PID Pool + initial PID State BEFORE any GetFeature can
+            // race in. DirectInput's CDIEffect::CreateEffect issues
+            // GetFeature(PidPool) up-front to discover capabilities, so the
+            // shared section must be populated by the time the device shows
+            // up to host enumeration. Lazy init on first OutputReceived was
+            // too late — the first GetFeature can land before the first
+            // SetFeature/Output packet ever does.
+            //
+            // Gate on the descriptor carrying the PID FFB block, not on VID.
+            // The synthetic Custom profile (0xBEEF) ships with FFB built in,
+            // but Extended slots that customize a non-Custom catalog profile
+            // also rebuild the descriptor with AddPidFfbBlock when the user
+            // ticks the FFB checkbox — those keep the catalog VID/PID (so
+            // games still recognize the original device's signature) but
+            // need the same decoder + PID-state publish path. Inspecting
+            // the descriptor catches both cases without coupling to VID.
+            string descriptorHex = _profile.DescriptorHex;
+            if (DescriptorHasPidFfbBlock(descriptorHex))
+            {
+                _ffbDecoder = new HMaestroFfbDecoder(_controller, descriptorHex);
+                _ffbDecoder.PublishInitialState();
+            }
+
+            IsConnected = true;
+        }
+
+        /// <summary>Set under <c>_dispatcherLock</c> the moment teardown
+        /// begins, so a concurrent attach sees the retirement before this
+        /// controller's own dispose has finished. IsConnected cannot carry
+        /// that, because Disconnect early-outs on it and Dispose calls
+        /// Disconnect again after the destroy pass has.</summary>
+        private volatile bool _retiring;
+
+        /// <summary>Stamped by every accepted feedback update. A queued stop
+        /// carries the value it was armed with and gives way to any later
+        /// command, which a compare on the motor value alone could not do:
+        /// two pulses of equal strength and different lengths are
+        /// indistinguishable by magnitude.</summary>
+        private long _feedbackGeneration;
+
+        public void Disconnect()
+        {
+            if (!IsConnected) return;
+
+            // Tear the DS5 pass-through dispatcher down BEFORE disposing
+            // _controller — once _controller.Dispose() runs, OutputReceived
+            // fires its final close events; we want the dispatcher's
+            // channel writer rejecting further enqueues by then.
+            try
+            {
+                _ds5Dispatcher?.Dispose();
+            }
+            catch { /* best-effort teardown */ }
+            finally
+            {
+                _ds5Dispatcher = null;
+            }
+
+            // User-effects dispatcher unsubscribes its PropertyChanged
+            // handler on Dispose; safe to call regardless of whether one
+            // was ever attached. Under _dispatcherLock so a concurrent
+            // AttachDeviceConfig (UI thread, from the DevicesUpdated
+            // handler) cannot slip between this dispose and the null, nor
+            // construct a replacement after teardown: this runs on the poll
+            // thread's destroy pass, and the two never synchronized.
+            lock (_dispatcherLock)
+            {
+                // Publish the retirement BEFORE releasing the gate. Clearing
+                // the field first and flipping the flag afterwards left an
+                // attach window as wide as the controller dispose, which is
+                // seconds on an xinputhid profile. A caller arriving in it
+                // saw connected plus null and constructed a replacement that
+                // registers itself in the static instance map and subscribes
+                // to the config, outliving this controller as exactly the
+                // zombie writer this lock was added to prevent.
+                _retiring = true;
+                try
+                {
+                    _userEffectsDispatcher?.Dispose();
+                }
+                catch { /* best-effort teardown */ }
+                finally
+                {
+                    _userEffectsDispatcher = null;
+                }
+            }
+
+            _controller?.Dispose();
+            _controller = null;
+            IsConnected = false;
+        }
+
+        /// <summary>Registers a new controller's effects without starting output.</summary>
+        internal UserEffectsDispatcher PrepareDeviceEffectsForPublication(PadForge.ViewModels.DeviceSlotConfig config)
+        {
+            if (config == null) return null;
+            lock (_dispatcherLock)
+            {
+                if (!IsConnected) return null;
+                // A new controller reaches this only after winning its slot.
+                // Timer startup and physical output follow outside the lifecycle lock.
+                return _userEffectsDispatcher ??= new UserEffectsDispatcher(FeedbackPadIndex, config, startTimer: false);
+            }
+        }
+
+        /// <summary>Attaches a per-slot
+        /// <see cref="DeviceSlotConfig"/> so user-configured trigger
+        /// / lightbar / audio effects synthesize and forward to the
+        /// assigned physical DualSense via SDL_SendGamepadEffect.
+        /// Initial registration belongs to Step 5's winning publication.
+        /// This method rebinds a live slot after device or configuration changes.
+        /// The dispatcher resolves no targets when no supported physical pad is mapped. Decoupling the gate
+        /// from the virtual's identity lets Feature B work when the
+        /// user has a DS4 virtual + physical DS5 assignment, or any
+        /// other mismatch where they still want to drive the assigned
+        /// physical DS5's lightbar / triggers / audio. Idempotent —
+        /// re-attach replaces the existing dispatcher's binding.</summary>
+        public void AttachDeviceConfig(PadForge.ViewModels.DeviceSlotConfig config)
+        {
+            if (config == null) return;
+
+            // Locked, and gated on IsConnected, against Disconnect's teardown
+            // on the poll thread. Two failures without it: the null-test and
+            // the use below were separate reads of the field, so a teardown
+            // between them threw; and an attach arriving after teardown saw
+            // null and CONSTRUCTED a fresh dispatcher, which registers itself
+            // in the static _instances map and subscribes to the config, so it
+            // outlived the disposed VC as a zombie HID writer that no later
+            // cleanup pass revisits.
+            lock (_dispatcherLock)
+            {
+                if (!IsConnected || _retiring) return;
+
+                var d = _userEffectsDispatcher;
+                if (d == null)
+                {
+                    d = new UserEffectsDispatcher(FeedbackPadIndex, config);
+                    _userEffectsDispatcher = d;
+                    d.ApplyOnce();
+                }
+                else
+                {
+                    d.Rebind(config);
+                }
+            }
+        }
+
+        /// <summary>Re-points this VC's effect dispatchers at a different pad.
+        ///
+        /// <para>A slot reorder REUSES a kernel VC at a new pad index (pad
+        /// index is data identity, visual position is the kernel-slot anchor),
+        /// and moving the pointer plus <see cref="FeedbackPadIndex"/> is not
+        /// enough: both dispatchers capture their pad index in a readonly
+        /// field at construction and resolve their physical target devices
+        /// from it (<c>us.MapTo != _padIndex</c>). Left alone they keep
+        /// writing lightbar / triggers / rumble to the OLD pad's controllers.
+        /// Worse, the DevicesUpdated handler re-binds their CONFIG by the new
+        /// index, so they end up running the new pad's settings against the
+        /// old pad's hardware.</para>
+        ///
+        /// <para>The fields are readonly by design (they are read from a timer
+        /// thread), so the honest fix is to rebuild rather than mutate. The
+        /// registry hand-off is safe: a disposing dispatcher only removes its
+        /// slot key when it is still the registered instance, so on a two-pad
+        /// swap the second rebuild cannot evict the first's fresh
+        /// entry.</para></summary>
+        internal void RetargetToPad(int newPadIndex, PadForge.ViewModels.DeviceSlotConfig config)
+        {
+            FeedbackPadIndex = newPadIndex;
+
+            // DS5 pass-through: rebuild against the new pad. Recreated here
+            // rather than deferred, because RegisterFeedbackCallback (its only
+            // other creator) runs solely from VC construction, so a reset alone
+            // would leave pass-through dead until the slot was torn down.
+            if (IsDualSenseVirtual)
+            {
+                // Migration hand-off: the successor takes over below in the
+                // same call, so the outgoing dispatcher must not write its
+                // shutdown release (old slot's identity color, zeroed
+                // triggers) onto a pad the game is still driving.
+                try { _ds5Dispatcher?.SkipShutdownRelease(); } catch { }
+                try { _ds5Dispatcher?.Dispose(); }
+                catch { /* best-effort teardown */ }
+                _ds5Dispatcher = null;
+                if (_controller != null && IsConnected)
+                {
+                    _ds5Dispatcher = new DualSensePassthroughDispatcher(newPadIndex);
+                    _ds5Dispatcher.Start();
+                }
+            }
+
+            // User effects: drop, then let AttachDeviceConfig rebuild against
+            // the new FeedbackPadIndex set above.
+            lock (_dispatcherLock)
+            {
+                try { _userEffectsDispatcher?.Dispose(); }
+                catch { /* best-effort teardown */ }
+                _userEffectsDispatcher = null;
+            }
+            if (config != null) AttachDeviceConfig(config);
+        }
+
+        /// <summary>Triggers a fresh apply pass on the user-effects
+        /// dispatcher. Called by InputService on every
+        /// <see cref="InputManager.DevicesUpdated"/> tick so a freshly-
+        /// reconnected DualSense gets its configured lightbar / trigger
+        /// / audio state re-pushed without waiting for the user to
+        /// touch a slider. No-op when no dispatcher is attached.</summary>
+        public void ReApplyUserEffects()
+        {
+            // Under the same gate as the attach. Reading the field bare could
+            // not throw, but it could drive physical output through a
+            // dispatcher teardown had disposed microseconds earlier.
+            lock (_dispatcherLock)
+            {
+                if (!IsConnected || _retiring) return;
+                _userEffectsDispatcher?.ApplyOnce();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Disconnect();
+        }
+
+        /// <summary>Submits a packer-built native input frame: Sony USB
+        /// Report 0x01 (touchpad, gyro, accel and battery that
+        /// HMGamepadState does not model) or a Valve persona frame. Step 5
+        /// skips SubmitGamepadState on those slots, so this is their only
+        /// submit. A profile whose frames carry their own report id goes
+        /// through SubmitRawExtendedReport, the rest through
+        /// HMController.SubmitRawReport.</summary>
+        public void SubmitRawReport(ReadOnlySpan<byte> report)
+        {
+            if (_controller == null) return;
+            // Every per-tick Submit path ticks FFB (see TickFfb doc). This
+            // is the ONLY submit on USB Sony slots now that Step 5 skips
+            // the redundant extended leg when a packer exists.
+            TickFfb();
+
+            // A profile that declares its own input report id and is always
+            // armed is never in legacy mode, so its frames carry that id and
+            // must go out verbatim. HM v1.7.1 (HIDMaestro#58) infers that
+            // from LENGTH on SubmitRawReport, a frame the size of the
+            // declared report passing through untouched and one byte shorter
+            // taking the prepend. Say it outright instead. The inference is
+            // correct today and would flip silently the day a packer size or
+            // a declared size moved by one, and on the 2026 Steam Controller
+            // the prepend branch means the descriptor's FIRST report, which
+            // is that pad's lizard-mode mouse: every frame became cursor
+            // motion. PackerFramesCarryTheirOwnReportId pins the pairing.
+            if (_extendedFrameCarriesItsOwnId)
+                _controller.SubmitRawExtendedReport(report);
+            else
+                _controller.SubmitRawReport(report);
+        }
+
+        /// <summary>True when this profile declares a non-zero input report
+        /// id and is always armed, which is HIDMaestro's definition of a
+        /// frame that already carries its own id.</summary>
+        private readonly bool _extendedFrameCarriesItsOwnId;
+
+        /// <summary>Re-evaluates PID effect state on the engine clock. The
+        /// HM packet callback applies the decoder only when the game sends a
+        /// report, but effect durations expire on the DEVICE clock — without
+        /// this per-tick pass, the last computed vibration latches on the
+        /// physical pad as soon as a game goes quiet. Called from every
+        /// per-tick Submit path; no-op for non-PID profiles.</summary>
+        public void TickFfb()
+        {
+            var vibs = _fbVibrationStates;
+            int idx = FeedbackPadIndex;
+            if (_ffbDecoder == null || vibs == null || idx < 0 || idx >= vibs.Length) return;
+            // A null element makes Apply a no-op; returning here keeps the
+            // pack write below from re-publishing a stale computed pair.
+            if (vibs[idx] == null) return;
+            _ffbDecoder.ApplyIfDue(vibs[idx]);
+
+            // Inbound pack (#236, owner directive: EVERY feedback source we
+            // support is an LFE source): the PID / vendor FFB lane feeds
+            // the bass shakers exactly like the Xbox and Sony motor lanes.
+            // The pair comes from the decoder's own game-authored compute
+            // (effect set x gains, durations expiring per tick), never
+            // from the shared Vibration array, so test rumble and macro
+            // rumble stay out by the same provenance rule. A sim-racing
+            // wheel slot is the audience that filed #234; constant-force
+            // steering load and periodic road texture both land here.
+            var (ffbLeft, ffbRight) = _ffbDecoder.LastComputedMotors;
+            System.Threading.Volatile.Write(ref _inboundRumblePack,
+                Engine.Common.LfeOutputState.Pack(ffbLeft, ffbRight, 0, 0));
+        }
+
+        public void SubmitGamepadState(Gamepad gp)
+        {
+            if (_controller == null) return;
+            TickFfb();
+
+            // Idle dedup with a 16 ms keepalive. An unchanged state means an
+            // identical frame: the driver reads a seqlocked LATCH (shared
+            // section, HMController class doc: "no internal pumping thread;
+            // the consumer drives the cadence"), so skipping an identical
+            // write changes nothing for state-latching consumers. Three
+            // driver watchdogs bound how long SeqNo may sit still:
+            //   * driver.c SharedInputWorkerProc: recycles all handles on any
+            //     500 ms without an event signal (WAIT_TIMEOUT -> recycle).
+            //   * driver.c: staleWakeups > 250 signals-without-SeqNo-advance
+            //     recycles too (keepalives advance SeqNo, resetting it).
+            //   * companion.c ReadGipData: > 500 consecutive unchanged-SeqNo
+            //     READS (8 ms pump + every XInput GET_STATE) tears the GIP
+            //     mapping down and DecodeGipToXInput ZEROES the XInput
+            //     state. The count is read-rate-bound, not time-bound, which
+            //     is why the keepalive is 16 ms (see the field note).
+            // Changes still submit the same tick they happen, so latency is
+            // untouched; only redundant identical frames drop. RawInput
+            // consumers see idle reports at ~62 Hz instead of the poll rate,
+            // which is within the app's configurable baseline range.
+            long nowTick = Environment.TickCount64;
+            if (_hasSubmitted
+                && nowTick - _lastSubmitTick < SubmitKeepaliveMs
+                && gp.Buttons == _lastSubmittedGp.Buttons
+                && gp.LeftTrigger == _lastSubmittedGp.LeftTrigger
+                && gp.RightTrigger == _lastSubmittedGp.RightTrigger
+                && gp.ThumbLX == _lastSubmittedGp.ThumbLX
+                && gp.ThumbLY == _lastSubmittedGp.ThumbLY
+                && gp.ThumbRX == _lastSubmittedGp.ThumbRX
+                && gp.ThumbRY == _lastSubmittedGp.ThumbRY
+                && gp.Share == _lastSubmittedGp.Share
+                && gp.MicMute == _lastSubmittedGp.MicMute
+                && gp.LeftPaddle == _lastSubmittedGp.LeftPaddle
+                && gp.RightPaddle == _lastSubmittedGp.RightPaddle
+                && gp.LeftFunction == _lastSubmittedGp.LeftFunction
+                && gp.RightFunction == _lastSubmittedGp.RightFunction)
+            {
+                return;
+            }
+            _lastSubmittedGp = gp;
+            _lastSubmitTick = nowTick;
+            _hasSubmitted = true;
+
+            // HM v1.3.9: HMGamepadState.Axes is a Dictionary<HMAxis, float>
+            // keyed by HID usage; named LeftStickX / LeftStickY / RightStickX /
+            // RightStickY / LeftTrigger / RightTrigger slots are gone. All
+            // values normalize to [0, 1] uniformly:
+            //   sticks: 0.5 = center, 0.0 = leftmost / topmost, 1.0 = rightmost / bottommost
+            //   triggers: 0.0 = released, 1.0 = fully pressed
+            //
+            // PadForge's source convention here is XInput (signed -32768..+32767
+            // for sticks, ushort 0..65535 for triggers, Y+ = stick up).
+            //   * Stick X: shift signed range to unsigned [0..1] —
+            //       (v + 32768) / 65535
+            //   * Stick Y: Y+ = up in XInput, Y+ = down in HID convention
+            //     (which is what HM's encoder writes to the wire), so flip:
+            //       (32768 - v) / 65535
+            //     ThumbLY=+32767 (XInput up)   -> 0.0 (HM up)
+            //     ThumbLY=-32768 (XInput down) -> 1.0 (HM down)
+            //     ThumbLY=0      (centered)    -> 0.5
+            //   * Trigger: already unsigned, just divide.
+            //
+            // Hot-path: overwrite the 6 standard slots in the pre-seeded
+            // _axesScratch (constructor seeded it with the profile's full
+            // axis set at rest values). DO NOT Clear() the dict — any
+            // extra-axis entries seeded by the constructor must persist
+            // or HM's encoder would default those bytes to logical mid.
+            if (_axLeftStickX  != HMAxis.None) _axesScratch[_axLeftStickX]  = (gp.ThumbLX  + 32768f) / 65535f;
+            if (_axLeftStickY  != HMAxis.None) _axesScratch[_axLeftStickY]  = (32768f - gp.ThumbLY)  / 65535f;
+            if (_axRightStickX != HMAxis.None) _axesScratch[_axRightStickX] = (gp.ThumbRX  + 32768f) / 65535f;
+            if (_axRightStickY != HMAxis.None) _axesScratch[_axRightStickY] = (32768f - gp.ThumbRY)  / 65535f;
+            if (_axLeftTrigger  != HMAxis.None) _axesScratch[_axLeftTrigger]  = gp.LeftTrigger  / 65535f;
+            if (_axRightTrigger != HMAxis.None) _axesScratch[_axRightTrigger] = gp.RightTrigger / 65535f;
+            if (_axLeftTriggerField  != HMAxis.None) _axesScratch[_axLeftTriggerField]  = gp.LeftTrigger  / 65535f;
+            if (_axRightTriggerField != HMAxis.None) _axesScratch[_axRightTriggerField] = gp.RightTrigger / 65535f;
+
+            var state = new HMGamepadState
+            {
+                Axes = _axesScratch,
+                Buttons = MapButtons(gp),
+                Hat = MapHat(gp.Buttons),
+            };
+
+            _controller.SubmitState(state);
+        }
+
+        // Sony int16 sensor scaling — must stay identical to
+        // SonyReportPackers.ScaleGyro / ScaleAccel: BT virtuals produce
+        // the same byte values the USB SubmitRawReport path produces,
+        // just at the Report 0x31 vendor-blob positions. The scales are
+        // the inverse of SDL3's no-hardware-calibration HIDAPI decode
+        // (deg/s = raw * 64 / 1024; g = raw / 8192).
+        private const float GyroScale  = 1024f / 64f; // = 16
+        private const float AccelScale = 8192f;
+
+        // Counters for the touchpad packet sequence + finger tracking IDs.
+        // PadForge's TouchpadState carries down/up bools per finger but no
+        // tracking ID; we synthesize one that increments on each new touch
+        // so consumers see a stable ID while a finger is held and a fresh
+        // one on each new press.
+        private byte _touchpadPacketCounter;
+        private byte _touchpadFinger0Id;
+        private byte _touchpadFinger1Id;
+        private bool _touchpadFinger0PrevDown;
+        private bool _touchpadFinger1PrevDown;
+
+        /// <summary>HM v1.3.5+ overload that submits gamepad state PLUS
+        /// touchpad / IMU / battery / mic-mute / headphone data via the
+        /// extended <c>HMGamepadState</c> fields. Sony BT virtuals (Report
+        /// 0x31 vendor-blob) light up touchpad / gyro / accel / battery on
+        /// the consumer side from this path; SubmitRawReport (called
+        /// separately for USB profiles) covers the same surface for the
+        /// USB Report 0x01 layout. Pass through whatever the assigned
+        /// physical pad reported via SDL. For non-Sony or sensor-less
+        /// physicals, supply zeros / Has=false and the encoder writes
+        /// zeros to those positions. The slot's button pressure (discussion
+        /// #476) rides along too, which only the DualShock 3 (SIXAXIS): Full
+        /// preset's report carries, and <see cref="PressureOnTheWire"/>
+        /// sends each button's pressure only while the frame presses
+        /// it.</summary>
+        public void SubmitGamepadState(
+            Gamepad gp,
+            in TouchpadState tp,
+            in MotionSnapshot motion,
+            byte batteryPercent,
+            bool batteryCharging,
+            in PadForge.Engine.Common.ButtonPressureState pressure)
+        {
+            if (_controller == null) return;
+            TickFfb();
+
+            // Tracking-ID synthesis. Bump each finger's ID on rising edge of
+            // its down state; keep stable while held; ID stays at last value
+            // (with active bit cleared via TouchpadFingerNActive=false) on
+            // release so the consumer sees a clean lift then a new press
+            // gets a new ID next time.
+            if (tp.Down0 && !_touchpadFinger0PrevDown) _touchpadFinger0Id++;
+            if (tp.Down1 && !_touchpadFinger1PrevDown) _touchpadFinger1Id++;
+            _touchpadFinger0PrevDown = tp.Down0;
+            _touchpadFinger1PrevDown = tp.Down1;
+            if (tp.PacketCounter != _touchpadPacketCounter) _touchpadPacketCounter = tp.PacketCounter;
+
+            byte battery10 = (byte)Math.Clamp(batteryPercent / 10, 0, 10);
+            bool batteryFull = batteryPercent >= 100;
+
+            // Same axis-dict population as the basic SubmitGamepadState
+            // overload — see the explanatory comment block there for the
+            // XInput → HM v1.3.9 [0..1] conversion rules. DO NOT Clear()
+            // — _axesScratch was pre-seeded at construction with the
+            // profile's full axis set at rest values so extra-axis entries
+            // survive frame to frame.
+            if (_axLeftStickX  != HMAxis.None) _axesScratch[_axLeftStickX]  = (gp.ThumbLX  + 32768f) / 65535f;
+            if (_axLeftStickY  != HMAxis.None) _axesScratch[_axLeftStickY]  = (32768f - gp.ThumbLY)  / 65535f;
+            if (_axRightStickX != HMAxis.None) _axesScratch[_axRightStickX] = (gp.ThumbRX  + 32768f) / 65535f;
+            if (_axRightStickY != HMAxis.None) _axesScratch[_axRightStickY] = (32768f - gp.ThumbRY)  / 65535f;
+            if (_axLeftTrigger  != HMAxis.None) _axesScratch[_axLeftTrigger]  = gp.LeftTrigger  / 65535f;
+            if (_axRightTrigger != HMAxis.None) _axesScratch[_axRightTrigger] = gp.RightTrigger / 65535f;
+            if (_axLeftTriggerField  != HMAxis.None) _axesScratch[_axLeftTriggerField]  = gp.LeftTrigger  / 65535f;
+            if (_axRightTriggerField != HMAxis.None) _axesScratch[_axRightTriggerField] = gp.RightTrigger / 65535f;
+
+            var state = new HMGamepadState
+            {
+                Axes = _axesScratch,
+                Buttons = MapButtons(gp),
+                Hat = MapHat(gp.Buttons),
+
+                TouchpadFinger0Active = tp.Down0,
+                TouchpadFinger0X = (ushort)Math.Clamp((int)Math.Round(tp.X0 * 1919f), 0, 1919),
+                TouchpadFinger0Y = (ushort)Math.Clamp((int)Math.Round(tp.Y0 * 1079f), 0, 1079),
+                TouchpadFinger0Id = (byte)(_touchpadFinger0Id & 0x7F),
+                TouchpadFinger1Active = tp.Down1,
+                TouchpadFinger1X = (ushort)Math.Clamp((int)Math.Round(tp.X1 * 1919f), 0, 1919),
+                TouchpadFinger1Y = (ushort)Math.Clamp((int)Math.Round(tp.Y1 * 1079f), 0, 1079),
+                TouchpadFinger1Id = (byte)(_touchpadFinger1Id & 0x7F),
+                TouchpadPacketCounter = _touchpadPacketCounter,
+
+                GyroPitch = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.GyroPitch * GyroScale), short.MinValue, short.MaxValue) : (short)0,
+                GyroYaw   = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.GyroYaw   * GyroScale), short.MinValue, short.MaxValue) : (short)0,
+                GyroRoll  = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.GyroRoll  * GyroScale), short.MinValue, short.MaxValue) : (short)0,
+                AccelX    = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.AccelX    * AccelScale), short.MinValue, short.MaxValue) : (short)0,
+                AccelY    = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.AccelY    * AccelScale), short.MinValue, short.MaxValue) : (short)0,
+                AccelZ    = motion.HasMotion ? (short)Math.Clamp((int)Math.Round(motion.AccelZ    * AccelScale), short.MinValue, short.MaxValue) : (short)0,
+                // The DualSense 0x31 sensor-timestamp field is in 0.33 µs
+                // ticks; convert from microseconds by × 3.
+                SensorTimestamp = (uint)((motion.TimestampUs * 3L) & 0xFFFFFFFF),
+
+                BatteryLevel    = battery10,
+                BatteryCharging = batteryCharging,
+                BatteryFull     = batteryFull,
+
+                // Not currently sourced from PadForge's input pipeline — SDL3
+                // doesn't surface DS5's MIC_MUTE state or the headphones-
+                // connected bit through the gamepad API. Leave at default
+                // (false) until we add a side-channel read; HM's encoder
+                // writes zero to the corresponding bits.
+                MicMuted = false,
+                HeadphonesConnected = false,
+            };
+
+            WritePressure(ref state, PressureOnTheWire(pressure, gp));
+
+            _controller.SubmitState(state);
+        }
+
+        /// <summary>Copies the frame's pressure into HIDMaestro's ten pressure
+        /// fields, cross into PressureA (HMButton.A) through the D-pad.</summary>
+        internal static void WritePressure(ref HMGamepadState state,
+            in PadForge.Engine.Common.ButtonPressureState wire)
+        {
+            state.PressureA = wire.ButtonA;
+            state.PressureB = wire.ButtonB;
+            state.PressureX = wire.ButtonX;
+            state.PressureY = wire.ButtonY;
+            state.PressureLeftBumper = wire.LeftShoulder;
+            state.PressureRightBumper = wire.RightShoulder;
+            state.PressureDpadUp = wire.DPadUp;
+            state.PressureDpadDown = wire.DPadDown;
+            state.PressureDpadLeft = wire.DPadLeft;
+            state.PressureDpadRight = wire.DPadRight;
+        }
+
+        /// <summary>
+        /// The pressure the frame sends: each button's pressure while the
+        /// frame presses it, 0 while it does not. The D-pad follows the hat
+        /// <see cref="MapHat"/> builds, so a direction the hat drops sends
+        /// none.
+        ///
+        /// <para>PCSX2 binds these ten buttons to the pressure axes alone
+        /// (SDLInputSource s_sdl_ps3_binding_pressure_mapping) and counts any
+        /// value above its button deadzone, 0 by default, as a press
+        /// (PadDualshock2::Set). A pressure left up while a turbo, a consumed
+        /// macro trigger, SOCD or a shift layer released the button would
+        /// hold it down there.</para>
+        ///
+        /// <para>A pressed button whose pressure reads 0 sends 0, which
+        /// HIDMaestro sends as fully pressed (HMGamepadState's pressure
+        /// rule), so a press from a macro, a key or a pad without pressure
+        /// reads at full strength.</para>
+        /// </summary>
+        internal static PadForge.Engine.Common.ButtonPressureState PressureOnTheWire(
+            in PadForge.Engine.Common.ButtonPressureState pressure, in Gamepad gp)
+        {
+            var wire = default(PadForge.Engine.Common.ButtonPressureState);
+            ushort b = gp.Buttons;
+            if ((b & Gamepad.A) != 0) wire.ButtonA = pressure.ButtonA;
+            if ((b & Gamepad.B) != 0) wire.ButtonB = pressure.ButtonB;
+            if ((b & Gamepad.X) != 0) wire.ButtonX = pressure.ButtonX;
+            if ((b & Gamepad.Y) != 0) wire.ButtonY = pressure.ButtonY;
+            if ((b & Gamepad.LEFT_SHOULDER) != 0) wire.LeftShoulder = pressure.LeftShoulder;
+            if ((b & Gamepad.RIGHT_SHOULDER) != 0) wire.RightShoulder = pressure.RightShoulder;
+            var hat = MapHat(b);
+            if (hat is HMHat.North or HMHat.NorthEast or HMHat.NorthWest) wire.DPadUp = pressure.DPadUp;
+            if (hat is HMHat.South or HMHat.SouthEast or HMHat.SouthWest) wire.DPadDown = pressure.DPadDown;
+            if (hat is HMHat.West or HMHat.NorthWest or HMHat.SouthWest) wire.DPadLeft = pressure.DPadLeft;
+            if (hat is HMHat.East or HMHat.NorthEast or HMHat.SouthEast) wire.DPadRight = pressure.DPadRight;
+            return wire;
+        }
+
+        /// <summary>
+        /// Submit an RawHidState (produced by the Extended dynamic
+        /// mapping path) directly to HIDMaestro. Covers the full HMGamepadState
+        /// surface — 6 axes, 13 buttons, and a hat — without going through
+        /// the XInput Gamepad intermediate, so Touchpad/Share buttons and
+        /// arbitrary profile layouts aren't truncated the way
+        /// <see cref="SubmitGamepadState"/>'s 11-button XInput bitmap would.
+        ///
+        /// Axis indices are computed via the same interleave logic as
+        /// <see cref="PadForge.ViewModels.ExtendedSlotConfig.ComputeAxisLayout"/>
+        /// so the right-stick axes land at the correct offsets regardless of
+        /// whether the active profile has 0, 1, or 2 triggers. Hardcoding
+        /// (3, 4) for right-stick X/Y silently dropped Stick 2 Y for every
+        /// 0-trigger or 1-trigger profile.
+        ///
+        /// RawHidState.Axes is in HID convention per Step 3
+        /// (positive = down/right), matching HMGamepadState's internal
+        /// convention, so no Y negation needed — pass signed short
+        /// straight through as a normalized float. Triggers in the raw
+        /// state are signed short centered at 0; convert to the 0..1
+        /// float range HMGamepadState expects.
+        /// </summary>
+        public void SubmitRawHidState(RawHidState raw, int sticks, int triggers)
+            => SubmitRawHidState(raw, sticks, triggers, default);
+
+        // Last-submitted raw frame for the idle dedup (content compare on
+        // the pooled arrays; shapes are stable per layout).
+        private short[] _lastRawAxes;
+        private uint[] _lastRawButtons;
+        private int[] _lastRawPovs;
+        private bool _lastRawHadMotion;
+        private long _lastRawSubmitTick;
+        private bool _hasRawSubmitted;
+
+        // PADFORGE_NO_RAWDEDUP=1 disables the raw idle dedup at launch
+        // (regression bisect switch).
+        private static readonly bool s_noRawDedup =
+            System.Environment.GetEnvironmentVariable("PADFORGE_NO_RAWDEDUP") == "1";
+
+        private bool RawFrameUnchanged(in RawHidState raw)
+        {
+            static bool EqS(short[] a, short[] b)
+            {
+                if (a == null || b == null || a.Length != b.Length) return false;
+                for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+                return true;
+            }
+            if (_lastRawButtons == null || raw.Buttons == null
+                || _lastRawButtons.Length != raw.Buttons.Length) return false;
+            for (int i = 0; i < raw.Buttons.Length; i++)
+                if (raw.Buttons[i] != _lastRawButtons[i]) return false;
+            if (_lastRawPovs == null || raw.Povs == null
+                || _lastRawPovs.Length != raw.Povs.Length) return false;
+            for (int i = 0; i < raw.Povs.Length; i++)
+                if (raw.Povs[i] != _lastRawPovs[i]) return false;
+            return EqS(raw.Axes, _lastRawAxes);
+        }
+
+        private void StoreRawFrame(in RawHidState raw, bool hadMotion, long tick)
+        {
+            static void CopyS(short[] src, ref short[] dst)
+            {
+                if (src == null) { dst = null; return; }
+                if (dst == null || dst.Length != src.Length) dst = new short[src.Length];
+                System.Array.Copy(src, dst, src.Length);
+            }
+            CopyS(raw.Axes, ref _lastRawAxes);
+            if (raw.Buttons != null)
+            {
+                if (_lastRawButtons == null || _lastRawButtons.Length != raw.Buttons.Length)
+                    _lastRawButtons = new uint[raw.Buttons.Length];
+                System.Array.Copy(raw.Buttons, _lastRawButtons, raw.Buttons.Length);
+            }
+            else _lastRawButtons = null;
+            if (raw.Povs != null)
+            {
+                if (_lastRawPovs == null || _lastRawPovs.Length != raw.Povs.Length)
+                    _lastRawPovs = new int[raw.Povs.Length];
+                System.Array.Copy(raw.Povs, _lastRawPovs, raw.Povs.Length);
+            }
+            else _lastRawPovs = null;
+            _lastRawHadMotion = hadMotion;
+            _lastRawSubmitTick = tick;
+            _hasRawSubmitted = true;
+        }
+
+        public void SubmitRawHidState(RawHidState raw, int sticks, int triggers,
+            in PadForge.Services.MotionSnapshot motion)
+        {
+            if (_controller == null) return;
+            TickFfb();
+
+            // Idle dedup, the EXACT basic-path shape (16 ms keepalive):
+            // identical frame within the window skips the seqlock publish +
+            // SetEvent. driver.c bounds how long SeqNo may sit still (500 ms
+            // wait-timeout recycle; 250 stale WAKES recycle), and the 16 ms
+            // keepalive republishes well inside both. Motion frames never
+            // dedup: SensorTimestamp must advance for downstream fusion.
+            long nowRawTick = Environment.TickCount64;
+            if (!s_noRawDedup
+                && _hasRawSubmitted
+                && !motion.HasMotion && !_lastRawHadMotion
+                && nowRawTick - _lastRawSubmitTick < SubmitKeepaliveMs
+                && RawFrameUnchanged(in raw))
+            {
+                return;
+            }
+            if (motion.HasMotion)
+            {
+                // While motion streams, dedup can never fire (the next
+                // frame's gate sees _lastRawHadMotion). Skip the three
+                // array copies; only the flags matter. The first frame
+                // AFTER motion clears re-stores a full frame below.
+                _lastRawHadMotion = true;
+                _lastRawSubmitTick = nowRawTick;
+                _hasRawSubmitted = true;
+            }
+            else
+            {
+                StoreRawFrame(in raw, hadMotion: false, nowRawTick);
+            }
+
+            short Ax(int i) => (raw.Axes != null && i >= 0 && i < raw.Axes.Length) ? raw.Axes[i] : (short)0;
+
+            // Convert raw signed short (-32768..+32767) to HM v1.3.9's
+            // unified [0..1] axis range. Stick rest is at signed 0
+            // -> 0.5, fully positive -> 1.0, fully negative -> 0.0;
+            // trigger rest is at signed -32768 -> 0.0, fully pressed
+            // (signed +32767) -> 1.0. Both shapes use the same shift
+            // because raw.Axes is already centered on signed zero for
+            // sticks (per ExtendedSlotConfig's signed-short convention)
+            // and on short.MinValue for triggers (per
+            // MapToRawTriggerAxis's released-rest contract).
+            float ToHmRange(short v) => (v + 32768f) / 65535f;
+
+            // Replicate ExtendedSlotConfig.ComputeAxisLayout. Interleaved
+            // groups of (stickX, stickY, trigger) while both sticks and
+            // triggers are available; trailing sticks (no-trigger case) pack
+            // sequentially at (prev, prev+1), trailing triggers pack one
+            // index at a time after that. Guard -1 on anything we don't have.
+            int interleave = System.Math.Min(sticks, triggers);
+            int StickX(int g) =>
+                g < interleave ? g * 3
+                : g < sticks   ? interleave * 3 + (g - interleave) * 2
+                               : -1;
+            int StickY(int g) => StickX(g) >= 0 ? StickX(g) + 1 : -1;
+            int TriggerIdx(int g) =>
+                g < interleave ? g * 3 + 2
+                : g < triggers ? interleave * 3 + System.Math.Max(0, sticks - interleave) * 2 + (g - interleave)
+                               : -1;
+
+            // HMButton is a [Flags] uint enum with named members for bits 0..12
+            // (A..Share). HidReportBuilder iterates bits 0..31 of the mask
+            // passed as (uint)state.Buttons, so any bit we set beyond 12
+            // still surfaces — it maps to the profile's corresponding
+            // descriptor button position (direct index, or via the profile's
+            // ButtonMap if one is declared). Profiles with 13+ buttons (Stadia,
+            // flight sticks, wheels, etc.) rely on this to receive inputs
+            // past the named button range. Pass through all 32 bits from
+            // the raw state mask verbatim.
+            uint buttonMask = 0;
+            for (int i = 0; i < 32; i++)
+            {
+                if (raw.IsButtonPressed(i))
+                    buttonMask |= 1u << i;
+            }
+            var buttons = (HMButton)buttonMask;
+
+            var hat = HMHat.None;
+            if (raw.Povs != null && raw.Povs.Length > 0)
+            {
+                int pov = raw.Povs[0];
+                if (pov >= 0)
+                {
+                    int octant = ((pov + 2250) / 4500) % 8;
+                    hat = octant switch
+                    {
+                        0 => HMHat.North,
+                        1 => HMHat.NorthEast,
+                        2 => HMHat.East,
+                        3 => HMHat.SouthEast,
+                        4 => HMHat.South,
+                        5 => HMHat.SouthWest,
+                        6 => HMHat.West,
+                        7 => HMHat.NorthWest,
+                        _ => HMHat.None
+                    };
+                }
+            }
+
+            // HM v1.3.9: address every analog axis the profile exposes
+            // by HMAxis key. Drive _profile.Sticks / _profile.Triggers
+            // directly — those are the SDK's authoritative per-row
+            // surface. raw.Axes is HID-convention (Y+ = down), so both
+            // stick X and stick Y use the same plain ToHmRange shift,
+            // no additional Y inversion vs. the basic SubmitGamepadState
+            // path's XInput→HID flip.
+            var profileSticks = _cachedProfileSticks;
+            var profileTriggers = _cachedProfileTriggers;
+            _axesScratch.Clear();
+            int sticksToWrite = System.Math.Min(sticks, profileSticks.Count);
+            for (int s = 0; s < sticksToWrite; s++)
+            {
+                int xi = StickX(s);
+                int yi = StickY(s);
+                if (profileSticks[s].XAxis != HMAxis.None && xi >= 0)
+                    _axesScratch[profileSticks[s].XAxis] = ToHmRange(Ax(xi));
+                if (profileSticks[s].YAxis != HMAxis.None && yi >= 0)
+                    _axesScratch[profileSticks[s].YAxis] = ToHmRange(Ax(yi));
+            }
+            for (int t = 0; t < triggers; t++)
+            {
+                int ti = TriggerIdx(t);
+                if (ti < 0) continue;
+                // The profile names a left and a right trigger and no more, so
+                // a third or fourth was built into the descriptor and shown in
+                // the grid while nothing ever wrote it. Past the named pair the
+                // axis is addressed by its declared key instead, which is what
+                // the encoder walks anyway.
+                HMAxis axis = t < profileTriggers.Count
+                    ? profileTriggers[t].Axis
+                    : DeclaredAxisAt(sticks, triggers, t);
+                if (axis != HMAxis.None)
+                    _axesScratch[axis] = ToHmRange(Ax(ti));
+            }
+
+            var state = new HMGamepadState
+            {
+                Axes = _axesScratch,
+                Buttons = buttons,
+                Hat = hat,
+            };
+
+            // IMU channel (HM v1.3.18, HM#33): MotionSnapshot is already
+            // g / deg/s in the SDL sensor frame, and the SDK's field docs
+            // direct SDL-reading consumers to submit those values
+            // VERBATIM (the per-profile packer owns the wire frame and
+            // scale, so the vector round-trips bit-consistent to SDL on
+            // the client). Zeroes when the slot maps no motion source.
+            if (motion.HasMotion)
+            {
+                state.AccelGX = motion.AccelX;
+                state.AccelGY = motion.AccelY;
+                state.AccelGZ = motion.AccelZ;
+                state.GyroDpsX = motion.GyroPitch;
+                state.GyroDpsY = motion.GyroYaw;
+                state.GyroDpsZ = motion.GyroRoll;
+            }
+
+            _controller.SubmitState(state);
+        }
+
+        /// <summary>The usage the descriptor gave trigger <paramref name="t"/>,
+        /// for the triggers past the profile's named pair.
+        ///
+        /// <para>PadForge emits this descriptor itself, so the answer is the
+        /// SDK's own allocation order rather than a guess. Sticks claim pairs
+        /// from (X, Y), (Z, Rz), (Rx, Ry), (Slider, Dial); triggers then take
+        /// whatever is left of Rx, Ry, Slider, Dial in that order; and a
+        /// trigger past the pool is declared on its own Generic Desktop usage
+        /// by CreateHMaestroController's ExtraTriggerAxis, in the same
+        /// order.</para></summary>
+        private static HMAxis DeclaredAxisAt(int sticks, int triggers, int t)
+        {
+            // Usages the sticks already hold.
+            bool rxUsed = sticks >= 3, ryUsed = sticks >= 3;
+            bool sliderUsed = sticks >= 4, dialUsed = sticks >= 4;
+            int index = 0;
+            foreach (HMAxis candidate in new[] { HMAxis.Rx, HMAxis.Ry, HMAxis.Slider, HMAxis.Dial })
+            {
+                bool taken = candidate switch
+                {
+                    HMAxis.Rx => rxUsed,
+                    HMAxis.Ry => ryUsed,
+                    HMAxis.Slider => sliderUsed,
+                    _ => dialUsed,
+                };
+                if (taken) continue;
+                if (index == t) return candidate;
+                index++;
+            }
+            // Past the pool, in ExtraTriggerAxis's order.
+            return (t - index) switch
+            {
+                0 => HMAxis.Vbrx,
+                1 => HMAxis.Vbry,
+                2 => HMAxis.Vbrz,
+                _ => HMAxis.Vno,
+            };
+        }
+
+        /// <summary>Submits a frame this process packed against the descriptor
+        /// it built, for an Extended layout the fixed gamepad state cannot
+        /// express. Data bytes only: the descriptor carries a report id only
+        /// when force feedback is on, and the driver heads the frame either
+        /// way.
+        ///
+        /// <para>Carries the idle dedup the fixed path has. The raw submit has
+        /// none of its own, so without this an Extended slot would publish at
+        /// the full poll rate whether or not anything moved.</para></summary>
+        public void SubmitPackedExtendedReport(ReadOnlySpan<byte> report)
+        {
+            if (_controller == null || report.Length == 0) return;
+            TickFfb();
+
+            long now = System.Environment.TickCount64;
+            if (_lastPackedLength == report.Length
+                && now - _lastPackedTick < SubmitKeepaliveMs
+                && report.SequenceEqual(new ReadOnlySpan<byte>(_lastPacked, 0, _lastPackedLength)))
+                return;
+
+            report.CopyTo(_lastPacked.AsSpan());
+            _lastPackedLength = report.Length;
+            _lastPackedTick = now;
+            _controller.SubmitRawReport(report);
+        }
+
+        private readonly byte[] _lastPacked = new byte[64];
+        private int _lastPackedLength;
+        private long _lastPackedTick;
+
+        /// <summary>Detaches this VC from the engine's feedback array
+        /// (audit 2026-07-25, C38). Called synchronously by
+        /// DestroyVirtualController BEFORE the motor zero: the driver-side
+        /// OutputDecoded / OutputReceived handlers die only when the async
+        /// dispose reaches _controller.Dispose() (seconds later for
+        /// xinputhid), and every one of them guards on FeedbackPadIndex,
+        /// so parking it at -1 makes late callbacks no-op instead of
+        /// repopulating a slot this VC no longer owns.</summary>
+        public void UnregisterFeedback()
+        {
+            FeedbackPadIndex = -1;
+            _fbVibrationStates = null;
+        }
+
+        public void RegisterFeedbackCallback(int padIndex, Vibration[] vibrationStates)
+        {
+            FeedbackPadIndex = padIndex;
+            // Keep the registration for the per-tick FFB re-evaluation —
+            // the packet callback below only runs when the game SENDS
+            // something, but PID effect durations expire on the device
+            // clock. Without a periodic Apply, the last computed vibration
+            // latches on the physical pad the moment a game goes quiet
+            // (discussion #125: Jedi Outcast's stuck rumble — the field log
+            // showed Apply timestamps exactly matching packet arrivals and
+            // nothing after the final packet).
+            _fbVibrationStates = vibrationStates;
+            if (_controller == null) return;
+
+            // Virtual DualSense slots get a per-VC pass-through dispatcher
+            // that forwards DS5 effect messages (Report 0x02 USB / 0x31 BT)
+            // to the assigned physical DualSense via SDL_SendGamepadEffect.
+            // Carries adaptive trigger commands, lightbar RGB, audio bytes,
+            // and rumble in a single message.  Created here so its lifetime
+            // matches the OutputReceived subscription it serves.
+            if (IsDualSenseVirtual && _ds5Dispatcher == null)
+            {
+                _ds5Dispatcher = new DualSensePassthroughDispatcher(padIndex);
+                _ds5Dispatcher.Start();
+            }
+
+            // Sony pads (DS5, DS4 in either transport) consume HM v1.3.5's
+            // OutputDecoded event for both the rumble decode AND the DS5
+            // passthrough forward. The decoded fields surface parsed
+            // `leftMotor` / `rightMotor` (transport-agnostic) plus a
+            // pre-stripped `sdlPassthrough` byte[] (47 bytes for DS5, 31
+            // for DS4) that's already in USB-equivalent form regardless
+            // of whether the host wrote Report 0x02 (USB) or Report 0x31
+            // (BT framing + CRC32). PadForge forwards `sdlPassthrough`
+            // verbatim via SDL_SendGamepadEffect — SDL handles the
+            // transport-specific framing for the destination physical pad.
+            //
+            // Compared to the prior byte-offset approach this also resolves
+            // the latent DS5 BT bug where Report 0x31's framing offset
+            // shifted every byte by two, plus the off-by-one DS4 read
+            // where the old code read the reserved byte instead of
+            // leftMotor.
+            //
+            // vibrationStates is written for every Sony virtual regardless
+            // of whether a DualSense passthrough is in flight. Step 2's
+            // ApplyForceFeedback reads it to fire SDL_RumbleJoystick on
+            // non-Sony devices on the same slot (Xbox, third-party, etc.).
+            // Double-fire on the real DualSense is prevented at a different
+            // layer: UserEffectsDispatcher's gameDrivenRumble branch zeroes
+            // the provider bytes for a passthrough target exactly while the
+            // game is writing (audit 2026-07-25, C37 replaced the old
+            // unconditional provider skip, which also killed test/macro
+            // rumble for the device), so the passthrough dispatcher carries
+            // the game's rumble and the Sony dispatcher carries the rest.
+            _controller.OutputDecoded += (ctrl, e) =>
+            {
+                int idx = FeedbackPadIndex;
+                if (idx < 0 || idx >= vibrationStates.Length) return;
+
+                // Chroma lightbar mirror (#373): every Sony profile's codec
+                // decodes a 'lightbar' rgb24 field (byte[3] R,G,B) with the
+                // per-transport offsets handled by the profile declaration,
+                // so no parser lives here. The family's validity bit says
+                // whether THIS write carries the lightbar: DualSense/Edge
+                // assert validFlag1 bit 2 (the NotifyExternalSubsystems
+                // gate), DualShock 4 asserts validFlag0 bit 1 (SDL
+                // k_EPS4EffectLED = 1 << 1). Publish is one volatile write,
+                // so an idle mirror costs nothing on this callback.
+                if (e.Fields.TryGetValue("lightbar", out var lbObj)
+                    && lbObj is byte[] lbRgb && lbRgb.Length >= 3)
+                {
+                    bool lbValid;
+                    if (IsDualSenseVirtual)
+                        lbValid = e.Fields.TryGetValue("validFlag1", out var vf1Obj)
+                            && vf1Obj is byte lbVf1 && (lbVf1 & 0x04) != 0;
+                    else
+                        lbValid = e.Fields.TryGetValue("validFlag0", out var vf0Obj)
+                            && vf0Obj is byte lbVf0 && (lbVf0 & 0x02) != 0;
+                    if (lbValid)
+                    {
+                        PadForge.Services.ChromaLightbarService.Publish(lbRgb[0], lbRgb[1], lbRgb[2]);
+                        // Lightsync lightbar mirror (#382): the Logitech
+                        // sibling rides the exact same decoded field and
+                        // validity gate, one more volatile write.
+                        PadForge.Services.LightsyncLightbarService.Publish(lbRgb[0], lbRgb[1], lbRgb[2]);
+                    }
+                }
+
+                int declaredSize = _profile.ExtendedOutputReport?.Size ?? -1;
+
+                // Order (#434): the pass-through forward and the
+                // per-subsystem mirror run BEFORE the motor gate below
+                // writes VibrationStates. The polling thread reads that
+                // array, and when a release zeroes it the thread stops the
+                // Sony timer and takes one final snapshot. That snapshot
+                // has to see the release already in the mirror, or it
+                // re-asserts the last nonzero pair with no timer left to
+                // correct it.
+                // Integrity gate on the passthrough forward (2026-07-25
+                // audit): a full-length BT report with a corrupt CRC
+                // decodes every field with CrcValid=false, and forwarding
+                // it re-frames corrupt bytes into a fresh PHYSICAL write
+                // plus poisons the grace-window subsystem mirror. The
+                // length leg covers the CrcValid-true-on-absent-footer
+                // trap exactly as the motor gate below documents. USB
+                // profiles declare no CRC, so CrcValid is trivially true
+                // there and only the length leg bites.
+                if (_ds5Dispatcher != null
+                    && _profile.VendorId == SonyVid
+                    // AT LEAST, not exactly, and > 0 so a profile with no
+                    // declared report fails closed. See SonyMotorsValid: an
+                    // equality here was unsatisfiable on every Bluetooth Sony
+                    // profile, because Windows sizes the host write to the
+                    // LARGEST declared output report (547) and the driver caps
+                    // its slot at 256, so RawBytes never equaled the 78-byte
+                    // declared size and every effect frame was dropped.
+                    && declaredSize > 0
+                    && e.RawBytes.Length >= declaredSize
+                    && e.CrcValid
+                    && e.Fields.TryGetValue("effectPayload", out var epObj)
+                    && epObj is byte[] effectPayload
+                    && effectPayload.Length > 0)
+                {
+                    _ds5Dispatcher.Enqueue(0x02, effectPayload);
+                    // Capture per-subsystem state from the external write.
+                    // The user-effects dispatcher mirrors each touched
+                    // subsystem (rumble / triggers / mic / lightbar /
+                    // player) verbatim for the grace window, while still
+                    // animating subsystems the writer didn't touch.
+                    // For a remote DualSense this merged output is forwarded at the
+                    // PlayStationEffectWriter chokepoint (issue #138), not here.
+                    UserEffectsDispatcher.NotifyExternalSubsystems(idx, effectPayload);
+                }
+
+                if (e.Fields.TryGetValue("leftMotor", out var lmObj2) && lmObj2 is byte left
+                 && e.Fields.TryGetValue("rightMotor", out var rmObj) && rmObj is byte right)
+                {
+                    // The Sony motor bytes are only TRUSTED behind the full
+                    // validity gate. The codec inserts leftMotor/rightMotor
+                    // unconditionally (report ID alone selects the decode),
+                    // but per the protocol contract (linux-hid
+                    // hid-playstation.c, dualsense_output_worker /
+                    // ds4_output_worker: motor bytes are assigned only
+                    // inside the block that asserts VALID_FLAG0 bit 0
+                    // (+bit 1 HAPTICS_SELECT on DS5), and an
+                    // audio/lightbar-only report carries motor=0 meaning
+                    // "ignore", NOT "stop"):
+                    //   1. exact declared report size (Decode silently
+                    //      skips out-of-range bytes, so a truncated BT
+                    //      report can surface partial fields);
+                    //   2. CRC valid (CrcValid alone is insufficient: it
+                    //      initializes true and is skipped when the footer
+                    //      is absent, hence the length check too);
+                    //   3. the motor-valid flag asserted. DS4 bit 0
+                    //      (0x01), DS5 bits 0/1 (0x03).
+                    // Fail any leg → PRESERVE the previous state, for BOTH
+                    // consumers: the #236 LFE pack AND the legacy
+                    // VibrationStates write (2026-07-25 audit: the write
+                    // shipped ungated, so a lightbar-only report zeroed
+                    // rumble on every non-Sony device on the slot). Flag
+                    // asserted with both bytes zero IS a real stop.
+                    // Sony pads have no trigger motors; those voices stay 0.
+                    // The DualSense is the exception on the flag leg: a
+                    // trusted frame with the rumble flags CLEAR is a stop,
+                    // not an ignore. See sonyRelease below (#434).
+                    byte motorMask = IsDualSenseVirtual ? (byte)0x03 : (byte)0x01;
+                    e.Fields.TryGetValue("validFlag0", out var vfObj);
+                    object vf2Obj = null;
+                    if (IsDualSenseVirtual) e.Fields.TryGetValue("validFlag2", out vf2Obj);
+                    bool sonyFrameValid = SonyFrameValid(e.RawBytes.Length, declaredSize, e.CrcValid);
+                    bool sonyMotorsValid = sonyFrameValid && SonyRumbleClaimed(vfObj, motorMask, vf2Obj);
+
+                    // DualSense release (#434): a trusted frame with every
+                    // rumble bit clear (validFlag0 bits 0 and 1, validFlag2
+                    // bit 2) is the firmware's stop, and the way SDL3 stops
+                    // rumble (SDL_hidapi_ps5.c HIDAPI_DriverPS5_UpdateEffects:
+                    // "Leaving emulated rumble bits off will restore audio
+                    // haptics"). Preserving the previous motors here left a
+                    // stale nonzero pair for every consumer after a game
+                    // released that way, and the Sony pass re-authored it
+                    // to the pad once the mirror's grace lapsed. The
+                    // DualShock 4 keeps the preserve rule: no reference
+                    // pins its firmware the same way.
+                    bool sonyRelease = IsDualSenseVirtual && sonyFrameValid && !sonyMotorsValid;
+                    byte motorLeft  = sonyRelease ? (byte)0 : left;
+                    byte motorRight = sonyRelease ? (byte)0 : right;
+
+                    // Non-Sony producers (Switch Pro's synthesized decode,
+                    // any future flag-less profile) keep the original
+                    // unconditional trust: the flag semantics are Sony's.
+                    if (MotorWriteAllowed(_profile.VendorId, sonyMotorsValid || sonyRelease))
+                    {
+                        vibrationStates[idx].LeftMotorSpeed  = (ushort)(motorLeft  * 257);
+                        vibrationStates[idx].RightMotorSpeed = (ushort)(motorRight * 257);
+                    }
+
+                    if (sonyMotorsValid || sonyRelease)
+                    {
+                        System.Threading.Volatile.Write(ref _inboundRumblePack,
+                            Engine.Common.LfeOutputState.Pack(
+                                (ushort)(motorLeft * 257), (ushort)(motorRight * 257), 0, 0));
+                    }
+                    else if (_profile.VendorId == NintendoVid)
+                    {
+                        // Switch Pro (HM v1.3.18): the driver decodes the
+                        // 0x01/0x10 rumble outputs itself and only emits
+                        // the motor fields for genuine rumble frames, and
+                        // this wire has no validFlag/CRC to gate on. Same
+                        // provenance as the motors above: game-authored
+                        // only, so the #236 pack rides directly.
+                        System.Threading.Volatile.Write(ref _inboundRumblePack,
+                            Engine.Common.LfeOutputState.Pack(
+                                (ushort)(left * 257), (ushort)(right * 257), 0, 0));
+                    }
+                }
+                // Both DualShock 3 (SIXAXIS) personas decode their own
+                // motor fields (TryDualShock3Motors), the plain one since
+                // HIDMaestro 1.10.1 (HIDMaestro#65), and the pair above
+                // never appears on them, so game rumble reached no consumer.
+                else if (TryDualShock3Motors(e.Fields, e.RawBytes.Length, declaredSize,
+                             out ushort ds3Large, out ushort ds3Small))
+                {
+                    vibrationStates[idx].LeftMotorSpeed = ds3Large;
+                    vibrationStates[idx].RightMotorSpeed = ds3Small;
+                    System.Threading.Volatile.Write(ref _inboundRumblePack,
+                        Engine.Common.LfeOutputState.Pack(ds3Large, ds3Small, 0, 0));
+                }
+            };
+
+            _controller.OutputReceived += (ctrl, pkt) =>
+            {
+                // Sony vendor test commands (SetFeature 0x80: deviceId,
+                // actionId, params — the report dualsense-tester /
+                // ds.daidr.me drives the firmware 1 kHz sine generator,
+                // speaker/headphone routing, and calibration actions
+                // through). Forward to the assigned physical DualSense so
+                // the test works through the virtual pad. Report 0x80 only:
+                // PID FFB feature writes (0x11 Create New Effect) ride the
+                // same HidFeature source and belong to the decoder below.
+                // GetFeature (0x81 response) round-trips are NOT forwarded —
+                // the driver serves feature reads synchronously and has no
+                // deferred-response path; fire-and-forget commands like the
+                // sine test don't need one.
+                if (_ds5Dispatcher != null
+                    && pkt.Source == HMOutputSource.HidFeature
+                    && pkt.ReportId == 0x80)
+                {
+                    _ds5Dispatcher.EnqueueFeature(pkt.ReportId, pkt.Data.Span);
+                    return;
+                }
+
+                int idx = FeedbackPadIndex;
+
+                // Evidence line (#350): every output packet, before any
+                // gate, so a packet dropped by the pad-index guard or
+                // decoded by another branch still shows its shape.
+                {
+                    // Shape only, never the payload: hashing the motor
+                    // magnitudes made every rumble frame a "new shape" and
+                    // flooded the 500-line diagnostics ring at rumble rate,
+                    // evicting the context these lines exist to preserve.
+                    var dspan = pkt.Data.Span;
+                    int sig = ((int)pkt.Source << 24) ^ (pkt.ReportId << 16) ^ dspan.Length;
+                    if (sig != _lastFfbAnyTraceSig)
+                    {
+                        _lastFfbAnyTraceSig = sig;
+                        var hex = new System.Text.StringBuilder(24);
+                        for (int i = 0; i < dspan.Length && i < 12; i++)
+                            hex.Append(dspan[i].ToString("X2")).Append(' ');
+                        Engine.SdlDiagLog.WriteLine(
+                            $"FFBANY idx={idx} src={pkt.Source} rid=0x{pkt.ReportId:X2} len={dspan.Length} bytes={hex.ToString().TrimEnd()}");
+                    }
+                }
+
+                if (idx < 0 || idx >= vibrationStates.Length) return;
+
+                var data = pkt.Data.Span;
+                bool isXbox = HMaestroProfileCatalog.IsXboxProfile(_profile);
+
+                // XInput vibration packet (IOCTL_XUSB_SET_STATE):
+                // [00, 08, leftHi, rightHi, reserved]. Chromium browser
+                // Gamepad API sends dual-rumble through this path with
+                // alternating hi=127 / hi=0 — that's a square-wave
+                // duty cycle, not keepalive noise; don't filter zeros.
+                //
+                // The XUSB SET_STATE wire struct is FIVE bytes and byte 4
+                // is a FLAGS byte (OpenXInput src/OpenXinput.cpp
+                // InSetState_t: deviceIndex, ledState, leftMotorSpeed,
+                // rightMotorSpeed, flags, with 0x01 = LED and 0x02 =
+                // VIBRATION). No extended vibration form exists on this
+                // wire: OpenXInput reimplements the whole protocol and has
+                // no trigger motors, and real impulse-trigger writes arrive
+                // on the 7-byte HID 0x0F lane below (probed 2026-05-19 and
+                // re-probed 2026-08-29).
+                //
+                // An earlier read here treated a payload of 7 or more bytes
+                // as "XINPUT_VIBRATION_EX" and took bytes 4 and 5 as
+                // trigger motors. HM forwards the caller's buffer verbatim
+                // at whatever size the caller supplied, so any stack that
+                // pads the struct handed the FLAGS byte (0x02, or 0x03 with
+                // LED) to the trigger lane, and the Sony impulse-AT pass
+                // turned even that value into an ENGAGED vibration-mode
+                // adaptive trigger on a DualSense: a faint buzz that
+                // resists the pull, on Virtual Xbox 360 slots only, exactly
+                // discussion #350's report.
+                if (pkt.Source == HMOutputSource.XInput && data.Length >= 5)
+                {
+                    // Evidence line for the XUSB dialect question (#350): the
+                    // wire has more than one SET_STATE shape and the length
+                    // gate below decides which bytes are trigger motors, so
+                    // record what actually arrives. Signature-gated so a
+                    // per-frame XInputSetState logs once per shape, not per
+                    // call.
+                    {
+                        // Length IS the dialect (the #350 question is who
+                        // pads the buffer), and the hex line prints every
+                        // byte when it fires, so no payload joins the hash
+                        // (see the FFBANY shape-only note above). The prior
+                        // contract holds too: nothing in this branch reads
+                        // past byte 3.
+                        int sig = data.Length;
+                        if (sig != _lastXusbTraceSig)
+                        {
+                            _lastXusbTraceSig = sig;
+                            var hex = new System.Text.StringBuilder(data.Length * 3);
+                            for (int i = 0; i < data.Length && i < 12; i++)
+                                hex.Append(data[i].ToString("X2")).Append(' ');
+                            Engine.SdlDiagLog.WriteLine(
+                                $"FFBXIN slot={idx} len={data.Length} bytes={hex.ToString().TrimEnd()}");
+                        }
+                    }
+                    // An LED-only SET_STATE is not a motor frame. The five-byte
+                    // input struct carries flags in byte 4 (0x01 LED, 0x02
+                    // vibration), and the reference client's own LED writer sends
+                    // exactly that shape with both motors zeroed on device add, on
+                    // destroy and on the port flip-flop. Decoding it as a vibration
+                    // write cut a game's rumble every time any client touched the
+                    // LED ring. Only the exact five-byte form is gated: at longer
+                    // lengths the dialect is unsettled (#350) and byte 4 is not
+                    // reliably the flags byte, so those keep the prior behavior.
+                    if (data.Length == 5 && (data[4] & 0x02) == 0 && (data[4] & 0x01) != 0)
+                        return;
+
+                    vibrationStates[idx].LeftMotorSpeed = (ushort)(data[2] * 257);
+                    vibrationStates[idx].RightMotorSpeed = (ushort)(data[3] * 257);
+
+                    // This wire carries no trigger motors, so an XUSB
+                    // vibration write always clears them.
+                    vibrationStates[idx].LeftTriggerMotorSpeed = 0;
+                    vibrationStates[idx].RightTriggerMotorSpeed = 0;
+                    // Inbound pack (#236): same decode, controller-local.
+                    // Zeros pass through unfiltered (the square-wave duty
+                    // cycle note above applies to the audio path too).
+                    System.Threading.Volatile.Write(ref _inboundRumblePack,
+                        Engine.Common.LfeOutputState.Pack(
+                            (ushort)(data[2] * 257), (ushort)(data[3] * 257),
+                            0, 0));
+                    return;
+                }
+
+                // Steam Deck persona haptics (#338). Steam drives a Deck's
+                // rumble with vendor feature commands on the controller
+                // interface, decoded byte-for-byte per HandheldCompanion's
+                // SteamDeckTarget.HandleOutput (proven against live Steam):
+                // 0xEB trigger rumble (u16 speeds at 5/7), 0xEA haptic
+                // (intensity at 4 plus signed gain at 5, x8), 0x8F the
+                // classic pulse train (period u16 at 5, count u16 at 7,
+                // gain at 9). The persona's reports are id-less, so the
+                // command byte is data[0] and pkt.ReportId is 0.
+                // Through the shared predicate, so the profile id is spelled
+                // once. The Bass Shakers gate asks the same question, and two
+                // spellings would let the gate fall behind the decode.
+                if (pkt.Source == HMOutputSource.HidFeature
+                    && DecodesFeedbackWithoutPidBlock(_profile.Id)
+                    && data.Length >= 1)
+                {
+                    switch (data[0])
+                    {
+                        case 0xEB when data.Length >= 9:
+                        {
+                            ushort left = (ushort)(data[5] | (data[6] << 8));
+                            ushort right = (ushort)(data[7] | (data[8] << 8));
+                            // HC scales /256 to a byte then back out; keep
+                            // the u16 precision and land it directly.
+                            vibrationStates[idx].LeftMotorSpeed = left;
+                            vibrationStates[idx].RightMotorSpeed = right;
+                            System.Threading.Interlocked.Increment(ref _feedbackGeneration);
+                            System.Threading.Volatile.Write(ref _inboundRumblePack,
+                                Engine.Common.LfeOutputState.Pack(left, right, 0, 0));
+                            return;
+                        }
+                        case 0xEA when data.Length >= 6:
+                        {
+                            int v = data[4] + unchecked((sbyte)data[5]) * 8;
+                            ushort mag = (ushort)(Math.Clamp(v, 0, 255) * 257);
+                            vibrationStates[idx].LeftMotorSpeed = mag;
+                            vibrationStates[idx].RightMotorSpeed = mag;
+                            System.Threading.Interlocked.Increment(ref _feedbackGeneration);
+                            System.Threading.Volatile.Write(ref _inboundRumblePack,
+                                Engine.Common.LfeOutputState.Pack(mag, mag, 0, 0));
+                            return;
+                        }
+                        case 0x8F when data.Length >= 10:
+                        {
+                            ushort period = (ushort)(data[5] | (data[6] << 8));
+                            ushort count = (ushort)(data[7] | (data[8] << 8));
+                            ushort mag = (ushort)(Math.Min(255, count * 16 + data[9]) * 257);
+                            vibrationStates[idx].LeftMotorSpeed = mag;
+                            vibrationStates[idx].RightMotorSpeed = mag;
+                            System.Threading.Volatile.Write(ref _inboundRumblePack,
+                                Engine.Common.LfeOutputState.Pack(mag, mag, 0, 0));
+                            // A pulse train is finite: stop when it ends, the
+                            // way HC does, and yield to any newer command.
+                            //
+                            // The yield used to be a magnitude compare, which
+                            // cannot tell a newer pulse of equal amplitude
+                            // from the one it queued against: two pulses of
+                            // the same strength and different lengths each
+                            // cut the other short. The generation is stamped
+                            // by every accepted feedback update, so only the
+                            // pulse that queued this stop can still own it.
+                            //
+                            // The slot is re-read rather than captured, too.
+                            // Unregister parks the index at -1 precisely so
+                            // late callbacks no-op, and a reorder moves it, so
+                            // a captured index landed on whatever successor
+                            // held that slot durMs later.
+                            long myGen = System.Threading.Interlocked.Increment(ref _feedbackGeneration);
+                            int durMs = Math.Max(1, (int)Math.Ceiling(period * (long)count / 1000.0));
+                            _ = System.Threading.Tasks.Task.Delay(durMs).ContinueWith(_ =>
+                            {
+                                try
+                                {
+                                    int liveIdx = FeedbackPadIndex;
+                                    if (System.Threading.Volatile.Read(ref _feedbackGeneration) == myGen
+                                        && liveIdx == idx
+                                        && liveIdx >= 0 && liveIdx < vibrationStates.Length)
+                                    {
+                                        vibrationStates[liveIdx].LeftMotorSpeed = 0;
+                                        vibrationStates[liveIdx].RightMotorSpeed = 0;
+                                        System.Threading.Volatile.Write(ref _inboundRumblePack,
+                                            Engine.Common.LfeOutputState.Pack(0, 0, 0, 0));
+                                    }
+                                }
+                                catch { }
+                            });
+                            return;
+                        }
+                    }
+                    // An unrecognized command (settings writes, mappings,
+                    // heartbeats) is Steam configuring the pad; nothing to
+                    // apply on the feedback side.
+                    return;
+                }
+
+                // Xbox Series BT browser-Gamepad / Game Controller Tester
+                // / Game Pass app short HID rumble:
+                // [trigL, trigR, motorL, motorR, dur, delay, loop].
+                // Same shape as SDL3 HIDAPI's HIDAPI_DriverXboxOne_UpdateRumble
+                // outbound payload with the 2-byte header (0x03 0x0F)
+                // stripped. Motors are 0..100; scale to ushort (~655x).
+                //
+                // Probe data 2026-05-19 (1518 captures during Game
+                // Controller Tester impulse-trigger run, all len=7,
+                // src=HidOutput): nonzero trigger values consistently
+                // land at bytes 0/1, never at bytes 2/3, and the
+                // tail bytes 4/5/6 are constant 0xFF 0x00 0xEB markers.
+                // The previous parser shape read motorL/motorR but
+                // dropped the trigger bytes entirely — fixed by also
+                // surfacing data[0]/data[1] as impulse trigger motors.
+                if (isXbox
+                    && pkt.Source == HMOutputSource.HidOutput
+                    && data.Length >= 4
+                    && data.Length < 8)
+                {
+                    vibrationStates[idx].LeftTriggerMotorSpeed = (ushort)(data[0] * 655);
+                    vibrationStates[idx].RightTriggerMotorSpeed = (ushort)(data[1] * 655);
+                    vibrationStates[idx].LeftMotorSpeed = (ushort)(data[2] * 655);
+                    vibrationStates[idx].RightMotorSpeed = (ushort)(data[3] * 655);
+                    // Inbound pack (#236): same decode, controller-local.
+                    System.Threading.Volatile.Write(ref _inboundRumblePack,
+                        Engine.Common.LfeOutputState.Pack(
+                            (ushort)(data[2] * 655), (ushort)(data[3] * 655),
+                            (ushort)(data[0] * 655), (ushort)(data[1] * 655)));
+                    return;
+                }
+
+                // Xbox wired / wireless-receiver legacy HID rumble:
+                // motor magnitudes at vendor-specific bytes 5/6.
+                if (isXbox
+                    && pkt.Source == HMOutputSource.HidOutput
+                    && data.Length >= 8)
+                {
+                    vibrationStates[idx].LeftMotorSpeed = (ushort)(data[5] * 257);
+                    vibrationStates[idx].RightMotorSpeed = (ushort)(data[6] * 257);
+                    // Inbound pack (#236): body motors only, exactly like
+                    // the physical decode above. This packet shape carries
+                    // no trigger bytes, so the trigger voices PRESERVE
+                    // their previous values rather than inventing a stop.
+                    long prevPack = System.Threading.Volatile.Read(ref _inboundRumblePack);
+                    System.Threading.Volatile.Write(ref _inboundRumblePack,
+                        Engine.Common.LfeOutputState.Pack(
+                            (ushort)(data[5] * 257), (ushort)(data[6] * 257),
+                            Engine.Common.LfeOutputState.TriggerLeft(prevPack),
+                            Engine.Common.LfeOutputState.TriggerRight(prevPack)));
+                    return;
+                }
+
+                // PID FFB-capable profile (Custom synthetic, catalog
+                // profile with the FFB block in its descriptor, OR a
+                // Customized+FFB Extended slot rebuilt with
+                // AddPidFfbBlock). Decode Set Effect / Set Constant /
+                // Set Periodic / Set Condition / Effect Operation /
+                // Block Free / Device Control / Device Gain. Apply()
+                // aggregates running effects into the Vibration with
+                // directional + condition data so
+                // SetDirectionalHapticForces routes DirectInput FFB to
+                // physical wheels and sticks. Gate is descriptor
+                // presence, not VID — catalog profiles keep their
+                // original VID/PID.
+                if (_ffbDecoder != null)
+                {
+                    if (pkt.Source == HMOutputSource.HidOutput)
+                    {
+                        _ffbDecoder.OnHidOutput(pkt.ReportId, data);
+                        _ffbDecoder.Apply(vibrationStates[idx]);
+                        return;
+                    }
+                    if (pkt.Source == HMOutputSource.HidFeature)
+                    {
+                        _ffbDecoder.OnHidFeature(pkt.ReportId, data);
+                        return;
+                    }
+                }
+            };
+        }
+
+        private static HMButton MapButtons(in Gamepad gp)
+        {
+            ushort xinputButtons = gp.Buttons;
+            HMButton b = HMButton.None;
+            if ((xinputButtons & Gamepad.A) != 0) b |= HMButton.A;
+            if ((xinputButtons & Gamepad.B) != 0) b |= HMButton.B;
+            if ((xinputButtons & Gamepad.X) != 0) b |= HMButton.X;
+            if ((xinputButtons & Gamepad.Y) != 0) b |= HMButton.Y;
+            if ((xinputButtons & Gamepad.LEFT_SHOULDER) != 0) b |= HMButton.LeftBumper;
+            if ((xinputButtons & Gamepad.RIGHT_SHOULDER) != 0) b |= HMButton.RightBumper;
+            if ((xinputButtons & Gamepad.BACK) != 0) b |= HMButton.Back;
+            if ((xinputButtons & Gamepad.START) != 0) b |= HMButton.Start;
+            if ((xinputButtons & Gamepad.LEFT_THUMB) != 0) b |= HMButton.LeftStick;
+            if ((xinputButtons & Gamepad.RIGHT_THUMB) != 0) b |= HMButton.RightStick;
+            if ((xinputButtons & Gamepad.GUIDE) != 0) b |= HMButton.Guide;
+            if ((xinputButtons & Gamepad.TOUCHPAD) != 0) b |= HMButton.Touchpad;
+            // HMButton.Share — Xbox Series Share button. HM silently drops
+            // the bit on profiles whose descriptor doesn't declare button
+            // 13 (Xbox 360 / Xbox One / DualShock 4 / DualSense / etc.),
+            // so this set is safe to do unconditionally.
+            if (gp.Share) b |= HMButton.Share;
+            // DualSense mic mute rides Misc1, SDL's own role for it
+            // (misc1:b12 in the PS5 mapping string), the Edge back
+            // paddles ride HM's side-named paddle pair, and the Edge Fn
+            // pair rides the second pair HM v1.5.1 added for it (HM#48),
+            // SDL's LEFT_PADDLE2 / RIGHT_PADDLE2. All five are safe to
+            // set unconditionally: since v1.5.1 the buttonMaps carry an
+            // explicit -1 for bits a profile does not declare, which is
+            // also what ended the identity fallthrough that had Share
+            // pressing PS on every Sony pad.
+            if (gp.MicMute) b |= HMButton.Misc1;
+            if (gp.LeftPaddle) b |= HMButton.LeftPaddle;
+            if (gp.RightPaddle) b |= HMButton.RightPaddle;
+            if (gp.LeftFunction) b |= HMButton.LeftPaddle2;
+            if (gp.RightFunction) b |= HMButton.RightPaddle2;
+            return b;
+        }
+
+        /// <summary>The Sony motor trust gate (#236 / 2026-07-25 audit), as
+        /// one pure predicate so tests can pin its legs: exact declared
+        /// report size (a truncated BT report surfaces partial fields AND
+        /// CrcValid=true, since the codec skips CRC when the footer is out
+        /// of range), CRC valid, and the motor-valid flag asserted (DS4
+        /// mask 0x01, DS5 mask 0x03, per linux-hid hid-playstation.c). A
+        /// failing gate means PRESERVE previous motors, never stop.</summary>
+        /// <para>The length leg is AT LEAST, not exactly. Its job is to prove
+        /// the declared report's bytes are all present so the CRC footer is in
+        /// range, and an equality made that unsatisfiable on Bluetooth. A BT
+        /// DualSense descriptor declares nine output reports (0x31..0x39, up to
+        /// 546 payload bytes), so Windows requires every host write to be
+        /// OutputReportByteLength = 547 whichever report is being sent. The
+        /// driver forwards wrSize-1 = 546 clamped to its 256-byte slot cap, so
+        /// RawBytes arrives at 257 against a declaredSize of 78 and the
+        /// equality could never hold. That silently failed the gate on every
+        /// BT frame: no rumble, no lightbar, no adaptive triggers, and no
+        /// VibrationStates write for any device on the slot. USB is unaffected
+        /// either way (one 48-byte report, 48 == 48 == >=48).</para>
+        ///
+        /// <para>declaredSize &gt; 0 is required, not decorative: it is -1 when
+        /// the profile declares no extended output report, and a bare
+        /// "&gt;= -1" would fail OPEN for exactly the profiles that have no
+        /// report to validate against.</para>
+        internal static bool SonyMotorsValid(
+            int rawByteCount, int declaredSize, bool crcValid, object validFlag0, byte motorMask)
+            => SonyFrameValid(rawByteCount, declaredSize, crcValid)
+            && SonyRumbleClaimed(validFlag0, motorMask, null);
+
+        /// <summary>The trust legs that do not depend on the flags: a
+        /// declared report, at least that many bytes, and a valid CRC.</summary>
+        internal static bool SonyFrameValid(int rawByteCount, int declaredSize, bool crcValid)
+            => declaredSize > 0
+            && rawByteCount >= declaredSize
+            && crcValid;
+
+        /// <summary>Whether a Sony output frame claims the motors: the
+        /// motor mask in validFlag0 (DS4 bit 0, DS5 bits 0 and 1), or on
+        /// the DualSense the improved emulation bit, validFlag2 bit 2,
+        /// which a writer on firmware 2.24 or newer can select alone
+        /// (SDL3 SDL_hidapi_ps5.c ucEnableBits3 0x04, Linux
+        /// DS_OUTPUT_VALID_FLAG2_COMPATIBLE_VIBRATION2). Pass null for
+        /// validFlag2 on profiles that do not decode it.</summary>
+        internal static bool SonyRumbleClaimed(object validFlag0, byte motorMask, object validFlag2)
+            => (validFlag0 is byte vf && (vf & motorMask) != 0)
+            || (validFlag2 is byte vf2 && (vf2 & 0x04) != 0);
+
+        /// <summary>The motors a DualShock 3 output report sets, decoded by
+        /// both DualShock 3 (SIXAXIS) profiles at the bytes hid-sony's
+        /// struct sixaxis_rumble names: rightMotorOn is the small
+        /// (high-frequency) motor, on or off, and leftMotorForce the large
+        /// (low-frequency) motor, 0 to 255. SDL's PS3 driver writes the same
+        /// two bytes (SDL_hidapi_ps3.c HIDAPI_DriverPS3_UpdateEffects:
+        /// rumble_right ? 1 : 0, then rumble_left). The report has no
+        /// validity flags. Both hosts send the whole report, motors
+        /// included, with every LED change, so a full-length frame is the
+        /// current motor state, and a stop is a frame with both motors
+        /// off.</summary>
+        internal static bool TryDualShock3Motors(IReadOnlyDictionary<string, object> fields,
+            int rawLength, int declaredSize, out ushort large, out ushort small)
+        {
+            large = small = 0;
+            if (fields == null || declaredSize <= 0 || rawLength < declaredSize) return false;
+            if (!fields.TryGetValue("leftMotorForce", out var forceObj) || forceObj is not byte force) return false;
+            if (!fields.TryGetValue("rightMotorOn", out var onObj) || onObj is not byte on) return false;
+            large = (ushort)(force * 257);
+            small = on != 0 ? ushort.MaxValue : (ushort)0;
+            return true;
+        }
+
+        /// <summary>Whether a decoded motor pair may land in
+        /// VibrationStates: Sony profiles require the full trust gate; any
+        /// other vendor (Switch Pro's synthesized decode, future flag-less
+        /// profiles) keeps unconditional trust, because the validity-flag
+        /// semantics are Sony's.</summary>
+        internal static bool MotorWriteAllowed(ushort vendorId, bool sonyMotorsValid)
+            => vendorId != SonyVid || sonyMotorsValid;
+
+        /// <summary>True when the descriptor declares a HID PID FFB block.
+        /// Detected by the canonical opening signature
+        /// <c>05 0F 09 21 A1 02</c> — Usage Page (Physical Interface),
+        /// Usage (Set Effect Report), Collection (Logical) — which begins
+        /// <see cref="HidDescriptorBuilder.MinimumViablePidFfbBlock"/>. The
+        /// Physical Interface usage page (0x0F) is reserved for PID and
+        /// doesn't appear in non-FFB controller descriptors, so the leading
+        /// pair alone would suffice; matching three bytes deeper just makes
+        /// false positives from coincidental byte sequences impossible.
+        /// Returns false when the descriptor hex is empty/null.</summary>
+        internal static bool DescriptorHasPidFfbBlock(string descriptorHex)
+        {
+            if (string.IsNullOrEmpty(descriptorHex)) return false;
+            // Detect the PID FFB Set Effect Report Collection signature:
+            //   09 21        Usage (Set Effect Report)            -- PID 0x21
+            //   A1 02        Collection (Logical)
+            // Every HID PID FFB descriptor — synthetic or hand-authored —
+            // emits this collection inside the PID Usage Page. Matching
+            // it directly also catches descriptors that declare Usage
+            // Page 0x0F once at the top of their PID block and then have
+            // intervening C0 end-collections before each sub-report
+            // (SideWinder Force Feedback 2 is the canonical case: the
+            // earlier check for the literal "050f0921a102" sequence
+            // wanted Usage Page directly adjacent to the Set Effect
+            // collection, which AddPidFfbBlock-built profiles satisfy
+            // but hand-authored ones don't). False-positive risk is
+            // negligible — Usage 0x21 with a Logical Collection has no
+            // common meaning outside the PID page.
+            return descriptorHex.IndexOf("0921a102", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static HMHat MapHat(ushort xinputButtons)
+        {
+            bool up = (xinputButtons & Gamepad.DPAD_UP) != 0;
+            bool down = (xinputButtons & Gamepad.DPAD_DOWN) != 0;
+            bool left = (xinputButtons & Gamepad.DPAD_LEFT) != 0;
+            bool right = (xinputButtons & Gamepad.DPAD_RIGHT) != 0;
+
+            if (up && right) return HMHat.NorthEast;
+            if (up && left) return HMHat.NorthWest;
+            if (down && right) return HMHat.SouthEast;
+            if (down && left) return HMHat.SouthWest;
+            if (up) return HMHat.North;
+            if (down) return HMHat.South;
+            if (left) return HMHat.West;
+            if (right) return HMHat.East;
+            return HMHat.None;
+        }
+    }
+}

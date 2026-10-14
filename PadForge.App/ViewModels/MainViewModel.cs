@@ -1,0 +1,571 @@
+using System;
+using System.Collections.ObjectModel;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using PadForge.Common.Input;
+using PadForge.Engine;
+using PadForge.Resources.Strings;
+
+namespace PadForge.ViewModels
+{
+    /// <summary>
+    /// ViewModel for a single virtual controller sidebar entry.
+    /// Line 1: "Virtual Controller N"
+    /// Line 2: [type icon] #instance_number
+    /// </summary>
+    public class NavControllerItemViewModel : ObservableObject
+    {
+        public NavControllerItemViewModel(int padIndex)
+        {
+            PadIndex = padIndex;
+            _slotNumber = 1;
+            _instanceLabel = "1";
+            _iconKey = "XboxControllerIcon";
+        }
+
+        /// <summary>Zero-based pad slot index (0–15).</summary>
+        public int PadIndex { get; }
+
+        /// <summary>Navigation tag for this item ("Pad1"–"Pad16").</summary>
+        public string Tag => $"Pad{PadIndex + 1}";
+
+        private int _slotNumber;
+        /// <summary>Overall controller number among active slots (1-based).</summary>
+        public int SlotNumber
+        {
+            get => _slotNumber;
+            set => SetProperty(ref _slotNumber, value);
+        }
+
+        private string _instanceLabel;
+        /// <summary>Per-type instance number label (e.g., "#1", "#2").</summary>
+        public string InstanceLabel
+        {
+            get => _instanceLabel;
+            set => SetProperty(ref _instanceLabel, value);
+        }
+
+        private string _iconKey;
+        /// <summary>Resource key for the controller type icon (e.g., "XboxControllerIcon").</summary>
+        public string IconKey
+        {
+            get => _iconKey;
+            set => SetProperty(ref _iconKey, value);
+        }
+
+        private bool _isEnabled = true;
+        /// <summary>Whether this virtual controller slot is enabled.</summary>
+        public bool IsEnabled
+        {
+            get => _isEnabled;
+            set => SetProperty(ref _isEnabled, value);
+        }
+
+        private int _connectedDeviceCount;
+        /// <summary>Number of mapped physical devices that are currently connected.</summary>
+        public int ConnectedDeviceCount
+        {
+            get => _connectedDeviceCount;
+            set => SetProperty(ref _connectedDeviceCount, value);
+        }
+
+        private int _mappedDeviceCount;
+        /// <summary>Number of physical devices assigned to this slot in config
+        /// (regardless of whether they are currently connected). Lets the mini card
+        /// tell "assigned but awaiting" (idle) from "nothing assigned" (cold), the
+        /// same split the Dashboard card makes.</summary>
+        public int MappedDeviceCount
+        {
+            get => _mappedDeviceCount;
+            set => SetProperty(ref _mappedDeviceCount, value);
+        }
+
+        private bool _isInitializing;
+        /// <summary>Whether the virtual controller for this slot is currently initializing.</summary>
+        public bool IsInitializing
+        {
+            get => _isInitializing;
+            set => SetProperty(ref _isInitializing, value);
+        }
+
+        private bool _isVirtualControllerConnected;
+        /// <summary>
+        /// Whether the live virtual controller for this slot is currently
+        /// alive (created and reporting IsConnected). Drives the sidebar
+        /// indicator's green-vs-yellow decision so the slot stays green
+        /// during the HM-inactivity grace period (VC alive, devices offline)
+        /// and only turns yellow when the timeout actually fires and the VC
+        /// is torn down.
+        /// </summary>
+        public bool IsVirtualControllerConnected
+        {
+            get => _isVirtualControllerConnected;
+            set => SetProperty(ref _isVirtualControllerConnected, value);
+        }
+
+        private bool _isCreateFailed;
+        /// <summary>Whether the slot's latest virtual-controller create
+        /// attempt failed (engine createFailed latch). Distinct from
+        /// awaiting devices: the flame tooltip must not blame absent
+        /// devices for a failed create.</summary>
+        public bool IsCreateFailed
+        {
+            get => _isCreateFailed;
+            set => SetProperty(ref _isCreateFailed, value);
+        }
+    }
+
+    /// <summary>
+    /// Root ViewModel for the application. Manages navigation state,
+    /// the collection of 16 pad ViewModels, and app-wide status information.
+    /// Serves as the DataContext for MainWindow.
+    /// </summary>
+    public partial class MainViewModel : ViewModelBase
+    {
+        // ─────────────────────────────────────────────
+        //  Constructor
+        // ─────────────────────────────────────────────
+
+        public MainViewModel()
+        {
+            Title = Strings.Instance.Common_PadForge;
+
+            // Create pad ViewModels (one per virtual controller slot).
+            for (int i = 0; i < Common.Input.InputManager.MaxPads; i++)
+            {
+                Pads.Add(new PadViewModel(i));
+            }
+
+            Dashboard = new DashboardViewModel();
+            Devices = new DevicesViewModel();
+            Settings = new SettingsViewModel();
+            // Remote Link's peer/identity state lives on Settings but is shown in the
+            // Dashboard's Remote Link section (issue #138), so expose it there.
+            Dashboard.RemoteLink = Settings;
+
+            // Default to Dashboard page.
+            _selectedNavTag = "Dashboard";
+        }
+
+        protected override void OnCultureChanged()
+        {
+            Title = Strings.Instance.Common_PadForge;
+            RefreshEngineStatus();
+        }
+
+        // ─────────────────────────────────────────────
+        //  Child ViewModels
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// The 16 virtual controller pad ViewModels (Virtual Controller 1–16).
+        /// </summary>
+        public ObservableCollection<PadViewModel> Pads { get; } = new ObservableCollection<PadViewModel>();
+
+        /// <summary>
+        /// Sidebar navigation items for virtual controller slots that have mapped devices.
+        /// Dynamically rebuilt when device assignments change.
+        /// </summary>
+        public ObservableCollection<NavControllerItemViewModel> NavControllerItems { get; } = new ObservableCollection<NavControllerItemViewModel>();
+
+        /// <summary>
+        /// Raised once after <see cref="RefreshNavControllerItems"/> finishes all
+        /// collection changes. MainWindow subscribes to this instead of
+        /// <c>NavControllerItems.CollectionChanged</c> to avoid multiple rapid
+        /// sidebar rebuilds that corrupt WPF UI's internal ItemsRepeater.
+        /// </summary>
+        public event EventHandler NavControllerItemsRefreshed;
+
+        /// <summary>
+        /// Rebuilds the sidebar controller entries based on which slots are created,
+        /// and computes per-type instance numbers.
+        /// </summary>
+        public void RefreshNavControllerItems()
+        {
+            // Build the active-slot list by concatenating each group's order
+            // list in fixed group order (Xbox → PlayStation → Extended →
+            // KbM → MIDI). Slot indices are stable identifiers; each group
+            // owns its own visual ordering.
+            var activeSlots = new System.Collections.Generic.List<int>();
+            foreach (var groupType in Engine.VirtualControllerGroups.InOrder)
+            {
+                foreach (int padIndex in SettingsManager.SlotOrders.GetOrderFor(groupType))
+                {
+                    if (padIndex >= 0
+                        && padIndex < Pads.Count
+                        && SettingsManager.SlotCreated[padIndex])
+                    {
+                        activeSlots.Add(padIndex);
+                    }
+                }
+            }
+
+            // Check if the set of active slots has changed.
+            bool slotsChanged = activeSlots.Count != NavControllerItems.Count;
+            if (!slotsChanged)
+            {
+                for (int i = 0; i < activeSlots.Count; i++)
+                {
+                    if (NavControllerItems[i].PadIndex != activeSlots[i])
+                    {
+                        slotsChanged = true;
+                        break;
+                    }
+                }
+            }
+
+            if (slotsChanged)
+            {
+                NavControllerItems.Clear();
+                foreach (int slot in activeSlots)
+                    NavControllerItems.Add(new NavControllerItemViewModel(slot));
+            }
+
+            // Compute global slot number and per-type instance numbers.
+            int xboxCount = 0;
+            int playstationCount = 0;
+            int nintendoCount = 0;
+            int extendedCount = 0;
+            int midiCount = 0;
+            int kbmCount = 0;
+            int vrCount = 0;
+            int globalCount = 0;
+
+            foreach (var nav in NavControllerItems)
+            {
+                globalCount++;
+                nav.SlotNumber = globalCount;
+
+                var pad = Pads[nav.PadIndex];
+                string iconKey;
+                int instanceNum;
+
+                switch (pad.OutputType)
+                {
+                    case VirtualControllerType.PlayStation:
+                        playstationCount++;
+                        instanceNum = playstationCount;
+                        iconKey = "DS4ControllerIcon";
+                        break;
+                    case VirtualControllerType.Nintendo:
+                        nintendoCount++;
+                        instanceNum = nintendoCount;
+                        iconKey = "NintendoControllerIcon";
+                        break;
+                    case VirtualControllerType.Extended:
+                        extendedCount++;
+                        instanceNum = extendedCount;
+                        iconKey = "ExtendedControllerIcon";
+                        break;
+                    case VirtualControllerType.Midi:
+                        midiCount++;
+                        instanceNum = midiCount;
+                        iconKey = "MidiControllerIcon";
+                        break;
+                    case VirtualControllerType.KeyboardMouse:
+                        kbmCount++;
+                        instanceNum = kbmCount;
+                        iconKey = "KeyboardMouseControllerIcon";
+                        break;
+                    case VirtualControllerType.Vr:
+                        vrCount++;
+                        instanceNum = vrCount;
+                        iconKey = "VrControllerIcon";
+                        break;
+                    default:
+                        xboxCount++;
+                        instanceNum = xboxCount;
+                        iconKey = "XboxControllerIcon";
+                        break;
+                }
+
+                nav.InstanceLabel = instanceNum.ToString();
+                nav.IconKey = iconKey;
+                nav.IsEnabled = SettingsManager.SlotEnabled[nav.PadIndex];
+
+                // Update PadViewModel's display label and type instance number.
+                pad.Title = string.Format(Strings.Instance.Main_VirtualController_Format, globalCount);
+                pad.SlotLabel = string.Format(Strings.Instance.Main_VirtualController_Format, globalCount);
+                pad.TypeInstanceLabel = instanceNum.ToString();
+            }
+
+            // Only trigger a full sidebar rebuild when slots were added/removed.
+            // Property-only changes (icon, label, enabled) are handled in-place
+            // by the PropertyChanged subscriptions wired in RebuildControllerSection.
+            if (slotsChanged)
+                NavControllerItemsRefreshed?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>Dashboard overview ViewModel.</summary>
+        public DashboardViewModel Dashboard { get; }
+
+        /// <summary>Devices list ViewModel.</summary>
+        public DevicesViewModel Devices { get; }
+
+        /// <summary>Application settings ViewModel.</summary>
+        public SettingsViewModel Settings { get; }
+
+        // ─────────────────────────────────────────────
+        //  Navigation
+        // ─────────────────────────────────────────────
+
+        private string _selectedNavTag;
+
+        /// <summary>
+        /// The tag string of the currently selected navigation item.
+        /// Used by MainWindow to determine which page to display.
+        /// Values: "Dashboard", "Pad1"–"Pad16", "Devices", "Settings", "About"
+        /// </summary>
+        public string SelectedNavTag
+        {
+            get => _selectedNavTag;
+            set
+            {
+                if (SetProperty(ref _selectedNavTag, value))
+                {
+                    OnPropertyChanged(nameof(IsPadPageSelected));
+                    OnPropertyChanged(nameof(SelectedPadIndex));
+                }
+            }
+        }
+
+        /// <summary>
+        /// True if a Pad page (Pad1–Pad16) is currently selected.
+        /// </summary>
+        public bool IsPadPageSelected =>
+            _selectedNavTag != null &&
+            _selectedNavTag.StartsWith("Pad", StringComparison.Ordinal) &&
+            _selectedNavTag.Length >= 4 &&
+            int.TryParse(_selectedNavTag.Substring(3), out _);
+
+        /// <summary>
+        /// Returns the zero-based pad index for the currently selected Pad page,
+        /// or -1 if no Pad page is selected.
+        /// </summary>
+        public int SelectedPadIndex
+        {
+            get
+            {
+                if (IsPadPageSelected && int.TryParse(_selectedNavTag.Substring(3), out int num))
+                    return num - 1; // "Pad1" → 0, "Pad2" → 1, etc.
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// Returns the PadViewModel for the currently selected Pad page, or null.
+        /// </summary>
+        public PadViewModel SelectedPad
+        {
+            get
+            {
+                int idx = SelectedPadIndex;
+                if (idx >= 0 && idx < Pads.Count)
+                    return Pads[idx];
+                return null;
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  App-wide status
+        // ─────────────────────────────────────────────
+
+        private string _statusText = Strings.Instance.Common_Ready;
+
+        // Status decay (#175 item 7): info-class messages ("Settings saved…",
+        // "Copied…") clear ~5 s after the last write instead of burning into
+        // the status bar forever. Persistent messages (failures, in-flight
+        // prompts like "Now map …") hold until the next write replaces them.
+        // The sweep rides MainWindow's existing 5 s driver-status timer, so
+        // no timer lives here.
+        private const long StatusDecayMs = 5000;
+        private bool _statusPersists;
+        private long _statusStampTick = Environment.TickCount64;
+
+        /// <summary>
+        /// Status bar text displayed at the bottom of the main window.
+        /// Plain writes are info-class and decay after ~5 s. Post failures
+        /// and active prompts through <see cref="SetStatus"/> instead.
+        /// </summary>
+        public string StatusText
+        {
+            get => _statusText;
+            set
+            {
+                // Restamp on every write. A repeated confirmation gets a
+                // fresh decay window even when the text is unchanged.
+                _statusPersists = false;
+                _statusStampTick = Environment.TickCount64;
+                SetProperty(ref _statusText, value);
+            }
+        }
+
+        /// <summary>
+        /// Writes the status bar with an explicit class. persist=true
+        /// (failures, prompts that a later write always terminates) exempts
+        /// the message from the decay sweep until the next write.
+        /// </summary>
+        public void SetStatus(string message, bool persist = false)
+        {
+            StatusText = message;       // stamps as info
+            _statusPersists = persist;  // then apply the class
+        }
+
+        /// <summary>
+        /// True when the current message is info-class, non-empty, and has
+        /// outlived <see cref="StatusDecayMs"/>, meaning the sweeper should
+        /// fade/clear it now.
+        /// </summary>
+        public bool IsStatusDecayDue =>
+            !_statusPersists &&
+            !string.IsNullOrEmpty(_statusText) &&
+            Environment.TickCount64 - _statusStampTick >= StatusDecayMs;
+
+        /// <summary>
+        /// Clears a decayed info message. Re-checks eligibility so a write
+        /// that lands mid-fade wins (fresh stamp → not due → no-op).
+        /// </summary>
+        public void ClearDecayedStatus()
+        {
+            if (!IsStatusDecayDue) return;
+            StatusText = string.Empty;
+        }
+
+        private bool _isEngineRunning;
+
+        /// <summary>
+        /// Whether the input engine polling loop is currently active.
+        /// </summary>
+        public bool IsEngineRunning
+        {
+            get => _isEngineRunning;
+            set
+            {
+                if (SetProperty(ref _isEngineRunning, value))
+                {
+                    RefreshEngineStatus();
+                }
+            }
+        }
+
+        private bool _hasActiveSlots;
+
+        /// <summary>
+        /// Whether any virtual controller slots are currently created.
+        /// </summary>
+        public bool HasActiveSlots
+        {
+            get => _hasActiveSlots;
+            set
+            {
+                if (SetProperty(ref _hasActiveSlots, value))
+                {
+                    RefreshEngineStatus();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Display string for engine status: "Running", "Idle", or "Stopped".
+        /// </summary>
+        public string EngineStatusText =>
+            !IsEngineRunning ? Strings.Instance.Common_Stopped :
+            HasActiveSlots ? Strings.Instance.Engine_Forging :
+            Strings.Instance.Common_Idle;
+
+        private static readonly System.Windows.Media.SolidColorBrush GreenBrush =
+            new(System.Windows.Media.Color.FromRgb(0x4C, 0xAF, 0x50)); // Running
+        private static readonly System.Windows.Media.SolidColorBrush AmberBrush =
+            new(System.Windows.Media.Color.FromRgb(0xFF, 0xB3, 0x00)); // Idle
+        private static readonly System.Windows.Media.SolidColorBrush RedBrush =
+            new(System.Windows.Media.Color.FromRgb(0xF4, 0x43, 0x36)); // Stopped
+
+        static MainViewModel()
+        {
+            GreenBrush.Freeze();
+            AmberBrush.Freeze();
+            RedBrush.Freeze();
+        }
+
+        /// <summary>
+        /// Brush for the engine status indicator dot.
+        /// </summary>
+        public System.Windows.Media.Brush EngineStatusBrush =>
+            !IsEngineRunning ? RedBrush :
+            HasActiveSlots ? GreenBrush :
+            AmberBrush;
+
+        /// <summary>
+        /// Refreshes engine status text and indicator brush.
+        /// </summary>
+        public void RefreshEngineStatus()
+        {
+            OnPropertyChanged(nameof(EngineStatusText));
+            OnPropertyChanged(nameof(EngineStatusBrush));
+        }
+
+        private double _pollingFrequency;
+
+        /// <summary>
+        /// Current input polling frequency in Hz.
+        /// </summary>
+        public double PollingFrequency
+        {
+            get => _pollingFrequency;
+            set => SetProperty(ref _pollingFrequency, value);
+        }
+
+        private int _connectedDeviceCount;
+
+        /// <summary>
+        /// Number of currently connected input devices.
+        /// </summary>
+        public int ConnectedDeviceCount
+        {
+            get => _connectedDeviceCount;
+            set => SetProperty(ref _connectedDeviceCount, value);
+        }
+
+        // ─────────────────────────────────────────────
+        //  Commands
+        // ─────────────────────────────────────────────
+
+        private RelayCommand _startEngineCommand;
+
+        /// <summary>
+        /// Command to start the input engine. Bound to a toolbar button.
+        /// The actual start logic is in InputService; this command is
+        /// wired up by MainWindow code-behind.
+        /// </summary>
+        public RelayCommand StartEngineCommand =>
+            _startEngineCommand ??= new RelayCommand(
+                () => StartEngineRequested?.Invoke(this, EventArgs.Empty),
+                () => !IsEngineRunning);
+
+        private RelayCommand _stopEngineCommand;
+
+        /// <summary>
+        /// Command to stop the input engine.
+        /// </summary>
+        public RelayCommand StopEngineCommand =>
+            _stopEngineCommand ??= new RelayCommand(
+                () => StopEngineRequested?.Invoke(this, EventArgs.Empty),
+                () => IsEngineRunning);
+
+        /// <summary>Raised when the user requests to start the engine.</summary>
+        public event EventHandler StartEngineRequested;
+
+        /// <summary>Raised when the user requests to stop the engine.</summary>
+        public event EventHandler StopEngineRequested;
+
+        /// <summary>
+        /// Refreshes the CanExecute state of start/stop commands.
+        /// Call after IsEngineRunning changes.
+        /// </summary>
+        public void RefreshCommands()
+        {
+            _startEngineCommand?.NotifyCanExecuteChanged();
+            _stopEngineCommand?.NotifyCanExecuteChanged();
+        }
+    }
+}

@@ -1,0 +1,228 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using PadForge.Engine;
+using PadForge.Engine.RemoteLink;
+
+namespace PadForge.Tests
+{
+    public class LinkConnectionTests
+    {
+        // Buffered in-memory duplex — what A sends, B receives, and vice versa.
+        private sealed class MemChannel : ILinkControlChannel
+        {
+            private readonly Channel<byte[]> _out, _in;
+            private MemChannel(Channel<byte[]> outbound, Channel<byte[]> inbound) { _out = outbound; _in = inbound; }
+            public Task SendAsync(byte[] m, CancellationToken ct) => _out.Writer.WriteAsync(m, ct).AsTask();
+            public async Task<byte[]> ReceiveAsync(CancellationToken ct) => await _in.Reader.ReadAsync(ct);
+            public static (MemChannel a, MemChannel b) Pair()
+            {
+                var ab = Channel.CreateUnbounded<byte[]>();
+                var ba = Channel.CreateUnbounded<byte[]>();
+                return (new MemChannel(ab, ba), new MemChannel(ba, ab));
+            }
+        }
+
+        private static RemotePeerDeviceInfo PadInfo() => new()
+        {
+            PeerLocalDeviceId = "pad0", Name = "A Pad",
+            VendorId = 0x054C, ProductId = 0x0CE6,
+            NumAxes = 6, NumButtons = 17, NumHats = 1,
+            HasRumble = true, InputDeviceType = InputDeviceType.Gamepad,
+        };
+
+        private static readonly byte[] Caps = { 1, 0 };
+
+        [Fact]
+        public async Task Pairing_EstablishesExchangesDevicesAndKeysCarryInput()
+        {
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            var trustA = new PeerTrustStore();
+            var trustB = new PeerTrustStore();
+            Func<PendingPairing, PairingApproval> approve = _ => true;
+
+            // A responder exposes a pad; B initiator consumes.
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, trustA, new[] { PadInfo() }, Caps, approve, "2026-06-13T00:00:00Z");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, trustB, Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "2026-06-13T00:00:00Z");
+            var rA = await taskA;
+            var rB = await taskB;
+
+            // B received A's exposed device, salted by A's authenticated identity.
+            Assert.Single(rB.RemoteDevices);
+            // Both lists carried the metadata extension, so each side reads
+            // the other's full lists.
+            Assert.True(rA.PeerReadsFullLists);
+            Assert.True(rB.PeerReadsFullLists);
+            // Peer devices are suffixed with the owning machine's name so they
+            // are distinguishable from local ones. This assertion used to
+            // expect the bare "A Pad", which was the unlabeled behavior the
+            // 2026-08-11 regression report was about.
+            Assert.StartsWith("A Pad", rB.RemoteDevices[0].Name);
+            Assert.Contains($"({LinkConnection.SafeMachineName()})", rB.RemoteDevices[0].Name);
+            Assert.StartsWith("peer://", rB.RemoteDevices[0].DevicePath);
+            Assert.Empty(rA.RemoteDevices); // B exposed nothing
+
+            // Both sides pinned each other (first contact -> explicit grant).
+            Assert.True(trustA.IsTrusted(idB.PublicKey));
+            Assert.True(trustB.IsTrusted(idA.PublicKey));
+
+            // The negotiated data keys actually open a LinkSession: A streams, B receives.
+            var sA = new LinkSession(rA.DataKey, rA.IsInitiator);
+            var sB = new LinkSession(rB.DataKey, rB.IsInitiator);
+            var state = CustomInputStateCodec.CreateNeutral();
+            state.Buttons[0] = true;
+            var dg = sA.Seal(LinkMessageType.Input, 0, 1, CustomInputStateCodec.Encode(state, new CustomInputStateCodec.Caps(false, false)));
+            Assert.True(sB.Open(dg, out _, out _, out _, out var payload));
+
+            rB.RemoteDevices[0].ApplyFramePayload(payload);
+            Assert.True(rB.RemoteDevices[0].GetCurrentState().Buttons[0]);
+        }
+
+        [Fact]
+        public async Task Pairing_DerivesIdenticalRendezvousCapability_OnBothSides()
+        {
+            // #294: both peers must derive the SAME pairwise DHT capability at
+            // pairing (from the shared session secret + symmetric transcript),
+            // or the presence lookup targets never match and reconnect-after-move
+            // silently fails. This is the correctness the whole lane rests on.
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            var trustA = new PeerTrustStore();
+            var trustB = new PeerTrustStore();
+            Func<PendingPairing, PairingApproval> approve = _ => true;
+
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, trustA, Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, trustB, Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "t");
+            await taskA; await taskB;
+
+            var capA = trustA.GetRendezvousCapability(idB.PublicKey); // A's record of B
+            var capB = trustB.GetRendezvousCapability(idA.PublicKey); // B's record of A
+            Assert.NotNull(capA);
+            Assert.Equal(32, capA.Length);
+            Assert.Equal(capA, capB); // identical: the two sides can find each other
+
+            // And the two publishing directions are complementary, so their
+            // slots never collide: A publishes DirA and reads B's DirB, vice versa.
+            var dirA = PadForge.Engine.RemoteLink.Dht.PresenceRecord.DirectionFor(
+                PeerCrypto.Fingerprint(idA.PublicKey), PeerCrypto.Fingerprint(idB.PublicKey));
+            var dirB = PadForge.Engine.RemoteLink.Dht.PresenceRecord.DirectionFor(
+                PeerCrypto.Fingerprint(idB.PublicKey), PeerCrypto.Fingerprint(idA.PublicKey));
+            Assert.NotEqual(dirA, dirB);
+        }
+
+        [Fact]
+        public async Task Pairing_LabelsPeerDevicesWithTheirMachineName_WithoutLanDiscovery()
+        {
+            // REGRESSION (owner report 2026-08-11): a peer's shared devices must
+            // read "<device> (Their PC)" so they are distinguishable from local
+            // ones. The name used to arrive ONLY from LAN discovery, so the
+            // punch / code path left every remote device unlabeled and the list
+            // was one undifferentiated pile. The handshake now carries the
+            // sender's machine name, so labeling no longer depends on HOW the
+            // peer was found. This test uses the in-memory channel: no
+            // discovery, no sockets, exactly the punch-path condition.
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            var trustA = new PeerTrustStore();
+            var trustB = new PeerTrustStore();
+            Func<PendingPairing, PairingApproval> approve = _ => true;
+
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, trustA, new[] { PadInfo() }, Caps, approve, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, trustB, Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "t");
+            await taskA;
+            var rB = await taskB;
+
+            // B consumed A's pad and must see it labeled with A's machine name.
+            var dev = Assert.Single(rB.RemoteDevices);
+            string expected = LinkConnection.SafeMachineName();
+            Assert.False(string.IsNullOrWhiteSpace(expected));
+            Assert.Contains($"({expected})", dev.Name);
+            Assert.StartsWith("A Pad", dev.Name);
+
+            // And the name is persisted on the trust record, so every later
+            // surface (peer manager, hot-plug reconcile) labels it too.
+            var entry = trustB.Find(idA.PublicKey);
+            Assert.Equal(expected, entry.HostName);
+            Assert.Equal(expected, trustB.ResolvePeerLabel(Convert.ToHexString(PeerCrypto.Fingerprint(idA.PublicKey))));
+        }
+
+        [Fact]
+        public async Task FirstContactRejected_AbortsBothSides()
+        {
+            var (chA, chB) = MemChannel.Pair();
+            Func<PendingPairing, PairingApproval> reject = _ => false;
+
+            var taskA = LinkConnection.RunResponderAsync(chA, PeerIdentity.Generate(), new PeerTrustStore(), new[] { PadInfo() }, Caps, reject, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, PeerIdentity.Generate(), new PeerTrustStore(), Array.Empty<RemotePeerDeviceInfo>(), Caps, reject, "t");
+
+            await Assert.ThrowsAsync<LinkConnectionException>(() => taskA);
+            await Assert.ThrowsAsync<LinkConnectionException>(() => taskB);
+        }
+
+        [Fact]
+        public async Task KnownPeer_Reconnects_WithoutPrompting()
+        {
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            // Pre-pin each other (a prior pairing), auto-select on.
+            var trustA = new PeerTrustStore(new[] { PeerTrust.FromPublicKey(idB.PublicKey, "B", "t", true, false) });
+            var trustB = new PeerTrustStore(new[] { PeerTrust.FromPublicKey(idA.PublicKey, "A", "t", true, false) });
+            Func<PendingPairing, PairingApproval> mustNotPrompt = _ => throw new Exception("reconnect must not prompt");
+
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, trustA, new[] { PadInfo() }, Caps, mustNotPrompt, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, trustB, Array.Empty<RemotePeerDeviceInfo>(), Caps, mustNotPrompt, "t");
+            await taskA;
+            var rB = await taskB;
+
+            Assert.Single(rB.RemoteDevices); // established with no SAS prompt
+        }
+
+        [Fact]
+        public async Task SharedDevices_FromHandshake_AreLabeledWithThePeerName()
+        {
+            // The handshake device set is the COMMON path (devices already shared when the
+            // link comes up). It must apply the peer label, not just the later hot-plug
+            // reconcile path. Regression guard for the peer-name suffix never showing on
+            // devices present at connect.
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            // B already knows A by a custom name (a prior pairing the user renamed).
+            var trustA = new PeerTrustStore(new[] { PeerTrust.FromPublicKey(idB.PublicKey, "B", "t", true, false) });
+            var trustB = new PeerTrustStore(new[] { PeerTrust.FromPublicKey(idA.PublicKey, "Living Room PC", "t", true, false) });
+            Func<PendingPairing, PairingApproval> noPrompt = _ => throw new Exception("reconnect must not prompt");
+
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, trustA, new[] { PadInfo() }, Caps, noPrompt, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, trustB, Array.Empty<RemotePeerDeviceInfo>(), Caps, noPrompt, "t");
+            await taskA;
+            var rB = await taskB;
+
+            Assert.Single(rB.RemoteDevices);
+            Assert.Equal("A Pad (Living Room PC)", rB.RemoteDevices[0].Name);
+        }
+
+        [Fact]
+        public async Task PeerFingerprint_IsTheAuthenticatedPeerIdentity()
+        {
+            var (chA, chB) = MemChannel.Pair();
+            var idA = PeerIdentity.Generate();
+            var idB = PeerIdentity.Generate();
+            Func<PendingPairing, PairingApproval> approve = _ => true;
+
+            var taskA = LinkConnection.RunResponderAsync(chA, idA, new PeerTrustStore(), Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "t");
+            var taskB = LinkConnection.RunInitiatorAsync(chB, idB, new PeerTrustStore(), Array.Empty<RemotePeerDeviceInfo>(), Caps, approve, "t");
+            var rA = await taskA;
+            var rB = await taskB;
+
+            Assert.Equal(idB.FingerprintHex, rA.PeerFingerprintHex); // A sees B
+            Assert.Equal(idA.FingerprintHex, rB.PeerFingerprintHex); // B sees A
+        }
+    }
+}

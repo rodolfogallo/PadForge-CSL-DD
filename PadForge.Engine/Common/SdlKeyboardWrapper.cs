@@ -1,0 +1,174 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using PadForge.Engine.Common;
+using static SDL3.SDL;
+
+namespace PadForge.Engine
+{
+    /// <summary>
+    /// Wraps a keyboard device for unified input via <see cref="ISdlInputDevice"/>.
+    /// State is read from Raw Input (per-device) via <see cref="RawInputListener"/>.
+    /// Enumeration comes from Raw Input too: the only Open takes a RawInputListener device.
+    /// </summary>
+    public class SdlKeyboardWrapper : ISdlInputDevice
+    {
+        private uint _sdlId;
+        private IntPtr _rawInputHandle;
+        private int _numKeys;
+        private bool _disposed;
+        private bool _isRawInputDevice;
+
+        public uint SdlInstanceId => _sdlId;
+        public string Name { get; private set; } = "Keyboard";
+        public int NumAxes => 0;
+        public int NumButtons => _numKeys;
+        public int RawButtonCount => 0;
+        public int NumHats => 0;
+        /// <summary>Every key, densely. An empty array would now read as
+        /// "this keyboard has no keys": the contract separates an empty set
+        /// from an ungated one so a device that truly has none can say so.
+        /// Cached, and rebuilt if the key count ever moves.</summary>
+        public int[] SupportedButtonIndices
+        {
+            get
+            {
+                var cached = _denseButtonIndices;
+                if (cached != null && cached.Length == _numKeys) return cached;
+                var a = new int[Math.Max(0, _numKeys)];
+                for (int i = 0; i < a.Length; i++) a[i] = i;
+                return _denseButtonIndices = a;
+            }
+        }
+        private int[] _denseButtonIndices;
+        public IntPtr GamepadHandle => IntPtr.Zero;
+        public bool HasRumble => false;
+        public bool HasRumbleTriggers => false;
+        public bool HasHaptic => false;
+        public bool HasGyro => false;
+        public bool HasAccel => false;
+        public bool HasTouchpad => false;
+        public HapticEffectStrategy HapticStrategy => HapticEffectStrategy.None;
+        public IntPtr HapticHandle => IntPtr.Zero;
+        public uint HapticFeatures => 0;
+        public int NumHapticAxes => 0;
+        public ushort VendorId { get; private set; }
+        public ushort ProductId { get; private set; }
+        public string DevicePath { get; private set; } = string.Empty;
+        public string SerialNumber => string.Empty;
+        public string SdlGuid => string.Empty;
+        public Guid InstanceGuid { get; private set; }
+        public Guid ProductGuid { get; private set; }
+
+        /// <summary>The Raw Input device handle for per-device state reading.</summary>
+        public IntPtr RawInputHandle => _rawInputHandle;
+
+        public bool IsAttached
+        {
+            get
+            {
+                if (_isRawInputDevice)
+                {
+                    var devices = RawInputListener.EnumerateKeyboards();
+                    for (int i = 0; i < devices.Length; i++)
+                    {
+                        if (devices[i].Handle == _rawInputHandle)
+                            return true;
+                    }
+                    return false;
+                }
+
+                var ids = SDL_GetKeyboards();
+                for (int i = 0; i < ids.Length; i++)
+                {
+                    if (ids[i] == _sdlId)
+                        return true;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Opens the keyboard from a Raw Input device enumeration result.
+        /// </summary>
+        public bool Open(RawInputListener.DeviceInfo deviceInfo)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(SdlKeyboardWrapper));
+
+            _isRawInputDevice = true;
+            _rawInputHandle = deviceInfo.Handle;
+            Name = deviceInfo.Name;
+            DevicePath = deviceInfo.DevicePath;
+
+            _numKeys = Math.Min(256, CustomInputState.MaxButtons);
+
+            InstanceGuid = BuildGuid(deviceInfo.DevicePath);
+            ProductGuid = BuildGuid("Keyboard");
+            VendorId = deviceInfo.VendorId;
+            ProductId = deviceInfo.ProductId;
+
+            // Use a hash of the device path as a pseudo SDL instance ID for tracking.
+            _sdlId = (uint)(deviceInfo.DevicePath.GetHashCode() & 0x7FFFFFFF);
+
+            return true;
+        }
+
+        // Pooled per-tick state (poll thread is the sole caller).
+        private PooledInputStatePair _statePool;
+
+        public CustomInputState GetCurrentState(bool forceRaw = false)
+        {
+            var state = _statePool.Next();
+            RawInputListener.GetKeyboardState(_rawInputHandle, state.Buttons, state.Buttons.Length);
+            // Merge keys captured by the low-level hook. WH_KEYBOARD_LL runs
+            // in the RIT before WM_INPUT is generated, so suppressed keys never
+            // reach RawInputListener. The hook records their state separately.
+            InputHookManager.MergeHookedKeyState(state.Buttons, state.Buttons.Length);
+            return state;
+        }
+
+        public DeviceObjectItem[] GetDeviceObjects() => KeyObjects(SupportedButtonIndices);
+
+        /// <summary>A keyboard's key objects for the given key indices, named
+        /// by the keyboard name table. Shared with a keyboard shared over
+        /// Remote Link (RemotePeerDevice), so its keys carry the same names
+        /// as a local keyboard's.</summary>
+        internal static DeviceObjectItem[] KeyObjects(int[] indices)
+        {
+            indices ??= System.Array.Empty<int>();
+            var items = new DeviceObjectItem[indices.Length];
+            for (int b = 0; b < indices.Length; b++)
+            {
+                int i = indices[b];
+                string name = (i >= 0 && i < VirtualKeyName.Length) ? VirtualKeyName[i] : $"Key {i}";
+                items[b] = new DeviceObjectItem
+                {
+                    InputIndex = i,
+                    ObjectTypeGuid = ObjectGuid.Key,
+                    Name = name,
+                    ObjectType = DeviceObjectTypeFlags.PushButton,
+                    Offset = b * 4
+                };
+            }
+            return items;
+        }
+
+        public int GetInputDeviceType() => InputDeviceType.Keyboard;
+        public bool SetRumble(ushort low, ushort high, uint durationMs = uint.MaxValue) => false;
+        public bool StopRumble() => false;
+
+        private static Guid BuildGuid(string identifier)
+        {
+            using var md5 = MD5.Create();
+            byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(identifier));
+            return new Guid(hash);
+        }
+
+        public void Dispose()
+        {
+            _disposed = true;
+            GC.SuppressFinalize(this);
+        }
+    }
+}

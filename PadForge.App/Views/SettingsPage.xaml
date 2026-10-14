@@ -1,0 +1,872 @@
+<UserControl x:Class="PadForge.Views.SettingsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:strings="clr-namespace:PadForge.Resources.Strings"
+             xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="po"
+             xmlns:reset="clr-namespace:PadForge.Controls">
+
+    <UserControl.Resources>
+        <!-- Hover glow (#175): hover color changes carry a hue-matched
+             bloom. Every hover shift on this page is neutral steel, so the
+             glow is the faint ember signature. Frozen shared static effect,
+             set from triggers only, never animated. -->
+        <DropShadowEffect x:Key="NeutralHoverGlow" po:Freeze="True" Color="#FF6B2C" ShadowDepth="0" BlurRadius="10" Opacity="0.30"/>
+        <!-- Hover glow sweep (#175): stock-chrome classes bloom in the same
+             moment their hover fill shifts. BasedOn the WPF-UI defaults so
+             theme brushes survive. -->
+        <Style TargetType="Button" BasedOn="{StaticResource DefaultButtonStyle}">
+            <!-- MinHeight mirrors the App.xaml implicit Button style (32px
+                 grid), which this page-local implicit replaces. -->
+            <Setter Property="MinHeight" Value="32"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="CheckBox" BasedOn="{StaticResource DefaultCheckBoxStyle}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="ComboBox" BasedOn="{StaticResource DefaultComboBoxStyle}">
+            <!-- First four setters mirror the App.xaml implicit ComboBox
+                 style, which this page-local implicit replaces. -->
+            <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Visible"/>
+            <Setter Property="MaxDropDownHeight" Value="200"/>
+            <Setter Property="MinHeight" Value="30"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="ui:NumberBox" BasedOn="{StaticResource DefaultUiNumberBoxStyle}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+
+    <ScrollViewer Padding="24,0">
+        <StackPanel Margin="0,16,0,16">
+
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
+                <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                           VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Text="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
+            </StackPanel>
+
+            <!-- ═══ Language ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xF2B7;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Language, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_LanguageDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <DockPanel LastChildFill="True" HorizontalAlignment="Left">
+                        <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="SelectedLanguage" SettingLabel="{Binding Settings_Language, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_SelectedLanguage_80"/>
+                        <ComboBox ItemsSource="{Binding AvailableLanguages}"
+                                  SelectedItem="{Binding SelectedLanguage}"
+                                  DisplayMemberPath="NativeName" Width="250"/>
+                    </DockPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Appearance ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE790;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Appearance, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_AppearanceDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <TextBlock Text="{Binding Settings_Theme, Source={x:Static strings:Strings.Instance}}" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6"/>
+                    <DockPanel LastChildFill="True" HorizontalAlignment="Left">
+                        <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="SelectedThemeIndex" SettingLabel="{Binding Settings_Theme, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_SelectedThemeIndex_96"/>
+                        <ComboBox SelectedIndex="{Binding SelectedThemeIndex}" Width="200">
+                            <ComboBoxItem Content="{Binding Settings_ThemeSystem, Source={x:Static strings:Strings.Instance}}"/>
+                            <ComboBoxItem Content="{Binding Settings_ThemeLight, Source={x:Static strings:Strings.Instance}}"/>
+                            <ComboBoxItem Content="{Binding Settings_ThemeDark, Source={x:Static strings:Strings.Instance}}"/>
+                        </ComboBox>
+                    </DockPanel>
+                    <Button Content="{Binding Settings_ShowTour, Source={x:Static strings:Strings.Instance}}"
+                            Click="ShowTour_Click" Margin="0,12,0,0" HorizontalAlignment="Left"/>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Window ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE737;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Window, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_WindowDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_MinimizeToTray, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_MinimizeToTrayTip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding MinimizeToTray}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="MinimizeToTray" SettingLabel="{Binding Settings_MinimizeToTray, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_MinimizeToTray_118"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox x:Name="CloseToTrayCheckBox"
+                                  Content="{Binding Settings_CloseToTray, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_CloseToTrayTip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding CloseToTray}" VerticalAlignment="Center"/>
+                        <reset:SettingResetButton x:Name="CloseToTrayReset" Command="{Binding ResetCloseToTrayCommand}" SettingLabel="{Binding Settings_CloseToTray, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_AlwaysShowTrayIcon, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_AlwaysShowTrayIconTip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding AlwaysShowTrayIcon}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AlwaysShowTrayIcon" SettingLabel="{Binding Settings_AlwaysShowTrayIcon, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_AlwaysShowTrayIcon_139"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_StartMinimized, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_StartMinimizedTip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding StartMinimized}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="StartMinimized" SettingLabel="{Binding Settings_StartMinimized, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_StartMinimized_132"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_StartAtLogin, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_StartAtLoginTip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding StartAtLogin}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="StartAtLogin" SettingLabel="{Binding Settings_StartAtLogin, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_StartAtLogin_135"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Updates (#457) ═══
+                 Releases, or with Include Pre-Releases the rolling dev build,
+                 from GitHub. UpdateController drives the status line, the
+                 progress bar and the two action buttons. -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE896;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Updates, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_UpdatesDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_CheckForUpdates, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_CheckForUpdatesTip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding CheckForUpdatesAutomatically}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="CheckForUpdatesAutomatically" SettingLabel="{Binding Settings_CheckForUpdates, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_CheckForUpdatesAutomatically_4571"/>
+                    </StackPanel>
+                    <!-- Installing automatically needs the automatic check, so
+                         it shows only while that is on, the Community Configs
+                         card's gating for a dependent option. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8" Visibility="{Binding CheckForUpdatesAutomatically, Converter={StaticResource BoolToVisibilityConverter}}">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_InstallUpdatesAutomatically, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_InstallUpdatesAutomaticallyTip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding InstallUpdatesAutomatically}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="InstallUpdatesAutomatically" SettingLabel="{Binding Settings_InstallUpdatesAutomatically, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_InstallUpdatesAutomatically_4572"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_IncludePreReleases, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_IncludePreReleasesTip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding IncludePreReleaseUpdates}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="IncludePreReleaseUpdates" SettingLabel="{Binding Settings_IncludePreReleases, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_IncludePreReleaseUpdates_4573"/>
+                    </StackPanel>
+                    <!-- Empty until a check has run, the G-key status's shape.
+                         Ember while an update is waiting. -->
+                    <TextBlock Text="{Binding UpdateStatusText}"
+                               Visibility="{Binding UpdateStatusText, Converter={StaticResource StringToVisibility}}"
+                               TextWrapping="Wrap" Margin="0,4,0,8">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsUpdateAvailable}" Value="True">
+                                        <Setter Property="Foreground" Value="{DynamicResource EmberBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <ProgressBar Value="{Binding UpdateProgress}" Maximum="100" Height="4" Width="320"
+                                 HorizontalAlignment="Left" Margin="0,0,0,10"
+                                 Visibility="{Binding IsUpdateDownloading, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                    <!-- Verb classes (#175 dialog language): Install and
+                         Restart is the accent, the other two are plain. -->
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="{Binding Settings_CheckNow, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding CheckForUpdatesNowCommand}" Margin="0,0,8,0"/>
+                        <Button Content="{Binding Settings_InstallAndRestart, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding InstallUpdateCommand}"
+                                Style="{StaticResource EmberAccentButton}" Margin="0,0,8,0"
+                                Visibility="{Binding IsUpdateAvailable, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <Button Content="{Binding Settings_ReleaseNotes, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding OpenReleaseNotesCommand}"
+                                Visibility="{Binding IsUpdateAvailable, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Engine ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE9F5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_InputEngine, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_InputEngineDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_AutoStart, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding AutoStartEngine}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AutoStartEngine" SettingLabel="{Binding Settings_AutoStart, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_AutoStartEngine_151"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_BackgroundPolling, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding EnablePollingOnFocusLoss}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnablePollingOnFocusLoss" SettingLabel="{Binding Settings_BackgroundPolling, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_EnablePollingOnFocusLoss_154"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_FlydigiEnhanced, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_FlydigiEnhancedTooltip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding FlydigiEnhancedProtocol}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="FlydigiEnhancedProtocol" SettingLabel="{Binding Settings_FlydigiEnhanced, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_FlydigiEnhancedProtocol_158"/>
+                    </StackPanel>
+                    <!-- Logitech G-keys (#454), the Flydigi row's shape: a
+                         vendor input path this engine can read, off until
+                         asked for. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_GKeys, Source={x:Static strings:Strings.Instance}}"
+                                  x:Name="GKeysEnableCheckBox"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_GKeysTooltip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding GKeysEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="GKeysEnabled" SettingLabel="{Binding Settings_GKeys, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_GKeysEnabled_186"/>
+                    </StackPanel>
+                    <!-- Which of the seven cases the machine is in, so a
+                         quiet G-key is never a mystery. Empty while the
+                         feature is off, the polling-override note's shape. -->
+                    <TextBlock Text="{Binding GKeysStatus}"
+                               Visibility="{Binding GKeysStatus, Converter={StaticResource StringToVisibility}}"
+                               TextWrapping="Wrap" Margin="0,0,0,8"
+                               Foreground="{DynamicResource EmberBrush}"/>
+                    <!-- Analog keyboards (#468), the G-keys row's shape. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_AnalogKeyboards, Source={x:Static strings:Strings.Instance}}"
+                                  x:Name="AnalogKeyboardsEnableCheckBox"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_AnalogKeyboardsTooltip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding AnalogKeyboardsEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AnalogKeyboardsEnabled" SettingLabel="{Binding Settings_AnalogKeyboards, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_AnalogKeyboardsEnabled_188"/>
+                    </StackPanel>
+                    <!-- Which keyboards are being read, and which wait for
+                         Razer Synapse. Empty while the feature is off. -->
+                    <TextBlock Text="{Binding AnalogKeyboardsStatus}"
+                               Visibility="{Binding AnalogKeyboardsStatus, Converter={StaticResource StringToVisibility}}"
+                               TextWrapping="Wrap" Margin="0,0,0,8"
+                               Foreground="{DynamicResource EmberBrush}"/>
+                    <!-- Bliss-Box adapters (#469), the analog keyboards row's shape. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_BlissBox, Source={x:Static strings:Strings.Instance}}"
+                                  x:Name="BlissBoxEnableCheckBox"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  ToolTip="{Binding Settings_BlissBoxTooltip, Source={x:Static strings:Strings.Instance}}"
+                                  IsChecked="{Binding BlissBoxEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="BlissBoxEnabled" SettingLabel="{Binding Settings_BlissBox, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_BlissBoxEnabled_189"/>
+                    </StackPanel>
+                    <!-- Each port and the controller in it. Empty while the
+                         feature is off. -->
+                    <TextBlock Text="{Binding BlissBoxStatus}"
+                               Visibility="{Binding BlissBoxStatus, Converter={StaticResource StringToVisibility}}"
+                               TextWrapping="Wrap" Margin="0,0,0,8"
+                               Foreground="{DynamicResource EmberBrush}"/>
+                    <!-- Shared label column (#175 typography): both rows sit
+                         in one Grid so the NumberBoxes align to one left
+                         edge regardless of label length. -->
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="{Binding Settings_PollingInterval, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Margin="0,0,8,8"/>
+                        <DockPanel LastChildFill="True" Grid.Column="1" Margin="0,0,0,8">
+                            <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="PollingRateMs" SettingLabel="{Binding Settings_PollingInterval, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_PollingRateMs_179"/>
+                            <ui:NumberBox Value="{Binding PollingRateMs, Mode=TwoWay}"
+                                          Minimum="1" Maximum="16"
+                                          SpinButtonPlacementMode="Inline" Width="200"
+                                          ToolTip="{Binding Settings_PollingIntervalTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        </DockPanel>
+                        <TextBlock Grid.Column="2" Text="{Binding Common_Ms, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center" Margin="6,0,0,8" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                        <!-- Who is in charge of the knob (#365): while the
+                             active profile carries a polling override, the
+                             global value above is dormant, and a setting
+                             that is silently outranked reads as broken.
+                             Collapsed while the global value rules. -->
+                        <TextBlock Grid.Row="1" Grid.ColumnSpan="3"
+                                   Text="{Binding PollingOverrideNote}"
+                                   Visibility="{Binding PollingOverrideNote, Converter={StaticResource StringToVisibility}}"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Foreground="{DynamicResource EmberBrush}"/>
+                        <TextBlock Grid.Row="2" Text="{Binding Settings_HmInactivityTimeout, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Margin="0,0,8,0"/>
+                        <DockPanel LastChildFill="True" Grid.Row="2" Grid.Column="1">
+                            <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="HmInactivityDestroyTimeoutSeconds" SettingLabel="{Binding Settings_HmInactivityTimeout, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_HmInactivityDestroyTimeoutSeconds_197"/>
+                            <ui:NumberBox Value="{Binding HmInactivityDestroyTimeoutSeconds, Mode=TwoWay}"
+                                          Minimum="0" Maximum="3600"
+                                          SpinButtonPlacementMode="Inline" Width="200"
+                                          ToolTip="{Binding Settings_HmInactivityTimeoutTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        </DockPanel>
+                        <TextBlock Grid.Row="2" Grid.Column="2" Text="{Binding Settings_SecondsZeroNever, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center" Margin="6,0,0,0" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Assignment Prompts ═══
+                 Two opt-outs for the pad-page offer banner. Auto-assigning
+                 outright was ruled out (sim rigs and arcade setups have
+                 many devices and no obvious home for each), so the app
+                 only ever OFFERS, and each offer can be switched off. -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <!-- Matches the banner this card governs (E8DE). -->
+                        <TextBlock Text="&#xE8DE;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_AssignOffer, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_AssignOfferDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_AssignOfferNew, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_AssignOfferNew_Tooltip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding AssignOfferNewDevice}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AssignOfferNewDevice" SettingLabel="{Binding Settings_AssignOfferNew, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_AssignOfferNewDevice_221"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_AssignOfferEmpty, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_AssignOfferEmpty_Tooltip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding AssignOfferEmptySlot}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AssignOfferEmptySlot" SettingLabel="{Binding Settings_AssignOfferEmpty, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_AssignOfferEmptySlot_225"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Handheld PC Buttons (issue #343) ═══
+                 Off by default. On, the Devices page gains the machine's
+                 Hidden Buttons row (learned by pressing) and its System
+                 Motion row. -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE7F8;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Handheld, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_HandheldDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_HandheldEnable, Source={x:Static strings:Strings.Instance}}"
+                                  ToolTip="{Binding Settings_HandheldEnable_Tooltip, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding HandheldButtonsEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="HandheldButtonsEnabled" SettingLabel="{Binding Settings_HandheldEnable, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_HandheldButtonsEnabled_245"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Battery Alerts (#293) ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE83F;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_BatteryNotify, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_BatteryNotifyDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_BatteryNotifyEnable, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding BatteryNotifyEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="BatteryNotifyEnabled" SettingLabel="{Binding Settings_BatteryNotifyEnable, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_BatteryNotifyEnabled_261"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="{Binding Settings_BatteryNotifyThreshold, Source={x:Static strings:Strings.Instance}}"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0"/>
+                        <ui:NumberBox Value="{Binding BatteryNotifyThreshold, Mode=TwoWay}"
+                                      Minimum="5" Maximum="50"
+                                      SpinButtonPlacementMode="Inline" Width="160" IsEnabled="{Binding DataContext.BatteryNotifyEnabled, RelativeSource={RelativeSource AncestorType={x:Type UserControl}}}"/>
+                        <TextBlock Text="%" VerticalAlignment="Center" Margin="6,0,0,0"
+                                   Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="BatteryNotifyThreshold" SettingLabel="{Binding Settings_BatteryNotifyThreshold, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_BatteryNotifyThreshold_269"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_BatteryNotifyVibrate, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding BatteryNotifyVibrate}"
+                                  IsEnabled="{Binding BatteryNotifyEnabled}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="BatteryNotifyVibrate" SettingLabel="{Binding Settings_BatteryNotifyVibrate, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_BatteryNotifyVibrate_276"/>
+                    </StackPanel>
+                    <Button Content="{Binding Settings_BatteryNotifyTest, Source={x:Static strings:Strings.Instance}}"
+                            Click="TestBatteryNotify_Click" Margin="0,12,0,0" HorizontalAlignment="Left"
+                            IsEnabled="{Binding BatteryNotifyEnabled}"/>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ HidHide ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xED1A;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_HidHide, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_HidHideDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Path Margin="0,0,8,0">
+                                    <Path.Style>
+                                        <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsHidHideInstalled}" Value="True">
+                                                    <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                    <Setter Property="Stroke" Value="{x:Null}"/>
+                                                    <Setter Property="Effect">
+                                                        <Setter.Value>
+                                                            <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Path.Style>
+                                </Path>
+                                <TextBlock Text="{Binding HidHideStatusText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding HidHideVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                        </StackPanel>
+
+                        <!-- Verb classes (#175 dialog language): Install is
+                             the card's primary affirmative (accent).
+                             Uninstall removes the driver from the system
+                             with no confirm, so it wears the shared
+                             destructive chrome. Visibility makes the two
+                             mutually exclusive. -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                    VerticalAlignment="Center">
+                            <Button Content="{Binding Common_Install, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding InstallHidHideCommand}"
+                                    Style="{StaticResource EmberAccentButton}"
+                                    Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}"
+                                    Margin="0,0,8,0"/>
+                            <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding UninstallHidHideCommand}"
+                                    Style="{StaticResource EmberDestructiveButton}"
+                                    Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0" Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_HideDevices, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding EnableInputHiding}"
+                                  ToolTip="{Binding Settings_HideDevicesTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnableInputHiding" SettingLabel="{Binding Settings_HideDevices, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_EnableInputHiding_348"/>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0" Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_KeepCloaksBetweenLaunches, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding KeepHidHideCloaksBetweenLaunches}"
+                                  ToolTip="{Binding Settings_KeepCloaksBetweenLaunchesTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="KeepHidHideCloaksBetweenLaunches" SettingLabel="{Binding Settings_KeepCloaksBetweenLaunches, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_KeepHidHideCloaksBetweenLaunches_355"/>
+                    </StackPanel>
+
+                    <!-- Whitelist section (only when installed) -->
+                    <StackPanel Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}"
+                                Margin="0,16,0,0">
+                        <TextBlock Text="{Binding Settings_WhitelistedApps, Source={x:Static strings:Strings.Instance}}" FontWeight="SemiBold" FontSize="13"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Margin="0,0,0,4"/>
+                        <TextBlock Text="{Binding Settings_WhitelistDesc, Source={x:Static strings:Strings.Instance}}"
+                                   Style="{StaticResource CardDescription}"/>
+                        <!-- Shared EmberTint container (user report 2026-07-05):
+                             carries the same ember-bloom hover the old inline
+                             style had, and replaces the stock accent
+                             selection slab. -->
+                        <ListBox ItemsSource="{Binding HidHideWhitelistPaths}"
+                                 SelectedItem="{Binding SelectedWhitelistPath}"
+                                 ItemContainerStyle="{StaticResource EmberSelectListItem}"
+                                 MaxHeight="140" MinHeight="32"
+                                 Margin="0,0,0,8">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}"
+                                               TextTrimming="CharacterEllipsis"/>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <StackPanel Orientation="Horizontal">
+                            <Button Content="{Binding Settings_AddDots, Source={x:Static strings:Strings.Instance}}" Command="{Binding AddWhitelistPathCommand}"
+                                    Margin="0,0,8,0"/>
+                            <Button Content="{Binding Common_Remove, Source={x:Static strings:Strings.Instance}}" Command="{Binding RemoveWhitelistPathCommand}"/>
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ HIDMaestro Driver ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE7FC;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_HIDMaestro, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_HIDMaestroDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"
+                               TextWrapping="Wrap"/>
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <Path Style="{StaticResource LivenessFlameBase}" Margin="0,0,8,0"
+                                  Fill="{DynamicResource EmberBrush}" Stroke="{x:Null}">
+                                <!-- Always lit, so the glow is static (#175 glow sweep). -->
+                                <Path.Effect>
+                                    <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                </Path.Effect>
+                            </Path>
+                            <TextBlock Text="{Binding Common_Installed, Source={x:Static strings:Strings.Instance}}"
+                                       FontWeight="SemiBold"/>
+                        </StackPanel>
+                        <TextBlock Text="{Binding HIDMaestroVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Windows MIDI Services ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_MidiServices, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_MidiDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Path Margin="0,0,8,0">
+                                    <Path.Style>
+                                        <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsMidiServicesInstalled}" Value="True">
+                                                    <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                    <Setter Property="Stroke" Value="{x:Null}"/>
+                                                    <Setter Property="Effect">
+                                                        <Setter.Value>
+                                                            <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Path.Style>
+                                </Path>
+                                <TextBlock Text="{Binding MidiServicesStatusText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding MidiServicesVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                        </StackPanel>
+
+                        <!-- Verb classes (#175 dialog language): same split as
+                             the HidHide card. Install accent, Uninstall
+                             destructive (removes the service, no confirm). -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                    VerticalAlignment="Center">
+                            <Button Content="{Binding Common_Install, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding InstallMidiServicesCommand}"
+                                    Visibility="{Binding IsMidiServicesInstalled, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}"
+                                    ToolTipService.ShowOnDisabled="True"
+                                    Margin="0,0,8,0">
+                                <Button.Style>
+                                    <Style TargetType="Button" BasedOn="{StaticResource EmberAccentButton}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding MidiOsSupported}" Value="False">
+                                                <Setter Property="ToolTip" Value="{Binding Settings_MidiOsRequired, Source={x:Static strings:Strings.Instance}}"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+                            <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding UninstallMidiServicesCommand}"
+                                    Style="{StaticResource EmberDestructiveButton}"
+                                    Visibility="{Binding IsMidiServicesInstalled, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ SteamVR (VR controllers, #49) ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xF119;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_SteamVR, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_SteamVRDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Path Margin="0,0,8,0">
+                                    <Path.Style>
+                                        <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsSteamVrInstalled}" Value="True">
+                                                    <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                    <Setter Property="Stroke" Value="{x:Null}"/>
+                                                    <Setter Property="Effect">
+                                                        <Setter.Value>
+                                                            <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Path.Style>
+                                </Path>
+                                <TextBlock Text="{Binding SteamVrStatusText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+
+                            <!-- Install-location picker: shown only before an
+                                 install exists. Not persisted by PadForge; on
+                                 success the HIDMaestro path hint becomes the
+                                 durable record of where the payload lives. -->
+                            <StackPanel Orientation="Horizontal" Margin="0,10,12,0"
+                                        Visibility="{Binding IsSteamVrInstalled, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}">
+                                <TextBlock Text="{Binding Settings_SteamVRInstallDir, Source={x:Static strings:Strings.Instance}}"
+                                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <TextBox Text="{Binding SteamVrInstallDir, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                         MinWidth="240" VerticalContentAlignment="Center"/>
+                                <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="SteamVrInstallDir" SettingLabel="{Binding Settings_SteamVRInstallDir, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_SteamVrInstallDir_535" Margin="4,0,8,0"/>
+                                <Button Content="{Binding Common_Browse, Source={x:Static strings:Strings.Instance}}"
+                                        Click="SteamVrBrowse_Click" Margin="6,0,0,0"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- Uninstall is offered ONLY for the Steam-free
+                             install PadForge itself created (ownership =
+                             the HIDMaestro path hint, and not Steam's own
+                             registry entries). A Steam-client install
+                             belongs to Steam and shows no uninstall. -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                    VerticalAlignment="Center">
+                            <Button Content="{Binding Common_Install, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding InstallSteamVrCommand}"
+                                    Style="{StaticResource EmberAccentButton}"
+                                    Visibility="{Binding IsSteamVrInstalled, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}"/>
+                            <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding UninstallSteamVrCommand}"
+                                    Style="{StaticResource EmberDestructiveButton}"
+                                    Visibility="{Binding ShowSteamVrUninstall, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Community Configs (Steam Workshop, #9) ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE716;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_CommunityConfigs, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_CommunityConfigsDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_EnableCommunityConfigs, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding EnableCommunityConfigLookup}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnableCommunityConfigLookup" SettingLabel="{Binding Settings_EnableCommunityConfigs, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_EnableCommunityConfigLookup_573"/>
+                    </StackPanel>
+                    <!-- Dependent options follow the HidHide card's Visibility
+                         gating: they appear once the master opt-in is on. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8" Visibility="{Binding EnableCommunityConfigLookup, Converter={StaticResource BoolToVisibilityConverter}}">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_ShowLegacyConfigs, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding ShowLegacyWorkshopConfigs}"
+                                  ToolTip="{Binding Settings_ShowLegacyConfigsTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="ShowLegacyWorkshopConfigs" SettingLabel="{Binding Settings_ShowLegacyConfigs, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_ShowLegacyWorkshopConfigs_581"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                        <Button Content="{Binding Settings_ClearWorkshopCache, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding ClearWorkshopCacheCommand}"
+                                Margin="0,0,8,0"/>
+                        <!-- Update detection (#9 Phase D). Stays visible with
+                             the opt-in off, like Clear Cached Configs: the
+                             handler answers with a status message instead of
+                             touching the network. -->
+                        <Button Content="{Binding Settings_CheckWorkshopUpdates, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding CheckWorkshopUpdatesCommand}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Settings File ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE8A5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_SettingsFile, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_SettingsFileDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}"/>
+                    <TextBlock Text="{Binding SettingsFilePath}" FontSize="12"
+                               FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" TextWrapping="Wrap"
+                               Margin="0,0,0,12"/>
+
+                    <!-- Verb classes (#175 dialog language): Save commits the
+                         file and is the card's primary affirmative (accent).
+                         Reset to Defaults wipes every setting with no
+                         confirm, so it wears the shared destructive chrome.
+                         Reload and Open Folder stay neutral. -->
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="{Binding Common_Save, Source={x:Static strings:Strings.Instance}}" Command="{Binding SaveCommand}"
+                                Style="{StaticResource EmberAccentButton}"
+                                Margin="0,0,8,0"/>
+                        <Button Content="{Binding Settings_Reload, Source={x:Static strings:Strings.Instance}}" Command="{Binding ReloadCommand}"
+                                Margin="0,0,8,0"/>
+                        <Button Content="{Binding Settings_ResetToDefaults, Source={x:Static strings:Strings.Instance}}" Command="{Binding ResetCommand}"
+                                Style="{StaticResource EmberDestructiveButton}"
+                                Margin="0,0,8,0"/>
+                        <Button Content="{Binding Settings_OpenFolder, Source={x:Static strings:Strings.Instance}}" Command="{Binding OpenSettingsFolderCommand}"/>
+                    </StackPanel>
+
+                    <TextBlock Visibility="{Binding HasUnsavedChanges, Converter={StaticResource BoolToVisibilityConverter}}"
+                               Text="{Binding Settings_UnsavedChanges, Source={x:Static strings:Strings.Instance}}" Foreground="Orange"
+                               FontSize="12" Margin="0,8,0,0"/>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ Diagnostics ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="&#xE9D9;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_Diagnostics, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding Settings_DiagnosticsDesc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="140"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Text="{Binding Settings_AppVersion, Source={x:Static strings:Strings.Instance}}" FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                        <TextBlock Grid.Column="1" Text="{Binding ApplicationVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}"/>
+
+                        <TextBlock Grid.Row="1" Text="{Binding Settings_DotNetRuntime, Source={x:Static strings:Strings.Instance}}" FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1"
+                                   Text="{Binding RuntimeVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Margin="0,4,0,0"/>
+
+                        <TextBlock Grid.Row="2" Text="{Binding Settings_SdlVersion, Source={x:Static strings:Strings.Instance}}" FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1"
+                                   Text="{Binding SdlVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Margin="0,4,0,0"/>
+                    </Grid>
+
+                    <!-- Diagnostics logging (#303): the flag-free way to get
+                         a trace. The toggle persists, so auto-started
+                         sessions log too; the snapshot works even with
+                         logging off, because the engine always keeps its
+                         recent events in memory. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,14,0,4">
+                        <CheckBox VerticalAlignment="Center" Content="{Binding Settings_DiagnosticsLogging, Source={x:Static strings:Strings.Instance}}"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  IsChecked="{Binding DiagnosticsLoggingEnabled}"
+                                  ToolTip="{Binding Settings_DiagnosticsLoggingTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="DiagnosticsLoggingEnabled" SettingLabel="{Binding Settings_DiagnosticsLogging, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_DiagnosticsLoggingEnabled_674"/>
+                    </StackPanel>
+                    <TextBlock Text="{Binding DiagnosticsFolderPath}" FontSize="12"
+                               FontFamily="{StaticResource TelemetryFontFamily}"
+                               Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                               TextWrapping="Wrap" Margin="0,0,0,10"/>
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="{Binding Settings_DiagnosticsSnapshot, Source={x:Static strings:Strings.Instance}}"
+                                Click="SaveDiagSnapshot_Click"
+                                ToolTip="{Binding Settings_DiagnosticsSnapshotTooltip, Source={x:Static strings:Strings.Instance}}"/>
+                        <Button Content="{Binding Settings_DiagnosticsOpenFolder, Source={x:Static strings:Strings.Instance}}"
+                                Click="OpenDiagFolder_Click" Margin="8,0,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

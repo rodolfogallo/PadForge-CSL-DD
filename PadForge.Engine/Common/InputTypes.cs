@@ -1,0 +1,173 @@
+using System;
+
+namespace PadForge.Engine
+{
+    // ─────────────────────────────────────────────────────────────────
+    //  DeviceObjectTypeFlags
+    //  Device object type classification flags. Values match the
+    //  original DirectInput constants for mapping compatibility.
+    // ─────────────────────────────────────────────────────────────────
+
+    [Flags]
+    public enum DeviceObjectTypeFlags : int
+    {
+        All = 0,
+        RelativeAxis = 1,
+        AbsoluteAxis = 2,
+        Axis = 3,
+        PushButton = 4,
+        Button = 12,
+        PointOfViewController = 16,
+        ForceFeedbackActuator = 16777216        // 0x01000000
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  ObjectGuid
+    //  Static class providing well-known GUIDs for device object types
+    //  (axes, buttons, POV controllers). Values match DirectInput
+    //  GUID_XAxis, GUID_YAxis, etc.
+    // ─────────────────────────────────────────────────────────────────
+
+    public static class ObjectGuid
+    {
+        /// <summary>GUID_XAxis — {A36D02E0-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid XAxis = new Guid("A36D02E0-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_YAxis — {A36D02E1-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid YAxis = new Guid("A36D02E1-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_ZAxis — {A36D02E2-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid ZAxis = new Guid("A36D02E2-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_RxAxis — {A36D02F4-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid RxAxis = new Guid("A36D02F4-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_RyAxis — {A36D02F5-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid RyAxis = new Guid("A36D02F5-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_RzAxis — {A36D02E3-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid RzAxis = new Guid("A36D02E3-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_Slider — {A36D02E4-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid Slider = new Guid("A36D02E4-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_Button — {A36D02F0-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid Button = new Guid("A36D02F0-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_Key — {55728220-D33C-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid Key = new Guid("55728220-D33C-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_POV — {A36D02F2-C9F3-11CF-BFC7-444553540000}</summary>
+        public static readonly Guid PovController = new Guid("A36D02F2-C9F3-11CF-BFC7-444553540000");
+
+        /// <summary>GUID_Unknown — {00000000-0000-0000-0000-000000000000}</summary>
+        public static readonly Guid Unknown = Guid.Empty;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  InputDeviceType
+    //  Integer constants matching DirectInput device type values.
+    //  Used for UserDevice.CapType to identify device categories.
+    // ─────────────────────────────────────────────────────────────────
+
+    public static class InputDeviceType
+    {
+        public const int Mouse = 18;
+        public const int Keyboard = 19;
+        public const int Joystick = 20;
+        public const int Gamepad = 21;
+        public const int Driving = 22;
+        public const int Flight = 23;
+        public const int FirstPerson = 24;
+        public const int Supplemental = 25;
+        public const int Touchpad = 26;
+        public const int Midi = 27;
+        public const int Nfc = 28;
+        // Consumer Control HID collections (issue #168): media remotes,
+        // headset strips, keyboard media rows. APPEND-ONLY here (CapType
+        // serializes as an int in PadForge.xml).
+        public const int ConsumerControl = 29;
+        // Sony headset head-tracker IMU over Bluetooth Classic HID
+        // (issue #188): WH-1000XM5 family exposing the Android Head
+        // Tracker sensor collection as a gyro/accel motion source.
+        public const int HeadsetMotion = 30;
+        // Standalone microphone capture endpoints (issue #317): real
+        // hardware exposed as input devices whose buttons are registered
+        // voice phrases. Mic-bearing controllers carry their phrases on
+        // their own device instead.
+        public const int Microphone = 31;
+        // Handheld PC hidden buttons (issue #343): one per-machine row
+        // whose buttons are learned on the machine, delivered by the
+        // firmware either as keyboard chords through the low-level hooks
+        // or as bits and codes in a vendor HID input report.
+        public const int HandheldButtons = 32;
+        // The machine's own gyroscope and accelerometer through the
+        // Windows sensor stack (issue #343), for handhelds whose IMU sits
+        // in the tablet rather than in the controller halves.
+        public const int SystemMotion = 33;
+        // A head pose from OpenTrack's UDP output or the FreeTrack 2.0
+        // shared memory (issue #355): six absolute axes, yaw, pitch, roll
+        // and the three translations, centered at rest.
+        public const int HeadTracker = 34;
+        public const int Tablet = 35;
+        // A VR motion controller read through an OpenXR runtime (issue #403):
+        // six pose axes in the head tracker's convention, plus a thumbstick,
+        // a trigger, a grip and four buttons. Left and right are separate
+        // rows, so one going to sleep does not touch the other.
+        public const int VrController = 36;
+
+        // Logitech G-keys and extra mouse buttons, through the G-key SDK
+        // (issue #454): 29 keys across 3 M-states plus mouse buttons 6 to 20,
+        // so a G-key binds without first being programmed to send a real key.
+        public const int LogitechGKeys = 37;
+
+        // An analog keyboard read over its vendor HID interface (issue #468):
+        // every key's press depth, published through
+        // CustomInputState.AnalogKeys rather than the numbered arrays.
+        public const int AnalogKeyboard = 38;
+
+        // A phone showing a slot's Touch Grid menus on the web controller's
+        // Web Menus layout (issue #471). It has no axes or buttons: a tap
+        // fires a menu cell directly.
+        public const int WebMenus = 39;
+
+        /// <summary>True when a row of this type answers a source whose
+        /// DeviceGuid is empty, the "(Any Device)" wildcard that means
+        /// whichever controller is assigned to the slot. Controllers,
+        /// keyboards, mice and touchpads answer it. The rows that publish
+        /// their own vocabulary through the numbered Axis and Buttons
+        /// arrays do not: a head tracker's six centered pose axes, an NFC
+        /// reader's tag buttons, a microphone's phrase buttons, a
+        /// handheld's learned hidden buttons, a Logitech keyboard's G-keys, a media strip's usages and a
+        /// tablet's pen state all start at index 0, so read through the
+        /// wildcard they impersonate the gamepad layout (#431: a resting
+        /// tracker held both triggers at half pull). These are the same
+        /// six rows the Mappings tab names instead of numbering. A named
+        /// source on any of them still reads. An analog keyboard leaves its
+        /// numbered arrays at zero and publishes its keys on their own
+        /// sub-state, and a zeroed trigger axis reads as half pull through
+        /// the wildcard, so it stays out for the #431 reason. A Web Menus
+        /// phone has no inputs at all, so the same zeroed axes keep it out.</summary>
+        public static bool AnswersAnyDeviceSources(int capType) => capType switch
+        {
+            HeadTracker or Nfc or Microphone or HandheldButtons or ConsumerControl or Tablet
+                or VrController or LogitechGKeys or AnalogKeyboard or WebMenus => false,
+            _ => true,
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  MapType
+    //  Identifies the source type of a mapping: axis, button, slider,
+    //  or POV hat switch.
+    // ─────────────────────────────────────────────────────────────────
+
+    public enum MapType : int
+    {
+        None = 0,
+        Axis = 1,
+        Button = 2,
+        Slider = 3,
+        POV = 4
+    }
+}

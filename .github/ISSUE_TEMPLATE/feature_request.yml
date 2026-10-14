@@ -1,0 +1,50 @@
+name: Feature Request
+description: Suggest a new feature or improvement for PadForge
+title: "[Feature Request] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before You Start
+
+        For early-stage ideas or open-ended brainstorming, start a thread in [Discussions](https://github.com/hifihedgehog/PadForge/discussions) instead. This form is for proposals that are concrete enough to act on.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What feature would you like to see? What problem does it solve?
+      placeholder: "Describe the feature..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use Case
+      description: How would you use this feature? What's your workflow?
+      placeholder: "I would use this to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you tried any workarounds or alternative approaches?
+      placeholder: "I currently work around this by..."
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Screenshots, mockups, links to related tools, or anything else
+
+  - type: checkboxes
+    id: validations
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched [existing issues](https://github.com/hifihedgehog/PadForge/issues?q=is%3Aissue) and [Discussions](https://github.com/hifihedgehog/PadForge/discussions) for the same or a similar request.
+          required: true

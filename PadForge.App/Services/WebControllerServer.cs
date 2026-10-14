@@ -1,0 +1,2292 @@
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using PadForge.Engine;
+using PadForge.Models2D;
+using PadForge.Resources.Strings;
+
+namespace PadForge.Services
+{
+    /// <summary>
+    /// Embedded HTTP + WebSocket server that serves a gamepad UI to browsers.
+    /// Each connected client becomes a <see cref="WebControllerDevice"/> in the
+    /// input pipeline. Follows the <see cref="DsuMotionServer"/> lifecycle pattern.
+    /// </summary>
+    public sealed class WebControllerServer : IDisposable
+    {
+        private const int MaxClients = 16;
+        private const int DefaultPort = 8080;
+        private const string WebAssetPrefix = "PadForge.WebAssets.";
+
+        private IWebControllerListener _listener;
+        private readonly object _lifecycleLock = new();
+        private readonly Func<int, IDisposable> _prepareEndpoint;
+        private readonly Func<IWebControllerListener> _createListener;
+        private readonly Action<Thread> _startThread;
+        private readonly Action<Thread> _joinThread;
+        private readonly Func<int, WebControllerTls.Failure> _httpsFailure;
+        private readonly Action<PlainHttpOptions> _plainFirewall;
+        private CancellationTokenSource _acceptLifetime;
+        private IDisposable _binding;
+        private long _startGeneration;
+        private bool _starting;
+        private bool _stopping;
+
+        public WebControllerServer() : this(null, null) { }
+
+        internal WebControllerServer(Func<int, IDisposable> prepareEndpoint,
+            Func<IWebControllerListener> createListener, Action<Thread> startThread = null,
+            Action<Thread> joinThread = null, Func<int, WebControllerTls.Failure> httpsFailure = null,
+            Action<PlainHttpOptions> plainFirewall = null)
+        {
+            _prepareEndpoint = prepareEndpoint ?? PrepareEndpoint;
+            _httpsFailure = httpsFailure ?? WebControllerTls.LastFailure;
+            // The plain port's firewall rule is the same kind of machine change
+            // as the main port's, which the real endpoint preparation makes.
+            // An injected preparation leaves both alone unless asked.
+            _plainFirewall = plainFirewall ?? (prepareEndpoint == null ? ApplyPlainFirewallRule : _ => { });
+            _createListener = createListener ?? (() => new HttpWebControllerListener());
+            _startThread = startThread ?? (thread => thread.Start());
+            _joinThread = joinThread ?? (thread =>
+            {
+                if (thread != null && thread != Thread.CurrentThread) thread.Join(3000);
+            });
+        }
+
+        internal bool IsRunning => _running;
+        internal long Generation => Volatile.Read(ref _startGeneration);
+
+        internal int? AllocateClientNumber(long generation, string compositeKey, string typeKey)
+        {
+            lock (_registrationLock)
+            {
+                if (!IsServing(generation)) return null;
+                return _clientPadIds.GetOrAdd(compositeKey,
+                    _ => _typePadCounters.AddOrUpdate(typeKey, 1, (_, value) => value + 1));
+            }
+        }
+
+        internal void PublishSessionStatus(long generation, bool removed)
+        {
+            if (!removed || !IsServing(generation)) return;
+            RaiseStatus(generation, _clients.Count > 0
+                ? string.Format(Strings.Instance.Server_RunningClients_Format, _clients.Count)
+                : string.Format(Strings.Instance.Server_RunningOn_Format, Url));
+        }
+
+        private bool IsServing(long generation)
+        {
+            lock (_lifecycleLock)
+                return _running && !_disposed && generation == _startGeneration;
+        }
+
+        private void RaiseStatus(long generation, string text)
+        {
+            if (generation != Generation) return;
+            var status = new Status(generation, text);
+            var handlers = StatusChanged;
+            if (handlers == null) return;
+            foreach (EventHandler<Status> handler in handlers.GetInvocationList())
+                try { handler(this, status); } catch { }
+        }
+        private Thread _acceptThread;
+        private volatile bool _running;
+        private int _port;
+        private string _localIp;
+        private bool _https;
+        /// <summary>Why the main address serves HTTP. Kept as a kind, not
+        /// text, so the Dashboard line follows a language change.</summary>
+        private HttpsFallback _httpsFallback;
+        /// <summary>The plain address being served, or null.</summary>
+        private volatile PlainHttpOptions _plain;
+        /// <summary>Why a requested plain address is not served.</summary>
+        private PlainFailure _plainFailure;
+        private int _plainFailurePort;
+        /// <summary>The plain address's access code, normalized. Only
+        /// <see cref="SetPlainAccessCode"/> writes it, so a new code set while
+        /// the server starts cannot be overwritten by the one it started with.</summary>
+        private volatile string _accessCode;
+
+        private enum HttpsFallback { None, PortTaken, BindFailed, ListenerRejected }
+        private enum PlainFailure { None, SamePort, NoCode, AccessDenied, PortInUse, Failed }
+        private readonly ConcurrentDictionary<string, int> _typePadCounters = new();
+        private readonly ConcurrentDictionary<string, int> _clientPadIds = new();
+        private bool _disposed;
+
+        private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
+        /// <summary>Serializes session registration: the client cap and the
+        /// retire-the-previous-session step must decide together.</summary>
+        private readonly object _registrationLock = new object();
+        private Dictionary<string, byte[]> _imageCache;
+
+        /// <summary>Raised when server status changes (for UI display).</summary>
+        public sealed record Status(long Generation, string Text);
+        public event EventHandler<Status> StatusChanged;
+
+        /// <summary>Raised when a browser client connects and a device is created.</summary>
+        public event Action<WebControllerDevice> DeviceConnected;
+
+        /// <summary>Raised when a Web Menus page asks for a profile (#471), on
+        /// the socket's receive thread. The PC checks the id.</summary>
+        public event Action<string> ProfileSwitchRequested;
+
+        /// <summary>Raised when a browser client disconnects.</summary>
+        public event Action<WebControllerDevice> DeviceDisconnected;
+
+        /// <summary>Number of currently connected clients.</summary>
+        public int ClientCount => _clients.Count;
+
+        /// <summary>The URL the server is listening on.</summary>
+        public string Url => _localIp != null ? $"{(_https ? "https" : "http")}://{_localIp}:{_port}" : null;
+
+        /// <summary>True when serving HTTPS (a secure context, required for the
+        /// phone motion sensors, #296 phase 0).</summary>
+        public bool IsHttps => _https;
+
+        /// <summary>The optional second address, served over plain HTTP on its
+        /// own port beside the main one. It is for browsers that refuse
+        /// PadForge's self-signed certificate and for a tunnel or reverse proxy
+        /// that supplies its own. <paramref name="LocalOnly"/> admits only
+        /// this PC, for a tunnel running here. Every request on it must carry
+        /// the access code set through <see cref="SetPlainAccessCode"/>.</summary>
+        public sealed record PlainHttpOptions(int Port, bool LocalOnly);
+
+        /// <summary>The plain address's default port, one above the main
+        /// address's.</summary>
+        internal const int DefaultPlainPort = 8081;
+
+        /// <summary>The plain address without its code, or null when it is
+        /// not served. In This PC Only mode it names localhost, the address
+        /// a local tunnel points at.</summary>
+        private string PlainBaseUrl
+        {
+            get
+            {
+                var plain = _plain;
+                string host = plain != null && plain.LocalOnly ? "localhost" : _localIp;
+                return _running && plain != null && host != null ? $"http://{host}:{plain.Port}" : null;
+            }
+        }
+
+        /// <summary>The plain address with its access code, ready to open or
+        /// share, or null when the plain address is not served.</summary>
+        public string PlainUrl
+        {
+            get
+            {
+                string baseUrl = PlainBaseUrl;
+                string code = _accessCode;
+                return baseUrl != null && code != null
+                    ? $"{baseUrl}/?{WebControllerAccess.QueryName}={code}" : null;
+            }
+        }
+
+        /// <summary>True while the plain address is served.</summary>
+        public bool IsPlainServing => _running && _plain != null;
+
+        /// <summary>True while the plain address is served to this PC only,
+        /// so its URL names localhost and a QR code would be no use.</summary>
+        public bool IsPlainLocalOnly => _running && _plain?.LocalOnly == true;
+
+        /// <summary>One line about the plain address: where it runs while
+        /// served, why it does not while one was requested, null otherwise.</summary>
+        public string PlainStatus
+        {
+            get
+            {
+                if (!_running) return null;
+                string baseUrl = PlainBaseUrl;
+                if (baseUrl != null) return string.Format(Strings.Instance.Server_RunningOn_Format, baseUrl);
+                int port = _plainFailurePort;
+                return _plainFailure switch
+                {
+                    PlainFailure.SamePort => Strings.Instance.Server_PlainSamePort,
+                    PlainFailure.AccessDenied => string.Format(Strings.Instance.Server_AccessDenied_Format, port),
+                    PlainFailure.PortInUse => string.Format(Strings.Instance.Server_PortInUse_Format, port),
+                    PlainFailure.NoCode or PlainFailure.Failed => Strings.Instance.Server_FailedToStart,
+                    _ => null,
+                };
+            }
+        }
+
+        /// <summary>Why the main address is plain HTTP and phone motion is
+        /// off, or null while it serves HTTPS. The status line alone would
+        /// show only the http:// in the address.</summary>
+        public string HttpsUnavailable
+        {
+            get
+            {
+                if (!_running) return null;
+                return _httpsFallback switch
+                {
+                    HttpsFallback.PortTaken => string.Format(Strings.Instance.Server_HttpsPortTaken_Format, _port),
+                    HttpsFallback.BindFailed => Strings.Instance.Server_HttpsBindFailed,
+                    HttpsFallback.ListenerRejected => string.Format(Strings.Instance.Server_HttpsListenerRejected_Format, _port),
+                    _ => null,
+                };
+            }
+        }
+
+        /// <summary>Sets the plain address's access code, before or while
+        /// serving. A change drops every session that joined through the plain
+        /// address, because a new code is how the user shuts out whoever had
+        /// the old one. Their browsers hold the old code in a cookie and are
+        /// refused until they open the address with the new code. An invalid
+        /// code is ignored.</summary>
+        public void SetPlainAccessCode(string code)
+        {
+            string normalized = WebControllerAccess.Normalize(code);
+            if (!WebControllerAccess.IsValid(normalized)) return;
+            // The code changes and the sweep reads the sessions under the
+            // registration lock, the same lock a new session registers under.
+            // A plain session admitted with the old code either registered
+            // first, and is in this sweep, or registers after, and meets the
+            // new code there and is refused.
+            List<ClientSession> revoked;
+            lock (_registrationLock)
+            {
+                if (normalized == _accessCode) return;
+                _accessCode = normalized;
+                revoked = _clients.Values.Where(s => s.ViaPlain).ToList();
+            }
+            // Canceled outside the lock: each receive loop then runs its
+            // normal teardown, which takes the lock itself.
+            foreach (var session in revoked)
+            {
+                try { session.CancellationSource.Cancel(); }
+                catch (ObjectDisposedException) { /* already torn down */ }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Lifecycle
+        // ─────────────────────────────────────────────
+
+        private IDisposable PrepareEndpoint(int port)
+        {
+            if (_imageCache == null)
+            {
+                if (Application.Current?.Dispatcher != null)
+                    Application.Current.Dispatcher.Invoke(() => _imageCache = LoadImageCache());
+                else
+                    _imageCache = LoadImageCache();
+            }
+            Task.Run(() => EnsureFirewallRule(port));
+            return WebControllerTls.AcquireBinding(port);
+        }
+
+        public bool Start(int port = DefaultPort, PlainHttpOptions plain = null)
+        {
+            long generation;
+            lock (_lifecycleLock)
+            {
+                if (_disposed || _stopping) return false;
+                if (_running) return true;
+                if (_starting) return false;
+                _starting = true;
+                generation = ++_startGeneration;
+            }
+
+            IWebControllerListener pending = null;
+            IDisposable pendingBinding = null;
+            CancellationTokenSource pendingLifetime = null;
+            try
+            {
+                // Preparation can wait on the UI dispatcher. It holds no lifecycle lock.
+                pendingBinding = _prepareEndpoint(port);
+                bool https = pendingBinding != null;
+                // A failed binding records its reason. None here means nothing
+                // was attempted (an injected endpoint), so there is no reason.
+                var httpsFallback = https ? HttpsFallback.None : _httpsFailure(port) switch
+                {
+                    WebControllerTls.Failure.PortTakenByOtherApp => HttpsFallback.PortTaken,
+                    WebControllerTls.Failure.BindFailed => HttpsFallback.BindFailed,
+                    _ => HttpsFallback.None,
+                };
+                string localIp = GetLocalIpAddress();
+                lock (_lifecycleLock)
+                    if (_disposed || generation != _startGeneration) return false;
+
+                pending = _createListener();
+                try { pending.Start($"{(https ? "https" : "http")}://+:{port}/"); }
+                catch when (https)
+                {
+                    try { pending.Close(); } catch { }
+                    pendingBinding.Dispose();
+                    pendingBinding = null;
+                    https = false;
+                    httpsFallback = HttpsFallback.ListenerRejected;
+                    pending = _createListener();
+                    pending.Start($"http://+:{port}/");
+                }
+
+                // The plain address is a second prefix on the same listener, so
+                // one accept loop serves both. http.sys refuses it without
+                // touching the main prefix, and the main address keeps serving.
+                PlainHttpOptions plainServed = null;
+                var plainFailure = PlainFailure.None;
+                if (plain != null)
+                {
+                    if (plain.Port == port)
+                        plainFailure = PlainFailure.SamePort;
+                    else if (!WebControllerAccess.IsValid(_accessCode))
+                        plainFailure = PlainFailure.NoCode;
+                    else
+                    {
+                        try
+                        {
+                            pending.AddPrefix($"http://+:{plain.Port}/");
+                            plainServed = plain;
+                        }
+                        catch (HttpListenerException ex)
+                        {
+                            plainFailure = ex.ErrorCode == 5 ? PlainFailure.AccessDenied : PlainFailure.PortInUse;
+                        }
+                        catch (Exception)
+                        {
+                            plainFailure = PlainFailure.Failed;
+                        }
+                    }
+                }
+
+                pendingLifetime = new CancellationTokenSource();
+                var ownedListener = pending;
+                var token = pendingLifetime.Token;
+                var servedPlain = plainServed;
+                var acceptThread = new Thread(() => AcceptLoop(ownedListener, token, generation, servedPlain))
+                {
+                    Name = "PadForge.WebServer",
+                    IsBackground = true
+                };
+                lock (_lifecycleLock)
+                {
+                    if (_disposed || generation != _startGeneration) return false;
+                    // The new thread waits on IsServing until publication releases this lock.
+                    _startThread(acceptThread);
+                    _port = port;
+                    _localIp = localIp;
+                    _https = https;
+                    _httpsFallback = httpsFallback;
+                    _plain = plainServed;
+                    _plainFailure = plainFailure;
+                    _plainFailurePort = plain?.Port ?? 0;
+                    // Under the lifecycle lock, so a later Stop's removal is
+                    // queued after this and wins. Best effort, like the rule.
+                    try { _plainFirewall(plainServed); } catch { }
+                    _listener = pending;
+                    _acceptThread = acceptThread;
+                    _acceptLifetime = pendingLifetime;
+                    _binding = pendingBinding;
+                    _running = true;
+                    _starting = false;
+                    pending = null;
+                    pendingLifetime = null;
+                    pendingBinding = null;
+                }
+                RaiseStatus(generation, string.Format(Strings.Instance.Server_RunningOn_Format, Url));
+                return true;
+            }
+            catch (HttpListenerException ex)
+            {
+                var msg = ex.ErrorCode == 5
+                    ? string.Format(Strings.Instance.Server_AccessDenied_Format, port)
+                    : string.Format(Strings.Instance.Server_PortInUse_Format, port);
+                RaiseStatus(generation, msg);
+                return false;
+            }
+            catch (Exception)
+            {
+                RaiseStatus(generation, Strings.Instance.Server_FailedToStart);
+                return false;
+            }
+            finally
+            {
+                // Rejected startup resources remain local until they have been released.
+                try { pendingLifetime?.Cancel(); } catch { }
+                try { pending?.Close(); } catch { }
+                pendingLifetime?.Dispose();
+                pendingBinding?.Dispose();
+                lock (_lifecycleLock)
+                    if (generation == _startGeneration) _starting = false;
+            }
+        }
+
+        public void Stop()
+        {
+            IWebControllerListener listener;
+            Thread acceptThread;
+            CancellationTokenSource lifetime;
+            IDisposable binding;
+            long generation;
+            lock (_lifecycleLock)
+            {
+                generation = ++_startGeneration;
+                _starting = false;
+                if (_stopping || !_running) return;
+                _stopping = true;
+                _running = false;
+                listener = _listener;
+                _listener = null;
+                acceptThread = _acceptThread;
+                _acceptThread = null;
+                lifetime = _acceptLifetime;
+                _acceptLifetime = null;
+                binding = _binding;
+                _binding = null;
+                _https = false;
+                _httpsFallback = HttpsFallback.None;
+                _plain = null;
+                _plainFailure = PlainFailure.None;
+                // Close the plain port's opening with the server. Queued under
+                // the lock, and this server cannot start again until Stop
+                // returns, so a later start's opening is queued after this.
+                try { _plainFirewall(null); } catch { }
+            }
+
+            try
+            {
+            try { lifetime?.Cancel(); } catch { }
+            try { listener?.Stop(); listener?.Close(); }
+            catch { /* best effort */ }
+
+            // Snapshot the live devices BEFORE anything clears the registry.
+            // Each receive loop's teardown is gated on a conditional remove
+            // from _clients (so a browser reconnecting under the same id
+            // cannot evict the new session), and Stop cleared the dictionary
+            // out from under those loops. The remove then failed, the gate
+            // stayed shut, and the web pad was never marked offline: it sat in
+            // the device list as a phantom online controller for the rest of
+            // the session.
+            var stopping = new System.Collections.Generic.List<WebControllerDevice>();
+            ClientSession[] sessions;
+            lock (_registrationLock)
+            {
+                sessions = _clients.Values.ToArray();
+                foreach (var session in sessions)
+                    if (session?.Device != null) stopping.Add(session.Device);
+                _clients.Clear();
+            }
+
+            foreach (var session in sessions)
+            {
+                try { session.CancellationSource.Cancel(); }
+                catch { /* best effort */ }
+            }
+
+            _joinThread(acceptThread);
+
+            // Fire the teardown ourselves, AFTER the clear. Doing it here
+            // rather than before is what keeps it exactly-once: with _clients
+            // already empty no receive loop can win its conditional remove, so
+            // this is the sole path that can raise DeviceDisconnected.
+            foreach (var dev in stopping)
+            {
+                try
+                {
+                    dev.SetConnected(false);
+                    DeviceDisconnected?.Invoke(dev);
+                }
+                catch { /* best effort */ }
+            }
+            _clientPadIds.Clear();
+            _typePadCounters.Clear();
+
+            RaiseStatus(generation, Strings.Instance.Common_Stopped);
+            }
+            finally
+            {
+                // Releasing an older lease cannot remove a newer startup's binding.
+                binding?.Dispose();
+                lifetime?.Dispose();
+                lock (_lifecycleLock) _stopping = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_lifecycleLock) _disposed = true;
+            Stop();
+            GC.SuppressFinalize(this);
+        }
+
+        // ─────────────────────────────────────────────
+        //  Accept loop
+        // ─────────────────────────────────────────────
+
+        private void AcceptLoop(IWebControllerListener listener, CancellationToken lifetime, long generation,
+            PlainHttpOptions plain)
+        {
+            while (!lifetime.IsCancellationRequested && IsServing(generation))
+            {
+                HttpListenerContext ctx;
+                try
+                {
+                    ctx = listener.GetContext();
+                }
+                catch
+                {
+                    if (lifetime.IsCancellationRequested || !IsServing(generation)) break;
+                    // A dead listener throws immediately and forever, and the
+                    // bare continue burned a core spinning on it. Stop when the
+                    // listener is gone; pause briefly on a transient failure.
+                    if (!listener.IsListening) break;
+                    Thread.Sleep(50);
+                    continue;
+                }
+
+                if (lifetime.IsCancellationRequested || !IsServing(generation))
+                {
+                    try { ctx?.Response.Close(); } catch { }
+                    break;
+                }
+                // Admission reads only the request line and headers, so it runs
+                // here. A refusal is written on the pool like any other page.
+                bool viaPlain;
+                string code;
+                try
+                {
+                    var admission = Admit(ctx, plain, out viaPlain, out code);
+                    if (admission is WebControllerAccess.Decision.DenyMissingCode
+                        or WebControllerAccess.Decision.DenyNotLocal)
+                    {
+                        var refused = ctx;
+                        _ = Task.Run(() => RefusePlain(refused, admission));
+                        continue;
+                    }
+                    // The page's later requests, its socket included, carry
+                    // the code in this cookie. A socket that named the code in
+                    // its own address needs none.
+                    if (admission == WebControllerAccess.Decision.AllowAndSetCookie
+                        && !ctx.Request.IsWebSocketRequest)
+                        ctx.Response.AppendHeader("Set-Cookie", WebControllerAccess.SetCookieValue(code));
+                }
+                catch
+                {
+                    try { ctx.Response.Abort(); } catch { }
+                    continue;
+                }
+                if (ctx.Request.IsWebSocketRequest)
+                {
+                    _ = Task.Run(() => HandleWebSocketAsync(ctx, lifetime, generation, viaPlain, code));
+                }
+                else
+                {
+                    // Serve static files on thread pool so the accept loop
+                    // can immediately process the next request (e.g. WebSocket
+                    // upgrade that arrives while a page is still being served).
+                    var captured = ctx;
+                    _ = Task.Run(() => ServeStaticFile(captured));
+                }
+            }
+        }
+
+        /// <summary>Rules on one request. A request on the main address is
+        /// always allowed. One on the plain address is judged against the
+        /// code read here, which <paramref name="code"/> returns so the cookie
+        /// and the session registration use the same one.
+        /// <paramref name="plain"/> is what this listener was started with,
+        /// never the live field, which Stop clears while a dequeued request
+        /// can still be on its way here.</summary>
+        private WebControllerAccess.Decision Admit(HttpListenerContext ctx, PlainHttpOptions plain,
+            out bool viaPlain, out string code)
+        {
+            viaPlain = false;
+            code = null;
+            if (plain == null || ctx.Request.LocalEndPoint?.Port != plain.Port)
+                return WebControllerAccess.Decision.Allow;
+            viaPlain = true;
+            code = _accessCode;
+            return WebControllerAccess.Evaluate(code, plain.LocalOnly,
+                ctx.Request.RemoteEndPoint?.Address,
+                ctx.Request.QueryString[WebControllerAccess.QueryName],
+                ctx.Request.Headers["Cookie"]);
+        }
+
+        /// <summary>Answers a refused plain request with 403 and, for a page
+        /// load, a line that says what to do. Plain pages are English like the
+        /// rest of the web controller.</summary>
+        private static void RefusePlain(HttpListenerContext ctx, WebControllerAccess.Decision decision)
+        {
+            try
+            {
+                ctx.Response.StatusCode = 403;
+                ctx.Response.Headers["Cache-Control"] = "no-store";
+                // No body on a HEAD: http.sys allows none, and the write would
+                // throw and reset the connection instead of answering 403.
+                if (!ctx.Request.IsWebSocketRequest
+                    && !string.Equals(ctx.Request.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase))
+                {
+                    string line = decision == WebControllerAccess.Decision.DenyNotLocal
+                        ? "This address works only on the PC that runs PadForge."
+                        : "This PadForge controller opens only with its access code. Use the full address from the PC that runs PadForge, code included.";
+                    var body = Encoding.UTF8.GetBytes(
+                        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+                        "<title>PadForge</title></head>" +
+                        "<body style=\"font-family:system-ui,sans-serif;background:#10131a;color:#dfe3ea;padding:24px;line-height:1.5\">" +
+                        "<p>" + WebUtility.HtmlEncode(line) + "</p></body></html>");
+                    ctx.Response.ContentType = "text/html; charset=utf-8";
+                    ctx.Response.ContentLength64 = body.Length;
+                    ctx.Response.OutputStream.Write(body, 0, body.Length);
+                }
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Abort(); } catch { }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Static file serving
+        // ─────────────────────────────────────────────
+
+        private void ServeStaticFile(HttpListenerContext ctx)
+        {
+            try
+            {
+                var path = ctx.Request.Url?.AbsolutePath ?? "/";
+
+                if (path == "/") path = "/index.html";
+
+                // Layout API endpoint.
+                if (path == "/api/custom-layouts")
+                {
+                    ServeCustomLayoutsApi(ctx);
+                    return;
+                }
+
+                if (path == "/api/layout")
+                {
+                    ServeLayoutApi(ctx);
+                    return;
+                }
+
+                if (path == "/api/info")
+                {
+                    ServeInfoApi(ctx);
+                    return;
+                }
+
+                if (path == "/api/menuicon")
+                {
+                    ServeMenuIcon(ctx);
+                    return;
+                }
+
+                // Serve 2D model PNGs from image cache (/img/2DModels/...).
+                if (path.StartsWith("/img/") && _imageCache != null)
+                {
+                    var imgPath = path.Substring(5); // strip "/img/"
+                    if (_imageCache.TryGetValue(imgPath, out var imgBytes))
+                    {
+                        ctx.Response.ContentType = "image/png";
+                        ctx.Response.ContentLength64 = imgBytes.Length;
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.OutputStream.Write(imgBytes, 0, imgBytes.Length);
+                        ctx.Response.Close();
+                        return;
+                    }
+                }
+
+                // Map URL path to embedded resource name.
+                // "/js/foo.js" → "PadForge.WebAssets.js.foo.js"
+                var resourceName = WebAssetPrefix + path.TrimStart('/').Replace('/', '.');
+
+                var assembly = Assembly.GetExecutingAssembly();
+                using var stream = assembly.GetManifestResourceStream(resourceName);
+
+                if (stream == null)
+                {
+                    ctx.Response.StatusCode = 404;
+                    ctx.Response.Close();
+                    return;
+                }
+
+                // Read into buffer so we can set Content-Length (avoids chunked
+                // encoding which can stall keep-alive on some mobile browsers).
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                var body = ms.ToArray();
+
+                ctx.Response.ContentType = GetContentType(path);
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentLength64 = body.Length;
+                ctx.Response.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+                ctx.Response.Headers["Pragma"] = "no-cache";
+                ctx.Response.OutputStream.Write(body, 0, body.Length);
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        /// <summary>The custom-layouts API (#296 phase 4). GET lists the
+        /// stored layouts; POST upserts one (returns its id); DELETE ?id=
+        /// removes one. All storage rides WebCustomLayoutStore, which
+        /// whitelists the schema, so the browser's payload is never stored
+        /// verbatim.</summary>
+        private void ServeCustomLayoutsApi(HttpListenerContext ctx)
+        {
+            try
+            {
+                switch (ctx.Request.HttpMethod)
+                {
+                    case "GET":
+                    {
+                        var bytes = Encoding.UTF8.GetBytes(WebCustomLayoutStore.Json);
+                        ctx.Response.ContentType = "application/json; charset=utf-8";
+                        ctx.Response.ContentLength64 = bytes.Length;
+                        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+                        break;
+                    }
+                    case "POST":
+                    {
+                        // Cap the READ, not the read result. ReadToEnd first and
+                        // check the length after means a client on the LAN can
+                        // make the app allocate as much as it cares to send.
+                        const int MaxBody = 64 * 1024;
+                        if (ctx.Request.ContentLength64 > MaxBody) { ctx.Response.StatusCode = 413; break; }
+                        var buf = new char[MaxBody + 1];
+                        int got = 0;
+                        using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
+                        {
+                            int n;
+                            while (got < buf.Length && (n = reader.Read(buf, got, buf.Length - got)) > 0)
+                                got += n;
+                        }
+                        if (got > MaxBody) { ctx.Response.StatusCode = 413; break; }
+                        string body = new string(buf, 0, got);
+                        var id = WebCustomLayoutStore.Upsert(body);
+                        if (id == null) { ctx.Response.StatusCode = 400; break; }
+                        var ok = Encoding.UTF8.GetBytes($"{{\"id\":\"{id}\"}}");
+                        ctx.Response.ContentType = "application/json; charset=utf-8";
+                        ctx.Response.ContentLength64 = ok.Length;
+                        ctx.Response.OutputStream.Write(ok, 0, ok.Length);
+                        break;
+                    }
+                    case "DELETE":
+                    {
+                        var id = ctx.Request.QueryString["id"];
+                        ctx.Response.StatusCode = WebCustomLayoutStore.Delete(id) ? 200 : 404;
+                        break;
+                    }
+                    default:
+                        ctx.Response.StatusCode = 405;
+                        break;
+                }
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        /// <summary>What a page needs to know about the server: the secure
+        /// address, so a page opened over plain HTTP can point the user at the
+        /// one where phone motion works. Null while the main address is HTTP,
+        /// and null for a peer on this PC, which is a local browser that is
+        /// already a secure context or a tunnel whose far end cannot reach a
+        /// LAN address anyway.</summary>
+        private void ServeInfoApi(HttpListenerContext ctx)
+        {
+            try
+            {
+                bool local = WebControllerAccess.IsLoopback(ctx.Request.RemoteEndPoint?.Address);
+                string secureUrl = _https && _localIp != null && !local ? $"https://{_localIp}:{_port}/" : null;
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(new { secureUrl });
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                ctx.Response.Headers["Cache-Control"] = "no-store";
+                ctx.Response.ContentLength64 = bytes.Length;
+                ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        /// <summary>A Web Menus tile's picture (#471), by the opaque token the
+        /// page's snapshot names. Only an icon a current snapshot references
+        /// has a token, so this reads nothing a menu does not show. 404
+        /// otherwise.</summary>
+        private static void ServeMenuIcon(HttpListenerContext ctx)
+        {
+            try
+            {
+                if (WebMenusService.TryGetIcon(ctx.Request.QueryString["t"], out byte[] bytes, out string contentType))
+                {
+                    ctx.Response.ContentType = contentType;
+                    ctx.Response.Headers["Cache-Control"] = "no-cache";
+                    ctx.Response.ContentLength64 = bytes.Length;
+                    ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+                }
+                else ctx.Response.StatusCode = 404;
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        /// <summary>Renders a URL to a QR image for the Dashboard card (#296),
+        /// so the phone scans instead of typing. Returns a frozen ImageSource,
+        /// or null if the URL will not encode.</summary>
+        public static System.Windows.Media.ImageSource RenderQr(string url)
+        {
+            try
+            {
+                var mods = QrCode.Encode(url);
+                if (mods == null) return null;
+                int size = mods.GetLength(0);
+                const int scale = 6, quiet = 3;
+                int dim = (size + quiet * 2) * scale;
+
+                var pixels = new byte[dim * dim]; // 8bpp grayscale, 0=black, 255=white
+                for (int i = 0; i < pixels.Length; i++) pixels[i] = 255;
+                for (int y = 0; y < size; y++)
+                    for (int x = 0; x < size; x++)
+                        if (mods[x, y])
+                            for (int dy = 0; dy < scale; dy++)
+                                for (int dx = 0; dx < scale; dx++)
+                                {
+                                    int px = (x + quiet) * scale + dx;
+                                    int py = (y + quiet) * scale + dy;
+                                    pixels[py * dim + px] = 0;
+                                }
+
+                var bmp = System.Windows.Media.Imaging.BitmapSource.Create(
+                    dim, dim, 96, 96, System.Windows.Media.PixelFormats.Gray8, null, pixels, dim);
+                bmp.Freeze();
+                return bmp;
+            }
+            catch { return null; }
+        }
+
+        private static string GetContentType(string path)
+        {
+            if (path.EndsWith(".html")) return "text/html; charset=utf-8";
+            if (path.EndsWith(".css")) return "text/css; charset=utf-8";
+            if (path.EndsWith(".js")) return "application/javascript; charset=utf-8";
+            if (path.EndsWith(".json")) return "application/json; charset=utf-8";
+            if (path.EndsWith(".svg")) return "image/svg+xml";
+            if (path.EndsWith(".png")) return "image/png";
+            if (path.EndsWith(".ico")) return "image/x-icon";
+            return "application/octet-stream";
+        }
+
+        // ─────────────────────────────────────────────
+        //  WebSocket handling
+        // ─────────────────────────────────────────────
+
+        private async Task HandleWebSocketAsync(HttpListenerContext ctx, CancellationToken lifetime, long generation,
+            bool viaPlain = false, string admittedCode = null)
+        {
+            WebSocket ws = null;
+            try
+            {
+                // Extract client ID from query string.
+                var clientId = ctx.Request.QueryString["id"] ?? Guid.NewGuid().ToString("N");
+                var clientType = ctx.Request.QueryString["type"] ?? "xbox360";
+                var layoutParam = ctx.Request.QueryString["layout"] ?? "xbox360";
+                // Only a Web Menus socket (#471) makes a menu surface. Another
+                // page naming that layout gets the default one.
+                if (layoutParam.Equals(WebControllerDevice.MenusLayoutKey, StringComparison.OrdinalIgnoreCase)
+                    && !clientType.Equals(WebControllerDevice.MenusLayoutKey, StringComparison.OrdinalIgnoreCase))
+                    layoutParam = "xbox360";
+                // The cheap pre-filter must not reject a client whose id is
+                // already registered: that is a reconnect the locked
+                // registration below retires and replaces (#402 review). It
+                // used to run before the key existed, so a phone reconnecting
+                // at the client limit got a 503 while its own stale session
+                // held the slot.
+                bool preIsTouchpad = clientType.Equals("touchpad", StringComparison.OrdinalIgnoreCase);
+                bool preIsMenus = clientType.Equals(WebControllerDevice.MenusLayoutKey, StringComparison.OrdinalIgnoreCase);
+                var preKey = (preIsTouchpad ? "touchpad" : preIsMenus ? WebControllerDevice.MenusLayoutKey
+                    : layoutParam.ToLowerInvariant()) + ":" + clientId;
+                if (_clients.Count >= MaxClients && !_clients.ContainsKey(preKey))
+                {
+                    ctx.Response.StatusCode = 503;
+                    ctx.Response.Close();
+                    return;
+                }
+
+                // Keepalive pings, so a phone that left the network (screen
+                // off, Wi-Fi dropped, walked out of range) is detected instead
+                // of parking a receive that never returns: without traffic the
+                // TCP connection has nothing to fail on, and the session held
+                // its device online and one of the MaxClients slots forever.
+                var wsCtx = await ctx.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(30));
+                ws = wsCtx.WebSocket;
+
+                // Create device — reuse pad number for reconnecting clients.
+                bool isTouchpadClient = clientType.Equals("touchpad", StringComparison.OrdinalIgnoreCase);
+                // A Web Menus page (#471): the slot's Touch Grid menus, no pad.
+                bool isMenusClient = !isTouchpadClient
+                    && clientType.Equals(WebControllerDevice.MenusLayoutKey, StringComparison.OrdinalIgnoreCase);
+                bool hasTouchpad = isTouchpadClient ||
+                    (!isMenusClient && ctx.Request.QueryString["touchpad"] == "1");
+                // Per-type pad numbering: each type (xbox360/ds4/touchpad) starts at 1.
+                var typeKey = isTouchpadClient ? "touchpad"
+                    : isMenusClient ? WebControllerDevice.MenusLayoutKey
+                    : layoutParam.ToLowerInvariant();
+                var compositeKey = typeKey + ":" + clientId;
+                int? allocated = AllocateClientNumber(generation, compositeKey, typeKey);
+                if (!allocated.HasValue)
+                {
+                    ws.Dispose();
+                    return;
+                }
+                int padId = allocated.Value;
+                string name;
+                string customLayoutJson = null;
+                if (isTouchpadClient)
+                    name = $"Web Touchpad {padId}";
+                else if (isMenusClient)
+                    name = $"Web Menus {padId}";
+                else if (typeKey == "gamepad")
+                    // A controller paired to the phone, or built into the
+                    // handheld, forwarded through the browser's Gamepad API
+                    // (#402). Its own type key, so its ProductGuid is distinct
+                    // from every drawn layout.
+                    name = $"Browser Gamepad {padId}";
+                else if (typeKey.StartsWith("custom:", StringComparison.Ordinal))
+                {
+                    // A builder pad (#296 phase 4): its own typeKey per layout
+                    // id, so the ProductGuid hash gives it a distinct product
+                    // identity like every stock layout.
+                    customLayoutJson = WebCustomLayoutStore.Find(typeKey.Substring(7));
+                    string customName = "Custom Pad";
+                    if (customLayoutJson != null)
+                    {
+                        try
+                        {
+                            using var cdoc = JsonDocument.Parse(customLayoutJson);
+                            if (cdoc.RootElement.TryGetProperty("name", out var np))
+                                customName = np.GetString();
+                        }
+                        catch { }
+                    }
+                    name = $"{customName} {padId}";
+                }
+                else
+                    name = $"{ResolveLayout(typeKey).NameStem} Web Controller {padId}";
+                // Pass typeKey explicitly so each layout (xbox360 / ds4 /
+                // touchpad) carries a distinct ProductGuid. Without this,
+                // FindOrCreateUserDevice's BT-reconnect fallback would
+                // migrate one layout's offline UserDevice row onto a
+                // freshly-connecting client of a different layout (the
+                // fallback gates on ProductGuid + offline status only),
+                // which is the source of issue: switching layouts in the
+                // browser silently overwrote the previous layout's row in
+                // the Devices list.
+                var device = new WebControllerDevice(compositeKey, name, isTouchpadClient, typeKey);
+                if (hasTouchpad && !isTouchpadClient)
+                    device.HasTouchpad = true; // gamepad layout with a touchpad zone
+                if (isMenusClient)
+                {
+                    // No surface to declare: the device has no inputs, and
+                    // its taps reach the engine as menu cells.
+                }
+                else if (!isTouchpadClient && customLayoutJson != null)
+                {
+                    // A custom pad's shape comes from its widgets: extended
+                    // button slots from button codes past the standard 11, a
+                    // touchpad surface when a touch area exists.
+                    try
+                    {
+                        var ext = new List<int>();
+                        // The pad's REAL surface, widget by widget. Without
+                        // this the picker offered a full gamepad for a pad
+                        // built from two buttons and a stick.
+                        var axes = new List<int>();
+                        var buttons = new List<int>();
+                        bool hasPov = false;
+                        using var cdoc = JsonDocument.Parse(customLayoutJson);
+                        foreach (var w in cdoc.RootElement.GetProperty("widgets").EnumerateArray())
+                        {
+                            string kind = w.GetProperty("kind").GetString();
+                            int code = w.TryGetProperty("code", out var cp0) ? cp0.GetInt32() : 0;
+                            if (kind == "touch") device.HasTouchpad = true;
+                            else if (kind == "dpad") hasPov = true;
+                            else if (kind == "stick")
+                            {
+                                // A stick widget drives its base axis and the next.
+                                if (!axes.Contains(code)) axes.Add(code);
+                                if (!axes.Contains(code + 1)) axes.Add(code + 1);
+                            }
+                            else if (kind == "slider")
+                            {
+                                if (!axes.Contains(code)) axes.Add(code);
+                            }
+                            else if (kind == "button")
+                            {
+                                if (!buttons.Contains(code)) buttons.Add(code);
+                                if (code > 10 && code != 16 && code < 22 && !ext.Contains(code)) ext.Add(code);
+                            }
+                        }
+                        if (ext.Count > 0) device.SetExtendedButtons(ext.ToArray());
+                        device.SetCustomSurface(axes.ToArray(), buttons.ToArray(), hasPov);
+                    }
+                    catch { }
+                }
+                else if (!isTouchpadClient && typeKey == "gamepad")
+                {
+                    // A forwarded pad (#402) declares its shape from the query
+                    // the page built after discovering the controller.
+                    ConfigureGamepadShape(device, ctx.Request.QueryString["mode"],
+                        ctx.Request.QueryString["buttons"], ctx.Request.QueryString["axes"]);
+                }
+                else if (!isTouchpadClient)
+                {
+                    // Declare the extended slots (paddles / Misc) this layout's
+                    // surface offers, so they surface in the picker with
+                    // canonical names instead of arriving as unmapped codes.
+                    var extDef = ResolveLayout(typeKey);
+                    var ext = new List<int>();
+                    foreach (var ov in extDef.Overlays)
+                        if (ResolveInput(typeKey, ov.TargetName, out var im)
+                            && im.kind == "button" && im.code > 10 && im.code != 16
+                            && !ext.Contains(im.code))
+                            ext.Add(im.code);
+                    if (ext.Count > 0) device.SetExtendedButtons(ext.ToArray());
+                }
+                device.SetConnected(true);
+
+                var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+                var session = new ClientSession(ws, device, cts) { ViaPlain = viaPlain };
+
+                // Handle rumble feedback → send to browser.
+                device.RumbleRequested += (low, high) =>
+                {
+                    if (cts.IsCancellationRequested || ws.State != WebSocketState.Open) return;
+                    // A forwarded pad's ping carries the current rumble (#402),
+                    // so rumble on the page is a lease the pings renew and a
+                    // gap in communication ends it.
+                    session.RumbleLeft = (int)low;
+                    session.RumbleRight = (int)high;
+                    _ = SendJsonAsync(ws, new { type = "rumble", left = (int)low, right = (int)high }, cts.Token, session.SendGate);
+                };
+                // Lightbar + player identity (#296): the phone renders the
+                // slot's LED color and player pips. Driven by the same
+                // identity pass that lights physical pads.
+                device.LedChanged += (r, g, b) =>
+                {
+                    if (cts.IsCancellationRequested || ws.State != WebSocketState.Open) return;
+                    _ = SendJsonAsync(ws, new { type = "led", r = (int)r, g = (int)g, b = (int)b }, cts.Token, session.SendGate);
+                };
+                device.PlayerIndexChanged += idx =>
+                {
+                    if (cts.IsCancellationRequested || ws.State != WebSocketState.Open) return;
+                    _ = SendJsonAsync(ws, new { type = "player", index = idx }, cts.Token, session.SendGate);
+                };
+                // Web Menus (#471): the page's snapshot, prebuilt JSON, and a
+                // profile the page asked for. Both come off at teardown: the
+                // profile handler holds this server, and an offline row keeps
+                // its device.
+                Action<string> onMenusFeed = json =>
+                {
+                    if (cts.IsCancellationRequested || ws.State != WebSocketState.Open) return;
+                    _ = SendTextAsync(ws, json, cts.Token, session.SendGate);
+                };
+                Action<string> onProfileRequested = id => ProfileSwitchRequested?.Invoke(id);
+                device.MenusFeedChanged += onMenusFeed;
+                device.ProfileRequested += onProfileRequested;
+
+                // Registration is one critical section: the MaxClients check
+                // above is a cheap pre-filter that races (several browsers can
+                // pass it before any of them registers), and a reconnect under
+                // an existing id has to retire the OLD session before the new
+                // device comes up. The old session's own teardown cannot do it:
+                // its removal is conditional on still being the registered
+                // session, so once the new one is in the dictionary the old
+                // loop's remove fails and its device stayed online forever as a
+                // phantom.
+                lock (_registrationLock)
+                {
+                    if (!IsServing(generation) || lifetime.IsCancellationRequested)
+                    {
+                        ws.Dispose();
+                        cts.Dispose();
+                        return;
+                    }
+                    // Admitted through the plain address under a code that
+                    // New Code has since replaced: the revocation sweep ran
+                    // before this session existed, so it is refused here.
+                    if (viaPlain && admittedCode != _accessCode)
+                    {
+                        try { ws.Abort(); } catch { }
+                        try { ws.Dispose(); } catch { }
+                        cts.Dispose();
+                        return;
+                    }
+                    _clients.TryGetValue(compositeKey, out var prior);
+                    if (prior == null && _clients.Count >= MaxClients)
+                    {
+                        try { ws.Abort(); } catch { }
+                        try { ws.Dispose(); } catch { }
+                        cts.Dispose();
+                        return;
+                    }
+                    if (prior != null)
+                    {
+                        // Claim the teardown here so the old loop's conditional
+                        // remove cannot also fire it.
+                        ((ICollection<KeyValuePair<string, ClientSession>>)_clients)
+                            .Remove(new KeyValuePair<string, ClientSession>(compositeKey, prior));
+                        try { prior.CancellationSource.Cancel(); } catch { }
+                        try
+                        {
+                            prior.Device.SetConnected(false);
+                            DeviceDisconnected?.Invoke(prior.Device);
+                        }
+                        catch { /* best effort */ }
+                    }
+                    _clients[compositeKey] = session;
+                    // Connect under the same lock (#402). Outside it, a session
+                    // that had installed itself could pause here while a
+                    // replacement retired it, installed and connected, then
+                    // deliver its own connect late: the engine would bind the
+                    // row to the retired device while the replacement's socket
+                    // kept answering. Under the lock every retire, install and
+                    // connect is whole and in order. Swallowed like the retire's
+                    // disconnect above, so a handler throw cannot orphan the
+                    // session before the try/finally below takes over.
+                    try { DeviceConnected?.Invoke(device); } catch { /* best effort */ }
+                }
+
+                // Once the session is registered, everything runs under try/finally
+                // so a throw from an event handler (StatusChanged), the confirm
+                // send, or the receive path can't orphan the session in
+                // _clients: that would leak ws/cts and permanently consume one of
+                // MaxClients slots. The finally is the sole teardown path.
+                try
+                {
+                    PublishSessionStatus(generation, true);
+
+                    // Send connection confirmation.
+                    await SendJsonAsync(ws, new { type = "connected", padId, name }, cts.Token, session.SendGate);
+                    // A reconnecting client missed any LED/player push that
+                    // happened while it was away; replay the current state.
+                    device.ResendIdentity();
+                    device.ResendMenusFeed();
+                    // A forwarded pad's phone can sleep or lose Wi-Fi mid-hold
+                    // (#402): the page heartbeats once a second, and this
+                    // neutralizes the device when nothing has arrived for
+                    // GamepadInputDeadlineMs, so a button cannot stay latched
+                    // on the PC. The 30 s socket keepalive stays the
+                    // connection deadline. A Web Menus phone (#471) holds
+                    // tiles the same way, so it answers the same ping.
+                    if (UsesInputDeadline(typeKey))
+                    {
+                        session.Freshness = new GamepadFreshness(Environment.TickCount64);
+                        _ = RunInputDeadline(session, cts.Token);
+                    }
+
+                    // Receive loop. A text message can arrive in several frames,
+                    // and handing a fragment to the JSON parser dropped the
+                    // whole message: assemble until EndOfMessage, with a cap so
+                    // a client cannot grow the buffer without bound.
+                    const int MaxMessageBytes = 16 * 1024;
+                    var buffer = new byte[1024];
+                    byte[] assembled = null;
+                    int assembledLen = 0;
+                    bool overflowed = false;
+                    while (ws.State == WebSocketState.Open && IsServing(generation) && !cts.Token.IsCancellationRequested)
+                    {
+                        WebSocketReceiveResult result;
+                        try
+                        {
+                            result = await ws.ReceiveAsync(
+                                new ArraySegment<byte>(buffer), cts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (WebSocketException)
+                        {
+                            break;
+                        }
+
+                        if (result.MessageType == WebSocketMessageType.Close)
+                            break;
+
+                        if (result.MessageType != WebSocketMessageType.Text)
+                            continue;
+
+                        if (result.EndOfMessage && assembledLen == 0 && !overflowed)
+                        {
+                            // The common case: one frame, one message. Applied under
+                            // the deadline lock (#402): the deadline's check-then-
+                            // neutralize cannot interleave with a press that arrived
+                            // after its check. Input is applied only while the session
+                            // is fresh (a timely echo of the server's ping): a slow link
+                            // draining old presses cannot keep a dead page alive, and
+                            // nothing it delivers after expiry is applied.
+                            bool resync;
+                            lock (session.DeadlineLock)
+                            {
+                                resync = ProcessMessage(device, buffer, result.Count,
+                                    acceptInput: session.Freshness == null || !session.Freshness.Expired,
+                                    session.Freshness);
+                            }
+                            if (resync) session.RequestResync();
+                            continue;
+                        }
+
+                        if (!overflowed)
+                        {
+                            if (assembledLen + result.Count > MaxMessageBytes)
+                            {
+                                overflowed = true;
+                            }
+                            else
+                            {
+                                if (assembled == null) assembled = new byte[MaxMessageBytes];
+                                Buffer.BlockCopy(buffer, 0, assembled, assembledLen, result.Count);
+                                assembledLen += result.Count;
+                            }
+                        }
+
+                        if (result.EndOfMessage)
+                        {
+                            if (!overflowed && assembledLen > 0)
+                            {
+                                bool resync;
+                                lock (session.DeadlineLock)
+                                {
+                                    resync = ProcessMessage(device, assembled, assembledLen,
+                                        acceptInput: session.Freshness == null || !session.Freshness.Expired,
+                                        session.Freshness);
+                                }
+                                if (resync) session.RequestResync();
+                            }
+                            assembledLen = 0;
+                            overflowed = false;
+                        }
+                    }
+                }
+                finally
+                {
+                    // Cleanup. Conditional: a browser that reconnected with the
+                    // same client id already replaced this session in _clients
+                    // (the indexer overwrite above), and an unconditional remove
+                    // here would evict the NEW session and offline the device the
+                    // new connection just brought up (audit F9). Only tear down
+                    // when this session is still the registered one.
+                    //
+                    // The remove and the disconnect are ONE step under the
+                    // registration lock (#402). Split, this loop could remove its
+                    // own entry, lose the thread, and fire DeviceDisconnected after
+                    // a replacement under the same key had registered: the engine
+                    // unregisters by InstanceGuid, which the replacement shares,
+                    // so the live replacement went offline while its socket kept
+                    // answering. Under the lock the two orders are whole: either
+                    // this teardown finishes before the replacement registers, or
+                    // the replacement's registration retires this session first
+                    // and the remove here fails.
+                    bool stillRegistered;
+                    lock (_registrationLock)
+                    {
+                        stillRegistered = ((System.Collections.Generic.ICollection<System.Collections.Generic.KeyValuePair<string, ClientSession>>)_clients)
+                            .Remove(new System.Collections.Generic.KeyValuePair<string, ClientSession>(compositeKey, session));
+                        if (stillRegistered)
+                        {
+                            // Swallowed like the retire's disconnect and the
+                            // connect above. This is the finally: a throw here
+                            // escaped it after the session was already out of
+                            // the map, so the cancel, the socket disposal and
+                            // the token disposal below were all skipped with
+                            // nothing left to retry them. The forwarded pad's
+                            // deadline task then woke once a second forever on a
+                            // token nobody would ever cancel.
+                            try
+                            {
+                                device.SetConnected(false);
+                                DeviceDisconnected?.Invoke(device);
+                            }
+                            catch { /* best effort */ }
+                        }
+                    }
+                    PublishSessionStatus(generation, stillRegistered);
+                    device.MenusFeedChanged -= onMenusFeed;
+                    device.ProfileRequested -= onProfileRequested;
+
+                    // Cancel BEFORE the handshake, not after. Disposal does not
+                    // cancel, and the forwarded pad's deadline task (#402) waits
+                    // on this token. The close waits for the CLIENT's own close
+                    // frame, so a page that went away without sending one held
+                    // the handshake open with no bound at all, and the deadline
+                    // task woke once a second behind it, holding the session and
+                    // its device until the transport itself gave up. The
+                    // handshake is a courtesy to a client that is still there,
+                    // so it gets a courtesy's worth of time.
+                    try { cts.Cancel(); } catch { }
+                    try
+                    {
+                        if (ws.State == WebSocketState.Open)
+                        {
+                            using var closing = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, closing.Token);
+                        }
+                    }
+                    catch { /* best effort */ }
+                    cts.Dispose();
+                    // Dispose the WebSocket after CloseAsync (the documented close
+                    // lifecycle). A late fire-and-forget rumble send would hit a
+                    // disposed socket, but SendJsonAsync is best-effort guarded and
+                    // checks ws.State, so the throw is swallowed.
+                    try { ws?.Dispose(); } catch { }
+                    // Don't dispose SendGate: a rumble send may still hold it,
+                    // and Release() on a disposed SemaphoreSlim throws into the
+                    // fire-and-forget send. The gate never touches
+                    // AvailableWaitHandle, so it holds no unmanaged handle and
+                    // the GC reclaims it with nothing to leak.
+                }
+            }
+            catch (Exception ex)
+            {
+                _ = ex;
+                // Connection failed before WebSocket established.
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        /// <summary>Applies one client message to the device. <paramref name="acceptInput"/>
+        /// is false while a forwarded pad's session is expired (#402): input,
+        /// motion and touch are then dropped, capability and echo messages
+        /// still land. Returns true when an echo turned an expired session
+        /// fresh again, which is the moment the page must resend everything.</summary>
+        internal static bool ProcessMessage(WebControllerDevice device, byte[] data, int length,
+            bool acceptInput = true, GamepadFreshness freshness = null)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(data.AsMemory(0, length));
+                var root = doc.RootElement;
+
+                if (!root.TryGetProperty("type", out var typeProp)) return false;
+                var type = typeProp.GetString();
+
+                if (type == "input")
+                {
+                    // A Web Menus phone (#471) has no pad input to take.
+                    if (!acceptInput || device.IsMenuSurface) return false;
+                    var kind = root.GetProperty("kind").GetString();
+                    var code = root.GetProperty("code").GetInt32();
+                    var value = root.GetProperty("value").GetInt32();
+
+                    if (kind == "button")
+                        device.UpdateButton(code, value != 0);
+                    else if (kind == "axis")
+                        device.UpdateAxis(code, value);
+                    else if (kind == "pov")
+                        device.UpdatePov(value);
+                }
+                else if (type == "motion")
+                {
+                    // Phone motion (#296 phase 1): gyro rad/s + accel m/s²,
+                    // already rotated into the SDL frame client-side. Caps flip
+                    // on first arrival, mirroring the touchpad pattern, so the
+                    // Devices page and the gyro pipeline discover the source
+                    // the moment it streams.
+                    if (!acceptInput || device.IsMenuSurface) return false;
+                    if (!device.HasGyro) device.EnableMotionCaps();
+                    float gx = root.TryGetProperty("gx", out var gxp) ? (float)gxp.GetDouble() : 0f;
+                    float gy = root.TryGetProperty("gy", out var gyp) ? (float)gyp.GetDouble() : 0f;
+                    float gz = root.TryGetProperty("gz", out var gzp) ? (float)gzp.GetDouble() : 0f;
+                    float ax = root.TryGetProperty("ax", out var axp) ? (float)axp.GetDouble() : 0f;
+                    float ay = root.TryGetProperty("ay", out var ayp) ? (float)ayp.GetDouble() : 0f;
+                    float az = root.TryGetProperty("az", out var azp) ? (float)azp.GetDouble() : 0f;
+                    device.UpdateMotion(gx, gy, gz, ax, ay, az);
+                }
+                else if (type == "cell")
+                {
+                    // A Web Menus tile pressed or released (#471). The engine
+                    // checks the slot, menu and cell before firing anything.
+                    if (!acceptInput) return false;
+                    int slot = root.GetProperty("slot").GetInt32();
+                    int menu = root.GetProperty("menu").GetInt32();
+                    int cell = root.GetProperty("cell").GetInt32();
+                    bool down = root.GetProperty("down").GetBoolean();
+                    device.SetMenuCell(slot, menu, cell, down);
+                }
+                else if (type == "profile")
+                {
+                    // A Web Menus page choosing a profile (#471). An expired
+                    // session's messages are old news, as its taps are.
+                    if (!acceptInput) return false;
+                    if (root.TryGetProperty("id", out var idp) && idp.ValueKind == JsonValueKind.String)
+                        device.RequestProfile(idp.GetString());
+                }
+                else if (type == "hb")
+                {
+                    // A forwarded pad's echo of the server's ping (#402). Only a
+                    // timely echo counts as fresh: the ping's own send tick
+                    // bounds the round trip, so a delayed echo renews nothing.
+                    if (freshness != null && root.TryGetProperty("n", out var np) && np.TryGetInt32(out int n))
+                        return freshness.Ack(n, Environment.TickCount64);
+                }
+                else if (type == "caps")
+                {
+                    // What this browser can actually do. Sent once right after
+                    // the socket opens. Sets the rumble claim in either
+                    // direction to what the client reported.
+                    if (root.TryGetProperty("vibrate", out var vp)
+                        && vp.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                        device.HasRumble = vp.GetBoolean();
+                    if (root.TryGetProperty("mapping", out var mp))
+                    {
+                        // A forwarded pad (#402) says how the browser mapped it
+                        // and how big it is, for the diagnostics log.
+                        int nb = root.TryGetProperty("buttons", out var nbp) && nbp.TryGetInt32(out int nbv) ? nbv : -1;
+                        int na = root.TryGetProperty("axes", out var nap) && nap.TryGetInt32(out int nav) ? nav : -1;
+                        PadForge.Engine.SdlDiagLog.WriteLine(
+                            $"WEBGP caps {device.Name} mapping=\"{mp.GetString()}\" buttons={nb} axes={na} vibrate={device.HasRumble}");
+                    }
+                    // A raw pad's axes at the moment it connected (#402): where
+                    // each one rests, as far as the page can tell. The device
+                    // returns them there when the session expires, so a trigger
+                    // the pad reports as an axis at -1 releases to its low end
+                    // and not to a synthetic center.
+                    if (root.TryGetProperty("rest", out var rest) && rest.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var p in rest.EnumerateObject())
+                            if (int.TryParse(p.Name, out int axis) && p.Value.TryGetInt32(out int value))
+                                device.SetRawAxisRest(axis, value);
+                        // Caps can arrive after the session already expired at
+                        // the default center. The deadline fires once per expiry,
+                        // so the new rest must land now, under the same lock the
+                        // caller holds for the deadline.
+                        if (freshness != null && freshness.Expired) device.NeutralizeAll();
+                    }
+                }
+                else if (type == "touchpad")
+                {
+                    // DS4 controller page sends touchpad-finger messages from
+                    // a gamepad connection — enable touchpad capability on
+                    // first touch. Touchpad CLICK is no longer a special-case
+                    // payload: controller_client.js emits a standard
+                    // {type:"input", kind:"button", code:16, ...} message
+                    // (handled by the "input" branch above) so this branch
+                    // only carries finger position now.
+                    // A forwarded pad (#402) has no touch surface: its page never
+                    // sends this, and another client on its session must not
+                    // leave a finger down that the deadline's release cannot lift.
+                    if (!acceptInput || device.LayoutKey == "gamepad" || device.IsMenuSurface) return false;
+                    device.HasTouchpad = true;
+
+                    int finger = root.TryGetProperty("finger", out var fp) ? fp.GetInt32() : 0;
+                    float x = root.TryGetProperty("x", out var xp) ? (float)xp.GetDouble() : 0f;
+                    float y = root.TryGetProperty("y", out var yp) ? (float)yp.GetDouble() : 0f;
+                    bool down = root.TryGetProperty("down", out var dp) && dp.GetBoolean();
+                    device.UpdateTouchpadFinger(finger, x, y, down);
+                }
+            }
+            catch
+            {
+                // Ignore malformed messages.
+            }
+            return false;
+        }
+
+        private static Task SendJsonAsync(WebSocket ws, object obj, CancellationToken ct, SemaphoreSlim gate = null)
+            => SendTextAsync(ws, JsonSerializer.Serialize(obj), ct, gate);
+
+        /// <summary>Sends one text message, already JSON. Web Menus snapshots
+        /// (#471) arrive built.</summary>
+        private static async Task SendTextAsync(WebSocket ws, string json, CancellationToken ct, SemaphoreSlim gate = null)
+        {
+            if (ws.State != WebSocketState.Open) return;
+            // Serialize concurrent sends on one socket — a managed WebSocket
+            // throws if a second SendAsync starts before the first completes.
+            // No context capture: a send that starts on the UI thread (a Web
+            // Menus snapshot, #471) must not queue its continuation, and the
+            // gate's release, behind the dispatcher, or a UI stall would hold
+            // the gate and delay the #402 ping past its round-trip limit.
+            if (gate != null)
+            {
+                try { await gate.WaitAsync(ct).ConfigureAwait(false); }
+                catch { return; }
+            }
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(json);
+                await ws.SendAsync(
+                    new ArraySegment<byte>(bytes),
+                    WebSocketMessageType.Text,
+                    true,
+                    ct).ConfigureAwait(false);
+            }
+            catch { /* best effort */ }
+            finally { gate?.Release(); }
+        }
+
+        // ─────────────────────────────────────────────
+        //  2D model image cache + layout API
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Where a layout's lightbar sits on its own art, and whether it
+        /// carries player indicator LEDs.
+        ///
+        /// <para>The rule is the Lighting tab's, not a new one: a lightbar
+        /// belongs to the DualSense family and the DualShock 4, and the
+        /// indicator LEDs to the DualSense family alone (PadPage's
+        /// hasLightbar / hasIndicatorLeds, "DS4 has neither"). Everything
+        /// else shows no lighting at all, which is why this table has no
+        /// entry for the Xbox, Switch or Steam layouts.</para>
+        ///
+        /// <para>Geometry is the same the Lighting tab's preview draws, in
+        /// the same base-coordinate space the overlays use, with the same
+        /// mask art. The Edge entry is the DualSense's shifted by 175,
+        /// which is the exact offset all 24 of its shared overlays carry:
+        /// its canvas is 350 wider and the pad sits centered in it.</para>
+        /// </summary>
+        private sealed class LightingDef
+        {
+            public (string Image, double X, double Y, double W, double H)[] Lightbar;
+            public bool IndicatorLeds;
+            public double PipCenterX, PipY;
+        }
+
+        private static readonly Dictionary<string, LightingDef> LightingDefs =
+            new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ds4"] = new LightingDef
+            {
+                Lightbar = new[]
+                {
+                    ("2DModels/DS4/DS4_Lightbar_Front.png", 510d, 228d, 446d, 5d),
+                    ("2DModels/DS4/DS4_Lightbar_Rear.png", 495d, 111d, 474d, 28d),
+                },
+                IndicatorLeds = false,
+            },
+            ["dualsense"] = new LightingDef
+            {
+                Lightbar = new[] { ("2DModels/DualSense/DualSense_Lightbar.png", 411d, 189d, 647d, 293d) },
+                IndicatorLeds = true, PipCenterX = 736.5, PipY = 505,
+            },
+            ["dualsenseedge"] = new LightingDef
+            {
+                Lightbar = new[] { ("2DModels/DUALSENSEEDGE/DualSense_Lightbar.png", 586d, 189d, 647d, 293d) },
+                IndicatorLeds = true, PipCenterX = 911.5, PipY = 505,
+            },
+        };
+
+        private static Dictionary<string, byte[]> LoadImageCache()
+        {
+            var cache = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+            void Load(string resourcePath)
+            {
+                if (cache.ContainsKey(resourcePath)) return;
+                try
+                {
+                    var sri = Application.GetResourceStream(new Uri(resourcePath, UriKind.Relative));
+                    if (sri == null) return;
+                    using var ms = new MemoryStream();
+                    sri.Stream.CopyTo(ms);
+                    cache[resourcePath] = ms.ToArray();
+                }
+                catch { }
+            }
+
+            void LoadAll(string folder, string basePath, OverlayElement[] overlays)
+            {
+                Load(basePath);
+                foreach (var ov in overlays)
+                    if (!string.IsNullOrEmpty(ov.ImageFile))
+                        Load($"2DModels/{folder}/{ov.ImageFile}");
+            }
+
+            // Lightbar masks are not overlays, so LoadAll never sees them.
+            foreach (var lit in LightingDefs.Values)
+                foreach (var bar in lit.Lightbar)
+                    Load(bar.Image);
+
+            foreach (var def in LayoutDefs)
+            {
+                LoadAll(def.Folder, def.BasePath, def.Overlays);
+                // Colorway variants: the finish-suffixed base art, plus any
+                // finish-suffixed overlay art (Xbox Series ships per-colorway
+                // stick and trigger PNGs). Missing files just don't cache,
+                // and the API only redirects to variants that did.
+                foreach (var finish in def.Finishes)
+                {
+                    Load(WithFinish(def.BasePath, finish));
+                    foreach (var ov in def.Overlays)
+                        if (!string.IsNullOrEmpty(ov.ImageFile))
+                            Load(WithFinish($"2DModels/{def.Folder}/{ov.ImageFile}", finish));
+                }
+            }
+
+            return cache;
+        }
+
+        /// <summary>One row per servable layout: the 2D model class values,
+        /// the art folder, the device display-name stem, and the colorway
+        /// finishes whose base art ships. Adding a layout is one row; the
+        /// ProductGuid distinctness rule is upheld automatically because the
+        /// typeKey feeds WebControllerDevice's per-layout product hash.</summary>
+        private sealed class LayoutDef
+        {
+            public string TypeKey;
+            public string Folder;
+            public string NameStem;
+            public int BaseWidth, BaseHeight;
+            public string BasePath;
+            public double StickMaxTravel;
+            public OverlayElement[] Overlays;
+            public string[] Finishes;
+            /// <summary>True when the base render draws the triggers at
+            /// rest, so the client must not synthesize a rest copy from the
+            /// press art. Exactly the layouts the overlay generator excludes
+            /// from TriggerBase entries: the three Valve pads, whose trigger
+            /// art is the pack's press blue.</summary>
+            public bool BaseDrawsTriggers;
+        }
+
+        private static readonly LayoutDef[] LayoutDefs =
+        {
+            new() { TypeKey = "xbox360", Folder = "XBOX360", NameStem = "Xbox 360",
+                    BaseWidth = Xbox360Layout.BaseWidth, BaseHeight = Xbox360Layout.BaseHeight,
+                    BasePath = Xbox360Layout.BasePath, StickMaxTravel = Xbox360Layout.StickMaxTravel,
+                    Overlays = Xbox360Layout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "ds4", Folder = "DS4", NameStem = "DualShock 4",
+                    BaseWidth = DS4Layout.BaseWidth, BaseHeight = DS4Layout.BaseHeight,
+                    BasePath = DS4Layout.BasePath, StickMaxTravel = DS4Layout.StickMaxTravel,
+                    Overlays = DS4Layout.Overlays,
+                    Finishes = new[] { "GlacierWhite", "Gold", "MagmaRed", "MidnightBlue" } },
+            new() { TypeKey = "dualsense", Folder = "DualSense", NameStem = "DualSense",
+                    BaseWidth = DualSenseLayout.BaseWidth, BaseHeight = DualSenseLayout.BaseHeight,
+                    BasePath = DualSenseLayout.BasePath, StickMaxTravel = DualSenseLayout.StickMaxTravel,
+                    Overlays = DualSenseLayout.Overlays,
+                    Finishes = new[] { "CosmicRed", "GalacticPurple", "Midnight", "NovaPink", "StarlightBlue" } },
+            new() { TypeKey = "xboxone", Folder = "XBOXONE", NameStem = "Xbox One",
+                    BaseWidth = XboxOneSLayout.BaseWidth, BaseHeight = XboxOneSLayout.BaseHeight,
+                    BasePath = XboxOneSLayout.BasePath, StickMaxTravel = XboxOneSLayout.StickMaxTravel,
+                    Overlays = XboxOneSLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "xboxseries", Folder = "XBOXSERIES", NameStem = "Xbox Series",
+                    BaseWidth = XboxSeriesXLayout.BaseWidth, BaseHeight = XboxSeriesXLayout.BaseHeight,
+                    BasePath = XboxSeriesXLayout.BasePath, StickMaxTravel = XboxSeriesXLayout.StickMaxTravel,
+                    Overlays = XboxSeriesXLayout.Overlays,
+                    Finishes = new[] { "Carbon", "DeepPink", "ElectricVolt", "PulseRed", "ShockBlue" } },
+            new() { TypeKey = "switchpro", Folder = "SWITCHPRO", NameStem = "Switch Pro",
+                    BaseWidth = SwitchProLayout.BaseWidth, BaseHeight = SwitchProLayout.BaseHeight,
+                    BasePath = SwitchProLayout.BasePath, StickMaxTravel = SwitchProLayout.StickMaxTravel,
+                    Overlays = SwitchProLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "switch2pro", Folder = "SWITCH2PRO", NameStem = "Switch 2 Pro",
+                    BaseWidth = Switch2ProLayout.BaseWidth, BaseHeight = Switch2ProLayout.BaseHeight,
+                    BasePath = Switch2ProLayout.BasePath, StickMaxTravel = Switch2ProLayout.StickMaxTravel,
+                    Overlays = Switch2ProLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "dualsenseedge", Folder = "DUALSENSEEDGE", NameStem = "DualSense Edge",
+                    BaseWidth = DualSenseEdgeLayout.BaseWidth, BaseHeight = DualSenseEdgeLayout.BaseHeight,
+                    BasePath = DualSenseEdgeLayout.BasePath, StickMaxTravel = DualSenseEdgeLayout.StickMaxTravel,
+                    Overlays = DualSenseEdgeLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "steamdeck", BaseDrawsTriggers = true, Folder = "STEAMDECK", NameStem = "Steam Deck",
+                    BaseWidth = SteamDeckLayout.BaseWidth, BaseHeight = SteamDeckLayout.BaseHeight,
+                    BasePath = SteamDeckLayout.BasePath, StickMaxTravel = SteamDeckLayout.StickMaxTravel,
+                    Overlays = SteamDeckLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "steamcontroller", BaseDrawsTriggers = true, Folder = "STEAMCONTROLLER", NameStem = "Steam Controller",
+                    BaseWidth = SteamControllerLayout.BaseWidth, BaseHeight = SteamControllerLayout.BaseHeight,
+                    BasePath = SteamControllerLayout.BasePath, StickMaxTravel = SteamControllerLayout.StickMaxTravel,
+                    Overlays = SteamControllerLayout.Overlays, Finishes = Array.Empty<string>() },
+            new() { TypeKey = "steamcontroller2", BaseDrawsTriggers = true, Folder = "STEAMCONTROLLER2", NameStem = "Steam Controller (2026)",
+                    BaseWidth = SteamController2Layout.BaseWidth, BaseHeight = SteamController2Layout.BaseHeight,
+                    BasePath = SteamController2Layout.BasePath, StickMaxTravel = SteamController2Layout.StickMaxTravel,
+                    Overlays = SteamController2Layout.Overlays, Finishes = Array.Empty<string>() },
+        };
+
+        /// <summary>Where a forwarded pad's browser buttons 17 and up land
+        /// (#402): PadForge's extended slots in a fixed order, never 16 (the
+        /// touchpad click), at most ten. The page's EXTRA_SLOTS table is this
+        /// list, and the contract test holds the two together.</summary>
+        internal static readonly int[] GamepadExtraSlotOrder = { 11, 12, 13, 14, 15, 17, 18, 19, 20, 21 };
+
+        internal static int[] GamepadExtendedSlots(int extras)
+        {
+            if (extras <= 0) return Array.Empty<int>();
+            if (extras > GamepadExtraSlotOrder.Length) extras = GamepadExtraSlotOrder.Length;
+            var r = new int[extras];
+            Array.Copy(GamepadExtraSlotOrder, r, extras);
+            return r;
+        }
+
+        /// <summary>Raw mode for a pad the browser did not recognize (#402):
+        /// browser button i is slot i with 16 skipped and 21 the ceiling,
+        /// browser axis i is axis i for the first six. The user maps the
+        /// forwarded controls.</summary>
+        internal static void GamepadRawSurface(int buttons, int axes, out int[] axesOut, out int[] buttonsOut)
+        {
+            var b = new List<int>();
+            for (int i = 0; i < Math.Max(0, buttons); i++)
+            {
+                int slot = i < 16 ? i : i + 1;
+                if (slot > 21) break;
+                b.Add(slot);
+            }
+            var a = new List<int>();
+            for (int i = 0; i < Math.Min(Math.Max(0, axes), 6); i++) a.Add(i);
+            axesOut = a.ToArray();
+            buttonsOut = b.ToArray();
+        }
+
+        /// <summary>Declares a forwarded pad's shape from the socket query
+        /// (#402), before the device registers, so the Devices page and the
+        /// mapping picker see the pad's real surface from the first tick.</summary>
+        internal static void ConfigureGamepadShape(WebControllerDevice device, string mode, string buttonsParam, string axesParam)
+        {
+            int buttons = int.TryParse(buttonsParam, out int nb) ? Math.Clamp(nb, 0, 64) : 17;
+            int axes = int.TryParse(axesParam, out int na) ? Math.Clamp(na, 0, 16) : 4;
+            if (string.Equals(mode, "raw", StringComparison.OrdinalIgnoreCase))
+            {
+                GamepadRawSurface(buttons, axes, out var rawAxes, out var rawButtons);
+                var ext = new List<int>();
+                foreach (int s in rawButtons) if (s > 10 && s != 16) ext.Add(s);
+                if (ext.Count > 0) device.SetExtendedButtons(ext.ToArray());
+                device.SetCustomSurface(rawAxes, rawButtons, hasPov: false);
+                // Start raw axes at center until the page supplies their sampled
+                // rest values. Stock trigger defaults would start two at an endpoint.
+                device.AxesCenterAtRest = true;
+                device.NeutralizeAll();
+                return;
+            }
+            var extras = GamepadExtendedSlots(buttons - 17);
+            if (extras.Length > 0) device.SetExtendedButtons(extras);
+        }
+
+        /// <summary>A forwarded pad's liveness (#402), as acknowledged freshness.
+        /// The server pings once a second and the page echoes the ping's number
+        /// while it is visible and sampling. Fresh means an echo arrived within
+        /// <see cref="MaxRoundTripMs"/> of its ping's send tick. No fresh echo
+        /// for <see cref="DeadlineMs"/> expires the session: the device is
+        /// neutralized and its input is dropped until a fresh echo arrives,
+        /// which is when the page is asked to resend. Input messages never
+        /// count as freshness, so a slow link draining stale presses cannot
+        /// keep a dead page alive. Every member is called under the session's
+        /// deadline lock.</summary>
+        internal sealed class GamepadFreshness
+        {
+            public const int DeadlineMs = 3000;
+            public const int MaxRoundTripMs = 1500;
+            private const int Ring = 8;
+            private readonly long[] _pingSent = new long[Ring];
+            private int _seq;
+
+            /// <summary>Tick of the last fresh echo, or of creation.</summary>
+            public long FreshTicks { get; private set; }
+            /// <summary>True from expiry until the next fresh echo.</summary>
+            public bool Expired { get; set; }
+
+            public GamepadFreshness(long nowTicks) { FreshTicks = nowTicks; }
+
+            /// <summary>Records a ping and returns its number for the wire.</summary>
+            public int NextPing(long nowTicks)
+            {
+                _seq++;
+                _pingSent[_seq % Ring] = nowTicks;
+                return _seq;
+            }
+
+            /// <summary>An echo of ping <paramref name="seq"/>. Returns true when
+            /// this echo turned an expired session fresh again.</summary>
+            public bool Ack(int seq, long nowTicks)
+            {
+                if (seq <= 0 || seq > _seq || seq <= _seq - Ring) return false;   // unknown, or fallen out of the ring
+                long rtt = nowTicks - _pingSent[seq % Ring];
+                if (rtt < 0 || rtt > MaxRoundTripMs) return false;                 // too slow to vouch for anything
+                FreshTicks = nowTicks;
+                if (!Expired) return false;
+                Expired = false;
+                return true;
+            }
+
+            /// <summary>True when the session should expire now.</summary>
+            public bool ShouldExpire(long nowTicks) => !Expired && nowTicks - FreshTicks > DeadlineMs;
+        }
+
+        /// <summary>The sessions that must answer the once-a-second ping
+        /// (#402): a forwarded pad, and a Web Menus phone (#471), whose held
+        /// tile would otherwise stay fired until the 30 s socket keepalive gave
+        /// up on a phone that dropped off Wi-Fi mid-press.</summary>
+        internal static bool UsesInputDeadline(string typeKey)
+            => typeKey == "gamepad" || typeKey == WebControllerDevice.MenusLayoutKey;
+
+        private static async Task RunInputDeadline(ClientSession session, CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested && session.Socket.State == WebSocketState.Open)
+                {
+                    await Task.Delay(1000, ct);
+                    long now = Environment.TickCount64;
+                    int seq;
+                    bool fired = false;
+                    // Check and act under the same lock the receive loop holds while
+                    // it applies a message, so a press that lands after the check is
+                    // never erased by the neutralize that follows it.
+                    lock (session.DeadlineLock)
+                    {
+                        seq = session.Freshness.NextPing(now);
+                        if (session.Freshness.ShouldExpire(now))
+                        {
+                            session.Freshness.Expired = true;
+                            session.Device.NeutralizeAll();
+                            fired = true;
+                        }
+                    }
+                    if (fired)
+                        PadForge.Engine.SdlDiagLog.WriteLine($"WEBGP deadline {session.Device.Name} idle={now - session.Freshness.FreshTicks}ms neutralized");
+                    // Never await a send here: a stalled send must not stall the
+                    // next check. The ping carries the slot's current rumble.
+                    if (session.Socket.State == WebSocketState.Open)
+                        _ = SendJsonAsync(session.Socket,
+                            new { type = "ping", n = seq, l = session.RumbleLeft, r = session.RumbleRight },
+                            ct, session.SendGate);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+        }
+
+        /// <summary>Resolves a layout key and its legacy aliases, defaulting to xbox360.</summary>
+        private static LayoutDef ResolveLayout(string type)
+        {
+            string k = (type ?? "xbox360").Trim().ToLowerInvariant();
+            foreach (var d in LayoutDefs)
+                if (d.TypeKey == k) return d;
+            return LayoutDefs[0];
+        }
+
+        private static readonly Dictionary<string, (string kind, int code)> _targetInputMap = new()
+        {
+            ["ButtonA"] = ("button", 0),
+            ["ButtonB"] = ("button", 1),
+            ["ButtonX"] = ("button", 2),
+            ["ButtonY"] = ("button", 3),
+            ["LeftShoulder"] = ("button", 4),
+            ["RightShoulder"] = ("button", 5),
+            ["ButtonBack"] = ("button", 6),
+            ["ButtonStart"] = ("button", 7),
+            ["LeftThumbButton"] = ("button", 8),
+            ["RightThumbButton"] = ("button", 9),
+            ["ButtonGuide"] = ("button", 10),
+            ["DPadUp"] = ("dpad", 0),
+            ["DPadDown"] = ("dpad", 18000),
+            ["DPadLeft"] = ("dpad", 27000),
+            ["DPadRight"] = ("dpad", 9000),
+            ["LeftTrigger"] = ("axis", 2),
+            ["RightTrigger"] = ("axis", 5),
+            ["LeftThumbRing"] = ("stick", 0),   // axes 0,1
+            ["RightThumbRing"] = ("stick", 3),  // axes 3,4
+            ["TouchpadClick"] = ("button", 16), // SDL_GAMEPAD_BUTTON_TOUCHPAD slot
+            // Extended standardized slots (SDL_gamepad.h): Misc1=11 is the
+            // Share/Mute/Capture/QAM family, paddles are 12-15 in R1/L1/R2/L2
+            // order, Misc2+=17.. carry per-device extras.
+            ["ButtonShare"] = ("button", 11),
+            ["ButtonMute"] = ("button", 11),
+            ["ButtonQuickAccess"] = ("button", 11),
+            ["ButtonC"] = ("button", 17),
+            ["RightPaddle"] = ("button", 12),
+            ["LeftPaddle"] = ("button", 13),
+            ["Paddle1"] = ("button", 12), // Deck grips, SDL order R1,L1,R2,L2
+            ["Paddle2"] = ("button", 13),
+            ["Paddle3"] = ("button", 14),
+            ["Paddle4"] = ("button", 15),
+            ["LeftFunction"] = ("button", 17),  // DualSense Edge Fn pair
+            ["RightFunction"] = ("button", 18),
+            ["LeftGrip"] = ("button", 13),
+            ["RightGrip"] = ("button", 12),
+            ["LeftTouchpadClick"] = ("button", 16),
+            ["RightTouchpadClick"] = ("button", 16),
+        };
+
+        /// <summary>Per-layout input overrides, for targets that mean different
+        /// things on different devices. The 2015 Steam Controller has NO
+        /// physical right thumbstick: its RIGHT TRACKPAD acts as the right
+        /// stick, and SDL routes the right-pad click to
+        /// SDL_GAMEPAD_BUTTON_RIGHT_STICK (slot 9), not the touchpad-click
+        /// slot. Without this the layout mapped BOTH trackpad clicks to slot
+        /// 16, so the two pads were the same input and read as "the touchpad
+        /// twice" (owner report 2026-08-12). The Steam Deck keeps the default:
+        /// it has a real right stick at slot 9 already, so its right-pad click
+        /// stays on the touchpad-click slot.</summary>
+        private static readonly Dictionary<string, Dictionary<string, (string kind, int code)>> _layoutInputOverrides = new()
+        {
+            ["steamcontroller"] = new()
+            {
+                // SDL_hidapi_steam.c: the left pad is "normally mapped to
+                // D-Pad" and the right pad drives RIGHTX/RIGHTY with its
+                // click on RIGHT_STICK. The surfaces carry inputKind so the
+                // client binds them as a D-pad zone and a right-stick zone
+                // instead of generic touch surfaces.
+                ["LeftTouchpad"] = ("pov", 0),           // left pad = D-pad surface
+                ["RightTouchpad"] = ("stick", 3),        // right pad = right stick surface
+                // On glass there is no touch-vs-click distinction, so the pad
+                // CLICK zones would sit on top of the surfaces and steal every
+                // touch. They yield: kind "none" tells the client to build no
+                // zone for them. The physical click semantics (dpad press /
+                // right-stick click) are carried by the surfaces themselves.
+                ["LeftTouchpadClick"] = ("none", 0),
+                ["RightTouchpadClick"] = ("none", 0),
+                // Its click is ALSO the right stick button, one bit doing
+                // two jobs. Same reasoning: the surface carries it.
+                ["RightThumbButton"] = ("none", 0),
+                // The four wedges cut out of the left pad and the stand-in
+                // stick standing on the right one are DRAWINGS of what the
+                // surfaces already do. Give either a zone of its own and it
+                // covers the surface it explains: the wedges span the whole
+                // left pad, so the client's unified D-pad zone would be
+                // built over the pad and swallow every drag.
+                ["DPadUp"] = ("none", 0),
+                ["DPadDown"] = ("none", 0),
+                ["DPadLeft"] = ("none", 0),
+                ["DPadRight"] = ("none", 0),
+                ["RightThumbRing"] = ("none", 0),
+                ["LeftThumbButton"] = ("button", 8),     // the single physical stick is the LEFT stick
+            },
+        };
+
+        /// <summary>Resolves an overlay target to its (kind, code), honoring the
+        /// per-layout overrides before the shared default map.</summary>
+        private static bool ResolveInput(string typeKey, string target, out (string kind, int code) input)
+        {
+            if (typeKey != null
+                && _layoutInputOverrides.TryGetValue(typeKey, out var ov)
+                && ov.TryGetValue(target, out input))
+                return true;
+            return _targetInputMap.TryGetValue(target, out input);
+        }
+
+        /// <summary>A double as JSON: invariant, never the current culture.</summary>
+        private static string Num(double v) =>
+            v.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+
+        /// <summary>"path/Stem.png" + "Carbon" -> "path/Stem_Carbon.png".</summary>
+        private static string WithFinish(string path, string finish)
+        {
+            int dot = path.LastIndexOf('.');
+            return dot < 0 ? path : path.Substring(0, dot) + "_" + finish + path.Substring(dot);
+        }
+
+        private void ServeLayoutApi(HttpListenerContext ctx)
+        {
+            try
+            {
+                // Type aliases match the 2D-model folder names so URL queries
+                // can request "?type=DualSense" or "?type=XBOXSERIES" directly.
+                // Legacy "ds4" / "xbox360" still work for older clients.
+                var type = ctx.Request.QueryString["type"] ?? "xbox360";
+                var def = ResolveLayout(type);
+                int baseWidth = def.BaseWidth, baseHeight = def.BaseHeight;
+                string basePath = def.BasePath, folder = def.Folder;
+                double stickMaxTravel = def.StickMaxTravel;
+                OverlayElement[] overlays = def.Overlays;
+
+                // Colorway: swap in the finish-suffixed base art when it
+                // shipped. Overlay art swaps per-element below the same way.
+                var finish = ctx.Request.QueryString["finish"];
+                bool hasFinish = !string.IsNullOrEmpty(finish)
+                    && Array.FindIndex(def.Finishes, f => f.Equals(finish, StringComparison.OrdinalIgnoreCase)) >= 0;
+                if (hasFinish)
+                {
+                    finish = def.Finishes[Array.FindIndex(def.Finishes, f => f.Equals(finish, StringComparison.OrdinalIgnoreCase))];
+                    var variant = WithFinish(def.BasePath, finish);
+                    if (_imageCache != null && _imageCache.ContainsKey(variant)) basePath = variant;
+                }
+
+                // Every number in this document goes out invariant. A
+                // StringBuilder.Append(double) formats in the CURRENT culture,
+                // and PadForge pins no culture, so on any comma-decimal Windows
+                // (de, fr, es, pt, ru, most of Europe and South America) every
+                // coordinate emitted "0,42" and the browser's JSON.parse threw
+                // on the whole layout: the web controller was a blank page for
+                // those users and worked perfectly for everyone testing it.
+                var sb = new StringBuilder(4096);
+                sb.Append("{\"baseWidth\":").Append(baseWidth)
+                  .Append(",\"baseHeight\":").Append(baseHeight)
+                  .Append(",\"basePath\":\"").Append(basePath).Append('"')
+                  .Append(",\"stickMaxTravel\":").Append(Num(stickMaxTravel))
+                  .Append(",\"baseDrawsTriggers\":").Append(def.BaseDrawsTriggers ? "true" : "false")
+                  .Append(",\"overlays\":[");
+
+                for (int i = 0; i < overlays.Length; i++)
+                {
+                    var ov = overlays[i];
+                    if (i > 0) sb.Append(',');
+
+                    var elementType = ov.ElementType switch
+                    {
+                        OverlayElementType.Button => "button",
+                        OverlayElementType.Trigger => "trigger",
+                        OverlayElementType.TriggerBase => "triggerBase",
+                        OverlayElementType.StickRing => "stickRing",
+                        OverlayElementType.StickClick => "stickClick",
+                        OverlayElementType.Touchpad => "touchpad",
+                        OverlayElementType.Decal => "decal",
+                        _ => "button"
+                    };
+
+                    string ovPath = $"2DModels/{folder}/{ov.ImageFile}";
+                    if (hasFinish)
+                    {
+                        var ovVariant = WithFinish(ovPath, finish);
+                        if (_imageCache != null && _imageCache.ContainsKey(ovVariant)) ovPath = ovVariant;
+                    }
+                    sb.Append("{\"image\":\"").Append(ovPath).Append('"')
+                      .Append(",\"target\":\"").Append(ov.TargetName).Append('"')
+                      .Append(",\"type\":\"").Append(elementType).Append('"')
+                      .Append(",\"x\":").Append(Num(ov.X))
+                      .Append(",\"y\":").Append(Num(ov.Y))
+                      .Append(",\"w\":").Append(Num(ov.Width))
+                      .Append(",\"h\":").Append(Num(ov.Height));
+
+                    if (ResolveInput(def.TypeKey, ov.TargetName, out var input))
+                    {
+                        sb.Append(",\"inputKind\":\"").Append(input.kind).Append('"')
+                          .Append(",\"inputCode\":").Append(input.code);
+                    }
+
+                    sb.Append('}');
+                }
+
+                sb.Append("],\"finishes\":[");
+                for (int i = 0; i < def.Finishes.Length; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append('"').Append(def.Finishes[i]).Append('"');
+                }
+                sb.Append(']');
+
+                // Lighting, for the layouts whose hardware actually has it.
+                // Absent for every other layout, which is what stops the
+                // client drawing a bar on a pad that owns none.
+                if (LightingDefs.TryGetValue(def.TypeKey, out var lit))
+                {
+                    sb.Append(",\"lightbar\":[");
+                    for (int i = 0; i < lit.Lightbar.Length; i++)
+                    {
+                        var bar = lit.Lightbar[i];
+                        if (i > 0) sb.Append(',');
+                        sb.Append("{\"image\":\"").Append(bar.Image).Append('"')
+                          .Append(",\"x\":").Append(Num(bar.X))
+                          .Append(",\"y\":").Append(Num(bar.Y))
+                          .Append(",\"w\":").Append(Num(bar.W))
+                          .Append(",\"h\":").Append(Num(bar.H)).Append('}');
+                    }
+                    sb.Append(']');
+                    if (lit.IndicatorLeds)
+                    {
+                        sb.Append(",\"indicatorLeds\":{\"cx\":").Append(Num(lit.PipCenterX))
+                          .Append(",\"y\":").Append(Num(lit.PipY)).Append('}');
+                    }
+                }
+                sb.Append('}');
+
+                var json = sb.ToString();
+                var bytes = Encoding.UTF8.GetBytes(json);
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                ctx.Response.ContentLength64 = bytes.Length;
+                ctx.Response.StatusCode = 200;
+                ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+                ctx.Response.Close();
+            }
+            catch
+            {
+                try { ctx.Response.Close(); } catch { }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Network utility
+        // ─────────────────────────────────────────────
+
+        private static string GetLocalIpAddress()
+        {
+            try
+            {
+                using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, 0);
+                socket.Connect("8.8.8.8", 80);
+                return ((IPEndPoint)socket.LocalEndPoint).Address.ToString();
+            }
+            catch
+            {
+                return "localhost";
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Firewall
+        // ─────────────────────────────────────────────
+
+        private const string FirewallRuleName = "PadForge Web Controller";
+
+        private static void EnsureFirewallRule(int port) => EnsureInboundFirewallRule(FirewallRuleName, "TCP", port);
+
+        private const string PlainFirewallRuleName = "PadForge Web Controller (HTTP)";
+
+        private static readonly object PlainFirewallGate = new();
+        private static long _plainFirewallTicket;
+        /// <summary>The plain port this process last opened, 0 once it closed
+        /// the opening, -1 before its first request. A stale rule from a
+        /// process that ended while serving is removed by that first request.</summary>
+        private static int _plainFirewallPort = -1;
+
+        /// <summary>Opens the served plain port to the LAN, or, for This PC
+        /// Only and when <paramref name="served"/> is null, removes the
+        /// opening. The rule has to name the port rather than PadForge.exe:
+        /// http.sys receives the traffic in the kernel, so a program rule
+        /// would never match. Runs off the caller's thread, since netsh
+        /// blocks. Requests run one at a time, and a request superseded
+        /// before its turn is skipped, so the newest one always lands last.</summary>
+        internal static void ApplyPlainFirewallRule(PlainHttpOptions served)
+        {
+            int wanted = served != null && !served.LocalOnly ? served.Port : 0;
+            long ticket = Interlocked.Increment(ref _plainFirewallTicket);
+            Task.Run(() =>
+            {
+                lock (PlainFirewallGate)
+                {
+                    if (ticket != Interlocked.Read(ref _plainFirewallTicket)) return;
+                    if (wanted != 0)
+                        EnsureInboundFirewallRule(PlainFirewallRuleName, "TCP", wanted);
+                    else if (_plainFirewallPort != 0)
+                    {
+                        try { RunNetsh($"advfirewall firewall delete rule name=\"{PlainFirewallRuleName}\""); }
+                        catch { /* best effort, like the rule itself */ }
+                    }
+                    _plainFirewallPort = wanted;
+                }
+            });
+        }
+
+        /// <summary>Adds an inbound allow rule for one port unless a rule of
+        /// that name already names the port. Best effort, blocking (netsh
+        /// spawns): callers hop to the thread pool. Shared with the head
+        /// tracker's UDP listener (#355).</summary>
+        internal static void EnsureInboundFirewallRule(string ruleName, string protocol, int port)
+        {
+            try
+            {
+                // Delete by name, then add. Reading netsh's own output to
+                // decide whether the rule already exists cannot be done
+                // portably: the dump is rendered from the firewall's MUI
+                // resources, so "LocalPort" is translated on a localized
+                // Windows and any label match silently never fires. The
+                // earlier substring test over the raw dump avoided the
+                // language problem and had a worse one, matching "42" inside
+                // "4242".
+                //
+                // Delete-then-add needs no parsing at all, is idempotent, and
+                // clears the pile-up the port-change path had been building:
+                // nothing ever removed the rule for a port the user moved
+                // away from, so the rules accumulated one per port under the
+                // same name. A delete with no matching rule is an error netsh
+                // reports and this swallows.
+                RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"");
+                RunNetsh($"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol={protocol} localport={port}");
+            }
+            catch { /* best effort, the app may not be elevated */ }
+        }
+
+        private static string RunNetsh(string arguments)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netsh.exe",
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return string.Empty;
+
+            // Start the read BEFORE waiting, and do not block on it. ReadToEnd
+            // returns only when the pipe closes, so a netsh that wedged without
+            // exiting hung here forever and the five-second timeout on the next
+            // line was unreachable. Kicking the read off asynchronously lets
+            // WaitForExit own the deadline, and the Kill closes the pipe, which
+            // is what completes the read.
+            var read = proc.StandardOutput.ReadToEndAsync();
+            if (!proc.WaitForExit(5_000))
+            {
+                try { proc.Kill(); } catch { }
+            }
+
+            try { return read.Wait(2_000) ? read.Result : string.Empty; }
+            catch { return string.Empty; }
+        }
+
+        // ─────────────────────────────────────────────
+        //  Client session record
+        // ─────────────────────────────────────────────
+
+        private sealed class ClientSession
+        {
+            public WebSocket Socket { get; }
+            public WebControllerDevice Device { get; }
+            public CancellationTokenSource CancellationSource { get; }
+            /// <summary>Serializes ws.SendAsync — a managed WebSocket forbids a
+            /// second outstanding send, so rapid rumble (SetRumble + StopRumble)
+            /// must not overlap.</summary>
+            public SemaphoreSlim SendGate { get; } = new SemaphoreSlim(1, 1);
+
+            /// <summary>True when the session arrived through the plain
+            /// address, so a new access code can drop it.</summary>
+            public bool ViaPlain { get; init; }
+
+            /// <summary>A forwarded pad's acknowledged freshness (#402). Null on
+            /// every other session.</summary>
+            public GamepadFreshness Freshness;
+            /// <summary>The rumble last sent to this client, carried by the
+            /// forwarded pad's pings so the page's rumble lease follows it.</summary>
+            public int RumbleLeft, RumbleRight;
+            /// <summary>Held while a message is applied, and while the deadline
+            /// checks and neutralizes, so the two never interleave.</summary>
+            public readonly object DeadlineLock = new object();
+            private int _resyncInFlight;
+
+            /// <summary>Asks the page to resend everything it holds, once per
+            /// in-flight send, never awaited by the caller.</summary>
+            public void RequestResync()
+            {
+                if (Interlocked.Exchange(ref _resyncInFlight, 1) == 1) return;
+                _ = SendResyncAsync();
+            }
+
+            private async Task SendResyncAsync()
+            {
+                try { await SendJsonAsync(Socket, new { type = "resync" }, CancellationSource.Token, SendGate); }
+                catch { }
+                finally { Interlocked.Exchange(ref _resyncInFlight, 0); }
+            }
+
+            public ClientSession(WebSocket socket, WebControllerDevice device, CancellationTokenSource cts)
+            {
+                Socket = socket;
+                Device = device;
+                CancellationSource = cts;
+            }
+        }
+    }
+}

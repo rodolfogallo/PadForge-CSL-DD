@@ -1,0 +1,461 @@
+﻿using System;
+
+namespace PadForge.Engine
+{
+    /// <summary>
+    /// API-agnostic snapshot of a device's complete input state at a single point in time.
+    /// All values use unsigned conventions:
+    ///   Stick axes:   0–65535  (center = 32768; the producer emits (ushort)(raw - short.MinValue),
+    ///                 so a centered raw 0 yields 32768 — see SdlDeviceWrapper. Any receiver doing
+    ///                 neutral/deadzone math must use 32768, not the 32767 arithmetic midpoint.)
+    ///   Trigger axes: 0–65535  (0-based: 0 = released, 65535 = full; not centered)
+    ///   Sliders:      0–65535
+    ///   POVs:         centidegrees 0–35900, or -1 for centered
+    ///   Buttons:      true = pressed, false = released
+    ///
+    /// Button index reference (PadForge-internal, matches SdlDeviceWrapper's population).
+    /// Indices 11-21 follow SDL3's SDL_GamepadButton enum order, skipping the four
+    /// DPad slots that PadForge synthesizes into POV[0]:
+    ///   0-10  Standard XInput-shape (A/B/X/Y/LB/RB/Back/Start/LS/RS/Guide)
+    ///   11    Misc1 (Capture / Share / Mute)
+    ///   12    Right Paddle 1
+    ///   13    Left Paddle 1
+    ///   14    Right Paddle 2
+    ///   15    Left Paddle 2
+    ///   16    TouchpadClick — maps to SDL_GAMEPAD_BUTTON_TOUCHPAD
+    ///   17-21 Misc2-Misc6 (driver-specific extras)
+    ///   22+   Raw joystick buttons beyond the standardized gamepad range
+    ///
+    /// This replaces the former CustomDiState class. The field layout is intentionally
+    /// compatible with the mapping pipeline (Steps 3–5) which indexes into these arrays
+    /// by ordinal position.
+    /// </summary>
+    public class CustomInputState
+    {
+        /// <summary>Maximum number of axes stored in the <see cref="Axis"/> array.</summary>
+        public const int MaxAxis = 24;
+
+        /// <summary>Maximum number of sliders stored in the <see cref="Sliders"/> array.</summary>
+        public const int MaxSliders = 8;
+
+        /// <summary>Maximum number of POV hat switches.</summary>
+        public const int MaxPovs = 4;
+
+        /// <summary>Maximum number of buttons (256 covers full Windows VK code range).</summary>
+        public const int MaxButtons = 256;
+
+        /// <summary>
+        /// Axis values (unsigned, 0–65535). Indices 0–5 correspond to standard axes
+        /// (X, Y, Z, Rx, Ry, Rz). Indices 6–23 are additional axes.
+        /// </summary>
+        public int[] Axis;
+
+        /// <summary>
+        /// Slider values (unsigned, 0–65535). Used for overflow axes beyond <see cref="MaxAxis"/>
+        /// or for devices that report dedicated slider controls.
+        /// </summary>
+        public int[] Sliders;
+
+        /// <summary>
+        /// POV hat switch values in centidegrees (0 = North, 9000 = East, etc.).
+        /// A value of -1 indicates the hat is centered (no direction pressed).
+        /// </summary>
+        public int[] Povs;
+
+        /// <summary>
+        /// Button pressed states. true = currently pressed, false = released.
+        /// </summary>
+        public bool[] Buttons;
+
+        /// <summary>
+        /// Gyroscope data: [X, Y, Z] in radians per second.
+        /// Only populated for devices with a gyro sensor.
+        /// </summary>
+        public float[] Gyro;
+
+        /// <summary>
+        /// Accelerometer data: [X, Y, Z] in meters per second squared.
+        /// Only populated for devices with an accelerometer sensor.
+        /// </summary>
+        public float[] Accel;
+
+        /// <summary>
+        /// Auxiliary (left-side) accelerometer data: [X, Y, Z] in meters per
+        /// second squared, SDL native frame (issue #199). SDL delivers this as
+        /// SDL_SENSOR_ACCEL_L: the Wii Nunchuk's own accelerometer on a
+        /// Nunchuk-attached remote, or the LEFT Joy-Con's accelerometer on a
+        /// combined Joy-Con pair (whose primary Accel is the right half).
+        /// Zeroed for devices without the sensor.
+        /// </summary>
+        public float[] AccelAux;
+
+        /// <summary>
+        /// Auxiliary (left-side) gyroscope data: [pitch, yaw, roll] in
+        /// radians per second, SDL native frame (issue #252). SDL delivers
+        /// this as SDL_SENSOR_GYRO_L, which ONLY the Switch drivers register:
+        /// the LEFT Joy-Con of a combined pair, gen 1 and gen 2, whose
+        /// primary Gyro is the right half. The Wii Nunchuk has no gyro, so
+        /// unlike <see cref="AccelAux"/> this never carries a Nunchuk.
+        /// Zeroed for devices without the sensor.
+        /// </summary>
+        public float[] GyroAux;
+
+        /// <summary>
+        /// Per-touchpad finger state. One <see cref="TouchpadInputState"/>
+        /// per physical touchpad surface the device exposes (1 for DS4 /
+        /// DualSense / Shield / PTP, 2 for Steam Controller 2026 / Steam
+        /// Deck, 3 for the original Steam Controller). Supports up to N
+        /// fingers per pad (PTP max 5, SDL gamepads typically 1-2) and
+        /// tracks contact identity across slot up/down transitions so
+        /// the gesture engine can distinguish "same finger continuing"
+        /// from "new finger landed in the same slot." Null when the
+        /// device has no touchpad. Replaced the legacy
+        /// <c>TouchpadFingers[6]</c> / <c>TouchpadDown[2]</c> single-pad
+        /// shape in v3.3 to support multi-touchpad devices natively.
+        /// </summary>
+        public TouchpadInputState[] Touchpads;
+
+        /// <summary>
+        /// Full MIDI input namespace (all 128 notes + 128 CCs + pitch bend),
+        /// channel-merged. Null when the device is not a MIDI input. Same
+        /// lazily-allocated, nullable cost model as <see cref="Touchpads"/>.
+        /// </summary>
+        public MidiInputState Midi;
+
+        /// <summary>Press depth of the keys an analog keyboard reports as down
+        /// (issue #468). Null when the device is not an analog keyboard, the
+        /// <see cref="Midi"/> cost model.</summary>
+        public AnalogKeyInputState AnalogKeys;
+
+        /// <summary>Wii Remote IR-camera pointer (issue #146), normalized to the
+        /// [-1..+1] stick range per screen axis from the two sensor-bar dots, plus
+        /// a <see cref="WiiIrState.Detected"/> flag. A value type, so it is always
+        /// present and costs no allocation; <c>Detected == false</c> means "no IR
+        /// or no dots this frame". Populated by SdlDeviceWrapper from the raw
+        /// joystick axes 6-9, where the SDL hidapi_wii driver posts dot0/dot1 X/Y
+        /// for a bare Wii Remote with the camera powered.</summary>
+        public WiiIrState Ir;
+
+        /// <summary>Right Joy-Con NIR camera average intensity, 0..1 (issue #151).
+        /// The SDL fork's hidapi_switch posts the MCU's per-frame average-intensity
+        /// byte on dedicated joystick axis 6 for a standalone right Joy-Con with the
+        /// camera powered (SDL#7). A covered sensor reads bright (high), an
+        /// uncovered one dark (low), so this is a cover/proximity scalar. 0 while
+        /// the camera is off. Populated by SdlDeviceWrapper.</summary>
+        public float JoyConIrIntensity;
+
+        /// <summary>Ring-Con flex (hifihedgehog/SDL#33 Part 13), bipolar -1..+1:
+        /// positive while the ring is squeezed, negative while it is pulled, 0 at
+        /// rest and while no Ring-Con polls. The fork posts the raw strain on a
+        /// right Joy-Con's joystick axis 7 and its first reading after polling
+        /// starts as the rest property. SdlDeviceWrapper subtracts the rest and
+        /// scales by <see cref="SdlDeviceWrapper.RingConFullScale"/>.</summary>
+        public float RingConStrain;
+
+        /// <summary>Joy-Con 2 optical mouse sensor motion, in raw sensor counts
+        /// accumulated since the previous poll (issue #154). The SDL fork's BLE
+        /// Switch 2 driver posts the sensor's absolute 16-bit X/Y counters on
+        /// dedicated joystick axes 6/7 (SDL#8); SdlDeviceWrapper turns them into
+        /// per-poll deltas with 16-bit wraparound (the jc2mouse delta_u16 idiom).
+        /// Screen convention: +X = right, +Y = toward the user (down), matching
+        /// how joycon2mouse/jc2mouse feed the OS cursor. 0 when idle or absent.</summary>
+        public float JoyCon2MouseDX;
+        public float JoyCon2MouseDY;
+
+        /// <summary>Raw Input mouse motion in unclamped sensor counts
+        /// accumulated since the previous poll (issue #200). The published
+        /// <see cref="Axis"/>[0/1] carry the same deltas centered and clamped
+        /// to the 16-bit stick range (SdlMouseWrapper MotionScale 2048, so
+        /// ±16 counts per poll max); the mouse-gesture recognizer needs the
+        /// unclamped counts or a fast flick saturates both axes to a 1:1
+        /// ratio and misclassifies. Set from the SAME single RawInput
+        /// consume that feeds the axes (plan-165: never a second delta
+        /// consumer). 0 when idle or for non-mouse devices.</summary>
+        public int MouseRawDX;
+        public int MouseRawDY;
+
+        /// <summary>Capacitive touch channels from the SDL fork's
+        /// SDL_GetGamepadCapSense (SDL_gamepad.h since 3.6.0): index by the
+        /// SDL_GAMEPAD_CAPSENSE_* constants (0 = left stick top, 1 = right
+        /// stick top, 2 = left grip, 3 = right grip). True while touched.
+        /// Null when the device exposes no capsense channel (the wrapper
+        /// allocates at device-open only when SDL_GamepadHasCapSense says
+        /// at least one channel exists), same nullable cost model as
+        /// <see cref="Touchpads"/>.</summary>
+        public bool[] CapSense;
+
+        /// <summary>NFC tag buttons for a Switch right Joy-Con / Pro
+        /// Controller reader (issue #241, fork SDL#15). Index 0 = "Any NFC
+        /// Tag" (any tag present pulses it); index N = the tag whose stable
+        /// <see cref="PadForge.Common.Input.NfcTagRegistry"/> button is N.
+        /// True while a matching tag is held (pulsed by SdlDeviceWrapper
+        /// from SDL_GetGamepadNfcTagUid). Null until NFC first arms on a
+        /// device that has a reader; thereafter retained (cleared all-false)
+        /// across disarm rather than re-nulled, which the Remote Link codec
+        /// omits so consumers still read "no NFC" either way. Same nullable
+        /// cost model as <see cref="CapSense"/>. The controller IS the reader
+        /// identity, so tags surface here rather than on a synthetic device,
+        /// and <see cref="Buttons"/> stays the gamepad buttons.</summary>
+        public bool[] NfcTag;
+
+        /// <summary>Battery percentage from SDL3 (0..100, or -1 if unknown).
+        /// Refreshed periodically by SdlDeviceWrapper, not every frame.</summary>
+        public int BatteryPercent;
+
+        /// <summary>True if the device reports as charging or fully charged.</summary>
+        public bool BatteryCharging;
+
+        /// <summary>
+        /// Creates a new zeroed input state with default array sizes.
+        /// All axes and sliders default to 0, all POVs default to -1 (centered),
+        /// all buttons default to false (released).
+        /// </summary>
+        public CustomInputState()
+        {
+            Axis = new int[MaxAxis];
+            Sliders = new int[MaxSliders];
+            Povs = new int[MaxPovs];
+            Buttons = new bool[MaxButtons];
+            Gyro = new float[3];
+            Accel = new float[3];
+            AccelAux = new float[3];
+            GyroAux = new float[3];
+            // Touchpads starts null. Device wrappers allocate the per-pad
+            // TouchpadState[] at device-open time with the right pad count
+            // and per-pad finger slot count for the actual hardware. Null
+            // here means "no touchpad surface on this device."
+            Touchpads = null;
+            BatteryPercent = -1;
+
+            // Initialize POVs to centered.
+            for (int i = 0; i < Povs.Length; i++)
+                Povs[i] = -1;
+        }
+
+        /// <summary>
+        /// Creates a deep copy of this input state.
+        /// </summary>
+        public CustomInputState Clone()
+        {
+            var clone = new CustomInputState();
+            CopyInto(clone);
+            return clone;
+        }
+
+        /// <summary>Deep-copies this state into <paramref name="dst"/>,
+        /// reallocating nested Touchpads/CapSense/Midi/AnalogKeys only on a
+        /// shape change. Clone delegates here so the class has exactly ONE
+        /// full-field mirror (guarded by a reflection round-trip test:
+        /// a field added to the class without joining this copy fails
+        /// CustomInputStateMirrorTests the day it lands).</summary>
+        public void CopyInto(CustomInputState dst)
+        {
+            Array.Copy(Axis, dst.Axis, MaxAxis);
+            Array.Copy(Sliders, dst.Sliders, MaxSliders);
+            Array.Copy(Povs, dst.Povs, MaxPovs);
+            Array.Copy(Buttons, dst.Buttons, MaxButtons);
+            Array.Copy(Gyro, dst.Gyro, 3);
+            Array.Copy(Accel, dst.Accel, 3);
+            Array.Copy(AccelAux, dst.AccelAux, 3);
+            Array.Copy(GyroAux, dst.GyroAux, 3);
+            if (Touchpads == null)
+            {
+                dst.Touchpads = null;
+            }
+            else
+            {
+                if (dst.Touchpads == null || dst.Touchpads.Length != Touchpads.Length)
+                    dst.Touchpads = new TouchpadInputState[Touchpads.Length];
+                for (int i = 0; i < Touchpads.Length; i++)
+                {
+                    var src = Touchpads[i];
+                    if (src == null) { dst.Touchpads[i] = null; continue; }
+                    dst.Touchpads[i] ??= new TouchpadInputState(src.MaxFingers);
+                    src.CopyInto(dst.Touchpads[i]);
+                }
+            }
+            if (CapSense == null)
+            {
+                dst.CapSense = null;
+            }
+            else
+            {
+                if (dst.CapSense == null || dst.CapSense.Length != CapSense.Length)
+                    dst.CapSense = new bool[CapSense.Length];
+                Array.Copy(CapSense, dst.CapSense, CapSense.Length);
+            }
+            if (NfcTag == null)
+            {
+                dst.NfcTag = null;
+            }
+            else
+            {
+                if (dst.NfcTag == null || dst.NfcTag.Length != NfcTag.Length)
+                    dst.NfcTag = new bool[NfcTag.Length];
+                Array.Copy(NfcTag, dst.NfcTag, NfcTag.Length);
+            }
+            if (Midi == null)
+            {
+                dst.Midi = null;
+            }
+            else
+            {
+                dst.Midi ??= new MidiInputState();
+                Midi.CopyInto(dst.Midi);
+            }
+            if (AnalogKeys == null)
+            {
+                dst.AnalogKeys = null;
+            }
+            else
+            {
+                dst.AnalogKeys ??= new AnalogKeyInputState();
+                AnalogKeys.CopyInto(dst.AnalogKeys);
+            }
+            dst.Ir = Ir; // value type copy (X/Y/Detected/Calibrated)
+            dst.JoyConIrIntensity = JoyConIrIntensity;
+            dst.RingConStrain = RingConStrain;
+            dst.JoyCon2MouseDX = JoyCon2MouseDX;
+            dst.JoyCon2MouseDY = JoyCon2MouseDY;
+            dst.MouseRawDX = MouseRawDX;
+            dst.MouseRawDY = MouseRawDY;
+            dst.BatteryPercent = BatteryPercent;
+            dst.BatteryCharging = BatteryCharging;
+        }
+
+        /// <summary>Returns this instance to the exact fresh-constructed
+        /// state WITHOUT dropping nested allocations (Touchpads / CapSense
+        /// arrays keep their device-open shape and are cleared in place).
+        /// Buffer-reuse support: a pooled state that passes through this is
+        /// semantically identical to <c>new CustomInputState()</c> plus the
+        /// wrapper's open-time shape setup, so read paths that rely on
+        /// fresh-zero fields (early-returning decoders, capability-gated
+        /// writes) stay correct. Guarded by the same reflection mirror
+        /// test as <see cref="CopyInto"/>.</summary>
+        public void ResetForReuse()
+        {
+            Array.Clear(Axis, 0, MaxAxis);
+            Array.Clear(Sliders, 0, MaxSliders);
+            Array.Clear(Buttons, 0, MaxButtons);
+            Array.Clear(Gyro, 0, 3);
+            Array.Clear(Accel, 0, 3);
+            Array.Clear(AccelAux, 0, 3);
+            Array.Clear(GyroAux, 0, 3);
+            for (int i = 0; i < Povs.Length; i++)
+                Povs[i] = -1;
+            if (Touchpads != null)
+                for (int i = 0; i < Touchpads.Length; i++)
+                    Touchpads[i]?.ResetForReuse();
+            if (CapSense != null)
+                Array.Clear(CapSense, 0, CapSense.Length);
+            if (NfcTag != null)
+                Array.Clear(NfcTag, 0, NfcTag.Length);
+            Midi?.ResetForReuse();
+            AnalogKeys?.ResetForReuse();
+            Ir = default;
+            JoyConIrIntensity = 0f;
+            RingConStrain = 0f;
+            JoyCon2MouseDX = 0f;
+            JoyCon2MouseDY = 0f;
+            MouseRawDX = 0;
+            MouseRawDY = 0;
+            BatteryPercent = -1;
+            BatteryCharging = false;
+        }
+
+        // ─────────────────────────────────────────────
+        //  Mask helpers — used by the mapping pipeline
+        //  to know which axes/sliders are present
+        // ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Scans device object items to build axis and actuator bitmasks.
+        /// An axis bit is set if a <see cref="DeviceObjectItem"/> with
+        /// <see cref="DeviceObjectTypeFlags.AbsoluteAxis"/> or
+        /// <see cref="DeviceObjectTypeFlags.RelativeAxis"/> exists at that index.
+        /// An actuator bit is set if the object also has
+        /// <see cref="DeviceObjectTypeFlags.ForceFeedbackActuator"/>.
+        /// </summary>
+        /// <param name="items">Device object metadata array.</param>
+        /// <param name="numAxes">Number of axes on the device.</param>
+        /// <param name="axisMask">Output: bitmask of present axes (bit N = axis N exists).</param>
+        /// <param name="actuatorMask">Output: bitmask of force-feedback actuator axes.</param>
+        /// <param name="actuatorCount">Output: total number of actuator axes.</param>
+        public static void GetAxisMask(DeviceObjectItem[] items, int numAxes,
+            out int axisMask, out int actuatorMask, out int actuatorCount)
+        {
+            axisMask = 0;
+            actuatorMask = 0;
+            actuatorCount = 0;
+
+            if (items == null)
+                return;
+
+            foreach (var item in items)
+            {
+                bool isAxis = (item.ObjectType & DeviceObjectTypeFlags.Axis) != 0;
+                if (!isAxis)
+                    continue;
+
+                int idx = item.InputIndex;
+                if (idx < 0 || idx >= 32)
+                    continue;
+
+                axisMask |= (1 << idx);
+
+                if ((item.ObjectType & DeviceObjectTypeFlags.ForceFeedbackActuator) != 0)
+                {
+                    actuatorMask |= (1 << idx);
+                    actuatorCount++;
+                }
+            }
+        }
+
+    }
+
+    /// <summary>Two-instance CustomInputState pool for per-tick device
+    /// reads (single reader thread per wrapper by contract). Two buffers
+    /// because the published instance must survive exactly one tick
+    /// (the OldInputState idle compare); no consumer retains it longer
+    /// (retainer footprint, perf audit 2026-07-20). Next() hands back the
+    /// spare restored to exact fresh-construction semantics.</summary>
+    public struct PooledInputStatePair
+    {
+        private CustomInputState _a, _b;
+        private bool _useB;
+
+        public CustomInputState Next()
+        {
+            var s = _useB ? (_b ??= new CustomInputState())
+                          : (_a ??= new CustomInputState());
+            _useB = !_useB;
+            s.ResetForReuse();
+            return s;
+        }
+    }
+
+    /// <summary>The IR pointer's aim for one frame (issue #146): a Wii
+    /// Remote's camera aim, or a GunCon 2's beam aim, which the wrapper writes
+    /// here so the same IR Pointer sources carry it. A value type so
+    /// <see cref="CustomInputState.Ir"/> needs no per-frame allocation.
+    /// <see cref="X"/> and <see cref="Y"/> are in the [-1..+1] stick range and
+    /// hold this frame's aim only while <see cref="Detected"/> is true. An
+    /// uncalibrated remote's aim is its camera position, which the IR read
+    /// stretches by its margin to reach the screen's edges. An aim through a
+    /// light-gun window, a calibrated remote's or a GunCon 2's, is the screen
+    /// position divided by that stretch, which the read restores. The state is
+    /// rebuilt each tick, so a frame with no aim carries none. The IR Pointer
+    /// read then serves the last aim it read (#485).</summary>
+    public struct WiiIrState
+    {
+        public float X;
+        public float Y;
+        public bool Detected;
+
+        /// <summary>The aim went through a light-gun window that already
+        /// places it on the screen: a Wii Remote's calibration (#485) or a
+        /// GunCon 2's beam window. The IR Pointer read adds no Pointer-tab
+        /// bar offset to it.</summary>
+        public bool Calibrated;
+    }
+}

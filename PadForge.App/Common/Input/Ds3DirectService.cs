@@ -1,0 +1,1725 @@
+﻿using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using SDL3;
+
+namespace PadForge.Common.Input
+{
+    /// <summary>
+    /// Surfaces a DualShock 3 that is connected over Bluetooth through the BthPS3
+    /// profile driver (RAW-PDO mode, no DsHidMini) as an SDL virtual joystick, so the
+    /// normal PadForge/SDL pipeline consumes it exactly like any other gamepad.
+    ///
+    /// BthPS3's raw PDO is NOT a HID device (it exposes a custom IOCTL interface,
+    /// GUID_DEVINTERFACE_BTHPS3 {968E1849}), so SDL's hidapi cannot open it directly.
+    /// This service owns the native transport (open + kick + read/parse) and pushes
+    /// the parsed state into an SDL virtual joystick, keeping SDL as the intermediary.
+    ///
+    /// I/O model (each point traced to the drivers' source):
+    ///  - Reads use EXACTLY 50-byte buffers. BthPS3 submits interrupt IN transfers
+    ///    without ACL_SHORT_TRANSFER_OK (L2CAP.Transfer.c:224), so a larger buffer
+    ///    only completes once it FILLS across multiple reports - misaligning the
+    ///    stream and collapsing the rate. DsHidMini reads with 0x32-byte buffers for
+    ///    the same reason (Device.c:1228-1249, BTHPS3_SIXAXIS_HID_INPUT_REPORT_SIZE).
+    ///  - One read handle with a single always-pended synchronous read (DsHidMini
+    ///    keeps exactly one outstanding read too: ContinuousRequestCount=1).
+    ///  - Writes go through a dedicated writer thread on a SEPARATE handle (separate
+    ///    file objects do not serialize against each other), rate-limited to one
+    ///    output packet per 150 ms with newest-wins coalescing, mirroring DsHidMini's
+    ///    BT output rate control (Configuration.c:1000-1001). SDL's Rumble callback
+    ///    runs under SDL's global joystick lock on the 1000 Hz polling thread, so it
+    ///    must NEVER touch the device - it only stores state and signals the writer.
+    /// </summary>
+    public sealed class Ds3DirectService
+    {
+        // GUID_DEVINTERFACE_BTHPS3 {968E1849-73B1-4876-B80A-ED6DD171489B} - the RAW PDO's IOCTL interface.
+        private static readonly Guid BthPs3Interface =
+            new Guid(0x968e1849, 0x73b1, 0x4876, 0xb8, 0x0a, 0xed, 0x6d, 0xd1, 0x71, 0x48, 0x9b);
+
+        // The navigation profile also finds its PDO on the GENERIC interface:
+        // BthPS3's raw PDOs register only GUID_DEVINTERFACE_BTHPS3, for every
+        // category (measured live 2026-08-18 with a connected Move; the
+        // per-category interface GUIDs registered nothing). The profiles are
+        // told apart by the PID token in the path.
+
+        // IOCTLs on the raw PDO (BthPS3 common/include/BthPS3.h).
+        private const uint IOCTL_HID_CONTROL_WRITE  = 0x2AA808;
+        private const uint IOCTL_HID_INTERRUPT_READ = 0x2A680C;
+
+        private const ushort DS3_VID = 0x054C;
+        private const ushort DS3_PID = 0x0268;
+        private const ushort NAV_PID = 0x042F;   // BTHPS3_NAVIGATION_PID (BthPS3.h:48)
+
+        /// <summary>The buttons this reader's virtual joystick has, the count
+        /// that tells it apart from DsHidMini's SDF mode when the default
+        /// mapping looks for a DualShock 3's pressure axes
+        /// (ButtonPressureSources).</summary>
+        internal const int VirtualJoystickButtons = 15;
+
+        // Navigation-controller profile (#277). The Nav IS a half sixaxis over
+        // Bluetooth: hid-sony's NAVIGATION_CONTROLLER_BT branch calls the same
+        // sixaxis_set_operational_bt enable and sends the same sixaxis output
+        // report on the control endpoint (hid-sony.c:2189-2202), and its input
+        // report is the sixaxis 49-byte layout (hid-sony.c:1172). Everything in
+        // this service applies verbatim except: its own PDO interface + PID, no
+        // right-stick axes, no motion sensors, and a single status LED
+        // (hid-sony.c:1656-1661 navigation_leds = LED1 only), so the
+        // player-number LED walk is skipped. It has a USB lane now: the
+        // WinUSB package took the Navigation controller on when the pairing
+        // ceremony had to move there (#277), since its 0xF2/0xF5 sixpair
+        // reports are as absent from its HID descriptor as the DS3's.
+        private readonly bool _nav;
+        private string Tag => _nav ? "NAV" : "DS3";
+        private ushort ProfilePid => _nav ? NAV_PID : DS3_PID;
+
+        /// <summary>This instance's pad, as the substring an interface path
+        /// carries. Both device finders filter on it. The WinUSB package
+        /// covers the DS3 and the Navigation controller and gives them the
+        /// SAME interface GUID, so a GUID-only match hands whichever pad is
+        /// present to whichever instance asks first.</summary>
+        private string PidPathToken => _nav ? "pid_042f" : "pid_0268";
+
+        /// <summary>The same pad as a hardware-id token, which is what the
+        /// driver installer matches on. Kept separate from the path token
+        /// rather than case-converted at the call site, because the two are
+        /// matched against different things and only look alike.</summary>
+        private string PidHwToken => _nav
+            ? PadForge.Services.Ds3DriverInstaller.NavPidToken
+            : PadForge.Services.Ds3DriverInstaller.Ds3PidToken;
+
+        // BTHPS3_SIXAXIS_HID_INPUT_REPORT_SIZE (BthPS3.h:350). Must match exactly; see I/O model above.
+        private const int DS3_BT_INPUT_REPORT_SIZE = 0x32;
+
+        // Minimum interval between Bluetooth output packets (DsHidMini's proven default).
+        private const int OUTPUT_MIN_INTERVAL_MS = 150;
+
+        // Resend the output report at least this often while streaming so the DS3 keeps
+        // rumble alive (ScpToolkit resends the whole report every 500 ms, BthDs3.cs:158).
+        // 500 ms is under the ~1 s motor cutout and well above the 150 ms floor.
+        private const int RUMBLE_KEEPALIVE_MS = 500;
+
+        private readonly Action<string> _log;
+        private Thread _readThread;
+        private Thread _writeThread;
+        private volatile bool _running;
+
+        // SDL virtual-joystick state. _sdlJoystick is our own opened handle for pushing state.
+        private uint _instanceId;
+        private IntPtr _sdlJoystick = IntPtr.Zero;
+
+        // Keep the callback delegates rooted for the lifetime of the attach.
+        private SDL.VJRumble _rumbleCb;
+        private SDL.VJSetLED _setLedCb;
+        private SDL.VJSetPlayerIndex _setPlayerCb;
+        private SDL.VJSetSensorsEnabled _setSensorsCb;
+
+        // Which transport the current session is streaming over. The DS3 works over
+        // Bluetooth (BthPS3 raw PDO, IOCTL I/O) OR USB (inbox WinUSB, control-transfer +
+        // interrupt-pipe I/O). The report is the SAME raw DS3 layout on both; USB just
+        // lacks Bluetooth's leading 0xA1 HID-transport byte, so the USB reader prepends
+        // one and the shared PushState parser handles both verbatim.
+        private enum Ds3Transport { None, Bluetooth, Usb }
+        private volatile Ds3Transport _transport = Ds3Transport.None;
+
+        // Bluetooth handles. _readPdo is owned by the read loop; _writePdo by the writer
+        // thread. Guarded by _outLock (writer state shares it).
+        private IntPtr _readPdo = IntPtr.Zero;
+        private IntPtr _writePdo = IntPtr.Zero;
+
+        // USB (WinUSB) handles: _usbDev is the CreateFile handle, _usbIfh the WinUSB
+        // interface handle used for control transfers and pipe reads, _usbInPipe the
+        // interrupt-IN endpoint id. Same lock discipline as the BT handles.
+        private IntPtr _usbDev = IntPtr.Zero;
+        private IntPtr _usbIfh = IntPtr.Zero;
+        private byte _usbInPipe;
+        private long _lastUsbBindAttempt;
+
+        // The real device-interface path of the current transport (BthPS3 PDO over BT,
+        // WinUSB interface over USB). The SDL virtual joystick has no path of its own, so
+        // this is surfaced for the Device Dossier (path display + BT/USB classification)
+        // via SdlDeviceWrapper.ExternalDevicePathProvider. NOT used for device identity
+        // (the two transports' paths differ; identity stays on the stable SDL GUID).
+        private volatile string _transportPath;
+
+        // The Bluetooth address of the pad on the current connection (#474),
+        // from its BthPS3 node over Bluetooth and its 0xF2 reply over USB.
+        // Every DualShock 3 reaches SDL as the same virtual joystick and so
+        // shares one device row, and a gyro calibration names the pad by this.
+        private volatile string _padAddress;
+
+        // A USB pad that refused 0xF2 while it settled is asked again once it
+        // streams, a few times at most (#474).
+        private int _padAddressRetries;
+        private long _padAddressNextTry;
+
+        // Per-connection writer generation: Teardown flips it false so the writer
+        // exits on THIS pad's disconnect even though the service keeps _running.
+        // Without it, every disconnect leaked a live writer thread (the loop's only
+        // exit was _running) and reconnect stacked another one on top.
+        private volatile bool _writerRun;
+
+        // The generation NUMBER behind that bool. A bool cannot distinguish
+        // "still my connection" from "a NEW connection has started", and
+        // Teardown only joins the writer for one second before abandoning
+        // it: a writer blocked longer than that in output I/O outlives its
+        // own teardown, and by the time it looks at _writerRun again the
+        // monitor may have opened the next pad and set it true. It would
+        // then keep running alongside the new generation's writer, two
+        // threads driving one pad. Each writer captures this at launch and
+        // stops the moment the field moves past it, the same shape the
+        // persona reader lanes use for their handles.
+        private int _writerGen;
+
+        // Held across every DeviceIoControl on the write handle AND across that
+        // handle's close in Teardown, so a write can never land on a closed (and
+        // possibly recycled) handle value. The SDL callbacks never take this lock;
+        // they only store state under _outLock, so the hot path stays I/O-free.
+        // Lock order where both are held: _ioLock outer, _outLock inner.
+        private readonly object _ioLock = new object();
+
+        // Serializes Teardown between Stop() and MonitorLoop (both call it) and
+        // makes it idempotent, so the SDL close/detach pair can never run twice
+        // for the same handles.
+        private readonly object _teardownLock = new object();
+
+        // Writer state: SDL callbacks store here and signal; the writer flushes.
+        private readonly object _outLock = new object();
+        private readonly AutoResetEvent _writeSignal = new AutoResetEvent(false);
+        private byte _ledMask = 0x02;            // player 1 LED by default
+        private byte _rumbleLarge, _rumbleSmall;
+        private bool _outDirty;
+        private volatile bool _everGotInput;
+
+        // Completed reads this session, any transport, input or not. The
+        // read-side pre-input summary sits behind a BLOCKING read, so on a
+        // fully silent channel it can never print: exactly the reporter's
+        // machine in #285, where the one diagnostic built for that state was
+        // structurally unable to speak ("I don't see the rx pre-input
+        // summary", 2026-08-18). The writer thread wakes every 50 ms and
+        // reports this counter instead.
+        private volatile int _rxCompletions;
+
+        // ── unpair coordination ──────────────────────────────────────────────────
+        // While true, the monitor loop tears down any live pad and does not re-grab
+        // it. The App-layer unpair flow sets this (and cancels the current read)
+        // before deleting a DS3's Bluetooth records + cycling the radio, so a still-
+        // connected pad can't re-attach a ghost virtual joystick mid-unpair.
+        // REFCOUNTED, not a bool. Two independent flows suppress this: the
+        // pairing ceremony (RunPairing's finally) and the remove-device
+        // unpair (UnpairAllDs3's finally, armed even earlier by the Devices
+        // page). They overlap, since the ceremony holds the radio gate only
+        // for its sixpair steps and both are launched fire-and-forget. A
+        // plain bool let whichever finished FIRST re-enable the monitor
+        // under the other, which then re-grabbed the pad mid-ceremony.
+        private static int _suppressDepth;
+        private static bool _suppressReconnect => System.Threading.Volatile.Read(ref _suppressDepth) > 0;
+        private static volatile Ds3DirectService _current;      // sixaxis profile
+        private static volatile Ds3DirectService _currentNav;   // navigation profile (#277)
+
+        /// <summary>Detach any live DS3 now and block reconnect until the
+        /// matching <see cref="AllowReconnect"/>. Nests: every call must be
+        /// paired, and the monitor resumes only when the last one releases.
+        /// Call before removing the pad's BT records.</summary>
+        public static void SuppressAndRelease()
+        {
+            System.Threading.Interlocked.Increment(ref _suppressDepth);
+            _current?.CancelCurrentRead();
+            _currentNav?.CancelCurrentRead();
+        }
+
+        /// <summary>Test seam (InternalsVisibleTo PadForge.Tests): whether
+        /// the monitor is currently suppressed. The regression this locks:
+        /// an acquire/release imbalance across the unpair flow left the
+        /// depth stuck above zero, and no DS3 could attach again until the
+        /// app restarted (owner repro 2026-08-08).</summary>
+        internal static bool IsReconnectSuppressedForTest => _suppressReconnect;
+
+        /// <summary>Test seam: hard-reset the suppression depth so tests
+        /// cannot leak state into each other.</summary>
+        internal static void ResetSuppressionForTest()
+            => System.Threading.Interlocked.Exchange(ref _suppressDepth, 0);
+
+        /// <summary>Release one suppression claim (see
+        /// <see cref="SuppressAndRelease"/>). Never drops below zero, so an
+        /// unbalanced extra release cannot strand the monitor suppressed or
+        /// un-suppress a claim it does not own.</summary>
+        public static void AllowReconnect()
+        {
+            while (true)
+            {
+                int cur = System.Threading.Volatile.Read(ref _suppressDepth);
+                if (cur <= 0) return;
+                if (System.Threading.Interlocked.CompareExchange(ref _suppressDepth, cur - 1, cur) == cur) return;
+            }
+        }
+
+        private void CancelCurrentRead()
+        {
+            lock (_outLock)
+            {
+                if (_readPdo != IntPtr.Zero && _readPdo != INVALID_HANDLE) CancelIoEx(_readPdo, IntPtr.Zero);
+                if (_usbDev != IntPtr.Zero && _usbDev != INVALID_HANDLE) CancelIoEx(_usbDev, IntPtr.Zero);
+            }
+        }
+
+        /// <summary>Raised once per plug-in when a NAVIGATION controller is
+        /// seen on USB, carrying its own address and the host it currently
+        /// stores. The App layer runs the pairing ceremony from it.
+        ///
+        /// <para>This is the Move's DockObserved, for the Navigation pad. The
+        /// Move auto-pairs the moment it is docked, exactly as a PS3 pairs by
+        /// cable, and the Navigation controller had nothing equivalent: it
+        /// opened over USB, streamed, and never became a Bluetooth device, so
+        /// no entry was ever written for it (owner-reported). The DS3 reaches
+        /// the same ceremony through the Pair dialog; this gives the
+        /// Navigation pad the Move's automatic route as well.</para></summary>
+        public static Action<string, byte[]> NavDockObserved;
+
+        /// <summary>Set once per USB plug-in so the dock event fires on the
+        /// plug, not on every monitor pass.</summary>
+        private string _lastNavDockedPath;
+
+        public Ds3DirectService(Action<string> log = null, bool navigation = false)
+        {
+            _log = log ?? (_ => { });
+            _nav = navigation;
+        }
+
+        public bool IsConnected => _sdlJoystick != IntPtr.Zero;
+
+        /// <summary>SDL instance id of the attached virtual joystick (0 when absent).</summary>
+        public uint InstanceId => _instanceId;
+
+        // ─── battery (raw[30] -> BT buf[31], DS_BATTERY_STATUS in DsCommon.h:61-70) ─
+        //
+        // SDL's PS3 driver has no battery path and the virtual-joystick API has no
+        // power setter, so battery reaches the #167 lane through
+        // SdlDeviceWrapper.ExternalPowerInfoProvider, keyed by SDL instance id.
+        // Discharge levels 0x01..0x05 map to quintiles (level * 20%). 0xEE/0xEF are
+        // USB charge states that cannot appear on a Bluetooth link; handled defensively.
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<uint, (int Percent, bool Charging)>
+            PowerByInstance = new();
+
+        /// <summary>Battery for a given SDL instance id, or null if it isn't a DS3
+        /// this service is driving. Wired into SdlDeviceWrapper.ExternalPowerInfoProvider.</summary>
+        public static (int Percent, bool Charging)? GetPowerInfo(uint instanceId)
+            => PowerByInstance.TryGetValue(instanceId, out var p) ? p : null;
+
+        /// <summary>The real transport interface path for a given SDL instance id (the
+        /// BthPS3 PDO path over Bluetooth, the WinUSB interface path over USB), or null
+        /// if it isn't the DS3 this service is driving. Wired into
+        /// SdlDeviceWrapper.ExternalDevicePathProvider so the Dossier can show a path and
+        /// classify the transport for a device whose SDL path is empty.</summary>
+        public static string GetDevicePath(uint sdlInstanceId)
+        {
+            var svc = _current;
+            if (svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId)
+                return svc._transportPath;
+            svc = _currentNav;
+            return (svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId)
+                ? svc._transportPath : null;
+        }
+
+        /// <summary>The Bluetooth address of the pad on this service's live
+        /// connection for a given SDL instance id, or null (#474). Every
+        /// DualShock 3 on this path shares one device row, so a gyro
+        /// calibration names the pad by this.</summary>
+        public static string GetPadAddress(uint sdlInstanceId)
+        {
+            var svc = _current;
+            if (svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId)
+                return svc._padAddress;
+            svc = _currentNav;
+            return (svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId)
+                ? svc._padAddress : null;
+        }
+
+        /// <summary>Set the player LED for a relayed player-index frame (#191 over Remote
+        /// Link), but only when this instance id is the DS3 this service is driving.
+        /// SetPlayerNumber is change-detected, so a repeated value is a no-op.</summary>
+        public static bool TrySetPlayerNumber(uint sdlInstanceId, int oneBasedNumber)
+        {
+            var svc = _current;
+            if (svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId)
+            {
+                svc.SetPlayerNumber(oneBasedNumber);
+                return true;
+            }
+            // The Navigation controller has one status LED (hid-sony.c:1656),
+            // so a matched Nav accepts the call and changes nothing.
+            svc = _currentNav;
+            return svc != null && svc.IsConnected && svc.InstanceId == sdlInstanceId;
+        }
+
+        private byte _lastBattery = 0xFF;
+
+        private void UpdateBattery(byte status)
+        {
+            // 0x00 = DsBatteryStatusNone (DsCommon.h:62): the pad has no reading yet
+            // (transient right after connect). Publishing it would show a hard "0%";
+            // leave the entry absent/unchanged so the indicator stays hidden instead.
+            if (status == 0x00) return;
+            if (status == _lastBattery || _instanceId == 0) return;
+            _lastBattery = status;
+            (int Percent, bool Charging) p = status switch
+            {
+                0xEF => (100, true),                        // charged (USB-only state)
+                0xEE => (-1, true),                         // charging (USB-only state)
+                _ => (Math.Min((int)status, 5) * 20, false) // 0x01..0x05 discharge quintiles
+            };
+            PowerByInstance[_instanceId] = p;
+        }
+
+        /// <summary>Player LED idle floor (#191): the virtual controller's 1-based
+        /// display number lights LED 1-4, wrapping past 4 exactly like SDL's PS3
+        /// driver (SDL_hidapi_ps3.c:244, 0x01 &lt;&lt; (1 + index % 4)). 0 = unmapped,
+        /// keeps LED 1.</summary>
+        public void SetPlayerNumber(int oneBasedNumber)
+        {
+            if (_nav) return;   // single status LED (hid-sony.c:1656-1661); LED1 stays lit
+            int zeroBased = oneBasedNumber <= 0 ? 0 : (oneBasedNumber - 1) % 4;
+            byte mask = (byte)(0x01 << (1 + zeroBased));
+            bool changed;
+            lock (_outLock)
+            {
+                changed = _ledMask != mask;
+                if (changed) { _ledMask = mask; _outDirty = true; }
+            }
+            if (changed) _writeSignal.Set();
+        }
+
+        /// <summary>Begin watching for a DS3 (USB or Bluetooth) and stream it as a virtual
+        /// joystick. Call after SDL has been initialized (SDL_INIT_JOYSTICK).</summary>
+        public void Start()
+        {
+            if (_running) return;
+            _running = true;
+            if (_nav) _currentNav = this; else _current = this;
+            _readThread = new Thread(MonitorLoop) { IsBackground = true, Name = "Ds3DirectRead" };
+            _readThread.Start();
+        }
+
+        public void Stop()
+        {
+            _running = false;
+            if (_current == this) _current = null;
+            if (_currentNav == this) _currentNav = null;
+            _writeSignal.Set();
+            lock (_outLock)
+            {
+                if (_readPdo != IntPtr.Zero) CancelIoEx(_readPdo, IntPtr.Zero);
+                if (_usbDev != IntPtr.Zero && _usbDev != INVALID_HANDLE) CancelIoEx(_usbDev, IntPtr.Zero);
+            }
+            try { _readThread?.Join(1500); } catch { }
+            Teardown();
+        }
+
+        // A session that ends the instant it opens means the node is present but
+        // dead. On Bluetooth the BthPS3 PDO lingers after the pad leaves (see the
+        // note above the OpenUsb/OpenBluetooth call), so the open keeps succeeding
+        // while the read returns at once. With no floor that is a hot spin which
+        // attaches and tears down a virtual controller on every iteration: a
+        // reporter's log caught five full cycles inside 3 ms (#285, 2026-08-15).
+        // Back off when a session does not last, and reset as soon as one does.
+        private bool _outWriteFailLogged;
+
+        private const int MinHealthySessionMs = 400;
+        private const int FlapBackoffFirstMs = 125;
+        private const int FlapBackoffMaxMs = 2000;
+
+        private void MonitorLoop()
+        {
+            int flapBackoffMs = 0;
+            while (_running)
+            {
+                // Unpair in progress: drop any live pad and don't re-grab it.
+                if (_suppressReconnect) { Teardown(); Thread.Sleep(250); continue; }
+
+                // USB takes priority: a present WinUSB interface means the pad is
+                // physically wired (it can't be on both transports at once), whereas the
+                // BthPS3 PDO node lingers present even after the pad leaves Bluetooth, so
+                // trying BT first could grab a dead node and never reach a live USB pad.
+                if (!OpenUsb() && !OpenBluetooth()) { Thread.Sleep(500); continue; }
+
+                lock (_outLock) { _everGotInput = false; _outDirty = true; }
+                _outWriteFailLogged = false;
+                _rxCompletions = 0;
+
+                // Re-check the unpair gate now that the handles are published: a
+                // SuppressAndRelease that fired between the loop-top check and the
+                // opens above would otherwise attach a ghost joystick mid-unpair.
+                if (_suppressReconnect) { Teardown(); Thread.Sleep(250); continue; }
+
+                string tag = _transport == Ds3Transport.Usb ? "USB" : "BT";
+                _log($"{Tag}({tag}): device opened, kicking + attaching virtual joystick...");
+
+                // A Navigation controller on the cable is a dock, and a dock
+                // is what pairs a PlayStation pad. Fired once per plug-in,
+                // before the reader settles, so the ceremony's suppression
+                // finds a handle it can take.
+                if (_nav && _transport == Ds3Transport.Usb && NavDockObserved != null
+                    && _transportPath != null && _transportPath != _lastNavDockedPath)
+                {
+                    _lastNavDockedPath = _transportPath;
+                    RaiseNavDock();
+                }
+
+                // Over Bluetooth the pad's own address is not readable here,
+                // so the row takes it from the pairing record PadForge wrote
+                // from that same pad's dock. Without this a pad paired before
+                // this build and never re-docked would never offer the idle
+                // disconnect that the address gates.
+                if (_transport == Ds3Transport.Bluetooth)
+                {
+                    try
+                    {
+                        // BthPS3 publishes the pad's address on the PDO this
+                        // connection is riding, so it is exact per pad and
+                        // needs nothing to have happened first. The pairing
+                        // record is the fallback for a node that does not
+                        // carry it: a DualShock 3 paired outside PadForge has
+                        // no BTHENUM node and no BTHPORT record either, which
+                        // is what left it with no address at all.
+                        PadForge.Services.Ds3PairingService
+                            .StampLinkAddressFromDeviceNode(0x054C, ProfilePid, _transportPath);
+                        PadForge.Services.Ds3PairingService
+                            .StampLinkAddressFromPairingRecord(0x054C, ProfilePid);
+                    }
+                    catch { }
+                }
+                // Which pad this connection carries (#474), read on every
+                // connect: the row's stored address can belong to another unit
+                // of the same model.
+                _padAddress = Ds3UnitIdentity.Normalize(_transport == Ds3Transport.Bluetooth
+                    ? PadForge.Services.Ds3PairingService.ReadDeviceNodeAddress(_transportPath)
+                    : ReadUsbPadAddress(3));
+                _padAddressRetries = 0;
+                _padAddressNextTry = 0;
+                if (!AttachVirtual()) { Teardown(); Thread.Sleep(1000); continue; }
+
+                _writerRun = true;
+                int writerGen = System.Threading.Interlocked.Increment(ref _writerGen);
+                _writeThread = new Thread(() => WriterLoop(writerGen)) { IsBackground = true, Name = "Ds3DirectWrite" };
+                _writeThread.Start();
+
+                _log($"{Tag}({tag}): virtual joystick attached; streaming.");
+                ResetGyroTracking();
+                long sessionStart = Environment.TickCount64;
+                if (_transport == Ds3Transport.Usb) UsbReadLoop();
+                else ReadLoop(_readPdo);   // blocks until the pad disconnects or Stop()
+
+                Teardown();
+                long sessionMs = Environment.TickCount64 - sessionStart;
+                _log($"{Tag}({tag}): disconnected after {sessionMs} ms; watching for reconnect.");
+
+                // Stop() sets _running false and cancels the read; that exit is a
+                // short session by design and must not be slept on.
+                if (!_running) break;
+
+                if (sessionMs < MinHealthySessionMs)
+                {
+                    flapBackoffMs = flapBackoffMs == 0 ? FlapBackoffFirstMs
+                                  : flapBackoffMs >= FlapBackoffMaxMs / 2 ? FlapBackoffMaxMs
+                                  : flapBackoffMs * 2;
+                    // Chunked so Stop() interrupts it: a monolithic 2 s
+                    // sleep outlives Stop's Join(1500) and leaves the dying
+                    // thread past the join window.
+                    for (int slept = 0; slept < flapBackoffMs && _running; slept += 100)
+                        Thread.Sleep(Math.Min(100, flapBackoffMs - slept));
+                }
+                else flapBackoffMs = 0;
+            }
+        }
+
+        /// <summary>Open the Bluetooth BthPS3 raw PDO if a wireless DS3 is connected.</summary>
+        private bool OpenBluetooth()
+        {
+            string path = FindPdoPath();
+            if (path == null) return false;
+
+            IntPtr rh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (rh == INVALID_HANDLE) return false;
+            IntPtr wh = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (wh == INVALID_HANDLE) { CloseHandle(rh); return false; }
+
+            lock (_outLock) { _readPdo = rh; _writePdo = wh; }
+            _transportPath = path;
+            _transport = Ds3Transport.Bluetooth;
+            return true;
+        }
+
+        /// <summary>Open this instance's WinUSB-bound pad if it is on USB.
+        /// Binds WinUSB first if the pad is present but unbound (throttled),
+        /// so a plug-in works without the user having gone through the
+        /// pairing ceremony. Every step names THIS instance's pad: the
+        /// package covers the DS3 and the Navigation controller, and asking
+        /// about the wrong one either binds nothing or binds the other pad's
+        /// device.</summary>
+        private bool OpenUsb()
+        {
+            string path = FindWinUsbDs3();
+            if (path == null)
+            {
+                // Not WinUSB-bound. Bind it only if this pad is plugged in AND still on
+                // the inbox driver (no working function driver). If DsHidMini or anything
+                // else owns it, defer: don't fight over the device. Throttled so a repeated
+                // bind failure doesn't spin pnputil.
+                long now = Environment.TickCount64;
+                if (now - _lastUsbBindAttempt >= 15000
+                    && PadForge.Services.Ds3DriverInstaller.IsUsbPadNeedingWinUsb(
+                        m => _log($"{Tag}(USB): " + m), PidHwToken))
+                {
+                    _lastUsbBindAttempt = now;
+                    _log($"{Tag}(USB): unclaimed pad on USB, binding WinUSB...");
+                    try
+                    {
+                        PadForge.Services.Ds3DriverInstaller.EnsureWinUsbBound(
+                            _log, default, PidHwToken, Tag);
+                    }
+                    catch { }
+                    path = FindWinUsbDs3();
+                }
+                if (path == null) return false;
+            }
+
+            IntPtr dev = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (dev == INVALID_HANDLE) return false;
+            if (!WinUsb_Initialize(dev, out IntPtr ifh)) { CloseHandle(dev); return false; }
+
+            // Find the interrupt-IN endpoint (the input-report pipe).
+            byte inPipe = 0;
+            if (WinUsb_QueryInterfaceSettings(ifh, 0, out var idesc))
+            {
+                for (byte i = 0; i < idesc.bNumEndpoints; i++)
+                {
+                    if (WinUsb_QueryPipe(ifh, 0, i, out var pipe)
+                        && (pipe.PipeId & 0x80) != 0 && pipe.PipeType == 3 /*interrupt*/)
+                    { inPipe = pipe.PipeId; break; }
+                }
+            }
+            if (inPipe == 0) { WinUsb_Free(ifh); CloseHandle(dev); return false; }
+
+            // A short read timeout so UsbReadLoop wakes to re-check _running/_writerRun
+            // (WinUsb_ReadPipe otherwise blocks until a report arrives).
+            uint timeout = 100;
+            WinUsb_SetPipePolicy(ifh, inPipe, PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
+
+            lock (_outLock) { _usbDev = dev; _usbIfh = ifh; _usbInPipe = inPipe; }
+            _transportPath = path;
+            _transport = Ds3Transport.Usb;
+            return true;
+        }
+
+        // ─── writer thread: kick, re-kick, rate-limited output flush ────────────
+
+        private void WriterLoop(int gen)
+        {
+            long attachedAt = Environment.TickCount64;
+            long lastWrite = 0, lastKick = 0;
+            int kicks = 0;
+
+            // The two transports start differently, and the difference is the
+            // whole reason a Navigation controller connected over Bluetooth
+            // and never sent a byte.
+            //
+            // USB sends the output report and the enable together, right
+            // away. That is ScpToolkit's order, it is what has always worked
+            // here, and #285's wedge fix is built on top of it.
+            //
+            // Bluetooth follows DsHidMini instead: output report first, the
+            // reader already running, and the magic packet ONCE a second
+            // later, only if nothing has arrived (DsBth.Timers.c, the
+            // StartupDelay handler sends the output report and calls
+            // StreamStart, then arms PostStartupTasks at
+            // WDF_REL_TIMEOUT_IN_SEC(1), whose handler sends the enable only
+            // while BatteryStatus is still None, i.e. no input yet). Both of
+            // its comments matter: the delay is "required for compatibility
+            // with some SIXAXIS models", and the packet "must not be issued
+            // on e.g. the Defender BTH or it disconnects". Sending it at
+            // attach and then four more times is what this lane did, and the
+            // pad answered by dropping the link outright (err=1167 on the
+            // write, measured 2026-08-22).
+            if (_transport == Ds3Transport.Usb)
+            {
+                Kick(); kicks = 1;
+            }
+            else
+            {
+                WriteOutputReport(); kicks = 0;
+            }
+            lastKick = attachedAt; lastWrite = attachedAt;
+
+            long lastSilenceLog = attachedAt;
+            while (_running && _writerRun && System.Threading.Volatile.Read(ref _writerGen) == gen)
+            {
+                _writeSignal.WaitOne(50);
+                if (!_running || !_writerRun
+                    || System.Threading.Volatile.Read(ref _writerGen) != gen) break;
+
+                long now = Environment.TickCount64;
+
+                // Writer-side pre-input heartbeat (#285): cannot be starved by
+                // a blocked read. Zero completions with the enable writes
+                // landing = the interrupt channel is delivering NOTHING, which
+                // no read-side line can ever say.
+                if (!_everGotInput && now - lastSilenceLog >= 1000)
+                {
+                    lastSilenceLog = now;
+                    int rx = _rxCompletions;
+                    _log($"{Tag}({(_transport == Ds3Transport.Usb ? "USB" : "BT")}): no input yet, "
+                        + $"{(now - attachedAt) / 1000.0:F1} s since attach, completed reads={rx}"
+                        + (rx == 0 ? " (interrupt channel fully silent)" : ""));
+                }
+
+                // Bluetooth: the delayed enable, sent ONCE and never repeated.
+                // This is DsHidMini's PostStartupTasks, gated the same way it
+                // gates: only while no input has arrived. Repeating it is what
+                // disconnects the models its comment warns about.
+                if (_transport != Ds3Transport.Usb
+                    && !_everGotInput && kicks == 0 && now - attachedAt >= 1000)
+                {
+                    _log($"{Tag}(BT): no input after 1 s - sending the delayed enable");
+                    SendEnable(); kicks = 1; lastKick = now;
+                    continue;
+                }
+
+                // USB keeps its re-kick: the enable is harmless there and the
+                // #285 wedge needs the retry.
+                if (_transport == Ds3Transport.Usb
+                    && !_everGotInput && kicks < 5 && now - lastKick >= 1000)
+                {
+                    _log($"{Tag}(USB): no input yet - re-kick #{kicks + 1}");
+                    Kick(); kicks++; lastKick = now;
+                    continue;
+                }
+
+                // The five kicks ran and the pad never spoke. Detach so the
+                // monitor can rebuild the whole transport instead of
+                // sitting attached-but-silent forever: WinUsb_ReadPipe
+                // answers ERROR_SEM_TIMEOUT indefinitely on a pad that
+                // never enabled, which is not an error path, so nothing
+                // else in this object ever reconsiders. Reported
+                // 2026-08-08 (discussion #285) as "wired stops working
+                // after a pairing attempt until PadForge is restarted":
+                // the ceremony's cycle re-opens the device, the F4 enable
+                // lands on a pad still settling, and the lane wedges with
+                // a virtual joystick attached and no input behind it.
+                // The detach horizon. USB keeps #285's tight one. Bluetooth
+                // gets a far longer one, because the PDO appears as soon as
+                // the CONTROL channel connects (BthPS3 L2CAP.Connect.c calls
+                // BthPS3_PDO_Create on the first inbound connection whatever
+                // its PSM) while the INTERRUPT channel arrives as a separate,
+                // later connection. Tearing the transport down seven seconds
+                // in destroyed a link that was still assembling, and the
+                // rebuild restarted the same race, forever. DsHidMini never
+                // detaches on silence at all; this keeps a bound only so a
+                // genuinely dead session still recovers.
+                long silenceHorizon = _transport == Ds3Transport.Usb ? 3000 : 30000;
+                if (!_everGotInput && kicks >= 1 && now - lastKick >= silenceHorizon)
+                {
+                    _log($"{Tag}({(_transport == Ds3Transport.Usb ? "USB" : "BT")}): no input for "
+                        + $"{silenceHorizon / 1000} s after the enable - detaching for a clean re-open");
+                    // Cancel the read, NOT the service. The read loop then
+                    // returns, the monitor tears down and re-opens on its
+                    // next pass, and the enable is retried on a fresh
+                    // handle. Setting _running here would kill DS3 support
+                    // for the whole session.
+                    //
+                    // The flag comes FIRST: CancelIoEx only aborts I/O that
+                    // is already pended, so a cancel that lands in the gap
+                    // between two reads is simply lost, the writer is gone,
+                    // and the read loop would sit attached-but-silent
+                    // forever (the exact wedge this detach cures). With
+                    // _writerRun down, both read loops exit at their next
+                    // loop-top check even when the cancel misses.
+                    _writerRun = false;
+                    CancelCurrentRead();
+                    // Belt over the braces: if that cancel fired in the
+                    // between-reads gap AND the pad went silent right then,
+                    // the next read is pended with nothing to complete it.
+                    // By the time this second cancel runs the reader is
+                    // either parked in that read (it lands) or completing
+                    // traffic (the loop-top _writerRun check exits) - the
+                    // two miss modes exclude each other.
+                    //
+                    // 250 ms, not 50: the miss window is exactly "the reader
+                    // was descheduled between its flag check and its blocking
+                    // call", and only the BT lane can wedge on it, because
+                    // the USB pipe carries a 100 ms timeout and BT's
+                    // DeviceIoControl has no timeout at all. Teardown joins
+                    // this thread for 1000 ms, so 250 stays well inside the
+                    // budget while covering a far more realistic stall.
+                    Thread.Sleep(250);
+                    CancelCurrentRead();
+                    break;
+                }
+
+                bool doWrite;
+                lock (_outLock)
+                {
+                    // Keepalive: resend the current state every RUMBLE_KEEPALIVE_MS while
+                    // streaming, even with nothing changed, so held rumble is refreshed
+                    // before the DS3 stops its motors (~1 s after the last output report).
+                    // PadForge change-detects rumble at the SDL layer, so a sustained
+                    // rumble fires OnRumble once and _outDirty then clears; without this
+                    // the motor dies at ~1 s. Mirrors ScpToolkit's 500 ms full-report
+                    // resend (BthDs3.cs:158-164). Unconditional-while-streaming also
+                    // self-heals a dropped OFF (the next resend re-sends rumble=0). The
+                    // 150 ms floor still gates every write, so no BT flooding.
+                    bool keepaliveDue = _everGotInput && now - lastWrite >= RUMBLE_KEEPALIVE_MS;
+                    doWrite = (_outDirty || keepaliveDue) && now - lastWrite >= OUTPUT_MIN_INTERVAL_MS;
+                }
+                if (doWrite)
+                {
+                    WriteOutputReport();
+                    lastWrite = now;
+                }
+            }
+        }
+
+        private void Kick()
+        {
+            WriteOutputReport();
+            SendEnable();
+        }
+
+        /// <summary>The magic packet that starts input reports.
+        ///
+        /// <para>Split out of <see cref="Kick"/> because the two transports
+        /// need it at different MOMENTS. USB sends it immediately, which is
+        /// what ScpToolkit does and what has always worked here. Bluetooth
+        /// must not: DsHidMini sends the output report, starts its input
+        /// stream, and only one second later sends this, once, and only if no
+        /// input has arrived (DsBth.Timers.c, StartupDelay then
+        /// PostStartupTasks at WDF_REL_TIMEOUT_IN_SEC(1)). Its comment gives
+        /// both halves of the reason: "Required for compatibility with some
+        /// SIXAXIS models" and "It must not be issued on e.g. the Defender
+        /// BTH or it disconnects".</para></summary>
+        private void SendEnable()
+        {
+            lock (_ioLock)
+            {
+                if (_transport == Ds3Transport.Usb)
+                {
+                    // USB enable: SET_REPORT(FEATURE, 0xF4) {42,0C,00,00} flips the DS3
+                    // operational and starts the interrupt-IN stream (ScpToolkit
+                    // UsbDs3.cs Start(); proven prototype ds3winusb). Note 0x0C (USB),
+                    // not the 0x03 the BT enable uses.
+                    IntPtr ifh; lock (_outLock) ifh = _usbIfh;
+                    if (ifh != IntPtr.Zero)
+                        UsbSetReport(ifh, 0x03, 0xF4, new byte[] { 0x42, 0x0C, 0x00, 0x00 });
+                }
+                else
+                {
+                    // BT enable: 0x53 (SET_REPORT | FEATURE, report id 0xF4)
+                    // then F4 42 03 00 00. In the Bluetooth HID transport
+                    // header SET_REPORT is 0x50 and the low nibble is the
+                    // report type, 1 input / 2 output / 3 feature, so the 3
+                    // here is FEATURE. The bytes were always right; the
+                    // comment named the wrong type.
+                    byte[] en = { 0x53, 0xF4, 0x42, 0x03, 0x00, 0x00 };
+                    IntPtr h; lock (_outLock) h = _writePdo;
+                    if (h != IntPtr.Zero && h != INVALID_HANDLE)
+                    {
+                        bool ok = DeviceIoControl(h, IOCTL_HID_CONTROL_WRITE, en, en.Length, null, 0, out _, IntPtr.Zero);
+                        // Logged only while the pad has not streamed yet
+                        // (at most the five kicks), so a healthy session
+                        // costs one line and a silent one names the half
+                        // that failed: the write, or the pad's answer.
+                        if (!_everGotInput)
+                            _log($"{Tag}(BT): enable write " + (ok ? "ok"
+                                : $"FAILED err={Marshal.GetLastWin32Error()}"));
+                    }
+                }
+            }
+        }
+
+        // 50-byte DS3 Bluetooth output report (DsHidMini G_Ds3BthHidOutputReport):
+        // [0]=0x52 (SET_REPORT|OUTPUT), [1]=0x01 report id, then the raw 48-byte output
+        // payload, so raw offset N lands at [N+2]: smallDur raw[1]->[3], smallOn
+        // raw[2]->[4], largeDur raw[3]->[5], largeForce raw[4]->[6], LED raw[9]->[11].
+        // Rumble durations are 0xFE, not the 0xFF of the raw template: DsHidMini
+        // overrides both to 0xFE at BT startup (DsBth.Timers.c:50-51) and USB Host
+        // Shield's setRumbleOn uses 0xFE, the value that holds the motor until the
+        // next OFF. 0xFF with no periodic resend is what let the motor time out.
+        private void WriteOutputReport()
+        {
+            byte[] o = {
+                0x52,0x01, 0x00,0xFE,0x00,0xFE,0x00, 0x00,0x00,0x00,0x00,0x00,
+                0xFF,0x27,0x10,0x00,0x32, 0xFF,0x27,0x10,0x00,0x32, 0xFF,0x27,0x10,0x00,0x32, 0xFF,0x27,0x10,0x00,0x32,
+                0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 };
+            lock (_ioLock)
+            {
+                IntPtr h, ifh;
+                Ds3Transport tr = _transport;
+                lock (_outLock)
+                {
+                    o[4] = _rumbleSmall > 0 ? (byte)0x01 : (byte)0x00; // small motor on/off
+                    o[6] = _rumbleLarge;                               // large motor strength
+                    o[11] = _ledMask;                                  // player LED bitmask
+                    _outDirty = false;
+                    h = _writePdo;
+                    ifh = _usbIfh;
+                }
+                if (tr == Ds3Transport.Usb)
+                {
+                    // USB output: SET_REPORT(OUTPUT, 0x01) with just the 48-byte payload
+                    // (o[2..], dropping the BT 0x52/0x01 framing). Same rumble/LED bytes.
+                    if (ifh != IntPtr.Zero)
+                        UsbSetReport(ifh, 0x02, 0x01, o.AsSpan(2).ToArray());
+                }
+                else if (h != IntPtr.Zero && h != INVALID_HANDLE)
+                {
+                    bool ok = DeviceIoControl(h, IOCTL_HID_CONTROL_WRITE, o, o.Length, null, 0, out _, IntPtr.Zero);
+                    if (!ok && !_outWriteFailLogged)
+                    {
+                        _outWriteFailLogged = true;
+                        _log($"{Tag}(BT): output write FAILED err={Marshal.GetLastWin32Error()} (logged once per session)");
+                    }
+                }
+            }
+        }
+
+        /// <summary>WinUSB HID SET_REPORT class control transfer (reportType 0x02 OUTPUT
+        /// / 0x03 FEATURE). Caller holds _ioLock.</summary>
+        private static bool UsbSetReport(IntPtr ifh, byte reportType, byte reportId, byte[] data)
+        {
+            var s = new WINUSB_SETUP_PACKET
+            {
+                RequestType = 0x21,                                 // Host->Device | Class | Interface
+                Request = 0x09,                                     // HID SET_REPORT
+                Value = (ushort)((reportType << 8) | reportId),
+                Index = 0,
+                Length = (ushort)data.Length,
+            };
+            return WinUsb_ControlTransfer(ifh, s, data, (uint)data.Length, out _, IntPtr.Zero);
+        }
+
+        // ─── read loop: exact-size buffer, one pended read, no hot-path churn ───
+
+        private void ReadLoop(IntPtr h)
+        {
+            byte[] buf = new byte[DS3_BT_INPUT_REPORT_SIZE];
+            long lastProbe = 0;
+            // _writerRun is this loop's detach signal: the writer's five-kick
+            // detach lowers it before canceling, and a pad that streams only
+            // non-input frames (0xFF wake reports) keeps this loop cycling
+            // between reads where a bare CancelIoEx can miss.
+            int rxWake = 0, rxOther = 0, rxFails = 0, rxLastErr = 0;
+            long rxNextSummary = Environment.TickCount64 + 1000;
+            while (_running && _writerRun)
+            {
+                // Until the first real input frame, say once a second what
+                // the interrupt channel is actually delivering. A pad that
+                // opens and never streams (#285) was indistinguishable from
+                // a dead channel, a wake-frame loop, and a failing read.
+                if (!_everGotInput && Environment.TickCount64 >= rxNextSummary)
+                {
+                    rxNextSummary = Environment.TickCount64 + 1000;
+                    _log($"{Tag}(BT): rx pre-input summary wake={rxWake} other={rxOther} fails={rxFails}"
+                        + (rxFails > 0 ? $" lastErr={rxLastErr}" : ""));
+                }
+                if (DeviceIoControl(h, IOCTL_HID_INTERRUPT_READ, null, 0, buf, buf.Length, out int rd, IntPtr.Zero))
+                {
+                    _rxCompletions++;
+                    // Full 50-byte frames only (BthPS3 completes reads at exactly the
+                    // report size; a shorter completion would leave stale bytes from
+                    // the previous frame in the reused buffer past rd). raw[1]=0xFF is
+                    // the DS3's invalid/wake frame; both references drop it
+                    // (SDL_hidapi_ps3.c:566 data[1]==0xFF, ScpToolkit BthDs3.cs:42).
+                    if (rd >= DS3_BT_INPUT_REPORT_SIZE && buf[0] == 0xA1 && buf[1] == 0x01 && buf[2] != 0xFF)
+                    {
+                        _everGotInput = true;
+                        PushState(buf, rd);
+                        UpdateBattery(buf[31]);   // raw[30] BatteryStatus
+                    }
+                    // Non-input traffic on the interrupt channel: counted
+                    // for the pre-input summary, then read again.
+                    else if (rd >= 3 && buf[0] == 0xA1 && buf[2] == 0xFF) rxWake++;
+                    else rxOther++;
+                }
+                else
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    rxFails++; rxLastErr = err;
+                    if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_FILE_NOT_FOUND ||
+                        err == ERROR_INVALID_HANDLE || err == ERROR_OPERATION_ABORTED)
+                        break;
+                    // Transient failure: brief pause; liveness probe at most once per second.
+                    Thread.Sleep(2);
+                    long now = Environment.TickCount64;
+                    if (now - lastProbe >= 1000)
+                    {
+                        lastProbe = now;
+                        if (FindPdoPath() == null) break;
+                    }
+                }
+            }
+        }
+
+        /// <summary>USB read loop: WinUsb_ReadPipe on the interrupt-IN endpoint. The 49-byte
+        /// USB report is the raw DS3 report; prepend the 0xA1 byte Bluetooth carries so the
+        /// shared PushState parser (BT offsets) handles it verbatim.</summary>
+        private void UsbReadLoop()
+        {
+            byte[] buf = new byte[DS3_BT_INPUT_REPORT_SIZE];   // normalized (0xA1 + raw)
+            byte[] raw = new byte[64];
+            buf[0] = 0xA1;
+            long lastProbe = 0;
+            // The 100 ms pipe timeout below exists so this loop wakes to
+            // re-check these flags; _writerRun is the writer's five-kick
+            // detach signal (a bare CancelIoEx fired between two reads is
+            // lost, and ERROR_SEM_TIMEOUT loops forever otherwise).
+            while (_running && _writerRun && _transport == Ds3Transport.Usb)
+            {
+                IntPtr ifh; lock (_outLock) ifh = _usbIfh;
+                if (ifh == IntPtr.Zero) break;
+
+                if (WinUsb_ReadPipe(ifh, _usbInPipe, raw, (uint)raw.Length, out uint got, IntPtr.Zero))
+                {
+                    _rxCompletions++;
+                    // Standard DS3 report id 0x01. Shift raw[0..] to buf[1..] (buf[0]=0xA1),
+                    // giving the same layout the BT parser expects: report id at buf[1],
+                    // buttons at buf[3], sticks buf[7..10], pressures/motion at BT offsets.
+                    if (got >= 10 && raw[0] == 0x01)
+                    {
+                        int n = (int)Math.Min(got, (uint)(buf.Length - 1));
+                        Array.Copy(raw, 0, buf, 1, n);
+                        int rd = n + 1;
+                        if (rd >= DS3_BT_INPUT_REPORT_SIZE && buf[2] != 0xFF)
+                        {
+                            _everGotInput = true;
+                            PushState(buf, rd);
+                            UpdateBattery(buf[31]);
+                            if (_padAddress == null && _padAddressRetries < 3
+                                && Environment.TickCount64 >= _padAddressNextTry)
+                            {
+                                _padAddressRetries++;
+                                _padAddressNextTry = Environment.TickCount64 + 1000;
+                                _padAddress = Ds3UnitIdentity.Normalize(ReadUsbPadAddress());
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == ERROR_SEM_TIMEOUT) continue;   // pipe timeout, no report yet
+                    if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_FILE_NOT_FOUND ||
+                        err == ERROR_INVALID_HANDLE || err == ERROR_OPERATION_ABORTED ||
+                        err == ERROR_GEN_FAILURE || err == ERROR_NO_SUCH_DEVICE)
+                        break;
+                    Thread.Sleep(2);
+                    long now = Environment.TickCount64;
+                    if (now - lastProbe >= 1000)
+                    {
+                        lastProbe = now;
+                        if (FindWinUsbDs3() == null) break;
+                    }
+                }
+            }
+        }
+
+        // ─── SDL virtual joystick ───────────────────────────────────────────────
+
+        private bool AttachVirtual()
+        {
+            // Standard gamepad shape so SDL treats it as a gamepad and PadForge auto-maps.
+            _rumbleCb = OnRumble; _setLedCb = OnSetLed; _setPlayerCb = OnSetPlayerIndex; _setSensorsCb = OnSetSensors;
+
+            // Transport-independent name: SDL folds the name into the joystick GUID, and
+            // PadForge derives the device identity from that GUID (the virtual joystick
+            // has no path/serial). A per-transport name would give USB and Bluetooth
+            // different identities, so a slot mapping made on one wouldn't survive a
+            // switch to the other. One name = one identity for the physical pad.
+            var namePtr = Marshal.StringToHGlobalAnsi(_nav ? "PlayStation Move Navigation Controller" : "DualShock 3");
+            // Two sensors: accel + gyro at the DS3's ~100 Hz report rate. SDL deep-copies
+            // this array during attach (SDL_virtualjoystick.c attach inner), so the
+            // unmanaged copy only needs to live for the duration of the call.
+            var sensors = new SDL.SDL_VirtualJoystickSensorDesc[]
+            {
+                new SDL.SDL_VirtualJoystickSensorDesc { type = SDL_SENSOR_ACCEL, rate = 100.0f },
+                new SDL.SDL_VirtualJoystickSensorDesc { type = SDL_SENSOR_GYRO,  rate = 100.0f },
+            };
+            int sensorSize = Marshal.SizeOf<SDL.SDL_VirtualJoystickSensorDesc>();
+            IntPtr sensorsPtr = Marshal.AllocHGlobal(sensorSize * sensors.Length);
+            try
+            {
+                for (int i = 0; i < sensors.Length; i++)
+                    Marshal.StructureToPtr(sensors[i], sensorsPtr + i * sensorSize, false);
+
+                var desc = new SDL.SDL_VirtualJoystickDesc
+                {
+                    type = (ushort)SDL.SDL_JoystickType.SDL_JOYSTICK_TYPE_GAMEPAD,
+                    vendor_id = DS3_VID,
+                    product_id = ProfilePid,
+                    // 6 gamepad axes + the 10 button-pressure axes on 6-15, mirroring
+                    // upstream SDL's PS3 driver (SDL_hidapi_ps3.c:486-516) so the #193
+                    // HasExtraGenericAxes seam surfaces them as "Axis 6".."Axis 15"
+                    // identically on both transports.
+                    naxes = 16,
+                    nbuttons = VirtualJoystickButtons,
+                    nhats = 0,
+                    // The Navigation controller carries no motion sensors
+                    // (hid-sony registers sensors only for SIXAXIS_CONTROLLER,
+                    // hid-sony.c:2233/2254; its NAVIGATION branches do not).
+                    nsensors = _nav ? (ushort)0 : (ushort)sensors.Length,
+                    sensors = _nav ? IntPtr.Zero : sensorsPtr,
+                    // Nav surface per hid-sony navigation_mapping: Cross,
+                    // Circle, PS, L3, L1, dpad; left stick + L2 pressure only.
+                    button_mask = _nav ? 0x7AA3u : 0x7FFFu,
+                    axis_mask = _nav ? 0x13u : 0x3Fu,
+                    name = namePtr,
+                    Rumble = Marshal.GetFunctionPointerForDelegate(_rumbleCb),
+                    SetLED = Marshal.GetFunctionPointerForDelegate(_setLedCb),
+                    SetPlayerIndex = Marshal.GetFunctionPointerForDelegate(_setPlayerCb),
+                    SetSensorsEnabled = Marshal.GetFunctionPointerForDelegate(_setSensorsCb),
+                };
+                desc.version = (uint)Marshal.SizeOf<SDL.SDL_VirtualJoystickDesc>();
+
+                _instanceId = SDL.SDL_AttachVirtualJoystick(ref desc);
+                if (_instanceId == 0)
+                {
+                    _log($"{Tag}({(_transport == Ds3Transport.Usb ? "USB" : "BT")}): SDL_AttachVirtualJoystick failed.");
+                    return false;
+                }
+                _sdlJoystick = SDL.SDL_OpenJoystick(_instanceId);
+                return _sdlJoystick != IntPtr.Zero;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(sensorsPtr);
+                Marshal.FreeHGlobal(namePtr);
+            }
+        }
+
+        /// <summary>Reads the pad's own address (0xF2 bytes 4-9) and the host
+        /// it currently stores (0xF5 bytes 2-7) over the open WinUSB handle,
+        /// then raises <see cref="NavDockObserved"/>. Same two facts the Move
+        /// hands its own dock hook, and the same two the ceremony needs to
+        /// decide whether this pad is already paired to this PC.
+        ///
+        /// <para>Best-effort throughout: a pad that refuses either report
+        /// still streams, and the hook simply receives what was readable. It
+        /// never throws into the monitor loop.</para></summary>
+        private void RaiseNavDock()
+        {
+            string mac = null;
+            byte[] storedHost = null;
+            try
+            {
+                // Under _ioLock for the whole exchange, the same contract every
+                // other transfer in this file holds to: Teardown takes _ioLock
+                // before WinUsb_Free, so a transfer that starts inside it can
+                // never have its interface freed underneath it. Stop() joins the
+                // read thread with a 1.5 s timeout and tears down regardless, so
+                // a control transfer still in flight is exactly the case that
+                // needs it. Lock order is _ioLock outer, _outLock inner.
+                lock (_ioLock)
+                {
+                    IntPtr ifh;
+                    lock (_outLock) ifh = _usbIfh;
+                    if (ifh != IntPtr.Zero)
+                    {
+                        byte[] f2 = new byte[17];
+                        if (UsbGetFeature(ifh, 0xF2, f2))
+                            mac = AddressFromF2(f2);
+                        byte[] f5 = new byte[8];
+                        if (UsbGetFeature(ifh, 0xF5, f5))
+                            storedHost = f5[2..8];
+                    }
+                }
+            }
+            catch { }
+
+            _log(mac == null
+                ? "NAV(USB): Navigation controller docked; its address could not be read."
+                : $"NAV(USB): Navigation controller docked, address {mac}.");
+
+            // Also the idle disconnect's target. A pad that is already paired
+            // never reaches the ceremony again, so without this its row would
+            // stay address-less forever and never offer the control.
+            if (mac != null)
+                PadForge.Services.Ds3PairingService.StampLinkAddress(0x054C, NAV_PID, mac);
+            try { NavDockObserved?.Invoke(mac, storedHost); } catch { }
+        }
+
+        /// <summary>The pad's own address from its 0xF2 reply over the open
+        /// WinUSB handle, under the lock contract <see cref="RaiseNavDock"/>
+        /// keeps, or null when the pad won't say. Attempts 50 ms apart, as
+        /// DsHidMini makes three: some pads refuse the request while they
+        /// settle (driver/Ds3.c, DS3_DEVICE_ADDRESS_MAX_ATTEMPTS).</summary>
+        private string ReadUsbPadAddress(int attempts = 1)
+        {
+            for (int i = 0; i < attempts; i++)
+            {
+                if (i > 0) Thread.Sleep(50);
+                try
+                {
+                    lock (_ioLock)
+                    {
+                        IntPtr ifh;
+                        lock (_outLock) ifh = _usbIfh;
+                        if (ifh == IntPtr.Zero) return null;
+                        byte[] f2 = new byte[17];
+                        if (UsbGetFeature(ifh, 0xF2, f2)) return AddressFromF2(f2);
+                    }
+                }
+                catch { return null; }
+            }
+            return null;
+        }
+
+        /// <summary>Bytes 4-9 of a 0xF2 reply, the pad's own address, as
+        /// twelve lowercase hex digits.</summary>
+        internal static string AddressFromF2(byte[] f2)
+        {
+            var sb = new System.Text.StringBuilder(12);
+            for (int i = 4; i < 10; i++) sb.Append(f2[i].ToString("x2"));
+            return sb.ToString();
+        }
+
+        /// <summary>GET_REPORT(FEATURE) over WinUSB, the transport these
+        /// reports live on. A control-IN may SHORT COMPLETE, so a partial
+        /// reply is a failure: a truncated 0xF2 would otherwise leave the
+        /// zero-filled buffer's address bytes untouched and hand the ceremony
+        /// 00:00:00:00:00:00, the exact defect the DS3 path records.</summary>
+        private static bool UsbGetFeature(IntPtr ifh, byte reportId, byte[] buf)
+        {
+            var s = new WINUSB_SETUP_PACKET
+            {
+                RequestType = 0xA1,
+                Request = 0x01,
+                Value = (ushort)((0x03 << 8) | reportId),
+                Index = 0,
+                Length = (ushort)buf.Length
+            };
+            return WinUsb_ControlTransfer(ifh, s, buf, (uint)buf.Length, out uint moved, IntPtr.Zero)
+                && moved == (uint)buf.Length;
+        }
+
+        private void Teardown()
+        {
+            // Serialized + idempotent: Stop() and MonitorLoop can both arrive here
+            // (e.g. a wedged read thread outliving Stop's join), and the SDL
+            // close/detach pair must never run twice for the same handles.
+            lock (_teardownLock)
+            {
+                _writerRun = false;
+                _writeSignal.Set();
+                // Unblock a writer/reader stuck inside I/O so the joins can succeed.
+                lock (_outLock)
+                {
+                    if (_writePdo != IntPtr.Zero && _writePdo != INVALID_HANDLE) CancelIoEx(_writePdo, IntPtr.Zero);
+                    if (_usbDev != IntPtr.Zero && _usbDev != INVALID_HANDLE) CancelIoEx(_usbDev, IntPtr.Zero);
+                }
+                try { if (_writeThread != null && _writeThread != Thread.CurrentThread) _writeThread.Join(1000); } catch { }
+                _writeThread = null;
+
+                if (_instanceId != 0) { PowerByInstance.TryRemove(_instanceId, out _); _lastBattery = 0xFF; }
+                if (_sdlJoystick != IntPtr.Zero) { SDL.SDL_CloseJoystick(_sdlJoystick); _sdlJoystick = IntPtr.Zero; }
+                if (_instanceId != 0) { SDL.SDL_DetachVirtualJoystick(_instanceId); _instanceId = 0; }
+
+                // _ioLock: no write can be in flight while the handles close, so a late
+                // writer can never hit a closed/recycled handle value.
+                lock (_ioLock)
+                lock (_outLock)
+                {
+                    if (_readPdo != IntPtr.Zero && _readPdo != INVALID_HANDLE) CloseHandle(_readPdo);
+                    if (_writePdo != IntPtr.Zero && _writePdo != INVALID_HANDLE) CloseHandle(_writePdo);
+                    _readPdo = IntPtr.Zero;
+                    _writePdo = IntPtr.Zero;
+                    if (_usbIfh != IntPtr.Zero) { WinUsb_Free(_usbIfh); _usbIfh = IntPtr.Zero; }
+                    if (_usbDev != IntPtr.Zero && _usbDev != INVALID_HANDLE) CloseHandle(_usbDev);
+                    _usbDev = IntPtr.Zero;
+                    _usbInPipe = 0;
+                }
+                _transportPath = null;
+                _padAddress = null;
+                _transport = Ds3Transport.None;
+                // A re-plug is a new dock.
+                _lastNavDockedPath = null;
+            }
+        }
+
+        // ─── report parse -> SDL state ──────────────────────────────────────────
+        //
+        // BT input report = 0xA1 0x01 + the 48 remaining bytes of the raw 49-byte DS3
+        // report, so raw offset N lands at buf[N+1] (raw layout: DsHidMini Ds3Types.h).
+        //   buttons raw[2..4] -> buf[3..5]; sticks raw[6..9] -> buf[7..10];
+        //   pressures raw[14..25] -> buf[15..26]; accel raw[41..46] / gyro raw[47..48]
+        //   (big-endian words) -> buf[42..47] / buf[48..49].
+
+        private void PushState(byte[] b, int len)
+        {
+            IntPtr j = _sdlJoystick;
+            if (j == IntPtr.Zero) return;
+
+            byte b1 = b[3], b2 = b[4], b3 = b[5];
+            // raw btn1: Select L3 R3 Start  Up Right Down Left
+            bool select = (b1 & 0x01) != 0, l3 = (b1 & 0x02) != 0, r3 = (b1 & 0x04) != 0, start = (b1 & 0x08) != 0;
+            bool up = (b1 & 0x10) != 0, right = (b1 & 0x20) != 0, down = (b1 & 0x40) != 0, left = (b1 & 0x80) != 0;
+            // raw btn2: L2 R2 L1 R1  Tri Cir Cross Sq
+            bool l1 = (b2 & 0x04) != 0, r1 = (b2 & 0x08) != 0;
+            bool tri = (b2 & 0x10) != 0, cir = (b2 & 0x20) != 0, cross = (b2 & 0x40) != 0, sq = (b2 & 0x80) != 0;
+            bool ps = (b3 & 0x01) != 0;
+
+            // One lock acquisition for the whole frame: the per-call locks nest
+            // (recursive), the frame publishes atomically, and contention with the
+            // 1000 Hz polling thread costs one wait instead of 23.
+            string gyroRestLine = null, gyroTraceLine = null;
+            SDL.SDL_LockJoysticks();
+            try
+            {
+                if (_nav)
+                {
+                    // SPARSE-MASK INDEXING (#277, the Move-button lesson):
+                    // SDL's virtual mapping binds gamepad controls to
+                    // SEQUENTIAL joystick indices for the mask bits present
+                    // (VIRTUAL_JoystickGetGamepadMapping's current_button++),
+                    // not to bit positions. Nav mask 0x7AA3 therefore binds
+                    // south->0, east->1, guide->2, leftstick->3,
+                    // leftshoulder->4, dpad up/down/left/right->5/6/7/8.
+                    SDL.SDL_SetJoystickVirtualButton(j, 0, cross);
+                    SDL.SDL_SetJoystickVirtualButton(j, 1, cir);
+                    SDL.SDL_SetJoystickVirtualButton(j, 2, ps);
+                    SDL.SDL_SetJoystickVirtualButton(j, 3, l3);
+                    SDL.SDL_SetJoystickVirtualButton(j, 4, l1);
+                    SDL.SDL_SetJoystickVirtualButton(j, 5, up);
+                    SDL.SDL_SetJoystickVirtualButton(j, 6, down);
+                    SDL.SDL_SetJoystickVirtualButton(j, 7, left);
+                    SDL.SDL_SetJoystickVirtualButton(j, 8, right);
+                }
+                else
+                {
+                // SDL_GamepadButton order: 0 South 1 East 2 West 3 North 4 Back 5 Guide 6 Start
+                //   7 LStick 8 RStick 9 LShoulder 10 RShoulder 11 DpadUp 12 DpadDown 13 DpadLeft 14 DpadRight
+                // (The DS3 mask 0x7FFF is CONTIGUOUS, so sequential == bit position here.)
+                SDL.SDL_SetJoystickVirtualButton(j, 0, cross);
+                SDL.SDL_SetJoystickVirtualButton(j, 1, cir);
+                SDL.SDL_SetJoystickVirtualButton(j, 2, sq);
+                SDL.SDL_SetJoystickVirtualButton(j, 3, tri);
+                SDL.SDL_SetJoystickVirtualButton(j, 4, select);
+                SDL.SDL_SetJoystickVirtualButton(j, 5, ps);
+                SDL.SDL_SetJoystickVirtualButton(j, 6, start);
+                SDL.SDL_SetJoystickVirtualButton(j, 7, l3);
+                SDL.SDL_SetJoystickVirtualButton(j, 8, r3);
+                SDL.SDL_SetJoystickVirtualButton(j, 9, l1);
+                SDL.SDL_SetJoystickVirtualButton(j, 10, r1);
+                SDL.SDL_SetJoystickVirtualButton(j, 11, up);
+                SDL.SDL_SetJoystickVirtualButton(j, 12, down);
+                SDL.SDL_SetJoystickVirtualButton(j, 13, left);
+                SDL.SDL_SetJoystickVirtualButton(j, 14, right);
+                }
+
+                // Indices resolved from the descriptor's own mask, never
+                // hand-counted. See SeqAxis: a contiguous mask makes bit
+                // position and index identical, a sparse one does not.
+                uint amask = _nav ? 0x13u : 0x3Fu;
+                SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 0), AxisFromByte(b[7]));   // LX
+                SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 1), AxisFromByte(b[8]));   // LY
+                if (!_nav)
+                {
+                    // The Nav has no right stick and its report leaves those
+                    // bytes unpopulated; 0x00 would decode as full-corner
+                    // deflection, so the axes stay at rest instead.
+                    SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 2), AxisFromByte(b[9]));   // RX
+                    SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 3), AxisFromByte(b[10]));  // RY
+                }
+                // The Nav's ONE analog trigger is L2 (its published surface,
+                // hid-sony navigation_mapping, and the mask all agree), and
+                // it has no R2 at all, so that write is skipped for it.
+                SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 4), PressureAxis(b[19]));  // L2 pressure (raw[18])
+                if (!_nav)
+                    SDL.SDL_SetJoystickVirtualAxis(j, SeqAxis(amask, 5), PressureAxis(b[20]));  // R2 pressure (raw[19])
+
+                // Button-pressure axes 6-15, same order and scale as upstream SDL's
+                // PS3 driver (SDL_hidapi_ps3.c button_axis_offsets, axis_index from 6;
+                // raw offset -> BT buf offset is +1). Order: South East West North,
+                // LShoulder RShoulder, DpadUp DpadDown DpadLeft DpadRight.
+                SDL.SDL_SetJoystickVirtualAxis(j, 6, PressureAxis(b[25]));   // Cross    (raw[24])
+                SDL.SDL_SetJoystickVirtualAxis(j, 7, PressureAxis(b[24]));   // Circle   (raw[23])
+                SDL.SDL_SetJoystickVirtualAxis(j, 8, PressureAxis(b[26]));   // Square   (raw[25])
+                SDL.SDL_SetJoystickVirtualAxis(j, 9, PressureAxis(b[23]));   // Triangle (raw[22])
+                SDL.SDL_SetJoystickVirtualAxis(j, 10, PressureAxis(b[21]));  // L1       (raw[20])
+                SDL.SDL_SetJoystickVirtualAxis(j, 11, PressureAxis(b[22]));  // R1       (raw[21])
+                SDL.SDL_SetJoystickVirtualAxis(j, 12, PressureAxis(b[15]));  // D-pad Up    (raw[14])
+                SDL.SDL_SetJoystickVirtualAxis(j, 13, PressureAxis(b[17]));  // D-pad Down  (raw[16])
+                SDL.SDL_SetJoystickVirtualAxis(j, 14, PressureAxis(b[18]));  // D-pad Left  (raw[17])
+                SDL.SDL_SetJoystickVirtualAxis(j, 15, PressureAxis(b[16]));  // D-pad Right (raw[15])
+
+                // Motion. Raw words are BIG-endian (DsHidMini byteswaps them before its
+                // SXS serve; we read the raw report, so swap here). Frame mapping and
+                // scale follow the fork's SonySixaxis motion patch as landed (memory:
+                // sdl-patch-spec-ds3-sixaxis-motion, hardware-verified 2026-07-08),
+                // composed back through DsHidMini's transforms to raw byte order:
+                //   SDL accel = ( (ax-512), -(az-512), -(ay-512) ) / 113 * g
+                //   SDL gyro  = ( 0, (gz-512) * (90/123) deg/s, 0 )
+                // The yaw is not negated (#472). DsHidMini measured four genuine
+                // pads whose raw word falls for a clockwise turn seen from above
+                // (docs/MOTION.md, Units), and SDL counts counter-clockwise from
+                // above as positive. The negation this path first carried was
+                // measured on a pad that fails DsHidMini's genuineness check,
+                // and it made one genuine pad turn opposite ways here and on the
+                // SXS path under DsHidMini 3.15.0 and later, the first published
+                // setup whose driver zeroes the word (3.7.0 over USB, 3.9.0 for
+                // Bluetooth).
+                if (!_nav && len >= DS3_BT_INPUT_REPORT_SIZE)
+                {
+                    int ax = (b[42] << 8) | b[43];
+                    int ay = (b[44] << 8) | b[45];
+                    int az = (b[46] << 8) | b[47];
+                    int gz = (b[48] << 8) | b[49];
+
+                    ulong ts = SDL.SDL_GetTicksNS();
+
+                    _accelData[0] = (ax - 512) * ACCEL_SCALE;
+                    _accelData[1] = -(az - 512) * ACCEL_SCALE;
+                    _accelData[2] = -(ay - 512) * ACCEL_SCALE;
+                    SDL.SDL_SendJoystickVirtualSensorData(j, SDL_SENSOR_ACCEL, ts, _accelData, 3);
+
+                    // Canonical center, deliberately. The DS3's single yaw gyro is
+                    // a poor part, and Linux's hid-sony declines to support it at
+                    // all on the grounds that "the sensor is inaccurate and the
+                    // behavior is very different between hardware revisions."
+                    // Resting values of 727 and ~724 have been measured here, but
+                    // a learned center silently bakes in whatever a possibly
+                    // degraded part happened to read at connect. The pad keeps a
+                    // factory zero in EEPROM page 0xA0, which sixaxis.sys and
+                    // DsHidMini apply (docs/MOTION.md), but Bluetooth cannot read
+                    // it and this path does not, so 512, the 10-bit midpoint,
+                    // stands in. Removing a per-unit offset is the user's press of
+                    // Calibrate Gyro, a deliberate act against a known-still pad
+                    // rather than a guess.
+                    gyroRestLine = ObserveGyroRest(gz);
+                    _gyroData[0] = 0.0f;
+                    _gyroData[1] = YawFromWord(gz);
+                    _gyroData[2] = 0.0f;
+                    SDL.SDL_SendJoystickVirtualSensorData(j, SDL_SENSOR_GYRO, ts, _gyroData, 3);
+
+                    gyroTraceLine = TraceGyro(gz);
+                }
+            }
+            finally { SDL.SDL_UnlockJoysticks(); }
+            // Emitted OUTSIDE the joystick lock: the log ring takes its own
+            // lock and can append to a file on bench runs, neither of which
+            // belongs inside a lock the 1000 Hz poll thread contends on.
+            if (gyroRestLine != null) _log(gyroRestLine);
+            if (gyroTraceLine != null) _log(gyroTraceLine);
+        }
+
+        private const int SDL_SENSOR_ACCEL = 1;
+        private const int SDL_SENSOR_GYRO = 2;
+        private const float SDL_STANDARD_GRAVITY = 9.80665f;
+        private const float ACCEL_SCALE = SDL_STANDARD_GRAVITY / 113.0f;                  // 113 LSB/g
+        private const float GYRO_SCALE = PadForge.Engine.DualShock3Motion.GyroRadPerCount;                // 123 LSB per 90 deg/s
+
+        /// <summary>The raw 10-bit yaw word as SDL's yaw rate, rad/s,
+        /// counter-clockwise from above positive (#472).</summary>
+        internal static float YawFromWord(int word) => (word - 512) * GYRO_SCALE;
+
+        private readonly float[] _accelData = new float[3];
+        private readonly float[] _gyroData = new float[3];
+
+        // Raw-word trace for the yaw gyro. The Devices tab shows a value that has
+        // already been through bias calibration and the source curve, so it cannot
+        // answer what the SENSOR did. This reports the undecorated 10-bit word.
+        //
+        // Open questions it exists to settle, none of which are answerable from the
+        // parse alone: the RESTING value (nominal 512, but a large per-unit offset
+        // is on record for this part), whether the clockwise and counter-clockwise
+        // excursions are symmetric about that rest, and whether either direction
+        // reaches a rail (0 or 1023) and clips.
+        //
+        // Quiet by construction: it reports only while the pad is actually moving,
+        // at most every 2 s, plus one line naming the resting baseline when a
+        // session's first sample arrives.
+        // Measures where the yaw word actually rests and REPORTS it. It does
+        // not correct it, on purpose.
+        //
+        // An earlier revision learned this value and published against it. That
+        // was wrong for this part. Linux's hid-sony refuses to expose the DS3
+        // gyro at all because "the sensor is inaccurate and the behavior is very
+        // different between hardware revisions", and with per-revision behavior
+        // there is no correct center to converge on. Worse, a learned center
+        // cannot tell a healthy offset from a failing sensor: it would quietly
+        // adopt whatever a dying part read at connect and call that zero. DS3
+        // gyros do fail, and users report axes stuck or barely moving.
+        //
+        // So the published value stays anchored to the 512 midpoint and the
+        // per-unit offset is the user's Calibrate Gyro press to remove,
+        // deliberately, against a pad they know is still. The automatic pass at
+        // connect may not take it (GyroCalibratorService.MaxPlausibleBias). This
+        // line exists to tell them that is needed, and to leave evidence when
+        // the part is simply gone.
+        private const int GzRailMargin = PadForge.Engine.DualShock3Motion.GyroRailMargin;   // counts from 0 or 1023
+
+        private string ObserveGyroRest(int gz)
+        {
+            if (_gzRest >= 0) return null;   // baseline is captured once per session
+            int delta = gz - 512;
+            string note;
+            // The classes follow the calibrator's own bounds (#474): the
+            // automatic pass takes a rest within MaxPlausibleBias, a press
+            // takes one within MaxRestingYawCounts, and nothing takes more.
+            if (gz <= GzRailMargin || gz >= 1023 - GzRailMargin
+                || Math.Abs(delta) > PadForge.Engine.DualShock3Motion.MaxRestingYawCounts)
+                note = " AT-RAIL: resting against the end of its range, so one "
+                     + "direction cannot register. Calibration will not recover this.";
+            else if (Math.Abs(YawFromWord(gz)) > PadForge.Services.GyroCalibratorService.MaxPlausibleBias)
+                // A press takes this offset only for a pad PadForge can name
+                // by its address (GyroCalibratorService's large allowance).
+                note = $" OFFSET: reads ~{YawFromWord(gz):F2} rad/s while still. "
+                     + (_padAddress != null
+                         ? "Pressing Calibrate Gyro with the pad still removes it. "
+                         : "Pressing Calibrate Gyro with the pad still removes it once PadForge reads the pad's address. ")
+                     + $"Headroom is uneven: up={1023 - gz} down={gz}.";
+            else
+                note = " within normal range of the 10-bit midpoint.";
+            return $"DS3MOTION gyro resting baseline={gz} (nominal center 512, delta={delta}).{note}";
+        }
+
+        /// <summary>Fresh measurement per session, since a different pad or the
+        /// same pad after warm-up should not inherit the previous reading.</summary>
+        private void ResetGyroTracking()
+        {
+            _gzMin = int.MaxValue; _gzMax = int.MinValue; _gzRest = -1;
+        }
+
+        private int _gzMin = int.MaxValue, _gzMax = int.MinValue, _gzRest = -1;
+        private long _gzNextLogTicks;
+        private const int GzMoveThreshold = 8;      // counts; below this the pad is at rest
+        private const long GzLogIntervalMs = 2000;
+
+        private string TraceGyro(int gz)
+        {
+            if (_gzRest < 0)
+            {
+                // ObserveGyroRest already reported this sample. Just keep it as
+                // the reference the excursions below are measured against.
+                _gzRest = gz;
+                _gzNextLogTicks = Environment.TickCount64 + GzLogIntervalMs;
+                return null;
+            }
+            if (gz < _gzMin) _gzMin = gz;
+            if (gz > _gzMax) _gzMax = gz;
+
+            long now = Environment.TickCount64;
+            if (now < _gzNextLogTicks) return null;
+            _gzNextLogTicks = now + GzLogIntervalMs;
+
+            int span = _gzMax - _gzMin;
+            if (span < GzMoveThreshold) { _gzMin = int.MaxValue; _gzMax = int.MinValue; return null; }
+
+            // Both excursions measured from the resting baseline, so an asymmetry
+            // between the two directions is readable straight off the line.
+            int below = _gzRest - _gzMin, above = _gzMax - _gzRest;
+            string line = $"DS3MOTION gyro raw min={_gzMin} max={_gzMax} rest={_gzRest} "
+                 + $"span={span} belowRest={below} aboveRest={above}"
+                 + (_gzMin <= 0 ? " CLIPPED-LOW" : "") + (_gzMax >= 1023 ? " CLIPPED-HIGH" : "")
+                 + $" | yaw now={YawFromWord(gz):F2} rad/s";
+            // Fresh 2 s window: the excursion envelope resets after each
+            // report, or min/max would grow into a session-wide envelope.
+            _gzMin = int.MaxValue; _gzMax = int.MinValue;
+            return line;
+        }
+
+        /// <summary>0..255 stick byte to the full SDL axis range with 0x80 = exactly 0.
+        /// SDL's own PS3 driver uses v*257-32768 (center = +128); keeping a true zero
+        /// center matters for downstream deadzones, so scale each half to its full
+        /// extent instead: 128..255 -> 0..32767, 0..128 -> -32768..0.</summary>
+        private static short AxisFromByte(byte v) =>
+            v >= 128 ? (short)((v - 128) * 32767 / 127) : (short)((v - 128) * 32768 / 128);
+
+        /// <summary>0..255 pressure to the full SDL axis range, exactly as SDL's PS3
+        /// driver scales it (v*257 - 32768; released = -32768). The virtual backend
+        /// rests trigger axes at SDL_JOYSTICK_AXIS_MIN, confirming the convention.</summary>
+        /// <summary>The virtual-joystick axis index SDL binds a gamepad axis
+        /// to, for a descriptor carrying <paramref name="axisMask"/>.
+        ///
+        /// <para>SDL's VIRTUAL_JoystickGetGamepadMapping walks the mask from
+        /// the low bit up and assigns <c>current_axis++</c> for each PRESENT
+        /// bit, so the index is a COUNT OF PRESENT LOWER BITS and never the
+        /// bit position. The two coincide only for a contiguous mask, which
+        /// is exactly why hand-written indices survive on the DS3 (0x3F) and
+        /// are wrong on the Navigation controller (0x13): LEFT_TRIGGER is
+        /// bit 4 there but only the third present axis, so it binds to
+        /// index 2.</para>
+        ///
+        /// <para>This is the axis half of the SPARSE-MASK INDEXING rule the
+        /// button block in Poll already documents. That block got it; this
+        /// one did not, and the Nav's only analog trigger was written to an
+        /// index nothing maps, so it read at rest forever (#277).</para></summary>
+        internal static int SeqAxis(uint axisMask, int sdlAxisBit) =>
+            System.Numerics.BitOperations.PopCount(axisMask & ((1u << sdlAxisBit) - 1));
+
+        private static short PressureAxis(byte v) => (short)(v * 257 - 32768);
+
+        // ─── SDL callbacks: store + signal ONLY (they run under SDL's joystick lock
+        //     on the polling thread; device I/O here would stall the whole pipeline) ─
+
+        private bool OnRumble(IntPtr userdata, ushort low, ushort high)
+        {
+            lock (_outLock)
+            {
+                _rumbleLarge = (byte)(low >> 8);
+                _rumbleSmall = (byte)(high >> 8);
+                _outDirty = true;
+            }
+            _writeSignal.Set();
+            return true;
+        }
+
+        private bool OnSetLed(IntPtr userdata, byte r, byte g, byte bl) => true; // DS3 has no RGB; player LED via SetPlayerIndex
+
+        private void OnSetPlayerIndex(IntPtr userdata, int playerIndex)
+        {
+            // Same convention as SDL's PS3 driver: 0x01 << (1 + index % 4).
+            SetPlayerNumber(playerIndex < 0 ? 0 : playerIndex + 1);
+        }
+
+        private bool OnSetSensors(IntPtr userdata, bool enabled) => true; // sensors are always in the report
+
+        // ─── device enumeration + native I/O ────────────────────────────────────
+
+        private string FindPdoPath()
+        {
+            // The one generic raw-PDO interface, filtered by each profile's
+            // PID token (the old any-054c match would have grabbed a Move or
+            // Navigation PDO as a DS3, #277).
+            Guid g = BthPs3Interface;
+            string pidToken = _nav ? "pid_042f" : "pid_0268";
+            IntPtr set = SetupDiGetClassDevs(ref g, IntPtr.Zero, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (set == INVALID_HANDLE) return null;
+            var did = new SP_DEVICE_INTERFACE_DATA { cbSize = Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>() };
+            try
+            {
+                for (int i = 0; SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref g, i, ref did); i++)
+                {
+                    int req = 0;
+                    SetupDiGetDeviceInterfaceDetail(set, ref did, IntPtr.Zero, 0, ref req, IntPtr.Zero);
+                    IntPtr det = Marshal.AllocHGlobal(req);
+                    try
+                    {
+                        Marshal.WriteInt32(det, IntPtr.Size == 8 ? 8 : 6);
+                        if (SetupDiGetDeviceInterfaceDetail(set, ref did, det, req, ref req, IntPtr.Zero))
+                        {
+                            string p = Marshal.PtrToStringUni(det + 4);
+                            if (p != null && p.IndexOf("054c", StringComparison.OrdinalIgnoreCase) >= 0
+                                && p.IndexOf(pidToken, StringComparison.OrdinalIgnoreCase) >= 0) return p;
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(det); }
+                }
+            }
+            finally { SetupDiDestroyDeviceInfoList(set); }
+            return null;
+        }
+
+        // WinUSB interface GUID from the shipped ds3_winusb.inf (the USB DS3 binding).
+        private static readonly Guid DS3_WINUSB_IF = new Guid("B35924D6-3E16-4A9E-9782-5524A4B79BAC");
+
+        /// <summary>This instance's pad on WinUSB.
+        ///
+        /// <para>The GUID alone is not enough any more. It used to be: the
+        /// package bound the DS3 and nothing else, so "an interface with our
+        /// GUID" meant "the DS3". Once the package covered the Navigation
+        /// controller too (#277, its sixpair reports are as absent from its
+        /// HID descriptor as the DS3's), the unfiltered match handed the
+        /// Navigation pad's interface to the DS3 instance, which opened it,
+        /// named it "DualShock 3" and stamped it PID 0x0268. FindPdoPath had
+        /// already been fixed for exactly this on the BthPS3 side; this is
+        /// its sibling.</para></summary>
+        private string FindWinUsbDs3() => FindInterfacePath(DS3_WINUSB_IF, PidPathToken);
+
+        // Generalized SetupDi interface-path lookup. Both callers filter on a
+        // PID substring, because both of their interface GUIDs are shared by
+        // more than one Sony pad.
+        private string FindInterfacePath(Guid ifGuid, string pidToken)
+        {
+            IntPtr set = SetupDiGetClassDevs(ref ifGuid, IntPtr.Zero, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (set == INVALID_HANDLE) return null;
+            var did = new SP_DEVICE_INTERFACE_DATA { cbSize = Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>() };
+            try
+            {
+                for (int i = 0; SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref ifGuid, i, ref did); i++)
+                {
+                    // ACTIVE only (SPINT_ACTIVE): registrations persist in
+                    // the registry after the driver changes, and a stale
+                    // path here short-circuited the auto-bind (path came
+                    // back non-null, so the rebind never ran) while the
+                    // live pad sat on HidUsb with no input (#285).
+                    if ((did.Flags & SPINT_ACTIVE) == 0) continue;
+                    int req = 0;
+                    SetupDiGetDeviceInterfaceDetail(set, ref did, IntPtr.Zero, 0, ref req, IntPtr.Zero);
+                    IntPtr det = Marshal.AllocHGlobal(req);
+                    try
+                    {
+                        Marshal.WriteInt32(det, IntPtr.Size == 8 ? 8 : 6);
+                        if (SetupDiGetDeviceInterfaceDetail(set, ref did, det, req, ref req, IntPtr.Zero))
+                        {
+                            string p = Marshal.PtrToStringUni(det + 4);
+                            if (p != null
+                                && p.IndexOf("054c", StringComparison.OrdinalIgnoreCase) >= 0
+                                && p.IndexOf(pidToken, StringComparison.OrdinalIgnoreCase) >= 0)
+                                return p;
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(det); }
+                }
+            }
+            finally { SetupDiDestroyDeviceInfoList(set); }
+            return null;
+        }
+
+        private const int DIGCF_PRESENT = 0x2, DIGCF_DEVICEINTERFACE = 0x10, SPINT_ACTIVE = 0x1;
+        private const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000, FILE_SHARE_RW = 0x3, OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+        private const int ERROR_FILE_NOT_FOUND = 2, ERROR_INVALID_HANDLE = 6,
+                          ERROR_GEN_FAILURE = 31, ERROR_SEM_TIMEOUT = 121,
+                          ERROR_NO_SUCH_DEVICE = 433,
+                          ERROR_OPERATION_ABORTED = 995, ERROR_DEVICE_NOT_CONNECTED = 1167;
+        private static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
+
+        // ── WinUSB interop (USB DS3, inbox winusb.sys) ──────────────────────────
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct WINUSB_SETUP_PACKET { public byte RequestType; public byte Request; public ushort Value; public ushort Index; public ushort Length; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct USB_INTERFACE_DESCRIPTOR { public byte bLength, bDescriptorType, bInterfaceNumber, bAlternateSetting, bNumEndpoints, bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol, iInterface; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINUSB_PIPE_INFORMATION { public int PipeType; public byte PipeId; public ushort MaximumPacketSize; public byte Interval; }
+        private const uint PIPE_TRANSFER_TIMEOUT = 0x03;
+
+        [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Initialize(IntPtr dev, out IntPtr ifh);
+        [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Free(IntPtr ifh);
+        [DllImport("winusb.dll", SetLastError = true)]
+        private static extern bool WinUsb_ControlTransfer(IntPtr ifh, WINUSB_SETUP_PACKET setup, byte[] buf, uint len, out uint transferred, IntPtr overlapped);
+        [DllImport("winusb.dll", SetLastError = true)]
+        private static extern bool WinUsb_ReadPipe(IntPtr ifh, byte pipeId, byte[] buf, uint len, out uint transferred, IntPtr overlapped);
+        [DllImport("winusb.dll", SetLastError = true)]
+        private static extern bool WinUsb_QueryInterfaceSettings(IntPtr ifh, byte alt, out USB_INTERFACE_DESCRIPTOR desc);
+        [DllImport("winusb.dll", SetLastError = true)]
+        private static extern bool WinUsb_QueryPipe(IntPtr ifh, byte alt, byte pipeIndex, out WINUSB_PIPE_INFORMATION pipe);
+        [DllImport("winusb.dll", SetLastError = true)]
+        private static extern bool WinUsb_SetPipePolicy(IntPtr ifh, byte pipeId, uint policyType, uint valueLen, ref uint value);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SP_DEVICE_INTERFACE_DATA { public int cbSize; public Guid InterfaceClassGuid; public int Flags; public IntPtr Reserved; }
+
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr enumerator, IntPtr hwnd, int flags);
+        [DllImport("setupapi.dll", SetLastError = true)]
+        private static extern bool SetupDiEnumDeviceInterfaces(IntPtr set, IntPtr devInfo, ref Guid g, int i, ref SP_DEVICE_INTERFACE_DATA data);
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr set, ref SP_DEVICE_INTERFACE_DATA data, IntPtr detail, int detailSize, ref int required, IntPtr devInfo);
+        [DllImport("setupapi.dll")] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CancelIoEx(IntPtr h, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, int inLen, byte[] outBuf, int outLen, out int ret, IntPtr ov);
+    }
+}

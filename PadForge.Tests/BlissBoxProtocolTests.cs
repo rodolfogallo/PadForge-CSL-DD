@@ -1,0 +1,590 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using PadForge.Engine.Common.BlissBox;
+using Xunit;
+
+namespace PadForge.Tests
+{
+    /// <summary>
+    /// The Bliss-Box API's reports and parsers (issue #469), built byte for
+    /// byte against the API Tool (BBAPI.cs, main-original.c), DeviceBuddy
+    /// (bliss_box_api.js, automation.js) and the two firmware images' rules.
+    /// </summary>
+    public class BlissBoxProtocolTests
+    {
+        [Fact]
+        public void OnlyThePlayerPortsMatch_NeverAnUpdater()
+        {
+            for (ushort pid = 0x0D04; pid <= 0x0D07; pid++)
+                Assert.True(BlissBoxProtocol.IsPort(0x16D0, pid));
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x0D03));
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x0D08));
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x0A5F)); // 3.x bootloader
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x04FB)); // GPA bootloader
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x0A60)); // 1.x
+            Assert.False(BlissBoxProtocol.IsPort(0x16D0, 0x0A61)); // 4-Play Fix
+            Assert.False(BlissBoxProtocol.IsPort(0x16D1, 0x0D04));
+            Assert.Equal(1, BlissBoxProtocol.PlayerOf(0x0D04));
+            Assert.Equal(4, BlissBoxProtocol.PlayerOf(0x0D07));
+            Assert.Equal(7, BlissBoxProtocol.PlayerByte(4));
+        }
+
+        [Fact]
+        public void RumbleIsBbapiSendRumble_TypeOneWithFullLoop()
+        {
+            // sendRumble(type, state, amount, loop): [18][type][0][0][state][amount][loop].
+            Assert.Equal(new byte[] { 18, 4, 0, 0, 1, 200, 0xFF, 0, 0 }, BlissBoxProtocol.Rumble(true, 200));
+            Assert.Equal(new byte[] { 18, 5, 0, 0, 1, 1, 0xFF, 0, 0 }, BlissBoxProtocol.Rumble(false, 1));
+            Assert.Equal(new byte[] { 18, 4, 0, 0, 0, 0, 0, 0, 0 }, BlissBoxProtocol.Rumble(true, 0));
+            Assert.Equal(BlissBoxProtocol.CommandReportLength, BlissBoxProtocol.Rumble(false, 0).Length);
+        }
+
+        [Fact]
+        public void PlayerIsBbapiSetPlayer_WithResetAsTheWizardSendsIt()
+        {
+            // setPlayer(player, reset): player + 3 at [4], reset at [5].
+            Assert.Equal(new byte[] { 18, 8, 0, 0, 6, 1, 0, 0, 0 }, BlissBoxProtocol.SetPlayer(3));
+            Assert.Throws<ArgumentOutOfRangeException>(() => BlissBoxProtocol.SetPlayer(0));
+            Assert.Throws<ArgumentOutOfRangeException>(() => BlissBoxProtocol.SetPlayer(5));
+        }
+
+        [Fact]
+        public void ScreenPutsThePictureWhereBbapiAndDeviceBuddyPutIt()
+        {
+            var wire = Enumerable.Range(0, 192).Select(i => (byte)i).ToArray();
+            var report = BlissBoxProtocol.Screen(wire);
+            Assert.Equal(BlissBoxProtocol.ScreenReportLength, report.Length);
+            // BBAPI.cs sendLCD: [20][0x24][0][0] then the 192 bytes.
+            Assert.Equal(new byte[] { 20, 0x24, 0, 0 }, report[..4]);
+            Assert.Equal(wire, report[4..196]);
+            // DeviceBuddy's API_WRITE fills its buffer from index 2 with the
+            // parameters, whose first is a header, so the picture lands at
+            // index 3 after the report ID: byte 4 of the report, as here.
+            var parms = new byte[193];
+            Array.Copy(wire, 0, parms, 1, 192);
+            var data = new byte[200];
+            data[0] = parms[0];
+            for (int i = 0; i < parms.Length && i < 192; i++) data[2 + i] = parms[i];
+            Assert.Equal(wire[..191], data[3..194]);
+        }
+
+        [Fact]
+        public void InfoParsesTheFiveBytesAndChecksThePlayer()
+        {
+            var info = BlissBoxProtocol.ParseInfo(new byte[] { 121, 0x10, 4, 7, 86 }, 4);
+            Assert.NotNull(info);
+            Assert.Equal(121, info.Type);
+            Assert.Equal(0x10, info.Flags);
+            Assert.Equal(4, info.Major);
+            Assert.Equal(86, info.Minor);
+            Assert.False(info.Searching);
+            Assert.True(info.IsAdvanced);
+            Assert.Null(BlissBoxProtocol.ParseInfo(new byte[] { 121, 0x10, 4, 7, 86 }, 3));
+            Assert.Null(BlissBoxProtocol.ParseInfo(new byte[] { 121, 0x10, 4, 7 }, 4));
+            Assert.True(BlissBoxProtocol.ParseInfo(new byte[] { 0, 0x01, 3, 4, 24 }, 1).Searching);
+        }
+
+        [Fact]
+        public void PressureAndScreenReadsCheckThePlayerByte()
+        {
+            var data = new byte[13];
+            data[0] = 5; // player 2
+            for (int i = 1; i < 13; i++) data[i] = (byte)(i * 10);
+            var pressure = new byte[12];
+            Assert.True(BlissBoxProtocol.TryParsePressure(data, 2, pressure));
+            Assert.Equal(data[1..], pressure);
+            Assert.False(BlissBoxProtocol.TryParsePressure(data, 1, pressure));
+
+            var screen = new byte[193];
+            screen[0] = 4;
+            screen[192] = 0xAB;
+            var wire = new byte[192];
+            Assert.True(BlissBoxProtocol.TryParseScreen(screen, 1, wire));
+            Assert.Equal(0xAB, wire[191]);
+            Assert.False(BlissBoxProtocol.TryParseScreen(screen, 2, wire));
+        }
+
+        [Fact]
+        public void NativeRepliesFollowBbapiGetData()
+        {
+            // [player + 3][use][size][bytes]
+            var state = BlissBoxProtocol.ParseNativeReply(new byte[] { 4, 1, 3, 5, 0, 1, 99 }, 1, 1, out var reply);
+            Assert.Equal(BlissBoxProtocol.NativeReplyState.Ready, state);
+            Assert.Equal(new byte[] { 5, 0, 1 }, reply);
+            Assert.Equal(BlissBoxProtocol.NativeReplyState.NoReply,
+                BlissBoxProtocol.ParseNativeReply(new byte[] { 4, 0, 0 }, 1, 1, out _));
+            Assert.Equal(BlissBoxProtocol.NativeReplyState.NotReady,
+                BlissBoxProtocol.ParseNativeReply(new byte[] { 5, 1, 3, 1, 2, 3 }, 1, 1, out _));
+            Assert.Equal(BlissBoxProtocol.NativeReplyState.NotReady,
+                BlissBoxProtocol.ParseNativeReply(new byte[] { 4, 1, 0 }, 1, 1, out _));
+        }
+
+        [Fact]
+        public void ShortMessagesAreTheHeaderAlone()
+        {
+            foreach (bool advanced in new[] { false, true })
+            {
+                var reports = BlissBoxProtocol.NativeReports(new byte[] { 0x00 }, advanced);
+                var header = Assert.Single(reports);
+                // [18][0x25][0][size hi][size lo][use][m0][m1][0]
+                Assert.Equal(new byte[] { 18, 0x25, 0, 0, 1, 1, 0x00, 0, 0 }, header);
+                Assert.Single(BlissBoxProtocol.NativeReports(new byte[] { 7, 8 }, advanced));
+            }
+        }
+
+        /// <summary>Every length comes through whole on the generation it is
+        /// framed for: on a GPA with no copy count out of range, and on a 3.x
+        /// adapter right after another message left its stale position
+        /// somewhere else.</summary>
+        [Fact]
+        public void EveryLengthAssemblesWholeOnTheFirmwareItIsFramedFor()
+        {
+            var rng = new Random(469);
+            var threeZero = new ThreeZeroModel();
+            var gpa = new GpaModel();
+            for (int length = 1; length <= BlissBoxProtocol.MaxNativeMessage; length++)
+            {
+                var message = new byte[length];
+                rng.NextBytes(message);
+                Assert.Equal(message, threeZero.Feed(BlissBoxProtocol.NativeReports(message, advanced: false)));
+                Assert.Equal(message, gpa.Feed(BlissBoxProtocol.NativeReports(message, advanced: true)));
+                Assert.False(gpa.Overrun, $"length {length}");
+                Assert.True(threeZero.Highest < 256, $"length {length}");
+            }
+        }
+
+        /// <summary>A 3.0 adapter copies five bytes for every chunk, the last
+        /// included, so a longer message would write past the first 256
+        /// bytes of its buffer.</summary>
+        [Fact]
+        public void ALongerMessageThanTheLimitIsRefused()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                BlissBoxProtocol.NativeReports(new byte[BlissBoxProtocol.MaxNativeMessage + 1], advanced: false));
+            Assert.Throws<ArgumentException>(() => BlissBoxProtocol.NativeReports(Array.Empty<byte>(), advanced: true));
+            var model = new ThreeZeroModel();
+            model.Feed(BlissBoxProtocol.NativeReports(new byte[BlissBoxProtocol.MaxNativeMessage], advanced: false));
+            Assert.Equal(251, model.Highest);
+        }
+
+        /// <summary>Why the framing depends on the firmware. A GPA reads a 0xFF
+        /// chunk after a positioned one at that position plus five and copies
+        /// the size minus that position, so the 3.x framing of a 3 to 6 byte
+        /// message, a Controller Pak read among them, sends it a negative count
+        /// (0x2D47). A 3.x adapter places a lone 0xFF chunk at its stale
+        /// position plus five, so the GPA framing lands its data there.</summary>
+        [Fact]
+        public void EachFramingBreaksTheOtherGeneration()
+        {
+            for (int length = 3; length <= 6; length++)
+            {
+                var message = Enumerable.Range(1, length).Select(i => (byte)i).ToArray();
+                var gpa = new GpaModel();
+                gpa.Feed(BlissBoxProtocol.NativeReports(message, advanced: false));
+                Assert.True(gpa.Overrun, $"length {length}");
+                Assert.NotEqual(message, new ThreeZeroModel().Feed(BlissBoxProtocol.NativeReports(message, advanced: true)));
+            }
+            // From 8 bytes on, where the data takes two chunks, the framings agree.
+            var eight = Enumerable.Range(1, 8).Select(i => (byte)i).ToArray();
+            Assert.Equal(BlissBoxProtocol.NativeReports(eight, advanced: false),
+                BlissBoxProtocol.NativeReports(eight, advanced: true));
+        }
+
+        /// <summary>BBAPI.cs sendData's chunk count, transcribed, leaves the
+        /// last byte of a 28-byte message off the wire, and sends an 11-byte
+        /// message a chunk too many, which a GPA reads as a negative count.
+        /// The count here does neither.</summary>
+        [Fact]
+        public void TheChunkCountCoversWhatBbapiGetsWrong()
+        {
+            var message = Enumerable.Range(1, 28).Select(i => (byte)i).ToArray();
+            Assert.NotEqual(message, new ThreeZeroModel().Feed(BbapiSendData(message)));
+            Assert.Equal(message, new ThreeZeroModel().Feed(BlissBoxProtocol.NativeReports(message, advanced: false)));
+
+            var eleven = Enumerable.Range(1, 11).Select(i => (byte)i).ToArray();
+            var gpa = new GpaModel();
+            gpa.Feed(BbapiSendData(eleven));
+            Assert.True(gpa.Overrun);
+            var ours = new GpaModel();
+            Assert.Equal(eleven, ours.Feed(BlissBoxProtocol.NativeReports(eleven, advanced: true)));
+            Assert.False(ours.Overrun);
+        }
+
+        private static List<byte[]> BbapiSendData(byte[] message)
+        {
+            var reports = new List<byte[]>();
+            var header = new byte[9];
+            header[0] = 18; header[1] = 0x25; header[3] = 0; header[4] = (byte)message.Length; header[5] = 1;
+            if (message.Length > 0) header[6] = message[0];
+            if (message.Length > 1) header[7] = message[1];
+            reports.Add(header);
+            if (message.Length > 2)
+            {
+                int c = 2, pos = 2, size = message.Length;
+                size -= 2; size += 1; size /= 5;
+                if (size == 0) size = 1;
+                if (size % 5 > 0) size++;
+                for (int s = 0; s < size; s++)
+                {
+                    var chunk = new byte[9];
+                    chunk[0] = 18; chunk[1] = 0x25;
+                    if (s == size - 1) chunk[2] = 0xFF;
+                    else { chunk[2] = (byte)pos; pos += 5; }
+                    for (int k = 0; k < 5; k++, c++) if (c < message.Length) chunk[3 + k] = message[c];
+                    reports.Add(chunk);
+                }
+            }
+            return reports;
+        }
+
+        /// <summary>A report as the adapter receives it: padded with zeros to
+        /// the collection's feature length.</summary>
+        private static byte[] Padded(byte[] report)
+        {
+            var padded = new byte[197];
+            Array.Copy(report, padded, report.Length);
+            return padded;
+        }
+
+        /// <summary>GPA 4.86's native channel, as its listing shows it. The
+        /// header keeps the size's low byte (0x2D20) and resets the last
+        /// position (0x2D30). A positioned chunk copies five bytes. A 0xFF
+        /// chunk goes to position 2 after the header (0x2DA5) or to the last
+        /// position plus five (0x2D47), and copies the size minus that
+        /// position. Either becomes the last position (0x2DC1).</summary>
+        private sealed class GpaModel
+        {
+            private byte[] _buffer;
+            private int _size, _last;
+
+            /// <summary>A copy count went negative, which on the adapter runs
+            /// the copy over its RAM.</summary>
+            public bool Overrun;
+
+            public byte[] Feed(IEnumerable<byte[]> reports)
+            {
+                byte[] done = null;
+                foreach (var report in reports)
+                {
+                    var r = Padded(report);
+                    Assert.Equal(18, r[0]);
+                    Assert.Equal(0x25, r[1]);
+                    if (r[2] == 0)
+                    {
+                        _size = r[4];
+                        _buffer = new byte[300];
+                        _buffer[0] = r[6];
+                        _buffer[1] = r[7];
+                        _last = 0;
+                        if (_size <= 2) done = _buffer[.._size];
+                        continue;
+                    }
+                    int at, count;
+                    if (r[2] != 0xFF) { at = r[2]; count = 5; }
+                    else if (_last == 0) { at = 2; count = _size - 2; }
+                    else { at = _last + 5; count = _size - at; }
+                    if (count < 0)
+                    {
+                        Overrun = true;
+                        return null;
+                    }
+                    Array.Copy(r, 3, _buffer, at, count);
+                    _last = at;
+                    if (r[2] == 0xFF) done = _buffer[.._size];
+                }
+                return done;
+            }
+        }
+
+        /// <summary>The 3.0 firmware's native channel (handler at 0x0902): the
+        /// header keeps the size's low byte (0x0954), the last position lives
+        /// in RAM a header never resets, a 0xFF chunk goes five past it
+        /// (0x0967 to 0x096B), every chunk copies five bytes, and every
+        /// chunk's position becomes the last one, the 0xFF chunk's included
+        /// (0x0983).</summary>
+        private sealed class ThreeZeroModel
+        {
+            private int _last = 40; // stale RAM from an earlier message
+            private byte[] _buffer;
+            private int _size;
+
+            /// <summary>The highest buffer index any chunk has written.</summary>
+            public int Highest;
+
+            public byte[] Feed(IEnumerable<byte[]> reports)
+            {
+                byte[] done = null;
+                foreach (var report in reports)
+                {
+                    var r = Padded(report);
+                    Assert.Equal(18, r[0]);
+                    Assert.Equal(0x25, r[1]);
+                    if (r[2] == 0)
+                    {
+                        _size = r[4];
+                        _buffer = new byte[300];
+                        _buffer[0] = r[6];
+                        _buffer[1] = r[7];
+                        if (_size <= 2) done = _buffer[.._size];
+                        continue;
+                    }
+                    int at = (r[2] == 0xFF ? _last + 5 : r[2]) & 0xFF;
+                    _last = at;
+                    Array.Copy(r, 3, _buffer, at, 5);
+                    Highest = Math.Max(Highest, at + 4);
+                    if (r[2] == 0xFF) done = _buffer[.._size];
+                }
+                return done;
+            }
+        }
+
+        // ── The VMU picture ──
+
+        /// <summary>DeviceBuddy's README example: 193 values, a header then
+        /// the 192 wire bytes, read the way DeviceBuddy draws report 24.</summary>
+        private static readonly byte[] DeviceBuddyExample =
+        {
+            0,240,1,227,255,129,254,240,3,231,207,199,254,60,15,15,1,231,14,30,30,14,0,231,14,7,120,30,0,247,158,7,240,24,0,113,156,15,240,24,0,113,252,15,240,24,0,113,252,15,224,24,0,113,252,14,248,30,0,115,220,30,30,31,0,243,158,60,15,15,129,195,142,240,3,231,231,195,238,240,1,225,255,129,255,0,0,0,0,0,0,0,0,0,0,0,0,63,131,241,247,241,254,121,199,185,227,243,254,97,230,57,224,227,14,97,230,56,240,227,14,97,198,32,240,243,158,96,6,0,248,115,156,120,7,128,120,115,252,62,3,224,120,112,252,15,129,248,248,115,252,3,192,124,240,115,220,0,192,28,240,115,158,0,192,28,240,115,142,48,195,28,0,123,238,113,199,60,0,57,254,127,135,249,240,60,255,63,3,241,240,28,127,
+        };
+
+        private static readonly string[] BlissBoxArt =
+        {
+            "#######...###.......#####...######......######..",
+            "########..####......#####..########....########.",
+            ".########..###............####..###...###...###.",
+            ".###.#####.####...........###...##....##....##..",
+            ".###...###..###.....####..###.........##........",
+            ".####..###..###.....####..###.........##........",
+            "..###.####..###.....####..#####.......####......",
+            "..########..###....#####...######......#####....",
+            "..######....###....####......#####.......#####..",
+            "..########..###....####........####........####.",
+            "..###..###..###....#####.........##..........##.",
+            ".####..###..####....####.....#...##...###....##.",
+            ".###....##...###....####...###...##..####....##.",
+            ".###....##...###.....####..###...##..####....##.",
+            ".#########..######...####..###.####...###..####.",
+            ".########...#######.#####...######.....#######..",
+            "................................................",
+            "................................................",
+            "#########......##########....####...........####",
+            ".###.#####....#####..######..#####..........####",
+            ".###...###....###......#####....####......####..",
+            ".####..###..####........#####....####....####...",
+            "..###.####..###..........####......#####.###....",
+            "..#######...###............##........#######....",
+            "..#######...###............##.......########....",
+            "..#######...###............##.......########....",
+            "..###..##...###............##.......#######.....",
+            ".####..####.####.........####......####.###.....",
+            ".###....###..###.........###.....####....####...",
+            ".###....###..####.......####....####......####..",
+            ".##########...######..#####..#####..........####",
+            ".########......###########...####...........####",
+        };
+
+        [Fact]
+        public void TheDeviceBuddyExampleReadsBlissBoxUpright()
+        {
+            Assert.Equal(193, DeviceBuddyExample.Length);
+            var image = BlissBoxScreen.FromWire(DeviceBuddyExample.AsSpan(1, 192));
+            for (int y = 0; y < BlissBoxScreen.Height; y++)
+                for (int x = 0; x < BlissBoxScreen.Width; x++)
+                    Assert.True(BlissBoxArt[y][x] == '#' == BlissBoxScreen.IsDark(image, x, y), $"pixel ({x}, {y})");
+        }
+
+        [Fact]
+        public void TheRotationIsItsOwnInverse_AndMatchesDlcd()
+        {
+            var rng = new Random(460);
+            var image = new byte[192];
+            rng.NextBytes(image);
+            var wire = BlissBoxScreen.ToWire(image);
+            Assert.Equal(image, BlissBoxScreen.FromWire(wire));
+            // dLCD.cs writeToLCD: reverse each byte's bits, then the order.
+            for (int k = 0; k < 192; k++)
+                Assert.Equal(BlissBoxScreen.ReverseBits(image[k]), wire[191 - k]);
+            Assert.Equal(0x01, BlissBoxScreen.ReverseBits(0x80));
+            Assert.Equal(0xB1, BlissBoxScreen.ReverseBits(0x8D));
+        }
+
+        [Fact]
+        public void AnLcdFileGivesItsFirstFrameInImageOrder()
+        {
+            var file = new byte[BlissBoxScreen.LcdPixelOffset + 48 * 32 + 10];
+            file[BlissBoxScreen.LcdPixelOffset + 0] = BlissBoxScreen.LcdDark;           // (0, 0)
+            file[BlissBoxScreen.LcdPixelOffset + 47] = BlissBoxScreen.LcdDark;          // (47, 0)
+            file[BlissBoxScreen.LcdPixelOffset + 48 * 31 + 5] = BlissBoxScreen.LcdDark; // (5, 31)
+            file[BlissBoxScreen.LcdPixelOffset + 1] = 0x07;                             // not 0x08: light
+            var image = BlissBoxScreen.FromLcd(file);
+            Assert.True(BlissBoxScreen.IsDark(image, 0, 0));
+            Assert.True(BlissBoxScreen.IsDark(image, 47, 0));
+            Assert.True(BlissBoxScreen.IsDark(image, 5, 31));
+            Assert.False(BlissBoxScreen.IsDark(image, 1, 0));
+            Assert.Equal(3, Enumerable.Range(0, 48 * 32).Count(p => BlissBoxScreen.IsDark(image, p % 48, p / 48)));
+            Assert.Null(BlissBoxScreen.FromLcd(new byte[100]));
+        }
+
+        [Fact]
+        public void AVmsIconIsCenteredWithEightBlankPixelsEitherSide()
+        {
+            var file = new byte[0x80 + 128 + 64];
+            BitConverter.GetBytes(0x80u).CopyTo(file, 16);
+            for (int i = 0; i < 128; i++) file[0x80 + i] = 0xFF; // every icon pixel dark
+            var image = BlissBoxScreen.FromVms(file);
+            for (int y = 0; y < 32; y++)
+                for (int x = 0; x < 48; x++)
+                    Assert.Equal(x >= 8 && x < 40, BlissBoxScreen.IsDark(image, x, y));
+
+            var bad = new byte[200];
+            BitConverter.GetBytes(0u).CopyTo(bad, 16);
+            Assert.Null(BlissBoxScreen.FromVms(bad));
+            BitConverter.GetBytes(150u).CopyTo(bad, 16); // icon would run past the end
+            Assert.Null(BlissBoxScreen.FromVms(bad));
+        }
+
+        [Fact]
+        public void AVmsFileTooShortForAnIconHoldsNoPicture()
+        {
+            // Under 128 bytes the bounds check used to wrap around and let a
+            // slice past the end throw.
+            var small = new byte[100];
+            BitConverter.GetBytes(16u).CopyTo(small, 16);
+            Assert.Null(BlissBoxScreen.FromVms(small));
+            Assert.Null(BlissBoxScreen.FromVms(new byte[20]));
+        }
+
+        // ── The Controller Pak ──
+
+        /// <summary>libdragon's joybus_accessory_calculate_addr_checksum
+        /// table.</summary>
+        private static int LibdragonAddressChecksum(int address)
+        {
+            int[] xorTable = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x1F, 0x0B, 0x16, 0x19, 0x07, 0x0E, 0x1C, 0x0D, 0x1A, 0x01 };
+            int checksum = 0;
+            for (int i = 15; i >= 5; i--)
+                if (((address >> i) & 1) != 0) checksum ^= xorTable[i];
+            return checksum & 0x1F;
+        }
+
+        /// <summary>libdragon's joybus_accessory_calculate_data_crc.</summary>
+        private static byte LibdragonDataCrc(byte[] data)
+        {
+            int crc = 0;
+            foreach (byte b in data)
+            {
+                int x = crc ^ b;
+                crc = 0;
+                if ((x & 0x80) != 0) crc ^= 0x89;
+                if ((x & 0x40) != 0) crc ^= 0x86;
+                if ((x & 0x20) != 0) crc ^= 0x43;
+                if ((x & 0x10) != 0) crc ^= 0xE3;
+                if ((x & 0x08) != 0) crc ^= 0xB3;
+                if ((x & 0x04) != 0) crc ^= 0x9B;
+                if ((x & 0x02) != 0) crc ^= 0x8F;
+                if ((x & 0x01) != 0) crc ^= 0x85;
+            }
+            return (byte)crc;
+        }
+
+        [Fact]
+        public void TheAddressChecksumMatchesLibdragonForEveryBlock()
+        {
+            for (int block = 0; block < BlissBoxControllerPak.Blocks; block++)
+            {
+                int address = block * 32;
+                Assert.Equal(LibdragonAddressChecksum(address), BlissBoxControllerPak.AddressChecksum(address));
+                Assert.Equal(address | LibdragonAddressChecksum(address), BlissBoxControllerPak.AddressField(block));
+            }
+            // The Rumble Pak's probe page, above the pak's own blocks.
+            Assert.Equal(LibdragonAddressChecksum(0x8000), BlissBoxControllerPak.AddressChecksum(0x8000));
+        }
+
+        [Fact]
+        public void TheDataCrcMatchesLibdragon_AndARumblePakBlockIsB8()
+        {
+            var rng = new Random(64);
+            for (int i = 0; i < 200; i++)
+            {
+                var data = new byte[32];
+                rng.NextBytes(data);
+                Assert.Equal(LibdragonDataCrc(data), BlissBoxControllerPak.DataCrc(data));
+            }
+            Assert.Equal(0xB8, BlissBoxControllerPak.DataCrc(Enumerable.Repeat((byte)0x80, 32).ToArray()));
+        }
+
+        [Fact]
+        public void ReadAndWriteMessagesCarryTheCheckedAddress()
+        {
+            ushort field = BlissBoxControllerPak.AddressField(3);
+            Assert.Equal(new byte[] { 0x02, (byte)(field >> 8), (byte)field }, BlissBoxControllerPak.ReadMessage(3));
+            var data = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
+            var write = BlissBoxControllerPak.WriteMessage(3, data);
+            Assert.Equal(35, write.Length);
+            Assert.Equal(0x03, write[0]);
+            Assert.Equal(data, write[3..]);
+            Assert.Equal(new byte[] { 0x00 }, BlissBoxControllerPak.StatusMessage());
+        }
+
+        [Fact]
+        public void BlockRepliesTellOkBadAndMissingApart()
+        {
+            var data = Enumerable.Range(0, 32).Select(i => (byte)(i * 7)).ToArray();
+            byte crc = BlissBoxControllerPak.DataCrc(data);
+            var copy = new byte[32];
+            Assert.Equal(BlissBoxControllerPak.BlockResult.Ok, BlissBoxControllerPak.ParseRead(data.Append(crc).ToArray(), copy));
+            Assert.Equal(data, copy);
+            Assert.Equal(BlissBoxControllerPak.BlockResult.NoPak, BlissBoxControllerPak.ParseRead(data.Append((byte)~crc).ToArray(), copy));
+            Assert.Equal(BlissBoxControllerPak.BlockResult.BadCrc, BlissBoxControllerPak.ParseRead(data.Append((byte)(crc ^ 1)).ToArray(), copy));
+            Assert.Equal(BlissBoxControllerPak.BlockResult.Short, BlissBoxControllerPak.ParseRead(data, copy));
+            Assert.Equal(BlissBoxControllerPak.BlockResult.Ok, BlissBoxControllerPak.ParseWrite(new[] { crc }, data));
+            Assert.Equal(BlissBoxControllerPak.BlockResult.NoPak, BlissBoxControllerPak.ParseWrite(new[] { (byte)~crc }, data));
+        }
+
+        [Fact]
+        public void APakIsPresentAtStatusOneOrThree()
+        {
+            Assert.True(BlissBoxControllerPak.IsPakPresent(new byte[] { 5, 0, 1 }));
+            Assert.True(BlissBoxControllerPak.IsPakPresent(new byte[] { 5, 0, 3 }));
+            Assert.False(BlissBoxControllerPak.IsPakPresent(new byte[] { 5, 0, 2 }));
+            Assert.False(BlissBoxControllerPak.IsPakPresent(new byte[] { 5, 0, 0 }));
+            Assert.False(BlissBoxControllerPak.IsPakPresent(new byte[] { 5, 0 }));
+        }
+
+        // ── The PlayStation poll ──
+
+        [Fact]
+        public void ThePollIsTheReadCommand_AndArrowsDecodeActiveLow()
+        {
+            Assert.Equal(new byte[] { 0x01, 0x42, 0x00, 0x00, 0x00 }, BlissBoxPsx.PollMessage());
+            // Up (bit 4) and left (bit 7) held, the rest released.
+            byte first = unchecked((byte)~(0x10 | 0x80));
+            Assert.True(BlissBoxPsx.TryDecodeArrows(new byte[] { 0xFF, 0x41, 0x5A, first, 0xFF }, out byte arrows));
+            Assert.Equal(0x01 | 0x04, arrows);
+            // Without the leading byte, the same.
+            Assert.True(BlissBoxPsx.TryDecodeArrows(new byte[] { 0x41, 0x5A, first, 0xFF }, out arrows));
+            Assert.Equal(0x01 | 0x04, arrows);
+            // All four at once, a jump.
+            Assert.True(BlissBoxPsx.TryDecodeArrows(new byte[] { 0xFF, 0x41, 0x5A, 0x0F, 0xFF }, out arrows));
+            Assert.Equal(0x0F, arrows);
+            Assert.False(BlissBoxPsx.TryDecodeArrows(new byte[] { 0xFF, 0x73, 0x5A, 0x0F, 0xFF }, out _));
+            Assert.False(BlissBoxPsx.TryDecodeArrows(new byte[] { 0xFF, 0x41 }, out _));
+        }
+
+        [Fact]
+        public void A2xPlayStationCodeReadsAsTheNewerFirmwaresGiveIt()
+        {
+            // 2.0 sends a PlayStation pad's ID as its type (0x219B to 0x21B1),
+            // so its neGcon read as 35, the Dreamcast Twin Stick on 3.0 and
+            // GPA 4.86 (0x2824, 0x0E91), which give the neGcon 51 and the
+            // JogCon 127 (0x253A to 0x2546, 0x0A18 to 0x0A2B).
+            byte player = BlissBoxProtocol.PlayerByte(1);
+            Assert.Equal((byte)51, BlissBoxProtocol.ParseInfo(new byte[] { 0x23, 0, 2, player, 30 }, 1).Type);
+            Assert.Equal((byte)127, BlissBoxProtocol.ParseInfo(new byte[] { 0xE3, 0, 2, player, 30 }, 1).Type);
+            Assert.Equal((byte)0x41, BlissBoxProtocol.ParseInfo(new byte[] { 0x41, 0, 2, player, 30 }, 1).Type);
+            Assert.Equal((byte)35, BlissBoxProtocol.ParseInfo(new byte[] { 0x23, 0, 3, player, 34 }, 1).Type);
+            Assert.Equal((byte)35, BlissBoxProtocol.ParseInfo(new byte[] { 0x23, 0, 4, player, 86 }, 1).Type);
+        }
+    }
+}

@@ -1,0 +1,118 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+*.dll
+!**/Resources/
+!**/Resources/**
+
+*.exe
+!**/Resources/*.exe
+*.pdb
+*.cache
+*.ilk
+*.log
+*.lib
+*.sbr
+*.scc
+
+# NuGet
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nupkg
+!nuget-local/*.nupkg
+**/packages/repositories.config
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# .NET Core / ASP.NET
+project.nuget.cache
+*.[Cc]ache
+!?*.[Cc]ache/
+
+# StyleCop
+StyleCopReport.xml
+
+# User-specific files
+*.rsuser
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+
+# Publish output
+*.Publish.xml
+PublishScripts/
+publish/
+
+# Release archives (uploaded to GitHub Releases, not tracked in repo)
+PadForge-*.zip
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor/tool artifacts
+null
+publish_output/
+*.lscache
+
+# Python bytecode cache (tools/)
+__pycache__/
+*.pyc
+
+
+# Scratch files dropped in the repo root (not PadForge sources)
+/tmpworkflow-v1.0.json
+/tmpopenvr_driver.h
+/tmpwmr_controller.c
+*openvr_driver_docs.md
+
+# Wild-corpus sweep download cache (manifest.json is committed, VDFs are not)
+tools/SteamWorkshopSweep/cache/
+PadForge.Tests/TestResults/
+PadForge.SteamWorkshop.Tests/TestResults/
+
+# WPF XAML compilation temp project. A generated copy was committed twice before this pattern existed.
+*_wpftmp.csproj

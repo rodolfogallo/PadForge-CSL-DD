@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>PadForge.Engine</RootNamespace>
+    <AssemblyName>PadForge.Engine</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+
+    <!--
+      CA1416: this assembly is Windows-only by design (SDL3, Raw Input, HID,
+      registry-driven device enumeration). The TargetFramework already pins
+      net10.0-windows; the platform-compatibility warnings on RegistryKey
+      etc. don't add information.
+    -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <Product>PadForge</Product>
+    <Company>PadForge</Company>
+    <Copyright>Copyright © PadForge Contributors</Copyright>
+    <Description>PadForge input engine — SDL3, Raw Input, and HID device enumeration.</Description>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pure-managed crypto (MIT) for the Remote Link pairing/transport: X25519
+         key agreement, Ed25519 static-key auth, ChaCha20-Poly1305 AEAD. The
+         in-box System.Security.Cryptography.ChaCha20Poly1305 is gated to Windows
+         11 (build 22000+); this managed implementation runs on the app's Win10
+         1809 floor, so it carries no OS gate and keeps the cipher suite pinned. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared AssemblyVersion + AssemblyFileVersion — single source of truth
+         across PadForge.App and PadForge.Engine. -->
+    <Compile Include="..\SharedVersion.cs" Link="Properties\SharedVersion.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Analog keyboard key tables and model catalogs (#468), read by
+         AnalogKeyboardData under PadForge.Engine.Common.AnalogKeyboard.Data. -->
+    <EmbeddedResource Include="Common\AnalogKeyboard\Data\*.json"
+                      LogicalName="PadForge.Engine.Common.AnalogKeyboard.Data.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,229 @@
+using System;
+using System.Collections.Generic;
+using PadForge.Engine.Common;
+
+namespace PadForge.Common.Input
+{
+    /// <summary>
+    /// One Learn Button pass (issue #343). The dialog drives three timed
+    /// phases: hands off (idle baseline), press and hold, release. Reports
+    /// from every open vendor collection are bucketed by collection and
+    /// report id per phase, and the chord engine's capture runs alongside,
+    /// so whichever path the firmware uses for the button is caught, or
+    /// both are. <see cref="Finish"/> runs the pure learner over the
+    /// buckets and returns the candidates for the user to name.
+    /// </summary>
+    internal sealed class HandheldLearnSession
+    {
+        public enum Phase { Idle = 0, Press = 1, Release = 2, Done = 3 }
+
+        public const int IdleMs = 1000;
+        public const int PressMs = 3000;
+        public const int ReleaseMs = 1000;
+
+        /// <summary>Samples kept per bucket per phase. Enough to build a
+        /// noise mask from a 1 kHz stream, small enough to stay cheap.</summary>
+        private const int MaxSamplesPerBucket = 256;
+
+        public sealed class Candidate
+        {
+            public string Collection;
+            public string CollectionName;
+            public byte ReportId;
+            public int ByteIndex;
+            public byte Mask;
+            public byte Value;
+            public VendorButtonKind Kind;
+            /// <summary>Set for a WMI event candidate: Collection carries the
+            /// event class, and these two the property and its value.</summary>
+            public bool IsWmi;
+            public string WmiProperty;
+            public string WmiValue;
+
+            public string Describe() => IsWmi
+                ? $"{Collection}: {WmiProperty} = {WmiValue}"
+                : Kind == VendorButtonKind.Bit
+                    ? $"{CollectionName}: report {ReportId:X2}, byte {ByteIndex}, bit 0x{Mask:X2}{(Value == 0 ? " clear" : "")}"
+                    : $"{CollectionName}: report {ReportId:X2}, byte {ByteIndex} = 0x{Value:X2}";
+        }
+
+        // WMI events per phase, in arrival order. Arrival order is the
+        // candidate order: on the Legion Pro 7 the utility event that names
+        // the key lands 3 ms before the lighting side event both keys share.
+        private readonly List<(string Cls, string Prop, string Val)>[] _wmiPhases =
+        {
+            new(), new(), new(),
+        };
+
+        /// <summary>WMI event callback (provider thread). Every data
+        /// property of the event lands in the current phase's list.</summary>
+        public void OnWmiEvent(WmiEventRuntime.Event ev)
+        {
+            if (ev == null || string.IsNullOrEmpty(ev.ClassName)) return;
+            var phase = _phase;
+            if (phase == Phase.Done) return;
+            lock (_lock)
+            {
+                var list = _wmiPhases[(int)phase];
+                if (list.Count >= MaxSamplesPerBucket) return;
+                foreach (var (name, value) in ev.Props)
+                    list.Add((ev.ClassName, name, value ?? string.Empty));
+            }
+        }
+
+        private readonly object _lock = new();
+        private readonly Dictionary<(string Key, byte ReportId), List<byte[]>>[] _phases =
+        {
+            new(), new(), new(),
+        };
+        // Last report seen per bucket before the press phase, the baseline
+        // for event-style collections that stay silent while idle (the
+        // ROG Ally's 0x5A report exists only while a key is down).
+        private readonly Dictionary<(string Key, byte ReportId), byte[]> _lastBefore = new();
+        private readonly Dictionary<string, string> _names = new(StringComparer.OrdinalIgnoreCase);
+
+        private volatile Phase _phase = Phase.Idle;
+        private int[] _chordKeys;
+
+        public Phase Current => _phase;
+
+        /// <summary>Codes the chord capture recorded, or null when no chord
+        /// arrived during the session.</summary>
+        public int[] ChordKeys { get { lock (_lock) return _chordKeys; } }
+
+        public void SetPhase(Phase phase) => _phase = phase;
+
+        public void OnChordCaptured(int[] keys)
+        {
+            lock (_lock)
+            {
+                if (keys != null && keys.Length > 0) _chordKeys = keys;
+            }
+        }
+
+        /// <summary>Report callback from any open vendor reader (reader
+        /// thread). Copies the bytes into the current phase's bucket.</summary>
+        public void OnReport(string collectionKey, string collectionName, byte[] buffer, int length)
+        {
+            if (length <= 0 || buffer == null) return;
+            var phase = _phase;
+            if (phase == Phase.Done) return;
+            var copy = new byte[length];
+            Array.Copy(buffer, copy, length);
+            var bucket = (collectionKey, copy[0]);
+            lock (_lock)
+            {
+                _names[collectionKey] = collectionName;
+                if (phase == Phase.Idle) _lastBefore[bucket] = copy;
+                var dict = _phases[(int)phase];
+                if (!dict.TryGetValue(bucket, out var list))
+                    dict[bucket] = list = new List<byte[]>();
+                if (list.Count < MaxSamplesPerBucket) list.Add(copy);
+            }
+        }
+
+        /// <summary>Report samples and WMI events seen per phase, for the
+        /// nothing-found message and the diagnostics ring.</summary>
+        public (int IdleReports, int PressReports, int ReleaseReports, int IdleEvents, int PressEvents, int ReleaseEvents) Counts
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    int Reports(Phase p) { int n = 0; foreach (var kv in _phases[(int)p]) n += kv.Value.Count; return n; }
+                    return (Reports(Phase.Idle), Reports(Phase.Press), Reports(Phase.Release),
+                        _wmiPhases[(int)Phase.Idle].Count, _wmiPhases[(int)Phase.Press].Count, _wmiPhases[(int)Phase.Release].Count);
+                }
+            }
+        }
+
+        /// <summary>Runs the learner over every bucket that received a
+        /// report during the press phase.</summary>
+        public List<Candidate> Finish()
+        {
+            _phase = Phase.Done;
+            var result = new List<Candidate>();
+            lock (_lock)
+            {
+                // WMI events first: a (class, property, value) that fired
+                // during the press OR the release is the key. Both windows
+                // count because a firmware key may report on key-up: the
+                // Legion Pro 7's Smart Connect key raises its event only
+                // when released, while Vantage raises on press (bench,
+                // 2026-08-25). Noise is an event that repeats while idle,
+                // the shape of a periodic status; one idle copy is an early
+                // press and does not spoil the pass. Press-window events
+                // are listed before release-window ones.
+                var idleCount = new Dictionary<(string, string, string), int>();
+                foreach (var t in _wmiPhases[(int)Phase.Idle]) idleCount[t] = idleCount.TryGetValue(t, out var n) ? n + 1 : 1;
+                var seen = new HashSet<(string, string, string)>();
+                var pressed = new List<(string Cls, string Prop, string Val)>(_wmiPhases[(int)Phase.Press]);
+                pressed.AddRange(_wmiPhases[(int)Phase.Release]);
+                foreach (var t in pressed)
+                {
+                    int idle = idleCount.TryGetValue(t, out var ic) ? ic : 0;
+                    if (idle >= 2 || !seen.Add(t)) continue;
+                    result.Add(new Candidate
+                    {
+                        Collection = t.Cls,
+                        CollectionName = t.Cls,
+                        IsWmi = true,
+                        WmiProperty = t.Prop,
+                        WmiValue = t.Val,
+                    });
+                }
+
+                var idleAll = _phases[(int)Phase.Idle];
+                var pressAll = _phases[(int)Phase.Press];
+                var releaseAll = _phases[(int)Phase.Release];
+                foreach (var kv in pressAll)
+                {
+                    var bucket = kv.Key;
+                    var press = kv.Value;
+                    if (press.Count == 0) continue;
+                    idleAll.TryGetValue(bucket, out var idle);
+                    releaseAll.TryGetValue(bucket, out var release);
+
+                    byte[] baseline;
+                    byte[] noise;
+                    if (idle != null && idle.Count > 0)
+                    {
+                        baseline = idle[0];
+                        noise = VendorReportLearner.NoiseMask(idle);
+                    }
+                    else if (_lastBefore.TryGetValue(bucket, out var last))
+                    {
+                        baseline = last;
+                        noise = new byte[last.Length];
+                    }
+                    else
+                    {
+                        // Event-style: nothing while idle, so every byte of
+                        // the press report is compared against zero.
+                        baseline = new byte[press[0].Length];
+                        noise = new byte[baseline.Length];
+                    }
+                    var found = VendorReportLearner.Learn(baseline, noise, press, release ?? new List<byte[]>());
+                    string name = _names.TryGetValue(bucket.Key, out var n) ? n : bucket.Key;
+                    foreach (var c in found)
+                    {
+                        // Byte 0 is the report id; a "button" there is the
+                        // id itself flipping between report layouts.
+                        if (c.ByteIndex == 0) continue;
+                        result.Add(new Candidate
+                        {
+                            Collection = bucket.Key,
+                            CollectionName = name,
+                            ReportId = bucket.ReportId,
+                            ByteIndex = c.ByteIndex,
+                            Mask = c.Mask,
+                            Value = c.Value,
+                            Kind = c.Kind,
+                        });
+                    }
+                }
+            }
+            return result;
+        }
+    }
+}

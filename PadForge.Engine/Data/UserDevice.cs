@@ -1,0 +1,1086 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Xml.Serialization;
+
+namespace PadForge.Engine.Data
+{
+    /// <summary>
+    /// Data model for a single physical input device. Contains both serializable
+    /// (settings-persisted) properties and runtime-only fields used during the
+    /// input pipeline.
+    /// 
+    /// This replaces the former UserDevice that depended on SharpDX.DirectInput types.
+    /// Key changes:
+    ///   - LoadInstance() takes discrete values instead of a DeviceInstance
+    ///   - LoadCapabilities() takes discrete values instead of Capabilities
+    ///   - Runtime device reference is ISdlInputDevice (was Joystick)
+    ///   - State fields renamed: InputState/InputUpdates/etc. (were Di* prefixed)
+    ///   - JoState/JoUpdate fields removed entirely
+    ///   - IsExclusiveMode field removed (SDL has no acquisition model)
+    /// </summary>
+    public partial class UserDevice : INotifyPropertyChanged
+    {
+        /// <summary>Serializes the two writers of this device's output that run
+        /// on different threads (#416): a remote peer's relayed frame being
+        /// claimed and applied, and the feedback pass deciding whether the
+        /// device has no local slots and stopping it. Without one gate the
+        /// pass could stop a frame the peer was applying, then reset its own
+        /// cache under the peer's write, leaving a nonzero command with the
+        /// feedback state reading inactive, so nothing ever stopped it.</summary>
+        [XmlIgnore]
+        public object OutputSync { get; } = new object();
+
+        public UserDevice()
+        {
+            DateCreated = DateTime.Now;
+            DateUpdated = DateTime.Now;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        //  Serializable identity properties (persisted to XML)
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>Unique GUID identifying this device instance (deterministic from device path).</summary>
+        [XmlElement]
+        public Guid InstanceGuid
+        {
+            get => _instanceGuid;
+            set { _instanceGuid = value; _instanceGuidString = null; }
+        }
+        private Guid _instanceGuid;
+        private string _instanceGuidString;
+
+        /// <summary>
+        /// Cached <see cref="Guid.ToString()"/> form of <see cref="InstanceGuid"/>.
+        /// Mirrors <see cref="UserSetting.InstanceGuidString"/>: the ~1000Hz poll
+        /// loop (motion snapshots, per-target descriptor reads) passes the guid
+        /// as a string, and stringifying per tick is pure GC pressure on the
+        /// rate-holding thread. Invalidated when <see cref="InstanceGuid"/> is
+        /// assigned.
+        /// </summary>
+        [XmlIgnore]
+        public string InstanceGuidString => _instanceGuidString ??= _instanceGuid.ToString();
+
+        /// <summary>Human-readable instance name (e.g., "Xbox Controller").</summary>
+        [XmlElement]
+        public string InstanceName { get; set; } = string.Empty;
+
+        /// <summary>Product GUID in PIDVID format for device family identification.</summary>
+        [XmlElement]
+        public Guid ProductGuid { get; set; }
+
+        /// <summary>Human-readable product name.</summary>
+        [XmlElement]
+        public string ProductName { get; set; } = string.Empty;
+
+        /// <summary>USB Vendor ID.</summary>
+        [XmlElement]
+        public ushort VendorId { get; set; }
+
+        /// <summary>USB Product ID.</summary>
+        [XmlElement]
+        public ushort ProdId { get; set; }
+
+        /// <summary>Device file system path (used for instance GUID generation).</summary>
+        [XmlElement]
+        public string DevicePath { get; set; } = string.Empty;
+
+        /// <summary>Device serial number (e.g. Bluetooth MAC address). Empty if unavailable.</summary>
+        [XmlElement]
+        public string SerialNumber { get; set; } = string.Empty;
+
+        /// <summary>SDL joystick GUID (32 hex chars) for gamecontrollerdb matching.</summary>
+        [XmlElement]
+        public string SdlGuid { get; set; } = string.Empty;
+
+        // ─────────────────────────────────────────────────────────────
+        //  Serializable capability properties
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>Number of axes on the device.</summary>
+        [XmlElement]
+        public int CapAxeCount { get; set; }
+
+        /// <summary>Number of buttons on the device (gamepad-mapped count for gamepad devices).</summary>
+        [XmlElement]
+        public int CapButtonCount { get; set; }
+
+        /// <summary>
+        /// The button SLOTS the device actually populates, as SDL positions
+        /// them. Sparse: an SDL3 gamepad occupies a fixed 22-slot space and a
+        /// given pad fills only some of it, so an 8BitDo Ultimate 2 reports
+        /// fifteen buttons at 0-10 and 12-15 rather than at 0-14.
+        ///
+        /// <para>Persisted for the same reason as
+        /// <see cref="CapTouchpadFingerCounts"/>: the Devices preview and the
+        /// mapping picker both showed these positions while the device was
+        /// connected and fell back to a dense 0..count-1 list while it was
+        /// not, so the same physical button wore two different numbers
+        /// depending on whether it happened to be on at launch (discussion
+        /// #344). The count was already made consistent across that boundary.
+        /// The positions were not, which is what this carries.</para>
+        ///
+        /// <para>Null or empty on configs predating this field and on devices
+        /// PadForge has never seen online. Callers fall back to the dense
+        /// range in that case, because a position nobody has observed cannot
+        /// be reported.</para>
+        ///
+        /// <para>The setter drops any position the input state has no slot
+        /// for. Every list PadForge builds is in range already. The one that
+        /// is not comes from a settings file edited by hand or damaged on
+        /// disk, and its readers index name tables and state arrays with
+        /// these values, checking the upper bound and not the lower one. A
+        /// -1 reached <c>names[-1]</c> in the mapping picker. Cleaning the
+        /// list where it enters covers every reader at once.</para>
+        /// </summary>
+        public int[] CapButtonIndices
+        {
+            get => _capButtonIndices;
+            set => _capButtonIndices = PositionsInRange(value, CustomInputState.MaxButtons);
+        }
+        private int[] _capButtonIndices;
+
+        /// <summary>The axis twin of <see cref="CapButtonIndices"/>: the axis
+        /// positions the device actually populates, recorded the last time it
+        /// was online so the offline listing shows the same set the live one
+        /// does.
+        ///
+        /// <para>Sparse for two reasons. The standardized block skips sticks
+        /// and triggers the pad does not have (SDL_GamepadHasAxis), and the
+        /// generic extras past it skip slots a shared report layout numbers
+        /// but no hardware drives. A Move Navigation has three of the first
+        /// six and seven of the ten extras.</para>
+        ///
+        /// <para>Null or empty on configs predating this field and on devices
+        /// PadForge has never seen online. Callers fall back to the dense
+        /// range in that case.</para>
+        ///
+        /// <para>Out-of-range positions are dropped on the way in, as for
+        /// <see cref="CapButtonIndices"/>.</para>
+        /// </summary>
+        public int[] CapAxisIndices
+        {
+            get => _capAxisIndices;
+            set => _capAxisIndices = PositionsInRange(value, CustomInputState.MaxAxis);
+        }
+        private int[] _capAxisIndices;
+
+        /// <summary>True when the device has numbered axis
+        /// <paramref name="index"/>, the axes the mapping picker offers for
+        /// it. Force Raw Joystick Mode on a gamepad-opened device reads the
+        /// joystick's own axes in their own order, the span
+        /// SdlDeviceWrapper.GetJoystickState reads: the gamepad's six, or
+        /// every raw axis when it carries extra generic ones. SDL reads an
+        /// axis past the joystick's own count as centered, never as the
+        /// zeroed filler past the span. Otherwise the device's object list
+        /// answers when it names anything: it carries a Bliss-Box port's
+        /// pressure axes, which no count covers. A row without objects
+        /// answers from <see cref="CapAxisIndices"/>, else
+        /// <see cref="CapAxeCount"/>. From <see cref="CustomInputState.MaxAxis"/>
+        /// up the index is Slider index - MaxAxis, the raw axis it stores. A
+        /// row with no wrapper whose capabilities were never loaded has every
+        /// axis, the capability-less fallback the default profile's auto-map
+        /// uses. A native Precision Touchpad row loads a count of 0 without a
+        /// wrapper, so it has none.</summary>
+        public bool HasAxis(int index)
+        {
+            if (index < 0) return false;
+            bool slider = index >= CustomInputState.MaxAxis;
+            int position = slider ? index - CustomInputState.MaxAxis : index;
+            if (position >= (slider ? CustomInputState.MaxSliders : CustomInputState.MaxAxis)) return false;
+            var device = Device;
+            if (ForceRawJoystickMode && device != null && device.GamepadHandle != IntPtr.Zero)
+                return index < RawModeAxisSpan(device);
+            var objects = ObjectAxes();
+            if (((slider ? objects.Sliders : objects.Axes) & (1u << position)) != 0) return true;
+            if (objects.Listed) return false;
+            bool unknown = device == null && !_capabilitiesLoaded;
+            if (slider) return index < RawAxisCount || unknown;
+            var sparse = _capAxisIndices;
+            if (sparse != null && sparse.Length > 0) return Array.IndexOf(sparse, index) >= 0;
+            return index < CapAxeCount || unknown;
+        }
+
+        /// <summary>The axes SdlDeviceWrapper.GetJoystickState reads for a
+        /// gamepad-opened device under Force Raw Joystick Mode, from 0: the
+        /// gamepad's six, or every raw axis when it carries extra generic
+        /// ones.</summary>
+        public static int RawModeAxisSpan(ISdlInputDevice device)
+            => device == null ? 0 : device.HasExtraGenericAxes ? device.RawAxisCount : device.NumAxes;
+
+        /// <summary>Set by <see cref="LoadCapabilities"/>: the counts are the
+        /// live device's, a zero included.</summary>
+        private bool _capabilitiesLoaded;
+
+        /// <summary>The positions an object list names, as masks: bit N of
+        /// <paramref name="axes"/> for "Axis N" and bit N of
+        /// <paramref name="sliders"/> for "Slider N", the descriptors the
+        /// picker offers for them. The <see cref="CustomInputState.GetAxisMask"/>
+        /// scan, with sliders kept apart, since a slider's InputIndex is its
+        /// Sliders[] position.</summary>
+        internal static void AxisObjectMasks(DeviceObjectItem[] objects, out uint axes, out uint sliders)
+        {
+            axes = 0;
+            sliders = 0;
+            if (objects == null) return;
+            foreach (var item in objects)
+            {
+                if (item == null || !item.IsAxis) continue;
+                int i = item.InputIndex;
+                if (item.IsSlider)
+                {
+                    if (i >= 0 && i < CustomInputState.MaxSliders) sliders |= 1u << i;
+                }
+                else if (i >= 0 && i < CustomInputState.MaxAxis) axes |= 1u << i;
+            }
+        }
+
+        private sealed class ObjectAxisSet
+        {
+            internal readonly DeviceObjectItem[] Source;
+            internal readonly uint Axes;
+            internal readonly uint Sliders;
+            internal readonly bool Listed;
+
+            internal ObjectAxisSet(DeviceObjectItem[] source)
+            {
+                Source = source;
+                Listed = source != null && source.Length > 0;
+                AxisObjectMasks(source, out Axes, out Sliders);
+            }
+        }
+
+        private ObjectAxisSet _objectAxes;
+
+        /// <summary>The masks of the current object list, rebuilt only when
+        /// the list is replaced: a Bliss-Box port identifying a controller,
+        /// an NFC tag registered. The poll reads it once per wildcard source
+        /// per device.</summary>
+        private ObjectAxisSet ObjectAxes()
+        {
+            var objects = DeviceObjects;
+            var set = _objectAxes;
+            if (set == null || !ReferenceEquals(set.Source, objects))
+                _objectAxes = set = new ObjectAxisSet(objects);
+            return set;
+        }
+
+        /// <summary>The list with every position outside 0..capacity-1
+        /// removed. The same array comes back when nothing had to go, so the
+        /// ordinary path allocates nothing, and null stays null because null
+        /// means "never observed", which is not the same as "has none".</summary>
+        internal static int[] PositionsInRange(int[] positions, int capacity)
+        {
+            if (positions == null) return null;
+            int keep = 0;
+            foreach (int p in positions)
+                if (p >= 0 && p < capacity) keep++;
+            if (keep == positions.Length) return positions;
+
+            var clean = new int[keep];
+            int n = 0;
+            foreach (int p in positions)
+                if (p >= 0 && p < capacity) clean[n++] = p;
+            return clean;
+        }
+
+        /// <summary>
+        /// Total number of raw joystick buttons (before gamepad remapping).
+        /// For gamepad devices this may exceed <see cref="CapButtonCount"/>
+        /// when the underlying HID descriptor reports more buttons than the
+        /// 22 standardized SDL gamepad slots (0-21 = std XInput + Misc1 +
+        /// paddles + Touchpad + Misc2-6) — extras are surfaced as raw
+        /// passthrough indices ≥22 for use as macro triggers.
+        /// For non-gamepad devices, this equals <see cref="CapButtonCount"/>.
+        /// </summary>
+        [XmlElement]
+        public int RawButtonCount { get; set; }
+
+        /// <summary>Raw joystick axis count, axis twin of
+        /// <see cref="RawButtonCount"/>.</summary>
+        public int RawAxisCount { get; set; }
+
+        /// <summary>Device carries raw axes past the standard six that should
+        /// surface as generic "Axis N" sources. Not derivable from the counts:
+        /// it excludes devices whose extras are already sensor sources.</summary>
+        public bool HasExtraGenericAxes { get; set; }
+
+        /// <summary>Number of POV hat switches on the device.</summary>
+        [XmlElement]
+        public int CapPovCount { get; set; }
+
+        /// <summary>Device type constant from <see cref="InputDeviceType"/>.</summary>
+        [XmlElement]
+        public int CapType { get; set; }
+
+        /// <summary>Whether the device has a gyroscope sensor.</summary>
+        [XmlElement]
+        public bool HasGyro { get; set; }
+
+        /// <summary>Whether the device has an accelerometer sensor.</summary>
+        [XmlElement]
+        public bool HasAccel { get; set; }
+
+        /// <summary>Whether the device exposes an auxiliary (left-side)
+        /// accelerometer (issue #199): the Nunchuk's own sensor, or the left
+        /// half of a combined Joy-Con pair. Mirrors
+        /// <see cref="Common.ISdlInputDevice.HasAccelAux"/>.</summary>
+        [XmlElement]
+        public bool HasAccelAux { get; set; }
+
+        /// <summary>Whether the device exposes an auxiliary (left-side)
+        /// gyroscope (issue #252): the left half of a combined Joy-Con pair.
+        /// Never a Nunchuk (no gyro there). Mirrors
+        /// <see cref="Common.ISdlInputDevice.HasGyroAux"/>.</summary>
+        [XmlElement]
+        public bool HasGyroAux { get; set; }
+
+        /// <summary>Whether the device is a Wii Remote configuration that carries
+        /// the IR camera (issue #146): the bare remote, or the remote with a
+        /// Nunchuk or a Classic Controller. Identity-derived from VID + name
+        /// (<see cref="WiiRemoteIdentity.CarriesIrCamera"/>), so it is correct
+        /// whether the remote is online or offline. The Wii U Pro, the Balance
+        /// Board, and a remote with a guitar, drum kit, turntable, Taiko drum,
+        /// tablet or Shinkansen controller have no IR axes. Computed, not
+        /// stored, so a stale persisted value can never linger. Gates whether
+        /// the "IR Pointer X/Y" mapping sources are offered for this device.</summary>
+        [XmlIgnore]
+        public bool HasIrCamera => WiiRemoteIdentity.CarriesIrCamera(VendorId, ProductName);
+
+        /// <summary>Whether the device is a Wii Balance Board, whose four corner
+        /// load cells drive the derived "Balance Total Weight / Lean X / Lean Y"
+        /// sources (issue #146). Identity-derived from VID + name (online or
+        /// offline), computed not stored.</summary>
+        [XmlIgnore]
+        public bool IsBalanceBoard => VendorId == 0x057E
+            && (ProductName ?? string.Empty).IndexOf("Balance Board", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>Whether the device is a standalone right Joy-Con, whose NIR
+        /// camera drives the "IR Brightness" cover/proximity source (issue #151).
+        /// Identity-derived from VID + name like the two properties above, so it
+        /// is correct online or offline. The SDL driver names it exactly
+        /// "Nintendo Switch Joy-Con (R)" (SDL_hidapi_switch.c:1786/1838), so the
+        /// match is exact equality, not a suffix test: the Switch 2 right
+        /// Joy-Con is "Nintendo Switch 2 Joy-Con (R)" under the same Nintendo
+        /// VID (SDL_ble_switch2joystick.c:1331) and has a mouse sensor, not an
+        /// IR camera, so a suffix match would offer a dead source there. The
+        /// combined pair's "(L/R)" name cannot match either way. Computed, not
+        /// stored, so a stale persisted value can never linger. Gates whether
+        /// the "IR Brightness" mapping source is offered for this device.</summary>
+        [XmlIgnore]
+        public bool HasJoyConIr => VendorId == 0x057E
+            && (string.Equals(ProductName, "Nintendo Switch Joy-Con (R)", StringComparison.OrdinalIgnoreCase)
+                // Combined gen-1 pair (#275, SDL#26): the right half's camera
+                // now posts on the pair. This leg keys on the PID rather than
+                // the name, because SDL's combined synthesis gives the gen-1
+                // AND gen-2 pairs the identical "Switch Joy-Con (L/R)" product
+                // string, so only the PID (gen-1 pair 0x2008, gen-2 0x2068
+                // with a mouse instead of a camera) can discriminate.
+                || ProdId == 0x2008);
+
+        /// <summary>Whether a Ring-Con can ride this device's rail and drive the
+        /// "Ring-Con Squeeze" and "Ring-Con Pull" sources (hifihedgehog/SDL#33
+        /// Part 13). The fork reads the ring through a right Joy-Con, standalone
+        /// or as the right half of a gen-1 pair, which is the camera identity
+        /// above. Computed, not stored. Gates the picker offering.</summary>
+        [XmlIgnore]
+        public bool HasRingCon => HasJoyConIr;
+
+        /// <summary>Whether the device is a Namco GunCon 2, 0B9A:016A
+        /// (hifihedgehog/SDL#33 Part 9), whose aim feeds the IR pointer
+        /// sources the picker offers under the gun's own names. Keyed by ID,
+        /// so a relayed gun answers too. Computed, not stored.</summary>
+        [XmlIgnore]
+        public bool IsGunCon2 => VendorId == 0x0B9A && ProdId == 0x016A;
+
+        /// <summary>Whether the device is a Joy-Con 2 (L or R), whose optical
+        /// mouse sensor drives the "Mouse Motion X/Y" sources (issue #154).
+        /// Identity-derived like the gates above, exact-equality against the
+        /// BLE driver's names (SDL_ble_switch2joystick.c:1328/:1331) so no
+        /// suffix collision is possible. The Switch 2 Pro and GameCube have no
+        /// mouse sensor, and the gen-1 Joy-Cons carry a camera instead.
+        /// Computed, not stored. Gates the picker offering.</summary>
+        [XmlIgnore]
+        public bool HasJoyCon2Mouse => VendorId == 0x057E
+            && (string.Equals(ProductName, "Nintendo Switch 2 Joy-Con (L)", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ProductName, "Nintendo Switch 2 Joy-Con (R)", StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>Whether the device is a Logitech WingMan Warrior, whose
+        /// spin dial drives the "Mouse Motion X" source
+        /// (hifihedgehog/SDL#33 Part 5). Identity-derived like the gates
+        /// above (<see cref="SpinDialIdentity"/>). Computed, not stored.
+        /// Gates the picker offering.</summary>
+        [XmlIgnore]
+        public bool HasSpinDial => SpinDialIdentity.HasSpinDial(ProductName);
+
+        /// <summary>Whether the device has an NFC reader the SDL fork can
+        /// drive (issue #241/#248, SDL#15): the classic Switch right
+        /// Joy-Con (PID 0x2007), the Pro Controller (PID 0x2009), and the
+        /// combined Joy-Con pair (synthetic PID 0x2008), whose right child
+        /// carries the MCU and posts onto the pair's joystick. Keyed by PID
+        /// like the wrapper's HasNfcReader so the picker offers the
+        /// "Any NFC Tag" / tag sources exactly where the reader exists.
+        /// Switch 2 controllers are excluded: no reference reads their NFC
+        /// on PC and no working code exists over any transport (verified
+        /// 2026-07-24). Computed, not stored. Gates the picker offering.</summary>
+        [XmlIgnore]
+        public bool HasNfcReader => VendorId == 0x057E
+            && (ProdId == 0x2007 || ProdId == 0x2008 || ProdId == 0x2009);
+
+        /// <summary>Voice phrases ride this pad's own surface (#317): the
+        /// DualSense / DualSense Edge carry an embedded microphone, so
+        /// recognitions stamp VoicePulse buttons on the pad and the picker
+        /// offers "Any Voice Phrase" / per-phrase sources here. Standalone
+        /// microphone devices are NOT gated by this: they expose phrases as
+        /// named raw buttons directly (the PC/SC-reader pattern). Computed,
+        /// not stored.</summary>
+        [XmlIgnore]
+        public bool HasVoicePhrases => VendorId == 0x054C
+            && (ProdId == 0x0CE6 || ProdId == 0x0DF2);
+
+        // Wii IR pointer tuning (sensor-bar position/compensation, smoothing)
+        // moved to PadSetting (issue #146 follow-up) so each (device, slot)
+        // pair gets its own pointer feel, the same move the gyro tuning made
+        // in v3.3. Old per-device values in existing XML are ignored by the
+        // serializer and the user re-tunes once on the Pointer tab.
+
+        /// <summary>Whether the device has a touchpad (DS4/DualSense/Steam Deck).</summary>
+        [XmlElement]
+        public bool HasTouchpad { get; set; }
+
+        /// <summary>Number of touchpad surfaces the device exposes
+        /// (Steam Controller 2026 / Steam Deck = 2; DualSense / DS4 = 1).
+        /// Persisted so the mapping picker offers every pad's descriptors
+        /// even when the device is offline. 0 on older saved configs that
+        /// predate this field — callers fall back to HasTouchpad (treat as 1).</summary>
+        [XmlElement]
+        public int CapTouchpadCount { get; set; }
+
+        /// <summary>Per-touchpad finger (simultaneous-contact) count, as SDL
+        /// enumerates it. Index aligns with the touchpad index. Persisted so the
+        /// mapping picker offers only the fingers each pad actually supports even
+        /// when the device is offline. Null/empty on configs predating this field
+        /// — callers fall back to the legacy two-finger assumption.</summary>
+        public int[] CapTouchpadFingerCounts { get; set; }
+
+        public bool? CapTouchpadPressure { get; set; }
+        public bool? CapTouchpadClick { get; set; }
+        public bool ShouldSerializeCapTouchpadPressure() => CapTouchpadPressure.HasValue;
+        public bool ShouldSerializeCapTouchpadClick() => CapTouchpadClick.HasValue;
+
+        [XmlIgnore]
+        public bool SupportsTouchpadPressure => CapTouchpadPressure ?? (!IsTablet && !(IsTouchpad && Device == null));
+        [XmlIgnore]
+        public bool SupportsTouchpadClick => CapTouchpadClick ?? (!IsTablet && !(IsTouchpad && Device == null));
+
+        /// <summary>Whether the device exposes per-trigger ("impulse") rumble
+        /// motors (Xbox One / Elite / Series). Driven by
+        /// <c>SDL_PROP_JOYSTICK_CAP_TRIGGER_RUMBLE_BOOLEAN</c>.</summary>
+        [XmlElement]
+        public bool HasRumbleTriggers { get; set; }
+
+        // Gyro bias, calibration timestamp, and tuning (H/V sensitivity,
+        // deadzone, smoothing, acceleration, output curve, units) all
+        // moved to PadSetting in v3.3 so each (device, slot) pair gets
+        // its own bias + feel. UserDevice no longer participates in
+        // gyro calibration state — only HasGyro / HasAccel capability
+        // flags remain above.
+
+        // ─────────────────────────────────────────────────────────────
+        //  Serializable metadata
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>Date when this device record was first created.</summary>
+        [XmlElement]
+        public DateTime DateCreated { get; set; }
+
+        /// <summary>Date when this device record was last updated.</summary>
+        [XmlElement]
+        public DateTime DateUpdated { get; set; }
+
+        /// <summary>Record-level enable flag. Persisted and shown as the
+        /// "Disabled" status in the Devices list.
+        ///
+        /// <para>It does NOT gate input. No mapping or macro read consults it,
+        /// and no control writes it, so it is true for every device the app
+        /// itself creates. Only a hand-edited settings file or an imported
+        /// record can carry false. Gating input on it would be a new
+        /// behavior, and it needs a decision first: whether disabling a DEVICE
+        /// should silence it everywhere, which is distinct from the per-slot
+        /// assignment flag (UserSetting.IsEnabled) that already gates
+        /// assignments. Do not add that gate without settling which scope
+        /// wins.</para></summary>
+        [XmlElement]
+        public bool IsEnabled { get; set; } = true;
+
+        /// <summary>Whether this device is currently hidden from the UI.</summary>
+        [XmlElement]
+        public bool IsHidden { get; set; }
+
+        /// <summary>User-assigned display name (overrides InstanceName in the UI if set).</summary>
+        [XmlElement]
+        public string DisplayName { get; set; } = string.Empty;
+
+        /// <summary>Whether this device should be hidden from games via HidHide when assigned to a slot.</summary>
+        [XmlElement]
+        public bool HidHideEnabled { get; set; }
+
+        /// <summary>Whether this device's mapped inputs should be consumed via low-level hooks (keyboards and mice).</summary>
+        [XmlElement]
+        public bool ConsumeInputEnabled { get; set; }
+
+        /// <summary>Whether to bypass SDL's gamepad remapping and read raw joystick indices instead.</summary>
+        [XmlElement]
+        public bool ForceRawJoystickMode { get; set; }
+
+        /// <summary>Idle disconnect countdown in seconds (issue #162). When the
+        /// device is Bluetooth-connected and its input has been idle this long,
+        /// the host radio drops the link so the controller sleeps. 0 disables.
+        /// Over USB there is no radio link to drop. Unlike DS4Windows there is
+        /// no charging gate: an idle pad on a charger still disconnects, since
+        /// dropping Bluetooth does not interrupt charging.</summary>
+        [XmlElement]
+        public int IdleDisconnectSeconds { get; set; }
+
+        /// <summary>Quick Charge (#372, asked in discussion #367): when this
+        /// Bluetooth-connected controller reports that it is CHARGING (a
+        /// cable arrived, any USB power source), drop the Bluetooth link so
+        /// the pad just charges without powering the radio. The trigger is
+        /// the pad's own charging report on this record, the DS4Windows
+        /// shape. Two earlier passes failed on @Jobima1st's bench for one
+        /// reason found in code: BuildInstanceGuid keys identity on the
+        /// serial, Sony pads carry the same MAC on both transports, so a
+        /// cable REBINDS this record to the USB wrapper (no twin record
+        /// ever exists, and the path stops reading as Bluetooth). The
+        /// check therefore handles both shapes: a Bluetooth-pathed record
+        /// drops through the idle timeout's lane, and a wired-rebound
+        /// record drops the radio by its own MAC serial. Default off.</summary>
+        [XmlElement]
+        public bool QuickChargeEnabled { get; set; }
+
+        /// <summary>A GunCon 2's calibration (hifihedgehog/SDL#33 Part 9): the
+        /// beam counts at the picture's edges as "minX,maxX,minY,maxY", set by
+        /// the Devices page's calibration screen. Empty means the PC tools'
+        /// starting window (<see cref="GunCon2Calibration.Default"/>). It
+        /// belongs to the gun and the CRT it aims at, so it is kept per
+        /// device, and the gun's wrapper takes it on every connect. A Wii
+        /// Remote calibrated as a light gun (#485) keeps its window here too,
+        /// in pointer counts (SdlDeviceWrapper.WiiPointerCountsX/Y), and empty
+        /// means its default aim range.</summary>
+        [XmlElement]
+        public string GunCalibration { get; set; } = string.Empty;
+
+        /// <summary>Quick Charge edge memory (#372): the last charging read,
+        /// so the drop fires only on the false-to-true edge. Deliberately
+        /// NOT reset on a fresh connection: a user who re-links Bluetooth
+        /// while the cable stays in reads charging=true with no edge and is
+        /// left alone until an unplug re-arms it. Not persisted either, so
+        /// the check's FIRST read of a record seeds it from the live state
+        /// (InputManager.QuickChargeStep) rather than comparing against
+        /// the default false, which read a plugged-in restart as a plug
+        /// edge. Polling thread only.</summary>
+        [XmlIgnore]
+        public bool QuickChargePrevCharging { get; set; }
+
+        /// <summary>
+        /// Cached HID device instance IDs resolved via SetupAPI for HidHide blacklisting.
+        /// Persisted so devices can be pre-emptively blacklisted at startup even if powered off.
+        /// </summary>
+        [XmlArray]
+        [XmlArrayItem("Id")]
+        public List<string> HidHideInstanceIds { get; set; } = new();
+
+        // ─────────────────────────────────────────────────────────────
+        //  Runtime-only fields (NOT serialized)
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// The opened SDL device wrapper. This is the live handle used for state
+        /// reading and rumble. Set during Step 1 (UpdateDevices) and cleared when
+        /// the device is disconnected.
+        /// </summary>
+        [XmlIgnore]
+        public ISdlInputDevice Device { get; set; }
+
+        /// <summary>
+        /// Whether this device is currently online (physically connected and opened).
+        /// </summary>
+        [XmlIgnore]
+        public bool IsOnline { get; set; }
+
+        /// <summary>
+        /// Current input state snapshot. Written by the background thread (Step 2),
+        /// read by the UI thread. Reference assignment is atomic.
+        /// </summary>
+        [XmlIgnore]
+        public CustomInputState InputState { get; set; }
+
+        /// <summary>Monotonic publish counter, incremented by Step 2 each
+        /// time <see cref="InputState"/> is republished. Consumers that
+        /// dedup "have I folded this state yet" compare THIS, not the
+        /// reference: with pooled state buffers a reference can recur
+        /// with fresh content, so identity no longer proves sameness.</summary>
+        [System.Xml.Serialization.XmlIgnore]
+        public long InputStateSeq;
+
+        /// <summary>Pooled state pair for the PTP touchpad read path,
+        /// which builds states outside any device wrapper (Step 2's
+        /// hDevice branch). Same two-buffer publish contract as the
+        /// wrapper pools.</summary>
+        [System.Xml.Serialization.XmlIgnore]
+        public PadForge.Engine.PooledInputStatePair PtpStatePool;
+
+        /// <summary>Last tick (Environment.TickCount64) this device's input was
+        /// non-idle, for the #162 idle disconnect countdown. Written only by the
+        /// polling thread (Step 2). 0 = not yet tracked this connection.</summary>
+        [XmlIgnore]
+        public long LastActiveTick { get; set; }
+
+        /// <summary>The wrapper instance the idle countdown last stamped
+        /// against. Each (re)connect creates a fresh wrapper, so a mismatch
+        /// marks the first tick of a new connection and restarts the
+        /// countdown. Without this, a reconnecting idle pad inherits its
+        /// pre-disconnect stamp and can be disconnected again instantly.
+        /// Polling thread only.</summary>
+        [XmlIgnore]
+        public object IdleTrackedConnection { get; set; }
+
+        /// <summary>Last tick the #162 idle countdown was checked, so the check
+        /// runs about once a second instead of at poll rate. Polling thread only.</summary>
+        [XmlIgnore]
+        public long LastIdleCheckTick { get; set; }
+
+        /// <summary>Last tick the Quick Charge charging-edge check ran
+        /// (#372), same ~1 Hz discipline as the idle countdown. Zero means
+        /// the check has not observed this record yet: that first
+        /// observation seeds <see cref="QuickChargePrevCharging"/> and is
+        /// never an edge, and the check zeroes it again while the flag is
+        /// off so the next enable seeds afresh. Polling thread only.</summary>
+        [XmlIgnore]
+        public long LastQuickChargeCheckTick { get; set; }
+
+        /// <summary>
+        /// Previous input state (from the prior poll cycle), used for change detection.
+        /// </summary>
+        [XmlIgnore]
+        public CustomInputState OldInputState { get; set; }
+
+        /// <summary>
+        /// Total number of force-feedback actuator axes.
+        /// </summary>
+        [XmlIgnore]
+        public int ActuatorCount { get; set; }
+
+        /// <summary>
+        /// Array of device object metadata (axes, hats, buttons).
+        /// Populated during Step 1.
+        /// </summary>
+        public DeviceObjectItem[] DeviceObjects { get; set; }
+
+        /// <summary>
+        /// Force feedback state tracker for this device.
+        /// </summary>
+        [XmlIgnore]
+        public ForceFeedbackState ForceFeedbackState { get; set; }
+
+        // ─────────────────────────────────────────────────────────────
+        //  Convenience properties
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>True if this device is a mouse (CapType == InputDeviceType.Mouse).</summary>
+        [XmlIgnore]
+        public bool IsMouse => CapType == InputDeviceType.Mouse;
+
+        /// <summary>True if this device is a keyboard (CapType == InputDeviceType.Keyboard).</summary>
+        [XmlIgnore]
+        public bool IsKeyboard => CapType == InputDeviceType.Keyboard;
+
+        /// <summary>True if this device is a precision touchpad (CapType == InputDeviceType.Touchpad).</summary>
+        [XmlIgnore]
+        public bool IsTouchpad => CapType == InputDeviceType.Touchpad;
+
+        [XmlIgnore]
+        public bool IsTablet => CapType == InputDeviceType.Tablet;
+
+        /// <summary>True if this device is a Consumer Control HID collection
+        /// (issue #168: media remotes, headset strips, keyboard media rows).</summary>
+        [XmlIgnore]
+        public bool IsConsumerControl => CapType == InputDeviceType.ConsumerControl;
+
+        /// <summary>True if the device has at least one force-feedback actuator, SDL rumble, or SDL haptic support.</summary>
+        [XmlIgnore]
+        public bool HasForceFeedback => ActuatorCount > 0 || (Device != null && (Device.HasRumble || Device.HasHaptic));
+
+        /// <summary>
+        /// Returns the display name for UI purposes: the user-assigned DisplayName if set,
+        /// otherwise the InstanceName, otherwise the ProductName.
+        /// </summary>
+        [XmlIgnore]
+        public string ResolvedName
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(DisplayName))
+                    return DisplayName;
+                if (!string.IsNullOrEmpty(InstanceName))
+                    return InstanceName;
+                return ProductName ?? "(Unknown Device)";
+            }
+        }
+
+        /// <summary>
+        /// Returns a status string for UI display.
+        /// </summary>
+        [XmlIgnore]
+        public string StatusText
+        {
+            get
+            {
+                if (!IsEnabled) return "Disabled";
+                if (IsOnline) return "Online";
+                return "Offline";
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        //  Loading methods (replace DirectInput DeviceInstance / Capabilities)
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Populates the device identity properties from discrete values.
+        /// This replaces the former LoadInstance(DeviceInstance) method.
+        /// </summary>
+        /// <param name="instanceGuid">Deterministic instance GUID (from SdlDeviceWrapper).</param>
+        /// <param name="instanceName">Device instance name.</param>
+        /// <param name="productGuid">Product GUID in PIDVID format.</param>
+        /// <param name="productName">Product name.</param>
+        public void LoadInstance(Guid instanceGuid, string instanceName, Guid productGuid, string productName)
+        {
+            InstanceGuid = instanceGuid;
+            InstanceName = instanceName ?? string.Empty;
+            ProductGuid = productGuid;
+            ProductName = productName ?? string.Empty;
+            DateUpdated = DateTime.Now;
+        }
+
+        /// <summary>
+        /// Populates the device capability properties from discrete values.
+        /// This replaces the former LoadCapabilities(Capabilities) method.
+        /// </summary>
+        /// <param name="axeCount">Number of axes.</param>
+        /// <param name="buttonCount">Number of buttons.</param>
+        /// <param name="povCount">Number of POV hats.</param>
+        /// <param name="type">Device type (see <see cref="InputDeviceType"/>).</param>
+        public void LoadCapabilities(int axeCount, int buttonCount, int povCount, int type)
+        {
+            CapAxeCount = axeCount;
+            CapButtonCount = buttonCount;
+            CapPovCount = povCount;
+            CapType = type;
+            _capabilitiesLoaded = true;
+            DateUpdated = DateTime.Now;
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from an <see cref="SdlDeviceWrapper"/>.
+        /// Convenience method that calls both <see cref="LoadInstance"/> and <see cref="LoadCapabilities"/>.
+        /// </summary>
+        /// <param name="wrapper">An opened SDL device wrapper.</param>
+        public void LoadFromSdlDevice(SdlDeviceWrapper wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+
+            LoadFromDevice(wrapper);
+
+            // The gun scales its aim by the calibration this record keeps, and
+            // so does a Wii Remote calibrated as a light gun (#485). An empty
+            // record leaves the remote on its default aim range.
+            if (wrapper.IsGunCon2)
+                wrapper.GunCon2Calibration = GunCon2Calibration.Parse(GunCalibration);
+            else if (wrapper.HasIrCamera)
+                wrapper.WiiPointerCalibration = GunCon2Calibration.TryParse(GunCalibration, out var pointer) ? pointer : null;
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from any <see cref="ISdlInputDevice"/>
+        /// (joystick, keyboard, or mouse). Common logic shared by all device types.
+        /// </summary>
+        private void LoadFromDevice(ISdlInputDevice wrapper)
+        {
+            LoadInstance(
+                wrapper.InstanceGuid,
+                wrapper.Name,
+                wrapper.ProductGuid,
+                wrapper.Name);
+
+            // Persist the gated button count (Misc1 / paddles / Touchpad /
+            // Misc2-6 only when SDL says the device has them) rather than
+            // the wrapper's NumButtons, which is a fixed 22 for any SDL3-
+            // recognized gamepad. This keeps the Devices list summary
+            // consistent with the live preview when the device is offline.
+            // Fall back to NumButtons for wrappers that don't expose a
+            // sparse list (keyboard / touchpad return empty arrays, mice
+            // return a dense 0..N-1).
+            // Null is "the wrapper does not gate", which falls back. An empty
+            // array is the wrapper saying the device HAS none, which must
+            // persist as zero rather than reappearing as the standardized slot
+            // count the moment the device goes offline.
+            var liveButtons = wrapper.SupportedButtonIndices;
+            int gatedButtons = liveButtons != null ? liveButtons.Length : wrapper.NumButtons;
+
+            // The positions behind that count, kept so the offline listing
+            // numbers buttons the way the live one does. Copied rather than
+            // aliased: the wrapper's array belongs to a connection, and this
+            // has to outlive it.
+            var supported = wrapper.SupportedButtonIndices;
+            CapButtonIndices = supported != null && supported.Length > 0
+                ? (int[])supported.Clone()
+                : null;
+
+            // Same for the axes, and cloned for the same reason.
+            var supportedAxes = wrapper.SupportedAxisIndices;
+            CapAxisIndices = supportedAxes != null && supportedAxes.Length > 0
+                ? (int[])supportedAxes.Clone()
+                : null;
+
+            // Extra generic axes (issue #193): a gamepad-opened device with raw
+            // joystick axes beyond the standard six (e.g. a DualShock 3 in SDF mode,
+            // 16 axes) exposes them as "Axis N" sources, so CapAxeCount reflects the
+            // full count for the live axis preview and the offline picker. NumAxes
+            // stays the gamepad 6 for the standard-axis read/reorder; the extras are
+            // read joystick-direct in GetGamepadState.
+            int effectiveAxisCount = wrapper.HasExtraGenericAxes
+                ? System.Math.Min(wrapper.RawAxisCount, CustomInputState.MaxAxis)
+                : wrapper.NumAxes;
+
+            // Prefer the gated count when the wrapper produced one, exactly as
+            // gatedButtons does above: a pad missing sticks, triggers or
+            // pressure slots must not have the row summary report axes the
+            // preview then declines to draw (discussion #344's complaint, on
+            // the axis side).
+            // Same split as the buttons above: an empty set is a count of
+            // zero, not an absent opinion.
+            var liveAxes = wrapper.SupportedAxisIndices;
+            if (liveAxes != null)
+                effectiveAxisCount = System.Math.Min(liveAxes.Length, CustomInputState.MaxAxis);
+            LoadCapabilities(
+                effectiveAxisCount,
+                gatedButtons,
+                wrapper.NumHats,
+                wrapper.GetInputDeviceType());
+
+            // Store the raw joystick button count (may exceed NumButtons for gamepad devices).
+            RawButtonCount = Math.Max(wrapper.RawButtonCount, wrapper.NumButtons);
+
+            // Axis twin of the line above. Kept alongside the folded
+            // effectiveAxisCount because Remote Link ships the RAW count and
+            // the extras flag separately: a consumer cannot derive the flag
+            // from the counts, since HasExtraGenericAxes deliberately excludes
+            // devices whose extra axes are already sensor sources.
+            RawAxisCount = Math.Max(wrapper.RawAxisCount, wrapper.NumAxes);
+            HasExtraGenericAxes = wrapper.HasExtraGenericAxes;
+
+            // Sensor capabilities.
+            HasGyro = wrapper.HasGyro;
+            HasAccel = wrapper.HasAccel;
+            HasAccelAux = wrapper.HasAccelAux;
+            HasGyroAux = wrapper.HasGyroAux;
+            HasTouchpad = wrapper.HasTouchpad;
+            CapTouchpadCount = wrapper.NumTouchpads;
+            CapTouchpadFingerCounts = wrapper.TouchpadFingerCounts;
+            CapTouchpadPressure = wrapper.TouchpadPressureSupported;
+            CapTouchpadClick = wrapper.TouchpadClickSupported;
+            HasRumbleTriggers = wrapper.HasRumbleTriggers;
+            // HasIrCamera / IsBalanceBoard are identity-derived (computed from VID +
+            // ProductName), so nothing to assign here. They are correct online and
+            // offline, and never go stale (issue #146).
+
+            VendorId = wrapper.VendorId;
+            ProdId = wrapper.ProductId;
+            DevicePath = wrapper.DevicePath;
+            // An arrival that reports NO serial must not erase one already
+            // known. SDL hands most Bluetooth pads their MAC here, and that
+            // is what the idle-disconnect targets, so losing it because a
+            // particular connection was silent costs the row a capability it
+            // had. The BthPS3 pads (DualShock 3, PS Move, Navigation) are
+            // the case that forced this: their virtual joysticks report no
+            // serial at all, and SDL_VirtualJoystickDesc has no field to set
+            // one, so their address can only arrive from the USB dock and
+            // must then survive every later connect.
+            if (!string.IsNullOrEmpty(wrapper.SerialNumber))
+                SerialNumber = wrapper.SerialNumber;
+            else
+                SerialNumber ??= string.Empty;
+            SdlGuid = wrapper.SdlGuid ?? string.Empty;
+
+            // Populate device objects.
+            DeviceObjects = wrapper.GetDeviceObjects();
+
+            // Compute actuator count for force feedback detection.
+            CustomInputState.GetAxisMask(DeviceObjects, CapAxeCount,
+                out _, out _, out int actuatorCount);
+            ActuatorCount = actuatorCount;
+
+            // Initialize force feedback state for devices with rumble or haptic
+            // FFB. A reload of the SAME connection keeps its cache: a fresh one
+            // forgets the rumble last sent, so a game's next zero looks like no
+            // change and the pad, or its page, rumbles on (#402). Decided here,
+            // before anything is published, so no disposable cache is ever
+            // visible to the polling thread. A new connection starts clean.
+            if (wrapper.HasRumble || wrapper.HasHaptic)
+            {
+                if (ForceFeedbackState == null || !SameConnection(Device, wrapper))
+                    ForceFeedbackState = new ForceFeedbackState();
+            }
+
+            // A new connection's IR pointer starts from center and its
+            // trackballs from rest (#485, #291), the same new-connection rule.
+            // The teardown drops both on a confirmed disconnect, but a removal
+            // it never sees, a disconnect that arrives after a stale read took
+            // the row offline, or an evaluation finishing on another thread as
+            // the teardown runs can leave them, and the new connection would
+            // serve the old aim while it cannot see the bar.
+            if (!SameConnection(Device, wrapper))
+            {
+                string guid = InstanceGuid.ToString();
+                PadForge.Engine.Common.Mapping.SourceCoercion.ForgetIrPointerForDevice(guid);
+                PadForge.Engine.Common.Mapping.SourceCoercion.ResetTouchMomentumForDevice(guid);
+            }
+
+            // Store the device wrapper for state reading in the polling loop.
+            // A replug can reach here while the previous connection's wrapper
+            // is still attached (exact-InstanceGuid rebind inside the Step 1
+            // disconnect debounce, or the Step 2 read-failure + ProductGuid
+            // fallback). Overwriting without disposing would leave the old
+            // SDL handles to the GC finalizer thread, racing the poll loop.
+            if (Device != null && !ReferenceEquals(Device, wrapper))
+            {
+                try { Device.Dispose(); } catch { }
+            }
+            Device = wrapper;
+        }
+
+        /// <summary>The same connection: the same device object, as a web
+        /// pad's capability refresh reloads it, or a fresh wrapper on the same
+        /// SDL instance, as the Bliss-Box switch reopens a port the other way
+        /// (#469). SDL counts the opens of one joystick, so its motors run on
+        /// whatever they were last told. Phase 1 opens only instances it does
+        /// not hold, so a replug always arrives as a new one. The old wrapper
+        /// may already be disposed, as the Remote Link exposure's is after the
+        /// reopen, so it is matched by the instance it was opened on.</summary>
+        public static bool SameConnection(ISdlInputDevice current, ISdlInputDevice next)
+            => ReferenceEquals(current, next)
+               || (current is SdlDeviceWrapper old && next is SdlDeviceWrapper fresh
+                   && old.ConnectionId != 0 && old.ConnectionId == fresh.SdlInstanceId);
+
+        /// <summary>
+        /// Populates the device identity and capabilities from a <see cref="SdlKeyboardWrapper"/>.
+        /// </summary>
+        public void LoadFromKeyboardDevice(SdlKeyboardWrapper wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>Populates identity and capabilities from a Consumer
+        /// Control wrapper (issue #168), same delegation as the keyboard.</summary>
+        public void LoadFromConsumerDevice(ConsumerControlWrapper wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from a <see cref="SdlMouseWrapper"/>.
+        /// </summary>
+        public void LoadFromMouseDevice(SdlMouseWrapper wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from a <see cref="WebControllerDevice"/>.
+        /// </summary>
+        public void LoadFromWebDevice(WebControllerDevice wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from any externally
+        /// managed <see cref="ISdlInputDevice"/> implementation the App layer
+        /// registers (MIDI input endpoints and other non-SDL sources).
+        /// </summary>
+        public void LoadFromExternalDevice(ISdlInputDevice wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>
+        /// Populates the device identity and capabilities from a <see cref="TouchpadOverlayDevice"/>.
+        /// </summary>
+        public void LoadFromOverlayDevice(TouchpadOverlayDevice wrapper)
+        {
+            if (wrapper == null)
+                throw new ArgumentNullException(nameof(wrapper));
+            LoadFromDevice(wrapper);
+        }
+
+        /// <summary>
+        /// Clears all runtime state when the device is disconnected.
+        /// The serializable identity and capability properties are preserved.
+        /// </summary>
+        public void ClearRuntimeState()
+        {
+            Device = null;
+            IsOnline = false;
+            InputState = null;
+            OldInputState = null;
+            // DeviceObjects preserved — static device capabilities needed by UI dropdowns.
+            ForceFeedbackState = null;
+
+            NotifyStateChanged();
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        //  INotifyPropertyChanged
+        // ─────────────────────────────────────────────────────────────
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        protected void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
+        /// <summary>
+        /// Raises PropertyChanged for all runtime display properties.
+        /// Call after updating IsOnline, InputState, etc.
+        /// </summary>
+        public void NotifyStateChanged()
+        {
+            OnPropertyChanged(nameof(IsOnline));
+            OnPropertyChanged(nameof(StatusText));
+            OnPropertyChanged(nameof(InputState));
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        //  Display
+        // ─────────────────────────────────────────────────────────────
+
+        public override string ToString()
+        {
+            return $"{ResolvedName} [{InstanceGuid:N}]";
+        }
+    }
+}
