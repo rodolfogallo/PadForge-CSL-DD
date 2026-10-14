@@ -1,3 +1,7 @@
+> **Cópia privada CSL DD — versão 5.0.0.1.** Base: PadForge v5.0.0.
+> Consulte [as correções e instruções de validação](CSL-DD-VALIDATION.md).
+> O projeto original e sua licença estão preservados abaixo.
+
 <p align="center">
   <img src="screenshots/icon.png" alt="PadForge" width="128">
 </p>

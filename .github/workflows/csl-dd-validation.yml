@@ -1,0 +1,21 @@
+name: CSL DD validation build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.x
+      - name: Hardware-safe regression tests
+        run: dotnet test PadForge.Tests/PadForge.Tests.csproj -c Release --filter "FullyQualifiedName~FanatecCslDdOutputTests|FullyQualifiedName~WheelFfbWriteCacheTests|FullyQualifiedName~AuditJuly26RoundTwentyThreeTests|FullyQualifiedName~EngineStopRumbleTests"
+      - name: Publish Windows x64
+        run: dotnet publish PadForge.App/PadForge.App.csproj -c Release -r win-x64 -o artifacts/csl-dd-win-x64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PadForge-CSL-DD-win-x64
+          path: artifacts/csl-dd-win-x64/
