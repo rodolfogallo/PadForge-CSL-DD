@@ -4,6 +4,7 @@
              xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
              xmlns:uictrl="clr-namespace:Wpf.Ui.Controls;assembly=Wpf.Ui"
              xmlns:conv="clr-namespace:PadForge.Converters"
+             xmlns:controls="clr-namespace:PadForge.Controls"
 >
 
     <Application.Resources>
@@ -198,6 +199,21 @@
                         <Setter Property="Effect" Value="{StaticResource NeutralHoverGlow}"/>
                     </Trigger>
                 </Style.Triggers>
+            </Style>
+
+            <!--
+                Plain ItemsControls stay out of the Tab order. Every Control
+                is focusable by default, so Tab stopped on each list container
+                (the Dashboard's slot list, an empty slot-badge row on the
+                Devices page) and drew the focus ring around a list that does
+                nothing with focus. The controls inside keep their own Tab
+                stops. A style keyed by the type reaches only plain
+                ItemsControls: ListBox, TabControl and the 3D view keep their
+                keyboard behavior. A list with a style of its own sets this
+                in that style.
+            -->
+            <Style TargetType="ItemsControl">
+                <Setter Property="Focusable" Value="False"/>
             </Style>
 
             <!--
@@ -564,7 +580,7 @@
                 <Setter Property="ContentTemplate">
                     <Setter.Value>
                         <DataTemplate>
-                            <TextBlock Text="{Binding}" FontFamily="Segoe MDL2 Assets" FontSize="12"/>
+                            <controls:GlyphText Text="{Binding}" FontFamily="Segoe MDL2 Assets" FontSize="12"/>
                         </DataTemplate>
                     </Setter.Value>
                 </Setter>
@@ -1067,12 +1083,14 @@
             <conv:StringToVisibilityConverter x:Key="StringToVisibility" />
             <conv:EnumIndexConverter x:Key="EnumIndexConverter" />
             <conv:EnumEqualityVisibilityConverter x:Key="EnumEqualityVisibilityConverter" />
+            <conv:EnumEqualityConverter x:Key="EnumEqualityConverter" />
             <conv:BoolToTriggerShapeKindConverter x:Key="BoolToTriggerShapeKindConverter" />
             <conv:RgbToBrushConverter x:Key="RgbToBrushConverter" />
             <conv:IndexToLetterConverter x:Key="IndexToLetterConverter" />
             <conv:IndexLessThanVisibilityConverter x:Key="IndexLessThanVisibilityConverter" />
             <conv:OneBasedIndexConverter x:Key="OneBasedIndexConverter" />
             <conv:ExeIconConverter x:Key="ExeIconConverter" />
+            <conv:CultureLanguageConverter x:Key="CultureLanguageConverter" />
 
         </ResourceDictionary>
     </Application.Resources>

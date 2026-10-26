@@ -93,6 +93,7 @@ namespace PadForge.ViewModels
             Services.VendorUsbDriverInstaller.OptInKind.Xbox360Receiver => Strings.Instance.Devices_DriverBind_Xbox360Receiver,
             Services.VendorUsbDriverInstaller.OptInKind.IntelBaseStation => Strings.Instance.Devices_DriverBind_IntelBaseStation,
             Services.VendorUsbDriverInstaller.OptInKind.Prodikeys => Strings.Instance.Devices_DriverBind_Prodikeys,
+            Services.VendorUsbDriverInstaller.OptInKind.TouchSenseMouse => Strings.Instance.Devices_DriverBind_TouchSenseMouse,
             _ => null,
         };
 
@@ -808,15 +809,6 @@ namespace PadForge.ViewModels
         /// <summary>Tracks which device's collections are currently populated.</summary>
         internal Guid LastRawStateDeviceGuid { get; set; }
 
-        /// <summary>
-        /// Rebuilds the raw state collections for a new device.
-        /// <paramref name="buttonIndices"/> is the sparse list of button
-        /// positions the device actually exposes — for SDL3 gamepads this
-        /// skips extended slots (paddles, Misc buttons) the device doesn't
-        /// have, so the preview only shows real buttons. Item Index values
-        /// are stored verbatim and used by the InputService update loop
-        /// to read the matching <c>state.Buttons[Index]</c>.
-        /// </summary>
         /// <summary>Localized name of a head tracker axis slot (#355), null
         /// past the six.</summary>
         internal static string HeadTrackerAxisName(int slot)
@@ -834,6 +826,15 @@ namespace PadForge.ViewModels
             };
         }
 
+        /// <summary>
+        /// Rebuilds the raw state collections for a new device.
+        /// <paramref name="buttonIndices"/> is the sparse list of button
+        /// positions the device actually exposes — for SDL3 gamepads this
+        /// skips extended slots (paddles, Misc buttons) the device doesn't
+        /// have, so the preview only shows real buttons. Item Index values
+        /// are stored verbatim and used by the InputService update loop
+        /// to read the matching <c>state.Buttons[Index]</c>.
+        /// </summary>
         internal void RebuildRawStateCollections(IReadOnlyList<int> axisIndices, IReadOnlyList<int> buttonIndices, int povCount, bool isKeyboard = false, bool isMouse = false, bool isTouchpad = false, bool isMidi = false, bool isNfc = false, IReadOnlyList<ConsumerButtonDisplayItem> consumerButtons = null, bool isHeadsetMotion = false, int voiceButtonBase = -1, bool isMicrophone = false, bool isHandheld = false, bool isSystemMotion = false, bool isHeadTracker = false, IReadOnlyList<PadForge.Engine.DeviceObjectItem> namedObjects = null, int[] analogKeyOrder = null)
         {
             // Analog keyboards (#468): key chips, gathered as keys move.

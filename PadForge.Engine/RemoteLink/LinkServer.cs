@@ -220,15 +220,6 @@ namespace PadForge.Engine.RemoteLink
         /// where plain UDP hole punching won't work. The UI pre-warns.</summary>
         public bool IsHardNat { get; private set; }
 
-        /// <summary>
-        /// Learns this socket's public endpoint via STUN (#294 step 1), reusing
-        /// the bound UDP socket so the mapping matches the one a punch would use.
-        /// Probes two independent servers to classify hard NAT. Sends are done
-        /// through the socket directly; responses come back through the shared
-        /// receive loop (<see cref="RouteStunResponse"/>). Safe to call while the
-        /// server is running and connections are live: STUN datagrams demux from
-        /// sealed session datagrams by the magic cookie.
-        /// </summary>
         /// <summary>This socket's classified NAT behavior from the last probe
         /// (#294), used to decide punch strategy. Null until probed.</summary>
         public NatProfile Nat { get; private set; }
@@ -282,6 +273,7 @@ namespace PadForge.Engine.RemoteLink
                     {
                         foreach (var (host, port) in StunClient.DefaultServers)
                         {
+                            if (PadForge.Engine.Common.OutboundNetworkGate.RefusesHost(host)) continue;
                             try
                             {
                                 var addrs = await Dns.GetHostAddressesAsync(host, AddressFamily.InterNetwork).ConfigureAwait(false);
@@ -331,6 +323,15 @@ namespace PadForge.Engine.RemoteLink
             catch { /* keepalive must never take the link down */ }
         }
 
+        /// <summary>
+        /// Learns this socket's public endpoint via STUN (#294 step 1), reusing
+        /// the bound UDP socket so the mapping matches the one a punch would use.
+        /// Probes two independent servers to classify hard NAT. Sends are done
+        /// through the socket directly; responses come back through the shared
+        /// receive loop (<see cref="RouteStunResponse"/>). Safe to call while the
+        /// server is running and connections are live: STUN datagrams demux from
+        /// sealed session datagrams by the magic cookie.
+        /// </summary>
         public async Task<StunResult> ProbePublicEndpointAsync(CancellationToken ct = default)
         {
             var sock = _udp;
@@ -350,6 +351,7 @@ namespace PadForge.Engine.RemoteLink
                 foreach (var (host, port) in StunClient.DefaultServers)
                 {
                     if (ct.IsCancellationRequested) break;
+                    if (PadForge.Engine.Common.OutboundNetworkGate.RefusesHost(host)) continue;
                     IPAddress[] addrs;
                     try { addrs = await Dns.GetHostAddressesAsync(host, AddressFamily.InterNetwork, ct).ConfigureAwait(false); }
                     catch { continue; }
@@ -395,6 +397,7 @@ namespace PadForge.Engine.RemoteLink
 
         private async Task<IPEndPoint> OneStunProbeAsync(Socket sock, IPEndPoint server, CancellationToken ct)
         {
+            if (PadForge.Engine.Common.OutboundNetworkGate.Refuses(server?.Address)) return null;
             // ONE transaction id across the retransmits (RFC 5389 §7.2.1): a
             // fresh id per attempt rejected any response slower than one
             // attempt window (finding 4).
@@ -444,7 +447,12 @@ namespace PadForge.Engine.RemoteLink
             return true;
         }
 
-        public bool Start(int port)
+        public bool Start(int port) => Start(port, IPAddress.Any);
+
+        /// <summary>Starts on one local address. The app listens on every
+        /// address, through the overload above. The tests pass loopback, so
+        /// the test host opens nothing the network can reach.</summary>
+        internal bool Start(int port, IPAddress bindAddress)
         {
             if (IsRunning) return true;
             Interlocked.Increment(ref _lifecycleVersion);
@@ -453,12 +461,14 @@ namespace PadForge.Engine.RemoteLink
 
             try
             {
-                _tcp = new TcpListener(IPAddress.Any, port);
+                // The test host binds loopback alone (NetworkListenerGate).
+                PadForge.Engine.Common.NetworkListenerGate.Enter(bindAddress);
+                _tcp = new TcpListener(bindAddress, port);
                 _tcp.Start();
 
                 _udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 try { _udp.IOControl(SIO_UDP_CONNRESET, new byte[4], null); } catch { /* non-Windows */ }
-                _udp.Bind(new IPEndPoint(IPAddress.Any, port));
+                _udp.Bind(new IPEndPoint(bindAddress, port));
                 // Report the port actually bound. With port 0 (ephemeral) the
                 // requested value is meaningless, and every candidate we
                 // advertise is built from Port, so a peer would be told to
@@ -741,6 +751,7 @@ namespace PadForge.Engine.RemoteLink
         /// <summary>Initiate an outbound pairing/reconnect to a peer, optionally exposing local devices.</summary>
         public async Task<bool> ConnectAsync(string host, int port, IReadOnlyList<RemotePeerDeviceInfo> exposeLocal, CancellationToken ct = default)
         {
+            if (PadForge.Engine.Common.OutboundNetworkGate.RefusesHost(host)) return false;
             // IPv4 to match the IPv4 UDP data socket (the DsuMotionServer model);
             // a default dual-stack TcpClient yields IPv4-mapped-IPv6 endpoints the
             // IPv4 UDP socket can't SendTo.
@@ -787,6 +798,7 @@ namespace PadForge.Engine.RemoteLink
             public UdpPunchAdapter(Socket s) { _sock = s; }
             public async Task SendToAsync(byte[] dg, IPEndPoint dest, CancellationToken ct)
             {
+                if (PadForge.Engine.Common.OutboundNetworkGate.Refuses(dest?.Address)) return;
                 try { await _sock.SendToAsync(dg, SocketFlags.None, dest, ct).ConfigureAwait(false); }
                 catch (ObjectDisposedException) { } catch (SocketException) { }
             }
@@ -802,6 +814,7 @@ namespace PadForge.Engine.RemoteLink
             {
                 var ep = _peer();
                 if (ep == null) return;
+                if (PadForge.Engine.Common.OutboundNetworkGate.Refuses(ep.Address)) return;
                 try { await _sock.SendToAsync(dg, SocketFlags.None, ep, ct).ConfigureAwait(false); }
                 catch (ObjectDisposedException) { } catch (SocketException) { }
             }
@@ -1573,6 +1586,7 @@ namespace PadForge.Engine.RemoteLink
         {
             var ep = c.PeerUdpEndpoint;
             var sock = _udp;
+            if (ep != null && PadForge.Engine.Common.OutboundNetworkGate.Refuses(ep.Address)) return false;
             if (ep != null && sock != null)
             {
                 try { sock.SendTo(dg, ep); return true; }
@@ -2199,6 +2213,13 @@ namespace PadForge.Engine.RemoteLink
                         || !SameKeys(existing.Info.SupportedAxisIndices, info.SupportedAxisIndices)
                         || (info.DeviceObjects != null && info.DeviceObjects.Length > 0
                             && !SameAxisObjects(existing.Info.DeviceObjects, info.DeviceObjects));
+                    // Rumble is registration state as well: the row's
+                    // force-feedback cache is made when the device registers
+                    // with rumble, so a device that gained it afterward (a
+                    // haptic mouse found after connect, #494) took no level
+                    // until it registered again.
+                    bool rumbleChanged = existing.Info.HasRumble != info.HasRumble
+                        || existing.Info.HasHaptic != info.HasHaptic;
                     existing.LinkSlot = info.Slot;
                     existing.SetConnected(info.Online); // same device, just active/inactive (+ maybe a new slot)
                     // Refresh relayed metadata in place: the owner's named
@@ -2250,12 +2271,17 @@ namespace PadForge.Engine.RemoteLink
                     existing.Info.SupportedAxisIndices = info.SupportedAxisIndices;
                     existing.RefreshSupportedSets();
                     existing.Info.InputDeviceType = info.InputDeviceType;
+                    // Read live by the "(Any Device)" Gamepad names, so a
+                    // layout the owner changes (Force Raw Joystick Mode set on
+                    // a wheel SDL opened as its gamepad) needs no registration.
+                    existing.Info.GamepadLayout = info.GamepadLayout;
                     // Read live by the picker and the rest rule: an analog
                     // keyboard's list grows as it reports new keys, and a port's
                     // mask moves with the controller in it.
                     bool keysChanged = !SameKeys(existing.Info.AnalogKeyOrder, info.AnalogKeyOrder);
                     existing.Info.AnalogKeyOrder = info.AnalogKeyOrder;
                     existing.Info.BlissBoxRestMask = info.BlissBoxRestMask;
+                    existing.Info.CapSenseChannelMask = info.CapSenseChannelMask;
                     // Every DualShock 3 on the owner's own path shares one row,
                     // so another pad connecting there changes the identity.
                     existing.Info.Ds3Identity = info.Ds3Identity;
@@ -2263,7 +2289,7 @@ namespace PadForge.Engine.RemoteLink
                     next[info.Slot] = existing;
                     // Re-register only when the slot moved, so the slot-stamped output route refreshes,
                     // or when what registration recorded changed.
-                    if (slotChanged || typeChanged || touchCapabilitiesChanged || axesChanged)
+                    if (slotChanged || typeChanged || touchCapabilitiesChanged || axesChanged || rumbleChanged)
                         notifications.Add(() => DeviceConnected?.Invoke(existing));
                 }
                 else

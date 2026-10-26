@@ -67,7 +67,11 @@ public static class NintendoPreviewMap
     // LB4 RB5 View6 Menu7 LS8 RS9 Steam10 QAM11, then the rear buttons in
     // SDL's R1 L1 R2 L2 order (Paddle1 = R4, Paddle2 = L4, Paddle3 = R5,
     // Paddle4 = L5, the translator convention the 3D model uses too), then
-    // the two pad clicks. The D-pad is a hat on this wire.
+    // the two pad clicks, then the capacitive stick tops. Those two came
+    // with HIDMaestro 1.12.0, which names their bits, and SDL reads them as
+    // SDL_GAMEPAD_CAPSENSE_LEFT_STICK and _RIGHT_STICK. Append only: a
+    // saved binding names its slot by index. The D-pad is a hat on this
+    // wire.
     private static readonly string[] PreviewByDeckBtn =
     {
         "ButtonA", "ButtonB", "ButtonX", "ButtonY",            // 0-3
@@ -77,6 +81,7 @@ public static class NintendoPreviewMap
         "ButtonGuide", "ButtonQuickAccess",                     // 10-11 Steam QAM
         "Paddle1", "Paddle2", "Paddle3", "Paddle4",             // 12-15 R4 L4 R5 L5
         "LeftTouchpadClick", "RightTouchpadClick",              // 16-17
+        "LeftStickTouch", "RightStickTouch",                    // 18-19 capacitive
     };
 
     // Steam Controller 2015 (steam-controller, steam-controller-composite).
@@ -117,6 +122,17 @@ public static class NintendoPreviewMap
         },
     };
 
+    /// <summary>The art a role lights when the previews flash it for
+    /// recording. A capacitive stick top has no art of its own, so it flashes
+    /// its stick's cap, the part a touch preview washes. Every other role,
+    /// grip touch included, is its own art or has none.</summary>
+    public static string ArtRole(string role) => role switch
+    {
+        "LeftStickTouch" => "LeftThumbButton",
+        "RightStickTouch" => "RightThumbButton",
+        _ => role,
+    };
+
     /// <summary>The role a wire slot is actually named, resolving an alias.
     /// Returns the name unchanged when the family has no alias for it.</summary>
     public static string ResolveAlias(string profileId, string previewName)
@@ -128,7 +144,10 @@ public static class NintendoPreviewMap
     // Steam Controller 2026 (steam-controller-2). Two sticks, a real D-pad
     // reported as four buttons (sc2-research HID_REPORT_FORMAT.md, the
     // TritonButtons table, verbatim from SDL3's controller_structs.h), four
-    // rear buttons in the same R4 L4 R5 L5 order as the Deck, Quick Access.
+    // rear buttons in the same R4 L4 R5 L5 order as the Deck, Quick Access,
+    // then the capacitive stick tops and grips, appended with HIDMaestro
+    // 1.12.0 (SDL_hidapi_steam_triton.c reads them as
+    // SDL_GAMEPAD_CAPSENSE_*). Append only, as on the Deck.
     private static readonly string[] PreviewBySteamController2Btn =
     {
         "ButtonA", "ButtonB", "ButtonX", "ButtonY",            // 0-3
@@ -139,6 +158,8 @@ public static class NintendoPreviewMap
         "Paddle1", "Paddle2", "Paddle3", "Paddle4",             // 12-15 R4 L4 R5 L5
         "LeftTouchpadClick", "RightTouchpadClick",              // 16-17
         "DPadUp", "DPadDown", "DPadLeft", "DPadRight",          // 18-21 discrete buttons
+        "LeftStickTouch", "RightStickTouch",                    // 22-23 capacitive
+        "LeftGripTouch", "RightGripTouch",                      // 24-25 capacitive
     };
 
     // Nintendo pads have no analog triggers, so ComputeAxisLayout packs the
@@ -173,7 +194,11 @@ public static class NintendoPreviewMap
     {
         if (string.IsNullOrEmpty(profileId)) return Family.None;
         if (Starts(profileId, "switch2-pro")) return Family.Switch2Pro;
-        if (string.Equals(profileId, "switch-pro", System.StringComparison.OrdinalIgnoreCase)) return Family.SwitchPro;
+        // The original Pro Controller on either descriptor: Bluetooth's, and
+        // the USB one HIDMaestro 2.0.0 added, whose buttons are the same and
+        // whose right stick sits on Z and Rz.
+        if (string.Equals(profileId, "switch-pro", System.StringComparison.OrdinalIgnoreCase)
+            || string.Equals(profileId, "switch-pro-usb", System.StringComparison.OrdinalIgnoreCase)) return Family.SwitchPro;
         if (Starts(profileId, "steam-deck")) return Family.SteamDeck;
         if (Starts(profileId, "steam-controller-2")) return Family.SteamController2;
         if (Starts(profileId, "steam-controller")) return Family.SteamController;
@@ -195,6 +220,16 @@ public static class NintendoPreviewMap
     /// no translation between them.</summary>
     public static bool SameWireFamily(string profileIdA, string profileIdB) =>
         FamilyOf(profileIdA) == FamilyOf(profileIdB);
+
+    /// <summary>True when two slots whose raw positions carry roles are
+    /// read through the same tables, so a raw index names the same control
+    /// on both. An id that names no wire is read through the original Pro
+    /// Controller's tables (<see cref="ButtonTable"/>), so it shares them
+    /// with "switch-pro" and with any other such id, where
+    /// <see cref="SameWireFamily"/> sets the two apart.</summary>
+    public static bool SameWireTables(string profileIdA, string profileIdB) =>
+        ReferenceEquals(ButtonTable(profileIdA), ButtonTable(profileIdB))
+        && ReferenceEquals(AxisTable(profileIdA), AxisTable(profileIdB));
 
     /// <summary>The wire table for a profile. Each family gets its own;
     /// an unlettered or unrecognized id falls back to the original Pro
@@ -350,5 +385,111 @@ public static class NintendoPreviewMap
         if (rawName.StartsWith("RawPov0", System.StringComparison.Ordinal))
             return "DPad" + rawName.Substring(7);
         return null;
+    }
+
+    /// <summary>How a position of SDL's gamepad layout is read on a pad: a
+    /// button, an axis, or one direction of the D-pad's hat.</summary>
+    public enum GamepadInput { Button, Axis, Hat }
+
+    /// <summary>One position of SDL's gamepad layout and the role it takes on
+    /// a lettered wire.
+    ///
+    /// <para><paramref name="Target"/> is the position's target on a gamepad
+    /// slot, null where a gamepad slot has none. <paramref name="Input"/> and
+    /// <paramref name="Index"/> say where the automap reads the position on a
+    /// pad, in SDL's gamepad order. A D-pad direction is read from the hat
+    /// and needs no index. The Nintendo role serves both Switch wires and
+    /// the Valve roles serve the three Valve wires. A wire that lacks a role
+    /// binds nothing for it, and of the two Valve roles a wire has at most
+    /// one.</para></summary>
+    public sealed record GamepadPosition(string Target, GamepadInput Input, int Index,
+        string NintendoRole, string ValveRole, string ValveAlternateRole = null)
+    {
+        /// <summary>The position's roles on a Valve wire or a Nintendo one,
+        /// in the order a wire takes them.</summary>
+        public IEnumerable<string> Roles(bool valve)
+        {
+            if (!valve)
+            {
+                if (NintendoRole != null) yield return NintendoRole;
+                yield break;
+            }
+            if (ValveRole != null) yield return ValveRole;
+            if (ValveAlternateRole != null) yield return ValveAlternateRole;
+        }
+    }
+
+    /// <summary>Where each position of a pad in SDL's gamepad layout lands on
+    /// a lettered wire, by placement: south button to south button (owner
+    /// direction 2026-07-19), so an Xbox pad's A lands on a Switch pad's B.
+    /// The automap binds a pad's inputs by it
+    /// (SettingsManager.CreateDefaultPadSetting), and Paste and Copy From
+    /// carry a gamepad slot's bindings onto a lettered slot and back by it
+    /// (InputService.TranslateTarget), so the two cannot disagree. Misc 1 is
+    /// one position with two gamepad targets, the Xbox pad's Share button and
+    /// the DualSense's mic button.</summary>
+    public static IReadOnlyList<GamepadPosition> GamepadPositions { get; } = new GamepadPosition[]
+    {
+        new("ButtonA", GamepadInput.Button, 0, "ButtonB", "ButtonA"),               // south
+        new("ButtonB", GamepadInput.Button, 1, "ButtonA", "ButtonB"),               // east
+        new("ButtonX", GamepadInput.Button, 2, "ButtonY", "ButtonX"),               // west
+        new("ButtonY", GamepadInput.Button, 3, "ButtonX", "ButtonY"),               // north
+        new("LeftShoulder", GamepadInput.Button, 4, "LeftShoulder", "LeftShoulder"),
+        new("RightShoulder", GamepadInput.Button, 5, "RightShoulder", "RightShoulder"),
+        new("ButtonBack", GamepadInput.Button, 6, "ButtonBack", "ButtonBack"),     // Minus, View
+        new("ButtonStart", GamepadInput.Button, 7, "ButtonStart", "ButtonStart"),  // Plus, Menu
+        new("LeftThumbButton", GamepadInput.Button, 8, "LeftThumbButton", "LeftThumbButton"),
+        new("RightThumbButton", GamepadInput.Button, 9, "RightThumbButton", "RightThumbButton"),
+        new("ButtonGuide", GamepadInput.Button, 10, "ButtonGuide", "ButtonGuide"), // Home, Steam
+        new("ButtonShare", GamepadInput.Button, 11, "ButtonShare", "ButtonQuickAccess"),   // misc 1
+        new("ButtonMute", GamepadInput.Button, 11, "ButtonShare", "ButtonQuickAccess"),    // misc 1
+        new("RightPaddle", GamepadInput.Button, 12, "RightPaddle", "Paddle1", "RightGrip"),
+        new("LeftPaddle", GamepadInput.Button, 13, "LeftPaddle", "Paddle2", "LeftGrip"),
+        new("RightFunction", GamepadInput.Button, 14, null, "Paddle3"),
+        new("LeftFunction", GamepadInput.Button, 15, null, "Paddle4"),
+        new(null, GamepadInput.Button, 17, "ButtonC", null),                         // misc 2
+        new("LeftThumbAxisX", GamepadInput.Axis, 0, "LeftThumbAxisX", "LeftThumbAxisX"),
+        new("LeftThumbAxisY", GamepadInput.Axis, 1, "LeftThumbAxisY", "LeftThumbAxisY"),
+        new("LeftTrigger", GamepadInput.Axis, 2, "LeftTrigger", "LeftTrigger"),     // ZL is a button
+        new("RightThumbAxisX", GamepadInput.Axis, 3, "RightThumbAxisX", "RightThumbAxisX"),
+        new("RightThumbAxisY", GamepadInput.Axis, 4, "RightThumbAxisY", "RightThumbAxisY"),
+        new("RightTrigger", GamepadInput.Axis, 5, "RightTrigger", "RightTrigger"),  // ZR is a button
+        new("DPadUp", GamepadInput.Hat, 0, "DPadUp", "DPadUp"),
+        new("DPadDown", GamepadInput.Hat, 0, "DPadDown", "DPadDown"),
+        new("DPadLeft", GamepadInput.Hat, 0, "DPadLeft", "DPadLeft"),
+        new("DPadRight", GamepadInput.Hat, 0, "DPadRight", "DPadRight"),
+    };
+
+    /// <summary>The raw target a gamepad slot's target lands on, on a
+    /// lettered wire: the first of its position's roles the wire has
+    /// (<see cref="ToRaw"/>). Null when the wire has none of them, or the
+    /// target is no position of SDL's layout.</summary>
+    public static string RawForGamepadTarget(string gamepadTarget, string profileId, bool valve)
+    {
+        if (string.IsNullOrEmpty(gamepadTarget)) return null;
+        foreach (var position in GamepadPositions)
+        {
+            if (!string.Equals(position.Target, gamepadTarget, System.StringComparison.Ordinal)) continue;
+            foreach (string role in position.Roles(valve))
+                if (ToRaw(role, profileId) is { } raw) return raw;
+        }
+        return null;
+    }
+
+    /// <summary>The gamepad targets whose positions land on a raw target of
+    /// a lettered wire (<see cref="RawForGamepadTarget"/>), in the table's
+    /// order. Empty when none does.</summary>
+    public static List<string> GamepadTargetsForRaw(string rawTarget, string profileId, bool valve)
+    {
+        var targets = new List<string>();
+        if (string.IsNullOrEmpty(rawTarget)) return targets;
+        foreach (var position in GamepadPositions)
+        {
+            if (position.Target == null || targets.Contains(position.Target)) continue;
+            if (string.Equals(RawForGamepadTarget(position.Target, profileId, valve), rawTarget,
+                    System.StringComparison.Ordinal))
+                targets.Add(position.Target);
+        }
+        return targets;
     }
 }

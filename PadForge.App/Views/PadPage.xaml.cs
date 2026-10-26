@@ -110,6 +110,15 @@ namespace PadForge.Views
             PadForge.Common.IconPackageManager.RegistryChanged += OnIconPackageRegistryChanged;
             RefreshIconPackages();
             SyncBassShakerMeterTimer();
+            // Peripheral outputs (#494): a mouse found to have haptics gains
+            // its Force Feedback tab, and a path that starts answering
+            // changes the tab's line.
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.LinksChanged -= OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.LinksChanged += OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.StatusChanged -= OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.StatusChanged += OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.ClaimsChanged -= OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.ClaimsChanged += OnPeripheralOutputsChanged;
         }
 
         private void PadPage_Unloaded(object sender, RoutedEventArgs e)
@@ -117,6 +126,87 @@ namespace PadForge.Views
             PadForge.Common.SoundPackageManager.RegistryChanged -= OnSoundPackageRegistryChanged;
             _bassShakerMeterTimer?.Stop();
             PadForge.Common.IconPackageManager.RegistryChanged -= OnIconPackageRegistryChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.LinksChanged -= OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.StatusChanged -= OnPeripheralOutputsChanged;
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.ClaimsChanged -= OnPeripheralOutputsChanged;
+        }
+
+        /// <summary>Raised on the peripheral host's thread. One refresh per
+        /// burst: a link pass and a status change in the same moment queue a
+        /// single tab sync.</summary>
+        private int _peripheralSyncQueued;
+        private void OnPeripheralOutputsChanged()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _peripheralSyncQueued, 1) != 0) return;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                System.Threading.Interlocked.Exchange(ref _peripheralSyncQueued, 0);
+                SyncTabVisibility();
+            }));
+        }
+
+        /// <summary>The lighting holds a mouse or keyboard offers above
+        /// colors alone (#494): 0 for none, 1 for its lighting power, 2 for
+        /// its on-board memory mode as well. Its links say so while a path
+        /// of its own lights it
+        /// (<see cref="PadForge.Common.Input.Peripherals.DeviceLinks.MaxClaimLevel"/>),
+        /// and its record keeps the answer while it sleeps or is unplugged
+        /// (<see cref="PadForge.Engine.Data.UserDevice.HasPeripheralLightingLevel1"/>
+        /// and <see cref="PadForge.Engine.Data.UserDevice.HasPeripheralLightingLevel2"/>),
+        /// so the Lighting Hold row and its options stay on the tab then.
+        /// The second hold is offered only on top of the first.</summary>
+        internal static int OfferedLightingHold(PadForge.Engine.Data.UserDevice ud)
+        {
+            if (ud == null) return 0;
+            int linked = PadForge.Common.Input.Peripherals.PeripheralOutputs.Links.For(ud.InstanceGuid)?.MaxClaimLevel ?? 0;
+            if (!ud.HasPeripheralLightingLevel1 && linked < 1) return 0;
+            return ud.HasPeripheralLightingLevel2 || linked >= 2 ? 2 : 1;
+        }
+
+        /// <summary>Shows the Lighting Hold row for a device that offers a
+        /// hold, and takes the last option out of its list for a device
+        /// that does not offer that one. The option stays in the list,
+        /// collapsed and disabled, so a choice of it saved earlier still
+        /// shows as the selection. Collapsed alone would leave it one arrow
+        /// key away: a closed ComboBox steps to the next item that is
+        /// enabled, whatever its visibility (dotnet/wpf, PresentationFramework,
+        /// ComboBox.cs:1549-1579, SelectItemHelper and IsSelectableHelper).
+        /// The picker's tooltip follows the list. Its last sentences say
+        /// when to choose the last option and what that switches off, so a
+        /// picker without the option takes the text that stops before
+        /// them, where "the last option" would name the wrong one. The
+        /// options still listed say how many there are: an option's set
+        /// size is the item count unless the option gives one, whatever is
+        /// collapsed (dotnet/wpf, PresentationFramework,
+        /// ItemAutomationPeer.cs:297-351), and a screen reader would read
+        /// "2 of 3" on a list of two.</summary>
+        internal static void ShowLightingHold(FrameworkElement row, ComboBox picker, ComboBoxItem hostModeItem, int offered)
+        {
+            if (row != null)
+                row.Visibility = offered >= 1 ? Visibility.Visible : Visibility.Collapsed;
+            if (hostModeItem != null)
+            {
+                hostModeItem.Visibility = offered >= 2 ? Visibility.Visible : Visibility.Collapsed;
+                hostModeItem.IsEnabled = offered >= 2;
+            }
+            if (picker != null)
+            {
+                foreach (var item in picker.Items)
+                {
+                    if (item is not ComboBoxItem option || ReferenceEquals(option, hostModeItem)) continue;
+                    if (offered >= 2 || hostModeItem == null)
+                        option.ClearValue(System.Windows.Automation.AutomationProperties.SizeOfSetProperty);
+                    else
+                        System.Windows.Automation.AutomationProperties.SetSizeOfSet(option, picker.Items.Count - 1);
+                }
+
+                string tooltip = offered >= 2
+                    ? nameof(Strings.Pad_Lighting_ClaimLevel_Tooltip)
+                    : nameof(Strings.Pad_Lighting_ClaimLevel_TooltipNoHostMode);
+                // Bound, never set, so the text follows a change of language.
+                if (BindingOperations.GetBinding(picker, ToolTipProperty)?.Path?.Path != tooltip)
+                    picker.SetBinding(ToolTipProperty, new Binding(tooltip) { Source = Strings.Instance });
+            }
         }
 
         private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
@@ -389,9 +479,10 @@ namespace PadForge.Views
             //   DualSense Edge (Sony VID 0x054C, PID 0x0CE6 or 0x0DF2).
             // Lighting: above plus DS4 (PIDs 0x05C4, 0x09CC, 0x0BA0).
             // Force Feedback: selected device's CapType is a stick-class
-            //   input (Gamepad / Joystick / Driving / Flight / FirstPerson).
-            //   Keyboards / mice / touchpads / MIDI controllers don't
-            //   have FFB endpoints, so the tab would be a no-op there.
+            //   input (Gamepad / Joystick / Driving / Flight / FirstPerson),
+            //   or a haptic mouse, keyboard or the Razer Sensa row (#494).
+            //   Other keyboards, mice, touchpads and MIDI controllers have
+            //   nothing to play rumble on, so the tab would be a no-op.
             bool hasAdaptiveTriggers = false;
             bool hasLightbar = false;
             bool lightbarIsDs4 = false;
@@ -421,6 +512,14 @@ namespace PadForge.Views
             // family and the DualShock 4 have a speaker. Same gating shape as
             // adaptive triggers (DualSense) or impulse triggers (Xbox One+).
             bool hasAudio = false;
+            // A haptic mouse, keyboard or the Razer Sensa row (#494).
+            bool hasPeripheralHaptics = false;
+            PadForge.Engine.Data.UserDevice peripheralRow = null;
+            // A lit mouse, keyboard or vendor lighting row (#494), and
+            // whether it is a vendor row, which lighting is all it carries.
+            bool hasPeripheralLighting = false;
+            bool vendorLightingRow = false;
+            PadForge.Engine.Data.UserDevice lightingRow = null;
             int numTouchpads = 0;
             if (DataContext is PadViewModel vmProfile
                 && vmProfile.SelectedMappedDevice != null
@@ -550,20 +649,89 @@ namespace PadForge.Views
                         hasRumble = hasImpulseTriggers
                                  || hasLightbar
                                  || (ud.Device != null && ud.Device.HasRumble);
+                        // A haptic mouse, keyboard or the Razer Sensa row
+                        // (#494) gets the tab a gamepad gets: this slot's
+                        // rumble reaches it through its own settings. The
+                        // record keeps the tab up while the device sleeps.
+                        hasPeripheralHaptics = PadForge.Common.Input.Peripherals.PeripheralOutputs.IsHapticPeripheral(ud);
+                        if (hasPeripheralHaptics)
+                        {
+                            hasForceFeedback = true;
+                            hasRumble = true;
+                            peripheralRow = ud;
+                        }
+                        // A lit mouse, keyboard or vendor row (#494) gets the
+                        // lightbar's mode card, this slot's lighting reaching
+                        // it through its own settings. The record keeps the
+                        // tab up while the device sleeps.
+                        hasPeripheralLighting = !hasLightbar
+                            && (ud.HasPeripheralLighting
+                                || PadForge.Common.Input.Peripherals.PeripheralOutputs.HasLighting(ud.InstanceGuid));
+                        if (hasPeripheralLighting)
+                        {
+                            lightingRow = ud;
+                            vendorLightingRow = ud.CapType == InputDeviceType.PeripheralLighting;
+                        }
                         break;
                     }
                 }
             }
             TabForceFeedback.Visibility = hasForceFeedback ? Visibility.Visible : Visibility.Collapsed;
+            // A slot whose controller is gone rumbles and lights nothing,
+            // by the link pass's own rule, which holds through a reorder's
+            // dispatcher rebuild, so neither route line blinks then.
+            var routeVm = DataContext as PadViewModel;
+            int routeSlot = routeVm?.PadIndex ?? -1;
+            bool slotLive = routeSlot >= 0 && PadForge.Common.Input.Peripherals.PeripheralOutputs.SlotLive(routeSlot);
+            if (PeripheralHapticsRoute != null)
+            {
+                string route = hasPeripheralHaptics
+                    ? PadForge.Common.Input.Peripherals.PeripheralRouteText.Haptics(peripheralRow, slotLive)
+                    : null;
+                PeripheralHapticsRoute.Text = route ?? string.Empty;
+                PeripheralHapticsRoute.Visibility = string.IsNullOrEmpty(route) ? Visibility.Collapsed : Visibility.Visible;
+            }
             if (TabAdaptiveTriggers != null)
                 TabAdaptiveTriggers.Visibility = hasAdaptiveTriggers ? Visibility.Visible : Visibility.Collapsed;
             if (TabLighting != null)
-                TabLighting.Visibility = (hasLightbar || hasGuideLed) ? Visibility.Visible : Visibility.Collapsed;
+                TabLighting.Visibility = (hasLightbar || hasGuideLed || hasPeripheralLighting)
+                    ? Visibility.Visible : Visibility.Collapsed;
             // Lightbar-specific content hides when the tab is up for a
             // guide-LED-only device (Xbox / 2015 Steam Controller / Switch
-            // home-LED devices, #226).
+            // home-LED devices, #226). A lit mouse, keyboard or vendor row
+            // (#494) keeps the mode card and its own panel, without the
+            // DualShock 4 or DualSense art or the Sony prose.
             if (LightbarModeCard != null)
-                LightbarModeCard.Visibility = hasLightbar ? Visibility.Visible : Visibility.Collapsed;
+                LightbarModeCard.Visibility = (hasLightbar || hasPeripheralLighting)
+                    ? Visibility.Visible : Visibility.Collapsed;
+            if (LightbarPreviewPanel != null)
+                LightbarPreviewPanel.Visibility = hasLightbar ? Visibility.Visible : Visibility.Collapsed;
+            if (PeripheralLightingPanel != null)
+                PeripheralLightingPanel.Visibility = hasPeripheralLighting ? Visibility.Visible : Visibility.Collapsed;
+            if (PeripheralLightingControlRow != null)
+                PeripheralLightingControlRow.Visibility = hasPeripheralLighting && !vendorLightingRow
+                    ? Visibility.Visible : Visibility.Collapsed;
+            // The Lighting Hold row sits under the switch for a mouse or
+            // keyboard whose device offers a hold above colors alone. A
+            // vendor row or a unit row has no such choice, and its claim
+            // asks for colors alone.
+            int offeredHold = hasPeripheralLighting && !vendorLightingRow ? OfferedLightingHold(lightingRow) : 0;
+            ShowLightingHold(PeripheralClaimLevelRow, PeripheralClaimLevelPicker, PeripheralClaimLevelHostModeItem, offeredHold);
+            if (PeripheralLightingRoute != null)
+            {
+                // The hold this controller's claim carries, as the
+                // dispatcher hands it over. The line names what is held at
+                // no more than the device offers.
+                int claimLevel = vendorLightingRow ? 0
+                    : (int)(routeVm?.DeviceConfig?.PeripheralClaimLevel ?? ViewModels.PeripheralClaimLevel.Colors);
+                string route = hasPeripheralLighting
+                    ? PadForge.Common.Input.Peripherals.PeripheralRouteText.Lighting(lightingRow, routeSlot,
+                        slotLive && (vendorLightingRow || routeVm?.DeviceConfig?.PeripheralLightingEnabled == true),
+                        claimLevel)
+                    : null;
+                PeripheralLightingRoute.Text = route ?? string.Empty;
+                PeripheralLightingRoute.Visibility = string.IsNullOrEmpty(route) ? Visibility.Collapsed : Visibility.Visible;
+            }
             if (LightingLightbarSubtitle != null)
                 LightingLightbarSubtitle.Visibility = hasLightbar ? Visibility.Visible : Visibility.Collapsed;
             if (LightingPlayerIdleHint != null)
@@ -623,6 +791,13 @@ namespace PadForge.Views
             if (FfbTriggerFoldChk != null)
                 FfbTriggerFoldChk.Visibility = (hasRumble && !hasImpulseTriggers)
                     ? Visibility.Visible : Visibility.Collapsed;
+            // Swap Left and Right Motors (#494): a haptic mouse, keyboard or
+            // the Razer Sensa row plays one level, the stronger motor
+            // (PeripheralOutputs.SetMotors), so swapping changes nothing
+            // there and the row hides. Left Motor and Right Motor stay, since
+            // each scales its motor before the stronger one is taken.
+            if (FfbSwapMotorsRow != null)
+                FfbSwapMotorsRow.Visibility = hasPeripheralHaptics ? Visibility.Collapsed : Visibility.Visible;
             // Compass-anchored yaw (#271 item 5): the magnetometer ships on
             // the Switch 2 Joy-Cons, the same identity set as the optical
             // mouse, so the mouse capability doubles as the gate.
@@ -713,11 +888,11 @@ namespace PadForge.Views
                 else if (vm.SelectedConfigTab == 6 && !hasAdaptiveTriggers)
                     vm.SelectedConfigTab = 0;
                 // Must match TabLighting's visibility predicate exactly
-                // (hasLightbar || hasGuideLed). Testing only hasLightbar
-                // bounced guide-LED-only devices (Xbox pads, the 2015 Steam
-                // Controller, Switch) straight off a tab that was visible and
-                // populated for them.
-                else if (vm.SelectedConfigTab == 7 && !(hasLightbar || hasGuideLed))
+                // (hasLightbar || hasGuideLed || hasPeripheralLighting).
+                // Testing only hasLightbar bounced guide-LED-only devices
+                // (Xbox pads, the 2015 Steam Controller, Switch) straight off
+                // a tab that was visible and populated for them.
+                else if (vm.SelectedConfigTab == 7 && !(hasLightbar || hasGuideLed || hasPeripheralLighting))
                     vm.SelectedConfigTab = 0;
                 else if (vm.SelectedConfigTab == 8 && !hasGyro)
                     vm.SelectedConfigTab = 0;
@@ -762,6 +937,11 @@ namespace PadForge.Views
             VRPreview.Unbind();
 
             if (DataContext is not PadViewModel vm) return;
+
+            // The touch sensors' capsules sit over the 2D and 3D views alike
+            // and record through the same funnel.
+            TouchSensors.ControllerElementRecordRequested -= OnModelRecordRequested;
+            TouchSensors.ControllerElementRecordRequested += OnModelRecordRequested;
 
             if (isKBM)
             {
@@ -895,7 +1075,7 @@ namespace PadForge.Views
         /// visual. SHIFT has no single owning row; it cycles the layer
         /// tab strip the way ShiftLayerTab_Click does (authoring
         /// selection only, nothing persisted).</summary>
-        private void PipelineChip_Click(object sender, MouseButtonEventArgs e)
+        private void PipelineChip_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not PadViewModel vm) return;
             if (sender is not FrameworkElement fe || fe.Tag is not string kind) return;
@@ -1996,7 +2176,7 @@ namespace PadForge.Views
             };
             source.CopySettingsTo(copy);
             copy.Sources = PadForge.Services.InputService.CopyRowSources(source,
-                s => s.DeviceGuid ?? "", out bool suppressPair);
+                g => g ?? "", out bool suppressPair);
             copy.SuppressBipolarPair = suppressPair;
             return copy;
         }
@@ -2545,13 +2725,13 @@ namespace PadForge.Views
             }
         }
 
-        private void LeftMotor_Click(object sender, MouseButtonEventArgs e)
+        private void LeftMotor_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is PadViewModel padVm)
                 padVm.FireTestLeftMotor();
         }
 
-        private void RightMotor_Click(object sender, MouseButtonEventArgs e)
+        private void RightMotor_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is PadViewModel padVm)
                 padVm.FireTestRightMotor();
@@ -2703,6 +2883,9 @@ namespace PadForge.Views
                 SyncLightbarHexBox();
                 SyncLightbarPreview();
                 SyncAudioHexBoxes();
+                // The route line reads the selected device's Control This
+                // Device's Lighting switch, which the anchor now carries.
+                SyncTabVisibility();
             }
             else if (e.PropertyName == nameof(PadViewModel.ProfileId))
             {
@@ -2815,6 +2998,9 @@ namespace PadForge.Views
             KbmSurfacesCombo.Visibility = isKbm ? Visibility.Visible : Visibility.Collapsed;
 
             ExtendedConfigBar.Visibility = isExtended ? Visibility.Visible : Visibility.Collapsed;
+            // The keyboard and mouse pickers (HIDMaestro 1.12.0) take Row 1
+            // the way the Extended and MIDI bars do.
+            KbmDeviceBar.Visibility = isKbm ? Visibility.Visible : Visibility.Collapsed;
 
             if (isExtended)
             {
@@ -3030,6 +3216,13 @@ namespace PadForge.Views
                     if (AudioHighHexBox != null && !AudioHighHexBox.IsKeyboardFocusWithin)
                         SyncOneAudioHex(AudioHighHexBox, "High");
                     break;
+                // The route line follows the switch even where no claim
+                // changes, a device offline or asleep, and names the hold
+                // this controller asks for.
+                case nameof(ViewModels.DeviceSlotConfig.PeripheralLightingEnabled):
+                case nameof(ViewModels.DeviceSlotConfig.PeripheralClaimLevel):
+                    SyncTabVisibility();
+                    break;
                 // Palette items (LightbarPaletteEntry) carry their own
                 // PropertyChanged via the ObservableCollection wiring in
                 // DeviceSlotConfig; their TextBoxes bind directly
@@ -3151,7 +3344,8 @@ namespace PadForge.Views
         /// <summary>Builds the lightbar preview scene for one Sony family
         /// out of the project's real 2D controller art (#175): the
         /// Gamepad-Asset-Pack base composite at native resolution inside
-        /// the LightbarPreviewHost Viewbox, plus one Rectangle per lightbar
+        /// the LightbarPreviewHost Viewbox, the triggers and stick caps it
+        /// leaves out (AddLightbarRestParts), plus one Rectangle per lightbar
         /// element whose OpacityMask is the pack's own strip PNG, so the
         /// lit shape is the art's shape (the DS4 front strip's alpha fades
         /// at both ends exactly like the baked art). Strip rectangles use
@@ -3195,7 +3389,9 @@ namespace PadForge.Views
             };
             Canvas.SetLeft(baseImg, 0);
             Canvas.SetTop(baseImg, 0);
+            Panel.SetZIndex(baseImg, 1);
             scene.Children.Add(baseImg);
+            AddLightbarRestParts(scene, isDs4);
 
             // Seed fill: the cold Off blue, frozen. SyncLightbarPreview
             // replaces it on the first pass right after this build.
@@ -3228,11 +3424,43 @@ namespace PadForge.Views
                 : new[] { MakeLitRect(_lightbarDs5Mask, 411, 189, 647, 293) };
             foreach (var rect in _lightbarRects)
                 _lightbarLitGroup.Children.Add(rect);
+            Panel.SetZIndex(_lightbarLitGroup, 3);
             scene.Children.Add(_lightbarLitGroup);
 
             LightbarPreviewHost.Children.Clear();
             LightbarPreviewHost.Children.Add(scene);
             _lightbarBuiltFamilyIsDs4 = isDs4;
+        }
+
+        /// <summary>Adds the parts of the controller the base art leaves out,
+        /// as the Preview tab's 2D view draws them at rest
+        /// (ControllerModel2DView.BuildModel): the L2 and R2 trigger
+        /// silhouettes behind the body (z 0, the body at z 1 covers their
+        /// lower edge) and the stick caps in front of it (z 2). They stay
+        /// still: this picture shows the lightbar, not the input. The lit
+        /// strips go above them all.</summary>
+        internal static void AddLightbarRestParts(Canvas scene, bool isDs4)
+        {
+            var overlays = isDs4 ? Models2D.DS4Layout.Overlays : Models2D.DualSenseLayout.Overlays;
+            string folder = isDs4 ? "DS4" : "DualSense";
+            foreach (var ov in overlays)
+            {
+                if (ov.ElementType is not (Models2D.OverlayElementType.TriggerBase or Models2D.OverlayElementType.StickRing))
+                    continue;
+                // A missing bitmap leaves the part empty, the soft degradation
+                // the strips and the 2D view use.
+                var part = new Image
+                {
+                    Source = EmbeddedBitmaps.Load($"2DModels/{folder}/{ov.ImageFile}"),
+                    Width = ov.Width,
+                    Height = ov.Height,
+                    Stretch = Stretch.Fill,
+                };
+                Canvas.SetLeft(part, ov.X);
+                Canvas.SetTop(part, ov.Y);
+                Panel.SetZIndex(part, ov.ElementType == Models2D.OverlayElementType.TriggerBase ? 0 : 2);
+                scene.Children.Add(part);
+            }
         }
 
         private System.Windows.Shapes.Rectangle MakeLitRect(
@@ -3581,7 +3809,7 @@ namespace PadForge.Views
         /// rows all follow on their own. The hex box is code-behind
         /// synced (not value-bound), so re-sync it explicitly, same
         /// contract as LightbarHexBox_Apply.</summary>
-        private void LightbarSwatch_Click(object sender, MouseButtonEventArgs e)
+        private void LightbarSwatch_Click(object sender, RoutedEventArgs e)
         {
             if (sender is not FrameworkElement fe || fe.Tag is not string hex) return;
             if (DataContext is not PadViewModel vm || vm.DeviceConfig == null) return;
@@ -4131,7 +4359,53 @@ namespace PadForge.Views
                 Set(MidiStartNoteBox, vm.MidiConfig.StartNote.ToString());
                 Set(MidiVelocityBox, vm.MidiConfig.Velocity.ToString());
                 _syncingMidiConfig = false;
+                SyncMidiOutputPortBox(vm, refreshPorts: false);
             }
+        }
+
+        // ── Legacy MIDI output port ──
+        // The picker lists "None" first, then every output port by the name
+        // it is saved under, then the saved port when it is not connected
+        // now, so the pick stays visible. The port list is read when the
+        // picker opens, never on a config change.
+
+        private List<string> _midiOutputPorts = new();
+        private bool _syncingMidiPort;
+
+        private void SyncMidiOutputPortBox(PadViewModel vm, bool refreshPorts)
+        {
+            if (MidiOutputPortBox == null) return;
+            if (refreshPorts)
+                _midiOutputPorts = Common.Input.MidiBackendLegacy.ListOutputPortsBounded();
+            string saved = vm.MidiConfig.OutputPort ?? string.Empty;
+            var items = new List<string> { Strings.Instance.Pad_MidiOutputPortNone };
+            items.AddRange(_midiOutputPorts);
+            if (saved.Length > 0 && !_midiOutputPorts.Contains(saved)) items.Add(saved);
+            // Index 0 is "None" whatever a port happens to be called.
+            int selected = saved.Length == 0 ? 0 : items.IndexOf(saved, 1);
+            if (!refreshPorts && MidiOutputPortBox.ItemsSource is List<string> shown
+                && shown.SequenceEqual(items) && MidiOutputPortBox.SelectedIndex == selected)
+                return;
+            _syncingMidiPort = true;
+            try
+            {
+                MidiOutputPortBox.ItemsSource = items;
+                MidiOutputPortBox.SelectedIndex = selected;
+            }
+            finally { _syncingMidiPort = false; }
+        }
+
+        private void MidiOutputPortBox_DropDownOpened(object sender, EventArgs e)
+        {
+            if (DataContext is PadViewModel vm) SyncMidiOutputPortBox(vm, refreshPorts: true);
+        }
+
+        private void MidiOutputPortBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_syncingMidiPort || DataContext is not PadViewModel vm) return;
+            int index = MidiOutputPortBox.SelectedIndex;
+            if (index < 0) return;
+            vm.MidiConfig.ChooseOutputPort(index == 0 ? string.Empty : MidiOutputPortBox.SelectedItem as string ?? string.Empty);
         }
 
         private void MidiConfig_Changed(object sender, RoutedEventArgs e) => ApplyMidiConfigValues();
@@ -4376,23 +4650,6 @@ namespace PadForge.Views
             cb.ItemsSource = axes;
         }
 
-        /// <summary>
-        /// Keeps a device/axis source picker's ItemsSource live outside the
-        /// dropdown-open path (owner bug 2026-08-10: the saved axis showed
-        /// blank at load and inconsistently after recording). DropDownOpened
-        /// and Loaded were the only population triggers, so three real flows
-        /// left the combo with a null or stale list that SelectedValue could
-        /// not display against: selecting a different action in the editor
-        /// (DataContext changes, items stay from the old action's device),
-        /// picking a different device (the axis list kept the old device's
-        /// axes until reopened), and the axis recorder writing
-        /// SourceDeviceGuid + SourceDeviceAxisIndex programmatically (no
-        /// dropdown ever opens). One hook per ComboBox instance, installed
-        /// on first Loaded/DropDownOpened, repopulates on DataContextChanged
-        /// and on the bound action's source-pair PropertyChanged, detaching
-        /// its action subscription on Unloaded so recycled template
-        /// instances never pile up handlers.
-        /// </summary>
         /// <summary>Holds a macro action's device and axis pair across a
         /// picker repopulation.
         ///
@@ -4424,6 +4681,23 @@ namespace PadForge.Views
             }
         }
 
+        /// <summary>
+        /// Keeps a device/axis source picker's ItemsSource live outside the
+        /// dropdown-open path (owner bug 2026-08-10: the saved axis showed
+        /// blank at load and inconsistently after recording). DropDownOpened
+        /// and Loaded were the only population triggers, so three real flows
+        /// left the combo with a null or stale list that SelectedValue could
+        /// not display against: selecting a different action in the editor
+        /// (DataContext changes, items stay from the old action's device),
+        /// picking a different device (the axis list kept the old device's
+        /// axes until reopened), and the axis recorder writing
+        /// SourceDeviceGuid + SourceDeviceAxisIndex programmatically (no
+        /// dropdown ever opens). One hook per ComboBox instance, installed
+        /// on first Loaded/DropDownOpened, repopulates on DataContextChanged
+        /// and on the bound action's source-pair PropertyChanged, detaching
+        /// its action subscription on Unloaded so recycled template
+        /// instances never pile up handlers.
+        /// </summary>
         private void HookDeviceAxisPickerRefresh(ComboBox cb, bool axisPicker)
         {
             if (cb.Tag is DeviceAxisPickerHook) return;
@@ -4940,6 +5214,46 @@ namespace PadForge.Views
             if (newIndex < 0 || newIndex == oldIndex) return;
             actions.Move(oldIndex, newIndex);
             lb.SelectedItem = dragged;
+        }
+
+        // The keyboard path for the same reorder: Alt+Up and Alt+Down move
+        // the selected step one place, with the single Actions.Move the drag
+        // commits, and the step keeps the focus.
+        private void ActionsList_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (sender is not ListBox lb) return;
+            int step = ReorderStep(Keyboard.Modifiers, e.Key, e.SystemKey);
+            if (step == 0) return;
+            e.Handled = true;
+            if (lb.SelectedItem is not MacroAction selected) return;
+            if (lb.ItemsSource is not System.Collections.ObjectModel.ObservableCollection<MacroAction> actions) return;
+            if (!MoveStep(actions, selected, step)) return;
+            lb.SelectedItem = selected;
+            lb.ScrollIntoView(selected);
+            // After layout, once the moved step's container is in place.
+            lb.Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+                (lb.ItemContainerGenerator.ContainerFromItem(selected) as ListBoxItem)?.Focus()));
+        }
+
+        /// <summary>How far Alt+Up (-1) or Alt+Down (+1) moves a step, or 0 for
+        /// any other key. With Alt held, WPF reports an arrow as Key.System
+        /// and the arrow itself in SystemKey.</summary>
+        internal static int ReorderStep(ModifierKeys modifiers, Key key, Key systemKey)
+        {
+            if (modifiers != ModifierKeys.Alt) return 0;
+            Key arrow = key == Key.System ? systemKey : key;
+            return arrow == Key.Up ? -1 : arrow == Key.Down ? 1 : 0;
+        }
+
+        /// <summary>Moves an item one step with the collection's own Move, so
+        /// selection and bindings survive. False at either end.</summary>
+        internal static bool MoveStep<T>(System.Collections.ObjectModel.ObservableCollection<T> items, T item, int step)
+        {
+            int oldIndex = items.IndexOf(item);
+            int newIndex = oldIndex + step;
+            if (oldIndex < 0 || step == 0 || newIndex < 0 || newIndex >= items.Count) return false;
+            items.Move(oldIndex, newIndex);
+            return true;
         }
 
         private static MacroAction ActionFromVisual(DependencyObject d)

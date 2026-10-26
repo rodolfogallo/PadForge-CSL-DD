@@ -463,6 +463,15 @@ namespace PadForge.Common.Input
                 ResolveThumbDeadZoneShape(slotIndex, left: false, ps));
         }
 
+        /// <summary>Test seam for <see cref="ApplyKbmStickSpeed"/>.</summary>
+        internal static void ApplyKbmStickSpeedForTest(ref short x, ref short y, double sens)
+            => ApplyKbmStickSpeed(ref x, ref y, sens);
+
+        /// <summary>Test seam for <see cref="EnsureRawShape"/>, so a guard
+        /// test can size a RawHidState the way Step 3 does.</summary>
+        internal static void EnsureRawShapeForTest(ref RawHidState raw, CustomControllerLayout cfg)
+            => EnsureRawShape(ref raw, cfg);
+
         /// <summary>Per-stick speed multiplier for the KEYBOARD AND MOUSE
         /// lane only, called from <see cref="MapInputToKbmRaw"/>: stick 0 is
         /// mouse movement (MouseDeltaX/Y) and stick 1 is the scroll wheel
@@ -477,15 +486,6 @@ namespace PadForge.Common.Input
         /// put the call there by mistake, which scaled exactly the sticks the
         /// owner had ruled out while still leaving the KBM rate outputs
         /// untouched.</para></summary>
-        /// <summary>Test seam for <see cref="ApplyKbmStickSpeed"/>.</summary>
-        internal static void ApplyKbmStickSpeedForTest(ref short x, ref short y, double sens)
-            => ApplyKbmStickSpeed(ref x, ref y, sens);
-
-        /// <summary>Test seam for <see cref="EnsureRawShape"/>, so a guard
-        /// test can size a RawHidState the way Step 3 does.</summary>
-        internal static void EnsureRawShapeForTest(ref RawHidState raw, CustomControllerLayout cfg)
-            => EnsureRawShape(ref raw, cfg);
-
         private static void ApplyKbmStickSpeed(ref short x, ref short y, double sens)
         {
             if (sens <= 0 || Math.Abs(sens - 1.0) < 1e-6) return;
@@ -914,15 +914,18 @@ namespace PadForge.Common.Input
                 {
                     var src = sources[i];
                     // A row modifier (Invert on Hold) is no source, whatever
-                    // its descriptor names, the row evaluators' rule.
-                    if (src == null || IsRowModifierSource(src)) continue;
+                    // its descriptor names, the row evaluators' rule. Nor is
+                    // a source whose kind reads no Descriptor on a stick:
+                    // the one an Incremental or Ramp source kept is no
+                    // input, and a motion kind reads gravity.
+                    if (src == null || IsRowModifierSource(src) || !KindReadsDescriptor(src.Kind, stickRead: true)) continue;
                     var d = src.Descriptor;
                     if (string.IsNullOrEmpty(d) || !d.StartsWith("Gyro ", StringComparison.Ordinal))
                         continue;
                     // Consume/postpone parity with the row evaluators: a
                     // suppressed source must not keep driving the cursor
                     // while its press is being eaten.
-                    if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                    if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                         continue;
 
                     var devState = LaneDeviceState(src, state, thisDeviceGuid);
@@ -966,11 +969,13 @@ namespace PadForge.Common.Input
                 for (int i = 0; i < sources.Count; i++)
                 {
                     var src = sources[i];
-                    if (src == null || IsRowModifierSource(src)) continue;
+                    // No modifier, and no Descriptor its kind does not read
+                    // (KindReadsDescriptor), as on the gyro lane.
+                    if (src == null || IsRowModifierSource(src) || !KindReadsDescriptor(src.Kind, stickRead: true)) continue;
                     if (!PadForge.Engine.Common.Mapping.SourceCoercion
                             .IsTouchpadFingerAxisDescriptor(src.Descriptor))
                         continue;
-                    if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                    if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                         continue;
 
                     var devState = LaneDeviceState(src, state, thisDeviceGuid);
@@ -1040,13 +1045,15 @@ namespace PadForge.Common.Input
             for (int i = 0; i < sources.Count; i++)
             {
                 var src = sources[i];
-                if (src == null || IsRowModifierSource(src)
+                // No modifier, and no Descriptor its kind does not read
+                // (KindReadsDescriptor), as on the mouse rate lanes.
+                if (src == null || IsRowModifierSource(src) || !KindReadsDescriptor(src.Kind, stickRead: true)
                     || !PadForge.Engine.Common.Mapping.SourceCoercion.IsFlickStickDescriptor(src.Descriptor))
                     continue;
                 // Consume/postpone parity with the row evaluators
                 // (2026-07-25 audit): a suppressed flick source must not
                 // keep ticking flick state while its press is being eaten.
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                     continue;
                 // Same cross-device resolution the per-target evaluators use:
                 // the source's own DeviceGuid wins. An empty one is this
@@ -1106,8 +1113,9 @@ namespace PadForge.Common.Input
                 {
                     if (src?.Descriptor == null) continue;
                     // A row modifier (Invert on Hold) is no source, whatever
-                    // its descriptor names, the row evaluators' rule.
-                    if (IsRowModifierSource(src)) continue;
+                    // its descriptor names, the row evaluators' rule, and
+                    // neither is a Descriptor its kind does not read.
+                    if (IsRowModifierSource(src) || !KindReadsDescriptor(src.Kind, stickRead: true)) continue;
                     if (!src.Descriptor.StartsWith("IR Pointer ", StringComparison.Ordinal)) continue;
                     if (!string.IsNullOrEmpty(src.DeviceGuid)
                         && !string.Equals(src.DeviceGuid, thisDeviceGuid, StringComparison.OrdinalIgnoreCase))
@@ -1119,7 +1127,7 @@ namespace PadForge.Common.Input
                     // Consume/postpone parity with the row evaluators
                     // (2026-07-25 audit): a suppressed pointer source must
                     // not keep steering the absolute cursor lane.
-                    if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                    if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                         continue;
                     // An aiming pointer is its layer's output (#206), as an
                     // engaged touchpad pointer is.
@@ -1186,7 +1194,8 @@ namespace PadForge.Common.Input
             if (row?.Sources == null) return null;
             foreach (var src in row.Sources)
             {
-                if (src?.Descriptor == null || IsRowModifierSource(src)) continue;
+                if (src?.Descriptor == null || IsRowModifierSource(src)
+                    || !KindReadsDescriptor(src.Kind, stickRead: true)) continue;
                 if (!PadForge.Engine.Common.Mapping.SourceCoercion
                         .IsTouchpadPointerDescriptor(src.Descriptor)) continue;
                 if (!string.IsNullOrEmpty(src.DeviceGuid)
@@ -1201,7 +1210,7 @@ namespace PadForge.Common.Input
                 // (2026-07-25 audit): a suppressed pointer source reads
                 // disengaged, so the caller falls through to the delta
                 // lane exactly as it does with no finger in the window.
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                     continue;
                 if (!PadForge.Engine.Common.Mapping.SourceCoercion
                         .IsTouchpadPointerEngaged(state, src.Descriptor)) continue;
@@ -1840,10 +1849,6 @@ namespace PadForge.Common.Input
         //  Dead zone processing
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Applies deadzone, anti-deadzone, and linear scaling to a pair
-        /// of thumbstick axes (X and Y) using the specified deadzone shape algorithm.
-        /// </summary>
         /// <summary>Test seam for <see cref="ApplyDeadZone"/>. Same
         /// arguments, no behavior of its own.</summary>
         internal static void ApplyDeadZoneForTest(ref short axisX, ref short axisY,
@@ -1857,6 +1862,10 @@ namespace PadForge.Common.Input
                 antiDeadZoneX, antiDeadZoneY, linear, maxRangeX, maxRangeY,
                 maxRangeXNeg, maxRangeYNeg, lutX, lutY, shape);
 
+        /// <summary>
+        /// Applies deadzone, anti-deadzone, and linear scaling to a pair
+        /// of thumbstick axes (X and Y) using the specified deadzone shape algorithm.
+        /// </summary>
         private static void ApplyDeadZone(ref short axisX, ref short axisY,
             double deadZoneX, double deadZoneY,
             double antiDeadZoneX, double antiDeadZoneY, double linear,
@@ -2313,11 +2322,6 @@ namespace PadForge.Common.Input
         //  Extended Custom mapping engine
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Maps a CustomInputState to a RawHidState using the PadSetting's Extended
-        /// dictionary-based mappings. Used for custom Extended configurations with
-        /// arbitrary numbers of axes, buttons, and POVs.
-        /// </summary>
         /// <summary>Ensures the scratch state's arrays match the layout
         /// shape (reallocates only on a layout edit).</summary>
         private static void EnsureRawShape(ref RawHidState raw, CustomControllerLayout cfg)
@@ -2371,6 +2375,11 @@ namespace PadForge.Common.Input
         /// floors treat a zero effective threshold as value &gt; 0.</summary>
         private const int TriggerClickActivationPercent = 0;
 
+        /// <summary>
+        /// Maps a CustomInputState to a RawHidState using the PadSetting's Extended
+        /// dictionary-based mappings. Used for custom Extended configurations with
+        /// arbitrary numbers of axes, buttons, and POVs.
+        /// </summary>
         internal static void MapInputToExtendedRaw(ref RawHidState raw,
             CustomInputState state, PadSetting ps,
             CustomControllerLayout cfg,
@@ -2790,6 +2799,11 @@ namespace PadForge.Common.Input
         private static readonly byte[] KbmKeyVkCodes;
         private static readonly int KbmKeyCount;
 
+        /// <summary>True when the key index has a Keyboard + Mouse row, so
+        /// the preview draws it clickable.</summary>
+        internal static bool IsKbmKeyTarget(int vk)
+            => vk >= 0 && vk <= 0xFF && Array.IndexOf(KbmKeyVkCodes, (byte)vk) >= 0;
+
         // ── Interpolated-key name tables (audit 1n) ──
         // The mapping dictionaries are keyed by a closed, index-driven
         // vocabulary ("KbmKey41", "RawAxis3", "MidiCC7", ...).
@@ -2905,6 +2919,9 @@ namespace PadForge.Common.Input
             // Numpad Enter, kept at its own index (RawInputListener.NumpadEnterKey).
             // The preview keyboard draws it, so leaving it out made that key dead.
             vks.Add(0x88);
+            // F13-F24, the non-US and Japanese keys, and the media keys, from
+            // the table the grid and the SOCD list read too.
+            vks.AddRange(KbmExtraKeys.Vks);
 
             KbmKeyVkCodes = vks.ToArray();
             KbmKeyCount = KbmKeyVkCodes.Length;

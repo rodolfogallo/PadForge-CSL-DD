@@ -59,16 +59,18 @@ namespace PadForge.ViewModels
         // singleton, so it lands in the event's weak list and can run AFTER
         // instance handlers (audit 2026-07-16: dropdowns stayed one
         // culture behind because the re-raise preceded the rebuild). The
-        // backing lists are stamped with the LCID they were built for, and
-        // every consumer path rebuilds them first when the culture moved.
-        // Whoever runs first does the work; order stops mattering.
-        private static int s_optionsLcid = System.Globalization.CultureInfo.CurrentUICulture.LCID;
+        // backing lists are stamped with the name of the culture they were
+        // built for, and every consumer path rebuilds them first when the
+        // culture moved. Whoever runs first does the work, so order stops
+        // mattering. The stamp is the name, not the LCID, because every
+        // language Windows has no number for shares LCID 4096 (#505).
+        private static string s_optionsCulture = System.Globalization.CultureInfo.CurrentUICulture.Name;
 
         internal static void EnsureOptionsCultureCurrent()
         {
-            int lcid = System.Globalization.CultureInfo.CurrentUICulture.LCID;
-            if (lcid == s_optionsLcid) return;
-            s_optionsLcid = lcid;
+            string culture = System.Globalization.CultureInfo.CurrentUICulture.Name;
+            if (culture == s_optionsCulture) return;
+            s_optionsCulture = culture;
             KindOptionsBacking = BuildKindOptions();
             HostHalfOptionsBacking = BuildHostHalfOptions();
             FireOptionsBacking = BuildFireOptions();
@@ -198,6 +200,7 @@ namespace PadForge.ViewModels
             OnPropertyChanged(nameof(HostInputLabel));
             OnPropertyChanged(nameof(HostInputTip));
             OnPropertyChanged(nameof(HostInputCaption));
+            RaiseRecordTexts();
             RefreshLayerChoices();
             RefreshInputChoices();
             foreach (var cell in Cells)
@@ -1047,7 +1050,16 @@ namespace PadForge.ViewModels
                 OnPropertyChanged(nameof(CustomXRecordIcon));
                 OnPropertyChanged(nameof(CustomYRecordIcon));
                 OnPropertyChanged(nameof(ClickRecordIcon));
+                RaiseRecordTexts();
             }
+        }
+
+        private void RaiseRecordTexts()
+        {
+            OnPropertyChanged(nameof(HostRecordText));
+            OnPropertyChanged(nameof(CustomXRecordText));
+            OnPropertyChanged(nameof(CustomYRecordText));
+            OnPropertyChanged(nameof(ClickRecordText));
         }
 
         internal void BeginRecord(MenuRecordTarget target)
@@ -1066,6 +1078,17 @@ namespace PadForge.ViewModels
         public string CustomXRecordIcon => IconFor(MenuRecordTarget.CustomX);
         public string CustomYRecordIcon => IconFor(MenuRecordTarget.CustomY);
         public string ClickRecordIcon => IconFor(MenuRecordTarget.Click);
+
+        private string TextFor(MenuRecordTarget t)
+            => _recordingTarget == t ? Strings.Instance.Common_Recording : Strings.Instance.Common_Record;
+
+        /// <summary>The record buttons' names for screen readers, "Record"
+        /// or "Recording" as the glyph shows, the text the Aim Engage record
+        /// button's tooltip gives.</summary>
+        public string HostRecordText => TextFor(MenuRecordTarget.Host);
+        public string CustomXRecordText => TextFor(MenuRecordTarget.CustomX);
+        public string CustomYRecordText => TextFor(MenuRecordTarget.CustomY);
+        public string ClickRecordText => TextFor(MenuRecordTarget.Click);
 
         // ── Fire mode / shape ────────────────────────────────────
 
@@ -1712,7 +1735,7 @@ namespace PadForge.ViewModels
         }
 
         private static SocdKeyOption[] _fullKeyOptionsCache;
-        private static int _fullKeyOptionsCulture;
+        private static string _fullKeyOptionsCulture;
 
         /// <summary>Every key the macro editor's Key Press offers (the
         /// full VirtualKey vocabulary, same localized labels), as cell
@@ -1725,7 +1748,7 @@ namespace PadForge.ViewModels
         {
             get
             {
-                int culture = System.Globalization.CultureInfo.CurrentUICulture.LCID;
+                string culture = System.Globalization.CultureInfo.CurrentUICulture.Name;
                 var cached = _fullKeyOptionsCache;
                 if (cached != null && _fullKeyOptionsCulture == culture)
                     return cached;

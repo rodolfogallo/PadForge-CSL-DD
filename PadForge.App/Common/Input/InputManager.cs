@@ -107,10 +107,32 @@ namespace PadForge.Common.Input
 
         private Thread _pollingThread;
 
-        // Last tick the unconditional poll heartbeat was written. See the
-        // HEARTBEAT write in the poll loop for why an always-on line exists
-        // in a log where everything else is edge-gated.
+        // Last tick the unconditional poll heartbeat was written. See
+        // WritePollHeartbeat for why an always-on line exists in a log where
+        // everything else is edge-gated.
         private long _pollHeartbeatTick;
+
+        /// <summary>The poll loop's channel heartbeat, every 10 s, from every
+        /// branch the loop takes. Every other line in this log is edge-gated
+        /// or threshold-gated, so an absence of lines has two possible
+        /// meanings: nothing happened, or the thing that writes stopped. The
+        /// 2026-07-26 VC investigation could not tell those apart and drew the
+        /// wrong conclusion from silence. This line is written from the poll
+        /// loop itself, so if it is present the loop AND the log are alive,
+        /// and any other silence is genuinely "no events". If it is absent,
+        /// the loop or the channel is dead. The idle and focus-suspended
+        /// branches go back to the loop's top before the active branch ends,
+        /// so they write it too: an idle engine once logged no heartbeat at
+        /// all and read as a dead loop. One line per 10 s is ~8.6k lines a
+        /// day, which the mirror carries without trouble.</summary>
+        private void WritePollHeartbeat(long cycleMs)
+        {
+            if (Environment.TickCount64 - _pollHeartbeatTick <= 10_000)
+                return;
+            _pollHeartbeatTick = Environment.TickCount64;
+            Engine.SdlDiagLog.WriteLine(
+                $"HEARTBEAT poll hz={CurrentFrequency:F0} idle={(IsIdle ? 1 : 0)} cycle={cycleMs}ms");
+        }
         // Injects accumulated macro mouse-move delta with a single SendInput per
         // tick, off the poll thread. See FlushPendingMouseMove: SendInput on the
         // 1000 Hz poll thread let a mouse-move macro drop the poll rate to ~200 Hz.
@@ -740,6 +762,42 @@ namespace PadForge.Common.Input
         public bool IsRunning => _running;
 
         /// <summary>
+        /// Whether this run's poll thread has finished a device enumeration,
+        /// so a row's IsOnline says what is connected. Step 1 notes the run
+        /// at the end of each enumeration, before <see cref="DevicesUpdated"/>
+        /// is raised (<see cref="NoteDevicesEnumerated"/>). Until then, and
+        /// while the manager is stopped, every row reads offline. Start moves
+        /// the run stamp, so a new run reads false with nothing to reset.
+        /// </summary>
+        public bool DevicesEnumerated
+        {
+            get
+            {
+                int run = System.Threading.Volatile.Read(ref _enumeratedRun);
+                return _running && run != 0 && run == System.Threading.Volatile.Read(ref _runGeneration);
+            }
+        }
+
+        // The stamp of the last run whose poll thread finished an
+        // enumeration, 0 for none.
+        private int _enumeratedRun;
+
+        // The stamp of the run this thread polls for, 0 on every other
+        // thread. Step 1 runs inside the poll loop without the stamp in hand.
+        [ThreadStatic] private static int t_runStamp;
+
+        /// <summary>Step 1's note that the poll loop of the run stamped
+        /// <paramref name="run"/> has finished an enumeration. Only the
+        /// current run's loop counts. A loop that outlived Stop's join can
+        /// still finish a pass, and its note would mark the next run's rows
+        /// as listed before that run had listed them.</summary>
+        internal void NoteDevicesEnumerated(int run)
+        {
+            if (run != 0 && run == System.Threading.Volatile.Read(ref _runGeneration))
+                System.Threading.Volatile.Write(ref _enumeratedRun, run);
+        }
+
+        /// <summary>
         /// When true, the polling loop skips the expensive pipeline steps and sleeps
         /// at a low rate (~20Hz) to minimize CPU usage. Device enumeration continues
         /// at a reduced rate so new controllers still appear on the Devices page.
@@ -773,6 +831,13 @@ namespace PadForge.Common.Input
         /// </summary>
         public event EventHandler<InputExceptionEventArgs> ErrorOccurred;
 
+        /// <summary>
+        /// Raised when a failure reported through <see cref="ErrorOccurred"/>
+        /// has recovered, with the message it was reported under, so a status
+        /// line that still shows it can be cleared.
+        /// </summary>
+        public event EventHandler<string> ErrorResolved;
+
         // ─────────────────────────────────────────────
         //  Constructor
         // ─────────────────────────────────────────────
@@ -801,6 +866,15 @@ namespace PadForge.Common.Input
         {
             if (_sdlInitialized)
                 return true;
+            // The test host starts no SDL device layer (DirectDeviceAccess).
+            // SDL opens every controller it lists and writes to some as it
+            // opens them, and the DualShock 3 and PS Move services start
+            // below. The answer of an SDL_Init that failed.
+            if (DirectDeviceAccess.RefusesAll)
+            {
+                RaiseError("SDL_Init failed: the test host starts no device layer", null);
+                return false;
+            }
 
             try
             {
@@ -1317,10 +1391,8 @@ namespace PadForge.Common.Input
         //  Start / Stop
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Starts the background polling thread. Safe to call multiple times;
-        /// subsequent calls are ignored if already running.
-        /// </summary>
+        private long _lastUiJoystickUpdateTicks;
+
         /// <summary>
         /// Pumps SDL's event queue. MUST be called on the thread that ran
         /// SDL_Init (the UI thread here), because SDL's hidapi creates its
@@ -1331,8 +1403,6 @@ namespace PadForge.Common.Input
         /// that drops on a read hiccup never comes back and a freshly-plugged one
         /// never appears until an app restart re-enumerates from scratch.
         /// </summary>
-        private long _lastUiJoystickUpdateTicks;
-
         public void PumpSdlEvents()
         {
             if (!_sdlInitialized)
@@ -1698,6 +1768,10 @@ namespace PadForge.Common.Input
         /// <summary>The switch's recorded state, replayed by InitializeSdl.</summary>
         public static bool FlydigiEnhancedProtocolDesired => _flydigiEnhancedDesired;
 
+        /// <summary>
+        /// Starts the background polling thread. Safe to call multiple times;
+        /// subsequent calls are ignored if already running.
+        /// </summary>
         public void Start()
         {
             if (_running || _disposed)
@@ -1716,6 +1790,14 @@ namespace PadForge.Common.Input
             // enumeration skips XUSB interfaces backed by a HIDMaestro virtual,
             // so they never take a user index. No per-process slot tracking,
             // no function-pointer hook.
+            //
+            // Keyboards and mice PadForge reads through its own Raw Input
+            // listener, which no fork filters. A Keyboard + Mouse slot can
+            // type and point through HIDMaestro's keyboards and mice
+            // (HIDMaestro 1.12.0), so the listener asks the same HIDMaestro
+            // test HidHide uses and leaves those devices out.
+            RawInputListener.IsOwnVirtualDevicePath ??= path =>
+                HidHideController.IsHidMaestroDeviceInstance(HidHideController.DevicePathToInstanceId(path));
 
             RawInputListener.Start();
 
@@ -1830,6 +1912,8 @@ namespace PadForge.Common.Input
             // riding it silenced the shakers on every profile switch.
             // EnsureStarted re-arms on the next engine start.
             RumbleAudioService.SilenceAll();
+            // #494: haptic mice, keyboards and the Sensa row take the same edges.
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.SilenceHaptics();
             RumbleAudioService.StopAll();
 
             // Retire this run before the joins. The join stays bounded so the
@@ -1959,6 +2043,9 @@ namespace PadForge.Common.Input
 
             try
             {
+                // Step 1 notes this run's enumerations by its stamp
+                // (NoteDevicesEnumerated).
+                t_runStamp = generation;
                 ReleaseInheritedLatches(generation);
                 long usioOwner = NewUsioOwner();
 
@@ -1990,6 +2077,7 @@ namespace PadForge.Common.Input
                     // ── Idle mode: skip expensive pipeline, sleep at ~20Hz ──
                     if (BeginIdlePoll())
                     {
+                        long tsIdleCycle = Stopwatch.GetTimestamp();
                         try
                         {
                             // #236: the feedback lane below never runs in
@@ -1998,6 +2086,9 @@ namespace PadForge.Common.Input
                             // (16 volatile writes at 20 Hz); without this
                             // the last nonzero pack would sound forever.
                             RumbleAudioService.SilenceAll();
+                            // Haptic peripherals (#494) take no such edge here:
+                            // Step 2 runs in idle and writes their level as it
+                            // writes SDL rumble.
                             if (System.Threading.Volatile.Read(ref _runGeneration) == generation) AdvanceUsioReopen(usioOwner);
                             long tsIdleSdl = Stopwatch.GetTimestamp();
                             SDL_UpdateJoysticks();
@@ -2011,7 +2102,14 @@ namespace PadForge.Common.Input
                             if (_enumerationTimer.ElapsedMilliseconds >= 5000 || ConsumeBlissBoxSwitchChange())
                             {
                                 _enumerationTimer.Restart();
+                                // Timed as the active branch times its sweep,
+                                // at the same bar, so a sweep stall shows in a
+                                // log taken with no slot online.
+                                long tsIdleEnum = Stopwatch.GetTimestamp();
                                 UpdateDevices();
+                                long idleEnumMs = (Stopwatch.GetTimestamp() - tsIdleEnum) * 1000 / Stopwatch.Frequency;
+                                if (idleEnumMs >= 25)
+                                    Engine.SdlDiagLog.WriteLine($"STALL idle enum={idleEnumMs}ms");
                             }
                             RetryPendingBlissBoxRows();
                             FlydigiReprobeTick();
@@ -2049,6 +2147,7 @@ namespace PadForge.Common.Input
                         _frequencyCounter = 0;
                         _frequencyTimer.Restart();
                         FrequencyUpdated?.Invoke(this, EventArgs.Empty);
+                        WritePollHeartbeat((Stopwatch.GetTimestamp() - tsIdleCycle) * 1000 / Stopwatch.Frequency);
                         Thread.Sleep(50);
                         firstCycle = true; // Ensure immediate enumeration on wake
                         // Reset wall-clock drift tracker so stale drift from
@@ -2064,6 +2163,7 @@ namespace PadForge.Common.Input
                         _frequencyCounter = 0;
                         _frequencyTimer.Restart();
                         FrequencyUpdated?.Invoke(this, EventArgs.Empty);
+                        WritePollHeartbeat(0);
                         Thread.Sleep(100);
                         firstCycle = true;
                         wallClock.Restart();
@@ -2142,7 +2242,6 @@ namespace PadForge.Common.Input
                         // UpdateVirtualDevices so a slot destroyed this
                         // tick publishes zeros the same tick.
                         UpdateRumbleAudioLane();
-                        UpdateSensaLane();
 
                         // Stall watchdog report: only outliers write anything.
                         long cycleMs = cycleTimer.ElapsedMilliseconds;
@@ -2150,25 +2249,8 @@ namespace PadForge.Common.Input
                             Engine.SdlDiagLog.WriteLine(
                                 $"STALL poll sdl={sdlMs}ms enum={enumMs}ms cycle={cycleMs}ms");
 
-                        // Channel heartbeat, UNCONDITIONAL, every 10 s. Every
-                        // other line in this log is edge-gated or
-                        // threshold-gated, so an absence of lines has two
-                        // possible meanings: nothing happened, or the thing
-                        // that writes stopped. The 2026-07-26 VC
-                        // investigation could not tell those apart and drew
-                        // the wrong conclusion from silence. This line is
-                        // emitted from the poll loop itself, so if it is
-                        // present the loop AND the log are alive, and any
-                        // other silence is genuinely "no events". If it is
-                        // absent, the loop or the channel is dead. One line
-                        // per 10 s is ~8.6k lines a day, which the mirror
-                        // carries without trouble.
-                        if (Environment.TickCount64 - _pollHeartbeatTick > 10_000)
-                        {
-                            _pollHeartbeatTick = Environment.TickCount64;
-                            Engine.SdlDiagLog.WriteLine(
-                                $"HEARTBEAT poll hz={CurrentFrequency:F0} idle={(IsIdle ? 1 : 0)} cycle={cycleMs}ms");
-                        }
+                        // Channel heartbeat, every 10 s from every branch.
+                        WritePollHeartbeat(cycleMs);
 
                         // Frequency measurement.
                         _frequencyCounter++;
@@ -2287,12 +2369,6 @@ namespace PadForge.Common.Input
         //  Device cleanup helpers
         // ─────────────────────────────────────────────
 
-        /// <summary>Last-chance hardware quiet for abnormal exits
-        /// (crash handler, ProcessExit). The Steam Deck's 0xEB rumble
-        /// command has no duration field and no firmware timeout in any
-        /// reference, so a nonzero rumble left behind by a dying process
-        /// buzzes the trackpad LRAs until something zeroes it
-        /// (discussion #179). Best-effort by design.</summary>
         /// <summary>True once an abnormal-exit quiesce ran. Sticky:
         /// the polling thread keeps ticking through a crash dialog and
         /// during ProcessExit (verified empirically on .NET 10), and one
@@ -2302,6 +2378,12 @@ namespace PadForge.Common.Input
         /// the Sony effects provider gate on this flag.</summary>
         public volatile bool OutputsQuiesced;
 
+        /// <summary>Last-chance hardware quiet for abnormal exits
+        /// (crash handler, ProcessExit). The Steam Deck's 0xEB rumble
+        /// command has no duration field and no firmware timeout in any
+        /// reference, so a nonzero rumble left behind by a dying process
+        /// buzzes the trackpad LRAs until something zeroes it
+        /// (discussion #179). Best-effort by design.</summary>
         public void QuiesceOutputs()
         {
             OutputsQuiesced = true;
@@ -2313,6 +2395,11 @@ namespace PadForge.Common.Input
 
         private void StopAllForceFeedback()
         {
+            // Peripheral haptics (#494) stop with every level at zero: their
+            // workers play nothing from the next tick on, and the crash path
+            // waits for the GameSense and Razer Sensa workers' next tick
+            // (PeripheralOutputHost.WaitForSilence).
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.SilenceHaptics();
             var devices = SettingsManager.UserDevices?.Items;
             if (devices == null) return;
 
@@ -2373,7 +2460,7 @@ namespace PadForge.Common.Input
                             if (ud.ForceFeedbackState.IsActive
                                 && PadForge.Engine.XboxControllerIdentity.IsImpulseTriggerDevice(ud.VendorId, ud.ProdId))
                             {
-                                try { XboxImpulseHidWriter.Write(ud, 0, 0, 0, 0); }
+                                try { XboxImpulseHidWriter.Write(ud, 0, 0, 0, 0, force: true); }
                                 catch { /* best effort */ }
                             }
                             // A Bliss-Box port's SDL rumble is inert while the
@@ -2398,6 +2485,11 @@ namespace PadForge.Common.Input
                                     BlissBoxRuntime.ResendMotors(ud.DevicePath);
                                 }
                             }
+                            // A haptic peripheral's level (#494) stops under the
+                            // gate as well. The silence above runs before any
+                            // gate, so a level the poll thread or Identify had
+                            // already decided under it would land after it.
+                            PadForge.Common.Input.Peripherals.PeripheralOutputs.StopHaptics(ud.InstanceGuid);
                             try { ud.ForceFeedbackState.StopDeviceForces(ud.Device); }
                             catch { /* best effort */ }
                         }
@@ -2430,25 +2522,6 @@ namespace PadForge.Common.Input
         //  Gyro engage state (per-slot, per-tick)
         // ─────────────────────────────────────────────
 
-        /// <summary>Settles each slot's <see cref="GyroEngagedFromButton"/>
-        /// bit once per tick from the slot's configured
-        /// <c>GyroAimEngageButton</c> + <c>GyroAimEngageMode</c>. Hold mode
-        /// tracks the button state directly (empty descriptor = always-on);
-        /// Toggle mode flips the sticky bit on each rising edge (empty
-        /// descriptor = no-op, the bit stays whatever the macro last set).
-        /// Runs between Step 2 (UpdateInputStates) and Step 3
-        /// (UpdateOutputStates) so both gyro evaluators — mapping-row reads
-        /// and motion passthrough — see a single, consistent engaged
-        /// decision for the tick.
-        ///
-        /// <para>Picks the first device on the slot that has a non-empty
-        /// engage button configured. Multi-device slots with multiple
-        /// engage buttons configured pick the first per UserSettings
-        /// storage order; this is intentional — the engage button is a
-        /// per-slot ergonomic, not a per-device setting at the runtime
-        /// level. Configuring engage on two devices simultaneously is
-        /// supported by editing the second device's PadSetting but only
-        /// the first-listed wins at runtime.</para></summary>
         /// <summary>Per-slot gyro-engage config snapshot, refreshed at 250 ms
         /// like its two engage-family siblings (_triggerRouteCfg,
         /// _mirrorEngageCfg): the SyncRoot lock + Items scan + GetPadSetting
@@ -2516,6 +2589,25 @@ namespace PadForge.Common.Input
             }
         }
 
+        /// <summary>Settles each slot's <see cref="GyroEngagedFromButton"/>
+        /// bit once per tick from the slot's configured
+        /// <c>GyroAimEngageButton</c> + <c>GyroAimEngageMode</c>. Hold mode
+        /// tracks the button state directly (empty descriptor = always-on);
+        /// Toggle mode flips the sticky bit on each rising edge (empty
+        /// descriptor = no-op, the bit stays whatever the macro last set).
+        /// Runs between Step 2 (UpdateInputStates) and Step 3
+        /// (UpdateOutputStates) so both gyro evaluators — mapping-row reads
+        /// and motion passthrough — see a single, consistent engaged
+        /// decision for the tick.
+        ///
+        /// <para>Picks the first device on the slot that has a non-empty
+        /// engage button configured. Multi-device slots with multiple
+        /// engage buttons configured pick the first per UserSettings
+        /// storage order; this is intentional — the engage button is a
+        /// per-slot ergonomic, not a per-device setting at the runtime
+        /// level. Configuring engage on two devices simultaneously is
+        /// supported by editing the second device's PadSetting but only
+        /// the first-listed wins at runtime.</para></summary>
         private void UpdateGyroEngageStates()
         {
             var settings = SettingsManager.UserSettings;
@@ -3684,20 +3776,27 @@ namespace PadForge.Common.Input
 
         /// <summary>
         /// Motion row candidates for the slot's engaged layer, in
-        /// preference order: the layer's own row, then Base, then any other
+        /// preference order: the row that applies, then Base, then any other
         /// row naming the target.
         ///
-        /// <para>Layer resolution is delegated ENTIRELY to the #221 resolver;
-        /// this only decides fallback ORDER, so there is no second
-        /// layer-resolution path to drift.</para>
+        /// <para>The row that applies is the engaged layer's own row when the
+        /// layer has one, and Base's row otherwise. A layer with no motion row
+        /// of its own therefore leaves Base driving whatever the layer's
+        /// replace or overlay mode, so motion never goes dark merely because a
+        /// layer engaged (owner decision, 2026-07-26). That is why the #221
+        /// resolver's <c>suppressed</c> flag cannot decide motion: replace
+        /// mode suppresses every target the layer has no row for.</para>
         ///
-        /// <para>The resolver's <c>suppressed</c> flag is deliberately
-        /// discarded here. Layers default to REPLACE semantics
-        /// (ShiftActivator.InheritUnmapped is false), so honoring suppression
-        /// would silence gyro and accel the moment a layer without a motion
-        /// row engaged. Motion never goes dark because of a layer: that is a
-        /// product decision, and it makes this change a strict preference
-        /// re-ordering, so nothing that resolves today stops resolving.</para></summary>
+        /// <para>When the row that applies has no motion input, an emptied
+        /// row or a Do Not Inherit row with no source, the channel is
+        /// switched off and the list stays empty (DC34). Walking on to Base or
+        /// to another layer's row filled a channel the user had turned off:
+        /// an emptied Base row read an inactive layer's row, and an emptied or
+        /// Do Not Inherit layer row read Base.</para>
+        ///
+        /// <para>A row that applies but whose devices are offline still hands
+        /// off down the list to a row with a live device, the walk's other
+        /// recorded decision.</para></summary>
         private static void BuildMotionRowCandidates(
             MappingSet ms, string targetName, int slotIndex, ref MappingRow[] buf, out int count)
         {
@@ -3714,11 +3813,26 @@ namespace PadForge.Common.Input
             int needed = ms.Rows.Count + 2;
             if (buf == null || buf.Length < needed) buf = new MappingRow[needed];
 
-            var activeRow = FindActiveRowForTarget(ms, targetName, slotIndex, out _);
-            if (activeRow != null) buf[count++] = activeRow;
+            // Both rows come from a walk of the live list, not from
+            // FindBaseRowForTarget's cache: that cache rebuilds only when the
+            // row count or the list changes, so rows removed and re-added at
+            // the same count hand back the removed row. The old walk hid that
+            // by scanning every row afterward, but a stale emptied row would
+            // now switch the channel off.
+            string engaged = GetEngagedLayerMask(slotIndex, ms);
+            bool layerEngaged = !string.IsNullOrEmpty(engaged)
+                && !string.Equals(engaged, "Base", StringComparison.Ordinal);
+            var baseRow = FindLayerRowForTarget(ms, targetName, "Base");
+            var applying = baseRow;
+            if (layerEngaged)
+            {
+                var layerRow = FindLayerRowForTarget(ms, targetName, engaged);
+                if (layerRow != null) applying = layerRow;
+            }
+            if (applying != null && MappingSetMigrator.IsEmptyMotionRow(applying)) return;
 
-            var baseRow = FindBaseRowForTarget(ms, targetName);
-            if (baseRow != null && !ReferenceEquals(baseRow, activeRow)) buf[count++] = baseRow;
+            if (applying != null) buf[count++] = applying;
+            if (baseRow != null && !ReferenceEquals(baseRow, applying)) buf[count++] = baseRow;
 
             var rows = ms.Rows;
             for (int r = 0; r < rows.Count && count < buf.Length; r++)
@@ -3726,18 +3840,38 @@ namespace PadForge.Common.Input
                 var row = rows[r];
                 if (row == null) continue;
                 if (!string.Equals(row.Target, targetName, StringComparison.Ordinal)) continue;
-                if (ReferenceEquals(row, activeRow) || ReferenceEquals(row, baseRow)) continue;
+                if (ReferenceEquals(row, applying) || ReferenceEquals(row, baseRow)) continue;
                 buf[count++] = row;
             }
         }
 
-        /// <summary>Checks the idle gate and publishes neutral DSU data before
-        /// idle maintenance. No input evaluation or native submission runs here.</summary>
+        /// <summary>The row <paramref name="layerMask"/> itself carries for
+        /// the target, or null when the layer has none. Bound by the captured
+        /// count and re-checked each step, like FindActiveRowForTarget's walk,
+        /// because the UI thread edits the list.</summary>
+        private static MappingRow FindLayerRowForTarget(MappingSet ms, string targetName, string layerMask)
+        {
+            var rows = ms?.Rows;
+            if (rows == null) return null;
+            MappingRow found = null;
+            int n = rows.Count;
+            for (int i = 0; i < n && i < rows.Count; i++)
+            {
+                var r = rows[i];
+                if (r == null) continue;
+                if (!string.Equals(r.Target, targetName, StringComparison.Ordinal)) continue;
+                if (string.Equals(r.LayerMask ?? "Base", layerMask, StringComparison.Ordinal)) found = r;
+            }
+            return found;
+        }
+
         /// <summary>True once the idle entry edge has neutralized the outputs.
         /// Cleared when the engine leaves idle so the next entry neutralizes
         /// again.</summary>
         private bool _idleNeutralized;
 
+        /// <summary>Checks the idle gate and publishes neutral DSU data before
+        /// idle maintenance. No input evaluation or native submission runs here.</summary>
         internal bool BeginIdlePoll()
         {
             if (!_idle) { _idleNeutralized = false; return false; }
@@ -3831,6 +3965,10 @@ namespace PadForge.Common.Input
             }
 
             RumbleAudioService.SilenceAll();
+            // #494: haptic mice, keyboards and the Sensa row take the same
+            // edge, except a level a Remote Link peer drives, which keeps
+            // playing like a peer-driven SDL rumble.
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.SilenceHaptics(keepRelayed: true);
             try
             {
                 if (submitControllers == null) UpdateVirtualDevices();
@@ -4023,14 +4161,31 @@ namespace PadForge.Common.Input
         //  Error helper
         // ─────────────────────────────────────────────
 
-        private void RaiseError(string message, Exception ex)
+        private void RaiseError(string message, Exception ex) => RaiseError(message, message, ex);
+
+        /// <summary>Raises a failure with a diagnostics log line of its own:
+        /// <paramref name="message"/> is the status text, in the UI language,
+        /// and <paramref name="logLine"/> is the log's, in English, since the
+        /// people who read the log need not share the user's
+        /// language.</summary>
+        private void RaiseError(string message, string logLine, Exception ex)
         {
             // The status bar shows only the headline; without this line the
             // exception's mechanism is invisible everywhere (the VR-create
             // failure of 2026-08-08 surfaced as a bare "Failed to create Vr
             // virtual controller" with the sharing-violation detail dropped).
-            PadForge.Engine.SdlDiagLog.WriteLine($"ERROR {message}: {ex}");
+            PadForge.Engine.SdlDiagLog.WriteLine($"ERROR {logLine}: {ex}");
             ErrorOccurred?.Invoke(this, new InputExceptionEventArgs(message, ex));
+        }
+
+        private void RaiseErrorResolved(string message) => RaiseErrorResolved(message, message);
+
+        /// <summary>Clears a failure raised with a log line of its own, with
+        /// the same two texts.</summary>
+        private void RaiseErrorResolved(string message, string logLine)
+        {
+            PadForge.Engine.SdlDiagLog.WriteLine($"RECOVERED {logLine}");
+            ErrorResolved?.Invoke(this, message);
         }
 
         // ─────────────────────────────────────────────
@@ -4107,6 +4262,8 @@ namespace PadForge.Common.Input
             ShutdownHandheldInputs();
             ShutdownHeadTrackerInputs();
             ShutdownLogitechGKeysInputs();
+            ShutdownPeripheralRows();
+            ShutdownTouchSenseMice();
             ShutdownAnalogKeyboardInputs();
             ShutdownSdl();
             _gyroTiltStates.Clear();
@@ -4116,10 +4273,13 @@ namespace PadForge.Common.Input
             GC.SuppressFinalize(this);
         }
 
-        ~InputManager()
-        {
-            Dispose();
-        }
+        // No finalizer. Dispose joins threads and shuts down services every
+        // manager shares (voice macros, the NFC reader, the handheld chord
+        // runtime), so it must never run on the finalizer thread at whatever
+        // moment a dropped manager is collected. An earlier finalizer called
+        // Dispose. In the tests, a manager that was never constructed threw
+        // there and ended the test host, and one left reading as running
+        // closed the Bliss-Box runtime under another test.
     }
 
     /// <summary>

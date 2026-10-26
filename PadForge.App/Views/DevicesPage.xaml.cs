@@ -148,14 +148,14 @@ namespace PadForge.Views
             if (Pad2Dot4 != null) { Canvas.SetLeft(Pad2Dot4, vm.Pad2X4 * w - 7); Canvas.SetTop(Pad2Dot4, vm.Pad2Y4 * h - 7); }
         }
 
+        /// <summary>The rumble capability chip's click (a Border, so a mouse
+        /// handler rather than a Button Click).</summary>
+        private void IdentifyChip_Click(object sender, RoutedEventArgs e)
+            => IdentifyDevice_Click(sender, e);
+
         /// <summary>Identify buzz (#293): route through InputService, which
         /// picks the sole-writer lane for mapped devices and the direct train
         /// for unmapped ones.</summary>
-        /// <summary>The rumble capability chip's click (a Border, so a mouse
-        /// handler rather than a Button Click).</summary>
-        private void IdentifyChip_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
-            => IdentifyDevice_Click(sender, e);
-
         private void IdentifyDevice_Click(object sender, RoutedEventArgs e)
         {
             // The button lives in the details pane, so the target is the
@@ -240,7 +240,7 @@ namespace PadForge.Views
         /// <summary>Facet chip click (#175 phase 2 item 13): filters the
         /// device list by type family. Chips are Border tokens (PipelineChip
         /// precedent); Tag carries the locale-neutral facet token.</summary>
-        private void FacetChip_Click(object sender, MouseButtonEventArgs e)
+        private void FacetChip_Click(object sender, RoutedEventArgs e)
         {
             if (sender is FrameworkElement fe && fe.Tag is string facet &&
                 DataContext is ViewModels.DevicesViewModel vm)
@@ -311,15 +311,6 @@ namespace PadForge.Views
             vm.NotifyDeviceHidingChanged(dev.InstanceGuid);
         }
 
-        /// <summary>
-        /// Persists the idle-disconnect minutes (#162) when the box loses focus,
-        /// through the same DevicesViewModel → DeviceService channel as the
-        /// hiding toggles. The binding is force-committed first: WPF does not
-        /// guarantee the LostFocus-triggered source update runs before this
-        /// instance handler, and when the handler won the race it persisted the
-        /// STALE value, which the next device-list sync then wrote back over
-        /// the user's edit (observed: 1 → 0 reverted to 1).
-        /// </summary>
         /// <summary>Quick Charge checkbox (#372): the TwoWay binding has
         /// already written the row when Click fires, so this only flushes
         /// the row into the persisted UserDevice, the same lane as the
@@ -356,6 +347,15 @@ namespace PadForge.Views
             vm.NotifyDeviceHidingChanged(dev.InstanceGuid);
         }
 
+        /// <summary>
+        /// Persists the idle-disconnect minutes (#162) when the box loses focus,
+        /// through the same DevicesViewModel → DeviceService channel as the
+        /// hiding toggles. The binding is force-committed first: WPF does not
+        /// guarantee the LostFocus-triggered source update runs before this
+        /// instance handler, and when the handler won the race it persisted the
+        /// STALE value, which the next device-list sync then wrote back over
+        /// the user's edit (observed: 1 → 0 reverted to 1).
+        /// </summary>
         private void IdleDisconnect_LostFocus(object sender, RoutedEventArgs e)
         {
             var vm = DataContext as ViewModels.DevicesViewModel;
@@ -373,7 +373,7 @@ namespace PadForge.Views
         private void ShowHidingWarningFlyout(CheckBox cb, ViewModels.DevicesViewModel vm,
             ViewModels.DeviceRowViewModel dev, string message, bool isHidHide)
         {
-            var warningIcon = new TextBlock
+            var warningIcon = new PadForge.Controls.GlyphText
             {
                 Text = "\uE7BA",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -487,7 +487,7 @@ namespace PadForge.Views
                 sb.Append(Uri.EscapeDataString(dev.SdlGuid));
             }
 
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            PadForge.Common.ShellLaunch.Start(new System.Diagnostics.ProcessStartInfo
             {
                 FileName = sb.ToString(),
                 UseShellExecute = true
@@ -595,7 +595,7 @@ namespace PadForge.Views
                 if (dev.HasBattery)
                     sb.AppendLine($"BATT      {dev.BatteryText}" + (dev.BatteryCharging ? " CHG" : string.Empty));
 
-                Clipboard.SetText(sb.ToString());
+                PadForge.Common.ShellLaunch.SetClipboardText(sb.ToString());
                 if (mainVm != null)
                     mainVm.StatusText = Strings.Instance.Status_DossierCopied;
             }

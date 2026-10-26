@@ -2,6 +2,7 @@
 using PadForge.Engine;
 using PadForge.Engine.Common.Mapping;
 using PadForge.Engine.Data;
+using PadForge.Engine.Menus;
 
 namespace PadForge.Common.Input
 {
@@ -158,7 +159,19 @@ namespace PadForge.Common.Input
                 if (i == trimIdx) continue;
                 var src = srcs[i];
                 if (src == null || IsRowModifierSource(src)) continue;
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false)) continue;
+                if (string.IsNullOrEmpty(src.DeviceGuid)
+                    && ReadsKeysOnPassInHand(src, currentDeviceGuid, slotIndex, currentState))
+                {
+                    // Its keys read the controllers they name (KeyHeld), so the
+                    // pass in hand reads it once. A gated one reads its gates
+                    // on each device in the walk below (ReadsKeysOnPassInHand).
+                    float kv = SourceEvaluator.EvaluateForTriggerTarget(
+                        currentState, src, slotIndex, row.Target, i, slotRuntime, dt,
+                        evaluatedDeviceGuid: currentDeviceGuid, layer: row.LayerMask);
+                    if (kv > gate) gate = kv;
+                    continue;
+                }
                 // Empty DeviceGuid = "the device currently being evaluated"
                 // (the documented MappingSource.DeviceGuid contract, same
                 // resolution the single-source per-target evaluators use).
@@ -210,10 +223,19 @@ namespace PadForge.Common.Input
             if (held && trimIdx >= 0)
             {
                 var trimSrc = srcs[trimIdx];
-                if (!IsSourceSuppressedPostpone(slotIndex, trimSrc.DeviceGuid, trimSrc.Descriptor))
+                if (!IsSourceSuppressedPostpone(slotIndex, trimSrc, stickRead: true))
                 {
                     float v = 0f;
-                    if (string.IsNullOrEmpty(trimSrc.DeviceGuid))
+                    if (string.IsNullOrEmpty(trimSrc.DeviceGuid)
+                        && ReadsKeysOnPassInHand(trimSrc, currentDeviceGuid, slotIndex, currentState, stickRead: true))
+                    {
+                        // Its keys read the controllers they name (KeyHeld). A
+                        // gated one takes the walk below.
+                        v = SourceEvaluator.EvaluateForBipolarAxisTarget(
+                            currentState, trimSrc, slotIndex, row.Target, trimIdx, slotRuntime, dt,
+                            evaluatedDeviceGuid: currentDeviceGuid, layer: row.LayerMask);
+                    }
+                    else if (string.IsNullOrEmpty(trimSrc.DeviceGuid))
                     {
                         // Signed read, so the strongest deflection wins by
                         // magnitude rather than by max, the same selection the
@@ -863,6 +885,32 @@ namespace PadForge.Common.Input
             return false;
         }
 
+        /// <summary>The hold-back test of one source on a lane:
+        /// <see cref="IsSourceSuppressedPostpone(int, string, string)"/> on its
+        /// Descriptor where its kind reads the Descriptor on that lane
+        /// (<see cref="KindReadsDescriptor"/>, with <paramref name="stickRead"/>
+        /// marking the stick lane), and false where it does not. An Incremental
+        /// or Ramp source reads its Up and Down keys, and a motion kind on a
+        /// stick reads gravity or the shake envelope, so the Descriptor either
+        /// kept from an earlier kind is no input. Weighed, it dropped the
+        /// source from its row while an activator held that old input or a
+        /// consuming macro ate it. A key is held back where it is read
+        /// (<see cref="KeyHeldBack"/>).
+        ///
+        /// <para>A steering kind reads two inputs as one stick on the stick
+        /// lane (<see cref="ReadsStickPair"/>), its Descriptor and its
+        /// ParamYDescriptor, and either one held back holds the source back
+        /// there. The Descriptor alone was weighed, so an activator on the
+        /// stick's second axis let the source steer on. On every other lane
+        /// the kind reads its Descriptor alone.</para></summary>
+        internal static bool IsSourceSuppressedPostpone(int slotIndex, MappingSource src, bool stickRead)
+        {
+            if (src == null || !KindReadsDescriptor(src.Kind, stickRead)) return false;
+            if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) return true;
+            return stickRead && ReadsStickPair(src.Kind) && !string.IsNullOrEmpty(src.ParamYDescriptor)
+                && IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.ParamYDescriptor);
+        }
+
         /// <summary>Folds a "Gamepad ..." alias to the canonical per-device
         /// descriptor (the public shape of Engine's internal
         /// CanonicalDescriptor) so the suppression key and its lookup agree
@@ -1175,11 +1223,11 @@ namespace PadForge.Common.Input
                 _suppressedSourcesBySlot[i] = null;
                 _suppressedScratchBySlot[i]?.Clear();
             }
+            // A commit recorded against a layer (DC20) belongs to the
+            // engagement this transition just cleared.
+            ClearLayerExitCommits();
         }
 
-        /// <summary>Clears one slot's shift runtime state. Use when a single
-        /// slot changes shift-activator topology (e.g. activator added/
-        /// removed/edited) and we want the new shape to start clean.</summary>
         /// <summary>Macro-driven layer switch (#377): engages
         /// <paramref name="mask"/> on the slot with the Latch ("Custom")
         /// activator's own discipline, writing the shift runtime's
@@ -1261,6 +1309,9 @@ namespace PadForge.Common.Input
             }
         }
 
+        /// <summary>Clears one slot's shift runtime state. Use when a single
+        /// slot changes shift-activator topology (e.g. activator added/
+        /// removed/edited) and we want the new shape to start clean.</summary>
         public static void ClearShiftRuntime(int slotIndex)
         {
             if (slotIndex < 0 || slotIndex >= _shiftRuntime.Length) return;
@@ -1272,12 +1323,6 @@ namespace PadForge.Common.Input
             _suppressedScratchBySlot[slotIndex]?.Clear();
         }
 
-        /// <summary>Inspect-only snapshot of the active engaged layer for a
-        /// slot. Returns <c>"Base"</c> when nothing is engaged; otherwise
-        /// the LayerMask of the activator at the top of the engagement
-        /// stack (or the Custom-mode layer override when set). Used by
-        /// the v3 visual overlay to display the live layer state without
-        /// having to thread state across the polling-thread boundary.</summary>
         /// <summary>Immutable memo of one resolved mask. The KBM/Extended
         /// path resolves the mask once per TARGET (~110 lock round-trips
         /// per device pass at 1 kHz); the engaged state changes at human
@@ -1297,6 +1342,12 @@ namespace PadForge.Common.Input
         }
         private static readonly EngagedMaskMemo[] _engagedMaskMemos = new EngagedMaskMemo[MaxPads];
 
+        /// <summary>Inspect-only snapshot of the active engaged layer for a
+        /// slot. Returns <c>"Base"</c> when nothing is engaged; otherwise
+        /// the LayerMask of the activator at the top of the engagement
+        /// stack (or the Custom-mode layer override when set). Used by
+        /// the v3 visual overlay to display the live layer state without
+        /// having to thread state across the polling-thread boundary.</summary>
         public static string GetEngagedLayerMask(int slotIndex, MappingSet mappingSet)
         {
             if (slotIndex < 0 || slotIndex >= _shiftRuntime.Length) return "Base";
@@ -1651,12 +1702,16 @@ namespace PadForge.Common.Input
             //    into WasDown below, which keeps the postpone suppression
             //    from consuming it, so the button's mapping rows on the
             //    engaged layer fire instead: the same physical button
-            //    carries a different job per layer, which is the point. ──
+            //    carries a different job per layer, which is the point.
+            //    A menu commit made by leaving the host layer (DC20) rises
+            //    after that layer has ended, so it opens the gate through
+            //    LayerExitCommitOpensActivator. ──
             if (!string.IsNullOrEmpty(act.HostLayerMask))
             {
                 bool hostRawRising = inputDown && !rt.HostGateRawWasDown[actIdx];
                 if (hostRawRising)
-                    rt.HostGateOpen[actIdx] = HostGateSatisfied(rt, activators, act.HostLayerMask);
+                    rt.HostGateOpen[actIdx] = HostGateSatisfied(rt, activators, act.HostLayerMask)
+                        || LayerExitCommitOpensActivator(act, slotIndex);
                 rt.HostGateRawWasDown[actIdx] = inputDown;
                 if (!inputDown) rt.HostGateOpen[actIdx] = false;
                 inputDown = rt.HostGateOpen[actIdx];
@@ -1841,12 +1896,16 @@ namespace PadForge.Common.Input
 
                     // v9 host-layer condition: the Previous button reads
                     // outside the shared input path above, so it carries its
-                    // own press-latched gate (same contract, own latches).
+                    // own press-latched gate (same contract, own latches,
+                    // and the same opening for a commit made by leaving the
+                    // host layer).
                     if (!string.IsNullOrEmpty(act.HostLayerMask))
                     {
                         bool prevHostRawRising = prevDown && !rt.HostGatePrevRawWasDown[actIdx];
                         if (prevHostRawRising)
-                            rt.HostGatePrevOpen[actIdx] = HostGateSatisfied(rt, activators, act.HostLayerMask);
+                            rt.HostGatePrevOpen[actIdx] = HostGateSatisfied(rt, activators, act.HostLayerMask)
+                                || IsLayerExitCommitCell(act.CyclePrevDescriptor, act.HostLayerMask, slotIndex,
+                                    MenuClock.NowMs);
                         rt.HostGatePrevRawWasDown[actIdx] = prevDown;
                         if (!prevDown) rt.HostGatePrevOpen[actIdx] = false;
                         prevDown = rt.HostGatePrevOpen[actIdx];
@@ -1971,7 +2030,11 @@ namespace PadForge.Common.Input
         /// mid-pass is deliberate: an earlier activator's transition this
         /// tick counts, and the alternative (a tick-start snapshot) costs
         /// a lock on every pass for a distinction no press can observe.
-        /// Only called on press edges of host-gated activators.</summary>
+        /// Only called on press edges of host-gated activators. A press that
+        /// is a menu commit made by leaving the host layer lands after that
+        /// layer has ended, so this reads false for it, and
+        /// <see cref="LayerExitCommitOpensActivator"/> opens the gate
+        /// instead (DC20).</summary>
         private static bool HostGateSatisfied(
             ShiftRuntime rt,
             System.Collections.Generic.List<ShiftActivator> activators,
@@ -1999,6 +2062,27 @@ namespace PadForge.Common.Input
                 engaged = string.IsNullOrEmpty(w?.LayerMask) ? "Base" : w.LayerMask;
             }
             return string.Equals(engaged, hostMask, System.StringComparison.Ordinal);
+        }
+
+        /// <summary>DC20 for an activator with a host layer
+        /// (<see cref="ShiftActivator.HostLayerMask"/>): true when every leg
+        /// it reads is a menu cell whose live commit leaving the host layer
+        /// made. Such a commit rises in a frame where the host has already
+        /// ended, so <see cref="HostGateSatisfied"/> reads the new layer and
+        /// would close the gate on it. The rule
+        /// <c>LayerExitCommitOpensMacro</c> applies to a macro's trigger: a
+        /// leg that is anything else (a third leg, an Axis activator's gate
+        /// or its input) is another input of the departed layer, at rest
+        /// after it, and keeps the gate closed.</summary>
+        private static bool LayerExitCommitOpensActivator(ShiftActivator act, int slotIndex)
+        {
+            if (!string.IsNullOrEmpty(act.Gate2Descriptor)) return false;
+            long nowMs = MenuClock.NowMs;
+            string kind = act.Kind ?? "Button";
+            if (kind == "Axis") return false;
+            if (!IsLayerExitCommitCell(act.Descriptor, act.HostLayerMask, slotIndex, nowMs)) return false;
+            return kind != "Chord"
+                   || IsLayerExitCommitCell(act.ChordSecondDescriptor, act.HostLayerMask, slotIndex, nowMs);
         }
 
         /// <summary><see cref="ReadActivatorInput"/> against the device behind
@@ -2164,12 +2248,6 @@ namespace PadForge.Common.Input
             }
         }
 
-        /// <summary>#206 edge-mode fire decision, one place for Toggle /
-        /// Latch / Sticky. DelayMs 0 keeps the classic rising edge.
-        /// DelayMs &gt; 0 is a long press: fires exactly once when the hold
-        /// crosses the threshold; <paramref name="longPressFired"/> is
-        /// the once-per-hold latch, cleared on release. Pure so the
-        /// state machine is testable frame by frame.</summary>
         /// <summary>One Cycle step edge: the press edge normally, the release
         /// edge under Fire on Release. Cycle keeps its no-DelayMs contract in
         /// both modes (a hold-to-engage debounce makes no sense on a
@@ -2178,6 +2256,12 @@ namespace PadForge.Common.Input
         internal static bool CycleStepEdge(bool down, bool wasDown, bool fireOnRelease)
             => fireOnRelease ? (!down && wasDown) : (down && !wasDown);
 
+        /// <summary>#206 edge-mode fire decision, one place for Toggle /
+        /// Latch / Sticky. DelayMs 0 keeps the classic rising edge.
+        /// DelayMs &gt; 0 is a long press: fires exactly once when the hold
+        /// crosses the threshold; <paramref name="longPressFired"/> is
+        /// the once-per-hold latch, cleared on release. Pure so the
+        /// state machine is testable frame by frame.</summary>
         internal static bool ComputeActivatorFire(
             bool inputDown, bool wasDown, long heldMs, int delayMs,
             ref bool longPressFired, bool fireOnRelease = false)
@@ -2411,13 +2495,18 @@ namespace PadForge.Common.Input
             ref Gamepad gp)
         {
             if (state == null || mappingSet == null) return;
-            // Snapshot Rows once — the save path mutates the live list on
-            // the UI thread (Rows.Add + Sources.Clear/Add inside
+            // Snapshot Rows once. The save path appends to the live list on
+            // the UI thread (Rows.Add inside
             // PushUiExtraSourcesIntoSlotMappingSets), which previously
             // produced spurious "Error mapping device {guid}" errors when
-            // a save raced the polling-thread iteration here. The snapshot
-            // is an array of MappingRow references, so per-row Sources
-            // still need SnapshotSources to handle the inner-list race.
+            // a save raced the polling-thread iteration here. Every writer
+            // that removes rows from a live set or rewrites a live row's
+            // sources builds a new list and swaps it in by reference, so a
+            // reader that captured a list keeps a complete one. (The load's
+            // SanitizeMappingSet edits in place a set it has not published
+            // yet.) The snapshot is an array of MappingRow references, and
+            // per-row Sources are read through SnapshotSources or a captured
+            // local.
             var rowsSnapshot = SnapshotRows(mappingSet, out int rowsSnapshotCount);
             if (rowsSnapshotCount == 0) return;
 
@@ -2612,7 +2701,7 @@ namespace PadForge.Common.Input
                         var src = rowSources[i];
                         if (IsRowModifierSource(src)) continue;
                         if (!SourceMatchesDevice(src, thisDeviceGuid, slotIndex, state)) continue;
-                        if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                        if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false)) continue;
                         boolContribs.Add(SourceEvaluator.EvaluateForButtonTarget(
                             state, src, globalAxisToButtonThreshold,
                             slotIndex, row.Target, i, runtime, dt,
@@ -2643,7 +2732,7 @@ namespace PadForge.Common.Input
                         var src = rowSources[i];
                         if (IsRowModifierSource(src)) continue;
                         if (!SourceMatchesDevice(src, thisDeviceGuid, slotIndex, state, stickRead: true)) continue;
-                        if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                        if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true)) continue;
                         axisContribs.Add(SourceEvaluator.EvaluateForBipolarAxisTarget(
                             state, src, slotIndex, row.Target, i, runtime, dt,
                             evaluatedDeviceGuid: thisDeviceGuid, layer: row.LayerMask));
@@ -2685,7 +2774,7 @@ namespace PadForge.Common.Input
                         var src = rowSources[i];
                         if (IsRowModifierSource(src)) continue;
                         if (!SourceMatchesDevice(src, thisDeviceGuid, slotIndex, state)) continue;
-                        if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                        if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false)) continue;
                         axisContribs.Add(SourceEvaluator.EvaluateForTriggerTarget(
                             state, src, slotIndex, row.Target, i, runtime, dt,
                             evaluatedDeviceGuid: thisDeviceGuid, layer: row.LayerMask));
@@ -2697,6 +2786,12 @@ namespace PadForge.Common.Input
                     WriteTriggerTarget(row.Target, combinedTrig, ref gp);
                 }
             }
+
+            // DC20: a menu commit made by leaving a layer reads the rows that
+            // layer reads, for the committed cell alone. After the loop, so it
+            // merges into whatever the engaged layer's rows wrote.
+            ApplyLayerExitCommitRows(state, mappingSet, rowsSnapshot, rowsSnapshotCount, activeMask,
+                thisDeviceGuid, globalAxisToButtonThreshold, slotIndex, ref gp);
         }
 
         /// <summary>True when any source on this row has Kind=InvertOnHold
@@ -2706,10 +2801,13 @@ namespace PadForge.Common.Input
         /// <see cref="IsRowModifierSource"/>); only its ParamModifier
         /// affects the row by sign-flipping the post-combine output.
         ///
-        /// <para>The modifier is read against each source's own DeviceGuid
-        /// when set; otherwise against the device currently processing
-        /// the row. Multiple InvertOnHold sources on one row OR together:
-        /// any held modifier triggers the flip.</para></summary>
+        /// <para>The modifier is read on the controller it names
+        /// (SourceKindRuntime.KeyDevice: its own, or the source's for a key
+        /// saved before keys carried one). An "(Any Device)" modifier reads
+        /// the device currently processing the row, or the whole slot on a
+        /// row whose value is the same on every pass. Multiple InvertOnHold
+        /// sources on one row OR together: any held modifier triggers the
+        /// flip.</para></summary>
         private static bool IsInvertOnHoldActive(MappingRow row, CustomInputState fallbackState, string fallbackDeviceGuid, int slotIndex,
             bool slotWide = false)
         {
@@ -2725,11 +2823,12 @@ namespace PadForge.Common.Input
                 if (!string.Equals(src.Kind ?? "Direct", "InvertOnHold", System.StringComparison.Ordinal))
                     continue;
                 if (string.IsNullOrEmpty(src.ParamModifier)) continue;
+                string modDev = SourceKindRuntime.KeyDevice(src.ParamModifierDeviceGuid, src);
                 // A row whose value is the same on every pass (slotWide) reads
                 // an "(Any Device)" modifier across the slot. Read on the pass
                 // device alone, it saw only whichever device's pass computed
                 // the row, so a press on another controller never inverted it.
-                if (slotWide && string.IsNullOrEmpty(src.DeviceGuid))
+                if (slotWide && modDev.Length == 0)
                 {
                     if (AnyDeviceModifierHeld(src, fallbackState, fallbackDeviceGuid, slotIndex)) return true;
                     continue;
@@ -2739,9 +2838,9 @@ namespace PadForge.Common.Input
                 // a slot no device answers for is read by the slot's Web Menus
                 // phone (#471), whichever pass is running, since a row read
                 // once per frame runs on one pass only.
-                string modifierDeviceGuid = string.IsNullOrEmpty(src.DeviceGuid) ? fallbackDeviceGuid : src.DeviceGuid;
+                string modifierDeviceGuid = modDev.Length == 0 ? fallbackDeviceGuid : modDev;
                 CustomInputState phoneModifierState = null;
-                if (string.IsNullOrEmpty(src.DeviceGuid) && !AnswersAnyDevice(fallbackDeviceGuid)
+                if (modDev.Length == 0 && !AnswersAnyDevice(fallbackDeviceGuid)
                     && !TryPhoneForMenuCell(src.ParamModifier, slotIndex, out phoneModifierState, out modifierDeviceGuid))
                     continue;
                 // The modifier takes the full Direct read, so a stick ring or
@@ -2749,14 +2848,18 @@ namespace PadForge.Common.Input
                 // all the way: an "(Any Device)" ring modifier read a keyboard
                 // as held. The pass device answers only with the axes the
                 // modifier reads (#431).
-                if (phoneModifierState == null && string.IsNullOrEmpty(src.DeviceGuid)
+                if (phoneModifierState == null && modDev.Length == 0
                     && !HasAxesFor(LookupUserDevice(fallbackDeviceGuid), src.ParamModifier, fallbackState))
                     continue;
-                // PostponeMapping suppression. When an activator with
-                // PostponeMapping=false names this same modifier descriptor,
-                // its press is "consumed" by the layer change and shouldn't
-                // also flip the row sign. Consistent with the source-eval
-                // suppression check in BuildCustomContribsFor*.
+                // One rule holds an activator's input back from every reader
+                // in a row. With "Also Fire Activator's Own Mapping"
+                // (PostponeMapping) off, the press only changes the layer: a
+                // Direct source on the input reads released, an Invert on
+                // Hold modifier on it inverts nothing (here), and an Up or
+                // Down key on it reads released (SourceKindRuntime.ReadKeyOn,
+                // through KeyHeldBack). With the option on, all three fire. A
+                // trigger a consuming macro eats is held back from all three
+                // the same way.
                 if (IsSourceSuppressedPostpone(slotIndex, modifierDeviceGuid, src.ParamModifier))
                     continue;
                 // A pinned modifier whose device is offline reads RELEASED.
@@ -2769,10 +2872,10 @@ namespace PadForge.Common.Input
                 // modifier.
                 CustomInputState s;
                 if (phoneModifierState != null) s = phoneModifierState;
-                else if (string.IsNullOrEmpty(src.DeviceGuid)) s = fallbackState;
+                else if (modDev.Length == 0) s = fallbackState;
                 else
                 {
-                    s = LookupDeviceState(src.DeviceGuid);
+                    s = LookupDeviceState(modDev);
                     if (s == null) continue;
                 }
                 // Both keys ride along, same as all five sibling call sites.
@@ -2808,9 +2911,83 @@ namespace PadForge.Common.Input
                 && SourceKindRuntimeReadButtonLikeBool(phoneState, src.ParamModifier, phoneGuid, slotIndex);
         }
 
+        // The slot's devices for an "(Any Device)" key. A buffer of its own:
+        // KeyHeld runs inside the multi-source builders' walks over the one
+        // GetSlotDeviceStates hands out.
+        [System.ThreadStatic] private static List<string> _keySpanGuidsBuf;
+
+        /// <summary>The app's <see cref="SourceCoercion.KeyHeldProvider"/>: an
+        /// Up or Down key of an Incremental or Ramp source read on the
+        /// controller it names. A device guid reads that device while it is
+        /// online, through its placement. An empty guid reads every device on
+        /// the slot that answers "(Any Device)" and has the inputs the key
+        /// reads, the span <see cref="AnyDeviceModifierHeld"/> reads. A menu
+        /// cell there reads as the slot's, the empty guid
+        /// <see cref="ActivatorLegGuid"/> gives an "(Any Device)" activator's
+        /// cell, so a menu scoped to any controller answers, a Web Menus
+        /// phone's included.</summary>
+        internal static bool KeyHeld(string keyDeviceGuid, string descriptor, int slotIndex)
+        {
+            if (string.IsNullOrWhiteSpace(descriptor)) return false;
+            if (!string.IsNullOrEmpty(keyDeviceGuid))
+            {
+                var dev = LookupUserDevice(keyDeviceGuid);
+                // Online only, the rule LookupDeviceState keeps: a failed read
+                // marks a device offline without clearing its state.
+                var state = dev != null && dev.IsOnline ? dev.InputState : null;
+                if (state == null) return false;
+                using var placement = SourceCoercion.UsePlacement(PlacementOf(dev));
+                return SourceKindRuntime.ReadKeyOn(state, descriptor, keyDeviceGuid, slotIndex);
+            }
+            if (SourceCoercion.IsMenuItemDescriptor(descriptor))
+                return SourceKindRuntime.ReadKeyOn(OfflinePinnedRestState, descriptor, "", slotIndex);
+            var settings = SettingsManager.UserSettings;
+            if (slotIndex < 0 || settings?.Items == null) return false;
+            var guids = _keySpanGuidsBuf ??= new List<string>(4);
+            guids.Clear();
+            // GetSlotDeviceStates's lock order: the guids under
+            // UserSettings.SyncRoot, the devices after it is released.
+            lock (settings.SyncRoot)
+            {
+                for (int i = 0; i < settings.Items.Count; i++)
+                {
+                    var us = settings.Items[i];
+                    if (us != null && us.MapTo == slotIndex) guids.Add(us.InstanceGuidString);
+                }
+            }
+            for (int i = 0; i < guids.Count; i++)
+            {
+                string g = guids[i];
+                // (#431) A device that never answers the wildcard stays out.
+                if (!AnswersAnyDevice(g)) continue;
+                var dev = LookupUserDevice(g);
+                var state = dev != null && dev.IsOnline ? dev.InputState : null;
+                if (state == null || !HasAxesFor(dev, descriptor, state)) continue;
+                using var placement = SourceCoercion.UsePlacement(PlacementOf(dev));
+                if (SourceKindRuntime.ReadKeyOn(state, descriptor, g, slotIndex)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>The app's <see cref="SourceCoercion.KeyHeldBackProvider"/>:
+        /// true while <paramref name="descriptor"/>, read as an Up or Down key
+        /// on <paramref name="deviceGuid"/>'s state, is held back from the
+        /// mapping rows (<see cref="IsSourceSuppressedPostpone(int, string, string)"/>),
+        /// which then read the key released. The test runs with no device's
+        /// placement in force, as the row loops run it, so a "Gamepad ..." key
+        /// meets an activator that names the same input under either
+        /// name.</summary>
+        internal static bool KeyHeldBack(int slotIndex, string deviceGuid, string descriptor)
+        {
+            using var placement = SourceCoercion.UsePlacement(null);
+            return IsSourceSuppressedPostpone(slotIndex, deviceGuid, descriptor);
+        }
+
         /// <summary>True when a row reads the same sources whichever device's
         /// pass evaluates it: every contributing source is pinned to a
-        /// device. Its InvertOnHold modifier is then read across the slot
+        /// device, or reads only keys, which read the controllers they name
+        /// (<see cref="SourceEvaluator.UsesUpDownKeys"/>). Its InvertOnHold
+        /// modifier is then read across the slot
         /// (<see cref="IsInvertOnHoldActive"/>).</summary>
         private static bool RowValueIgnoresThePass(MappingRow row)
         {
@@ -2821,7 +2998,7 @@ namespace PadForge.Common.Input
             {
                 var s = srcs[i];
                 if (s == null || IsRowModifierSource(s) || SourceEvaluator.IsUnmappedDirect(s)) continue;
-                if (string.IsNullOrEmpty(s.DeviceGuid)) return false;
+                if (string.IsNullOrEmpty(s.DeviceGuid) && !SourceEvaluator.UsesUpDownKeys(s)) return false;
                 any = true;
             }
             return any;
@@ -2957,8 +3134,9 @@ namespace PadForge.Common.Input
         // Pooled snapshot buffers + cached Base-row index. The KBM eval
         // calls FindBaseRowForTarget ~104×/slot/cycle; before caching, each
         // call allocated a MappingRow[] and linearly scanned. The dict
-        // cache rebuilds on (mappingSet, Count) change — same race
-        // tolerance as the prior SnapshotRows + scan.
+        // cache rebuilds when the set's row list, count or last row changes,
+        // and every 250 ms. Same race tolerance as the prior SnapshotRows
+        // and scan.
         [System.ThreadStatic] private static MappingRow[] _rowsSnapshotBuf;
         [System.ThreadStatic] private static MappingSource[] _sourcesSnapshotBuf;
         /// <summary>Per-MappingSet base-row index (weak-keyed so replaced
@@ -2968,13 +3146,44 @@ namespace PadForge.Common.Input
         private sealed class BaseRowCache
         {
             public int Count = -1;
-            /// <summary>The row list this index was built from. The save and
-            /// merge paths publish a REBUILT list by reference assignment, so
-            /// an equal-length republication changes this even when the count
-            /// does not. Counting alone left the old rows cached forever.</summary>
+            /// <summary>The row list this index was built from. A writer that
+            /// removes rows from a set publishes a REBUILT list by reference
+            /// assignment (device cleanup, a layer paste, clear or delete, a
+            /// Nintendo slot's wire translation), so an equal-length
+            /// republication changes this even when the count does not.
+            /// Counting alone left the old rows cached forever.</summary>
             public List<MappingRow> BuiltFrom;
+            /// <summary>The list's last row when the index was built. Rows are
+            /// appended in place (the motion backfill, the grid push, a device
+            /// paste), and a removal in place followed by an append keeps the
+            /// count and the list while it changes the last row. Without this
+            /// the index handed back the removed row. Device cleanup, the
+            /// writer that removed rows in place, now swaps in a new list,
+            /// which <see cref="BuiltFrom"/> catches, so this stays as the
+            /// guard for an in-place writer added later.</summary>
+            public MappingRow Last;
+            /// <summary>When the index was last built, in TickCount64 ms. An
+            /// in-place edit that changes none of the three keys, a retarget
+            /// with no per-slot reset, is picked up within
+            /// <see cref="BaseRowCacheRebuildMs"/>, the bound the pressure rows'
+            /// rescan keeps.</summary>
+            public long BuiltAtMs;
             public readonly Dictionary<string, MappingRow> Rows =
                 new(64, System.StringComparer.Ordinal);
+        }
+
+        private const long BaseRowCacheRebuildMs = 250;
+
+        /// <summary>The list's last row, or null when it is empty or shrinks
+        /// under the read. Rows are appended to a published list in place
+        /// and removed from it only by publishing a new one, so no writer
+        /// shrinks the list in hand. Should one added later do so, a removal
+        /// between the count and the indexer reads as a change.</summary>
+        private static MappingRow LastRowOrNull(List<MappingRow> rows, int count)
+        {
+            if (count <= 0) return null;
+            try { return count <= rows.Count ? rows[count - 1] : null; }
+            catch (ArgumentOutOfRangeException) { return null; }
         }
         private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<MappingSet, BaseRowCache>
             s_baseRowCaches = new();
@@ -2983,9 +3192,10 @@ namespace PadForge.Common.Input
             CustomInputState state, bool stickRead = false)
         {
             if (src == null) return false;
-            // "any device" (#431), and a phone's own menu cells (#471).
+            // "any device" (#431), a phone's own menu cells (#471), and a key
+            // source on a slot no device answers for (KeysStandIn).
             if (string.IsNullOrEmpty(src.DeviceGuid))
-                return AnswersAnyDeviceRead(thisDeviceGuid, src, state, stickRead) || PhoneStandsIn(src, thisDeviceGuid, slotIndex, state, stickRead);
+                return AnswersAnyDeviceRead(thisDeviceGuid, src, state, stickRead) || StandsInForAnyDevice(src, thisDeviceGuid, slotIndex, state, stickRead);
             return string.Equals(src.DeviceGuid, thisDeviceGuid, System.StringComparison.OrdinalIgnoreCase);
         }
 
@@ -3069,24 +3279,57 @@ namespace PadForge.Common.Input
                         }
                     }
 
+                    // A formula names its sources by the letter of their
+                    // place, so on a formula row a source that is not this
+                    // device's keeps its place, at rest, and the formula is
+                    // read as the live row reads it. Combined as the
+                    // strongest input, a formula row previewed a value the
+                    // trigger never took. The live loop reads a formula only
+                    // on a row with more than one source, and so does this.
+                    bool isCustom = string.Equals(row.CombineMode, "Custom", System.StringComparison.Ordinal)
+                        && CountContributingSources(row) > 1;
+                    bool own = false;
                     List<float> contribs = null;
                     for (int i = 0; i < rowSources.Count; i++)
                     {
                         var src = rowSources[i];
                         if (IsRowModifierSource(src)) continue;
-                        if (!SourceMatchesDevice(src, deviceGuid, slotIndex, state)) continue;
+                        if (!SourceMatchesDevice(src, deviceGuid, slotIndex, state))
+                        {
+                            if (isCustom) (contribs ??= new List<float>(rowSources.Count)).Add(0f);
+                            continue;
+                        }
+                        own = true;
                         // Preview truthfulness (audit 2026-07-25, C12): the
                         // live dispatch suppresses consumed/postponed
                         // sources, so the preview must too or the Pad page
                         // shows a trigger pulling while the press is eaten.
-                        if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                        // Counted at rest in its place, as the live builder
+                        // counts it (BuildCustomContribsForTrigger). Left out, it
+                        // changed what an Average, a Min or a formula row
+                        // previewed while an activator held one of its inputs.
+                        if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false))
+                        {
+                            (contribs ??= new List<float>(rowSources.Count)).Add(0f);
+                            continue;
+                        }
                         (contribs ??= new List<float>(rowSources.Count)).Add(
                             SourceEvaluator.EvaluateForTriggerTarget(state, src, slotIndex, target, i, null, 0,
                                 evaluatedDeviceGuid: deviceGuid));
                     }
-                    if (contribs == null || contribs.Count == 0) continue; // no source for this device on this row
+                    if (!own || contribs == null || contribs.Count == 0) continue; // no source for this device on this row
 
-                    float combined = ClampUnipolar(CombineHelper.CombineAxis(row.CombineMode, contribs));
+                    float combined = ClampUnipolar(isCustom
+                        ? EvaluateCustomFloat(row, contribs)
+                        : CombineHelper.CombineAxis(row.CombineMode, contribs));
+                    // The row's Invert on Hold modifier turns the pull over
+                    // while it is held, here as on the trigger, read the way
+                    // the live loop reads it for a row of one input and for
+                    // a row of several. The preview showed the pull as it
+                    // was.
+                    if (IsInvertOnHoldActive(row, state, deviceGuid, slotIndex,
+                            CountContributingSources(row) > 1 || RowValueIgnoresThePass(row)))
+                        combined = 1f - combined;
                     return (ushort)System.Math.Clamp((int)(combined * 65535f), 0, 65535);
                 }
             }
@@ -3358,9 +3601,12 @@ namespace PadForge.Common.Input
         /// ParamYDescriptor as one stick (SourceKindRuntime.ReadStick2D), each
         /// an "Axis N" or nothing, with no partner. On a button or trigger
         /// target they fall to the Direct read of Descriptor. ParamUp and
-        /// ParamDown read buttons, POV and hardware bools only. The row-level
-        /// InvertOnHold modifier takes the full Direct read and is gated where
-        /// it is read (IsInvertOnHoldActive).</summary>
+        /// ParamDown are not tested here. A key that names a controller reads
+        /// that controller, and an "(Any Device)" key reads the slot's
+        /// devices through <see cref="KeyHeld"/>, which tests the key's own
+        /// axes on each: a stick ring key takes its stick's two. The
+        /// row-level InvertOnHold modifier takes the full Direct read and is
+        /// gated where it is read (IsInvertOnHoldActive).</summary>
         private static bool HasAxesFor(UserDevice dev, MappingSource src, CustomInputState state, bool stickRead = false)
         {
             if (dev == null || src == null) return true;
@@ -3386,7 +3632,7 @@ namespace PadForge.Common.Input
         /// <summary>The steering kinds that read Descriptor and
         /// ParamYDescriptor as one stick on the stick lane: a winding wheel
         /// and the two angle projections.</summary>
-        private static bool ReadsStickPair(string kind)
+        internal static bool ReadsStickPair(string kind)
             => kind == "WindingStick" || kind == "AngleToAxisX" || kind == "AngleToAxisY";
 
         /// <summary>False where a kind's reader never takes Descriptor.
@@ -3396,7 +3642,7 @@ namespace PadForge.Common.Input
         /// on a button or trigger target they fall to the Direct read, which
         /// takes Descriptor. A kind change keeps the old Descriptor in the
         /// row, and an unread axis there hid the whole source.</summary>
-        private static bool KindReadsDescriptor(string kind, bool stickRead)
+        internal static bool KindReadsDescriptor(string kind, bool stickRead)
             => kind switch
             {
                 "Incremental" or "Ramped" => false,
@@ -3415,22 +3661,22 @@ namespace PadForge.Common.Input
                    || SourceCoercion.NumberedAxesRead(src.GateDescriptor, out _, out _) > 0
                    || SourceCoercion.NumberedAxesRead(src.Gate2Descriptor, out _, out _) > 0);
 
-        /// <summary>True when a descriptor <paramref name="src"/> reads names
-        /// the "Gamepad ..." family: its gates, the buttons an Incremental or
-        /// Ramped source steps with, a steering kind's axis aliases on the
-        /// stick lane (its reader takes a ring there as centered, reading
-        /// nothing), or else its input where its kind reads one. The same
-        /// reads <see cref="ReadsNumberedAxis"/> takes, plus the step
-        /// buttons.</summary>
+        /// <summary>True when a descriptor <paramref name="src"/> reads on the
+        /// pass device names the "Gamepad ..." family: its gates, a steering
+        /// kind's axis aliases on the stick lane (its reader takes a ring
+        /// there as centered, reading nothing), or else its input where its
+        /// kind reads one. The same reads <see cref="ReadsNumberedAxis"/>
+        /// takes. The keys of an Incremental or Ramp source are not tested
+        /// here. A key that names a controller reads that controller, and an
+        /// "(Any Device)" key reads the slot's devices through
+        /// <see cref="KeyHeld"/>, which tests the family on each.</summary>
         private static bool ReadsGamepadFamily(MappingSource src, bool stickRead)
         {
             if (src == null) return false;
             if (SourceCoercion.IsGamepadAliasDescriptor(src.GateDescriptor)
                 || SourceCoercion.IsGamepadAliasDescriptor(src.Gate2Descriptor))
                 return true;
-            if (src.Kind is "Incremental" or "Ramped")
-                return SourceCoercion.IsGamepadAliasDescriptor(src.ParamUp)
-                       || SourceCoercion.IsGamepadAliasDescriptor(src.ParamDown);
+            if (SourceEvaluator.UsesUpDownKeys(src)) return false;
             if (stickRead && ReadsStickPair(src.Kind))
                 return SourceCoercion.IsGamepadAxisAlias(src.Descriptor)
                        || SourceCoercion.IsGamepadAxisAlias(src.ParamYDescriptor);
@@ -3445,20 +3691,40 @@ namespace PadForge.Common.Input
         /// for). A Bliss-Box port read raw answers through the placement of
         /// the controller identified in it (<see cref="PlacementOf"/>), which
         /// the reads resolve the family through, and not before one is placed.
-        /// Any other device answers by its type: the web pad and a Remote Link
-        /// copy of a gamepad do, and a keyboard, a mouse and a touchpad do
-        /// not, so Tab no longer presses R3 through the family and a left
-        /// click no longer presses A. Force Raw Joystick Mode is tested
-        /// first: SDL still opens such a pad as its gamepad (the flag changes
-        /// the read, not the open), so the handle alone let "Gamepad A" read
-        /// raw button 0, whatever that button is on the pad.</summary>
+        /// Any other device answers by its type: the web pad does, and a
+        /// keyboard, a mouse and a touchpad do not, so Tab no longer presses
+        /// R3 through the family and a left click no longer presses A. Force
+        /// Raw Joystick Mode is tested first: SDL still opens such a pad as
+        /// its gamepad (the flag changes the read, not the open), so the
+        /// handle alone let "Gamepad A" read raw button 0, whatever that
+        /// button is on the pad. A Remote Link copy has no handle and
+        /// answers as its owner's device does, by the layout its list entry
+        /// carries (RemotePeerDeviceInfo.GamepadLayout, the owner's
+        /// <see cref="InSdlGamepadLayout"/>): a wheel SDL opened as its
+        /// gamepad answers through its copy, and a pad its owner reads
+        /// outside the layout answers none. An entry that says nothing
+        /// leaves the copy to its type, as every copy answered before the
+        /// list carried the layout: a gamepad's copy answers, and a pad its
+        /// owner reads raw arrives typed a joystick
+        /// (InputService.ExposedDeviceType) and answers none.</summary>
         private static bool SpeaksGamepadLayout(UserDevice dev)
         {
             if (dev.ForceRawJoystickMode) return false;
-            if (dev.Device is { } device && device.GamepadHandle != IntPtr.Zero) return true;
-            if (PlacementOf(dev) != null) return true;
-            return dev.Device is not SdlDeviceWrapper && dev.CapType == InputDeviceType.Gamepad;
+            if (dev.Device is PadForge.Engine.RemoteLink.RemotePeerDevice { Info.GamepadLayout: bool layout })
+                return layout;
+            return InSdlGamepadLayout(false, dev.Device, dev.CapType) || PlacementOf(dev) != null;
         }
+
+        /// <summary>True when the device's state is in SDL's gamepad layout,
+        /// the layout the Gamepad names read with no placement: SDL opened it
+        /// as its gamepad and it is not read raw, or it is no SDL joystick
+        /// and its type is a gamepad's (a web pad). The owner's PC sends this
+        /// answer with each device it shares (InputService.BuildExposedDevices),
+        /// so one rule serves the device and its Remote Link copy.</summary>
+        internal static bool InSdlGamepadLayout(bool forceRaw, ISdlInputDevice device, int type)
+            => !forceRaw
+               && ((device != null && device.GamepadHandle != IntPtr.Zero)
+                   || (device is not SdlDeviceWrapper && type == InputDeviceType.Gamepad));
 
         /// <summary>The placement the family reads <paramref name="dev"/>
         /// through, or null for a device in SDL's layout already
@@ -3589,6 +3855,45 @@ namespace PadForge.Common.Input
         private static bool PhoneStandsIn(MappingSource src, string deviceGuid, int slotIndex, CustomInputState state,
             bool stickRead = false)
             => PhoneStandsIn(src.Descriptor, deviceGuid, slotIndex) && HasAxesFor(deviceGuid, src, state, stickRead);
+
+        /// <summary>True when a pass device that does not answer "(Any
+        /// Device)" reads <paramref name="src"/> anyway: a Web Menus phone
+        /// reading its menu cells (<see cref="PhoneStandsIn(MappingSource, string, int, CustomInputState, bool)"/>),
+        /// or a key source on a slot no online device answers for
+        /// (<see cref="KeysStandIn"/>).</summary>
+        private static bool StandsInForAnyDevice(MappingSource src, string deviceGuid, int slotIndex,
+            CustomInputState state, bool stickRead = false)
+            => PhoneStandsIn(src, deviceGuid, slotIndex, state, stickRead)
+               || KeysStandIn(src, deviceGuid, slotIndex, state, stickRead);
+
+        /// <summary>True for an Incremental or Ramp source on a slot where no
+        /// online device answers "(Any Device)". Its keys read the controllers
+        /// they name (<see cref="KeyHeld"/>), nothing of the pass device, so
+        /// every pass reads it there. A source whose keys are on two such
+        /// controllers, like a pair of VR controllers, has no controller of
+        /// its own, and no pass would read it otherwise. Its gates read the
+        /// pass device, so a pass without every axis they read cannot stand
+        /// in, the rule <see cref="PhoneStandsIn(MappingSource, string, int, CustomInputState, bool)"/>
+        /// keeps for a phone's cell (#431).</summary>
+        private static bool KeysStandIn(MappingSource src, string deviceGuid, int slotIndex,
+            CustomInputState state, bool stickRead = false)
+            => SourceEvaluator.UsesUpDownKeys(src) && slotIndex >= 0 && !SlotHasAnsweringDevice(slotIndex)
+               && HasAxesFor(deviceGuid, src, state, stickRead);
+
+        /// <summary>True when an "(Any Device)" key source on a row read once
+        /// a frame (the multi-source builders, a stick trim) reads on the pass
+        /// in hand. An Incremental or Ramp source with no gate leg does: its
+        /// keys read the controllers they name (<see cref="KeyHeld"/>) and
+        /// nothing of the pass device. A gated one reads its gates on the
+        /// device it is evaluated on (SourceEvaluator.GateHeld), so it does
+        /// only where it stands in (<see cref="KeysStandIn"/>). Otherwise it
+        /// takes the span walk, which reads it on every answering device that
+        /// has its gates' axes, as it reads a Direct source's gates (#431).</summary>
+        private static bool ReadsKeysOnPassInHand(MappingSource src, string deviceGuid, int slotIndex,
+            CustomInputState state, bool stickRead = false)
+            => SourceEvaluator.UsesUpDownKeys(src)
+               && ((string.IsNullOrEmpty(src.GateDescriptor) && string.IsNullOrEmpty(src.Gate2Descriptor))
+                   || KeysStandIn(src, deviceGuid, slotIndex, state, stickRead));
 
         // ── Web Menus phones (#471) ──────────────────────────────────────
         // A phone never answers "(Any Device)", because its input arrays
@@ -3745,9 +4050,11 @@ namespace PadForge.Common.Input
             || MappingSetMigrator.IsMotionAxisTarget(target);
 
         /// <summary>Snapshots row.Sources into the thread-local pooled
-        /// buffer. The save path mutates row.Sources without locking;
-        /// a polling-thread Clear+Add race would otherwise throw. Returns
-        /// the shared buffer and writes the populated count to
+        /// buffer. The UI thread rewrites a row's sources without a lock,
+        /// by building a new list and swapping it in, so the list captured
+        /// here stays complete. The copy also contains a shrink mid-copy,
+        /// should a writer ever edit the list in place. Returns the shared
+        /// buffer and writes the populated count to
         /// <paramref name="count"/>. Iterate to <c>count</c>, not buf.Length.</summary>
         private static MappingSource[] SnapshotSources(MappingRow row, out int count)
         {
@@ -3841,16 +4148,28 @@ namespace PadForge.Common.Input
                 // PostponeMapping=false on an activator suppresses its own
                 // descriptor; substitute 0 so Custom-formula positions stay
                 // stable (sN references are positional).
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                 { list.Add(0f); continue; }
 
                 bool hasNegPair = (i == 0 && negPairIndex == 1);
                 var negSrc = hasNegPair ? srcs[1] : null;
                 bool useNeg = hasNegPair && negSrc != null
-                    && !IsSourceSuppressedPostpone(slotIndex, negSrc.DeviceGuid, negSrc.Descriptor);
+                    && !IsSourceSuppressedPostpone(slotIndex, negSrc, stickRead: true);
                 bool posAny = string.IsNullOrEmpty(src.DeviceGuid);
                 bool negAny = useNeg && string.IsNullOrEmpty(negSrc.DeviceGuid);
 
+                if (posAny && !hasNegPair
+                    && ReadsKeysOnPassInHand(src, currentDeviceGuid, slotIndex, currentState, stickRead: true))
+                {
+                    // Its keys read the controllers they name (KeyHeld), so the
+                    // pass in hand reads it once, on a slot no device answers
+                    // "(Any Device)" for too. A gated one reads its gates on
+                    // each device in the walk below (ReadsKeysOnPassInHand).
+                    list.Add(SourceEvaluator.EvaluateForBipolarAxisTarget(
+                        currentState, src, slotIndex, row.Target, i, slotRuntime, dt,
+                        evaluatedDeviceGuid: currentDeviceGuid, layer: row.LayerMask));
+                    continue;
+                }
                 if (posAny || negAny)
                 {
                     // Any "any device" side spans the slot's devices (the row is
@@ -3864,20 +4183,29 @@ namespace PadForge.Common.Input
                     {
                         // (#471) The slot's Web Menus phone reads the menu cell
                         // sides, whichever pass claimed the row. A pair's sides
-                        // share one guid, and a side that is no menu cell has
-                        // no device to read, so it stays at rest.
+                        // share one guid. A key side reads on the pass in hand
+                        // (KeysStandIn), as a lone key source does, so a pair of
+                        // them on two VR controllers moves the stick both ways.
+                        // A side that is neither has no device to read, so it
+                        // stays at rest.
                         bool posPhone = TryPhoneForEmptySpan(slotStates, src, slotIndex, out var posState, out var posGuid, stickRead: true);
                         CustomInputState negState = null;
                         string negGuid = null;
                         bool negPhone = useNeg && TryPhoneForEmptySpan(slotStates, negSrc, slotIndex, out negState, out negGuid, stickRead: true);
-                        if (posPhone || negPhone)
+                        bool posKeys = !posPhone && posAny
+                            && KeysStandIn(src, currentDeviceGuid, slotIndex, currentState, stickRead: true);
+                        bool negKeys = useNeg && !negPhone && negAny
+                            && KeysStandIn(negSrc, currentDeviceGuid, slotIndex, currentState, stickRead: true);
+                        if (posKeys) { posState = currentState; posGuid = currentDeviceGuid; }
+                        if (negKeys) { negState = currentState; negGuid = currentDeviceGuid; }
+                        if (posPhone || negPhone || posKeys || negKeys)
                         {
-                            float pv = posPhone
+                            float pv = posPhone || posKeys
                                 ? SourceEvaluator.EvaluateForBipolarAxisTarget(
                                     posState, src, slotIndex, row.Target, i, slotRuntime, dt,
                                     evaluatedDeviceGuid: posGuid, layer: row.LayerMask)
                                 : 0f;
-                            if (negPhone)
+                            if (negPhone || negKeys)
                                 pv += SourceEvaluator.EvaluateForBipolarAxisTarget(
                                     negState, negSrc, slotIndex, row.Target, 1, slotRuntime, dt,
                                     evaluatedDeviceGuid: negGuid, layer: row.LayerMask);
@@ -3950,10 +4278,21 @@ namespace PadForge.Common.Input
                 var src = srcs[i];
                 if (IsRowModifierSource(src)) continue;
                 if (src == null) { list.Add(0f); continue; }
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false))
                 { list.Add(0f); continue; }
                 if (string.IsNullOrEmpty(src.DeviceGuid))
                 {
+                    // Its keys read the controllers they name (KeyHeld), so the
+                    // pass in hand reads it once, on a slot no device answers
+                    // "(Any Device)" for too. A gated one reads its gates on
+                    // each device in the walk below (ReadsKeysOnPassInHand).
+                    if (ReadsKeysOnPassInHand(src, currentDeviceGuid, slotIndex, currentState))
+                    {
+                        list.Add(SourceEvaluator.EvaluateForTriggerTarget(
+                            currentState, src, slotIndex, row.Target, i, slotRuntime, dt,
+                            evaluatedDeviceGuid: currentDeviceGuid, layer: row.LayerMask));
+                        continue;
+                    }
                     // "any device": take the strongest pull across the slot's
                     // devices (this row is evaluated once, so it must span all
                     // devices, not just the first-evaluated one).
@@ -4007,10 +4346,22 @@ namespace PadForge.Common.Input
                 var src = srcs[i];
                 if (IsRowModifierSource(src)) continue;
                 if (src == null) { list.Add(0f); continue; }
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false))
                 { list.Add(0f); continue; }
                 if (string.IsNullOrEmpty(src.DeviceGuid))
                 {
+                    // Its keys read the controllers they name (KeyHeld), so the
+                    // pass in hand reads it once, on a slot no device answers
+                    // "(Any Device)" for too. A gated one reads its gates on
+                    // each device in the walk below (ReadsKeysOnPassInHand).
+                    if (ReadsKeysOnPassInHand(src, currentDeviceGuid, slotIndex, currentState))
+                    {
+                        list.Add(SourceEvaluator.EvaluateForButtonTarget(
+                            currentState, src, globalAxisToButtonThreshold,
+                            slotIndex, row.Target, i, slotRuntime, dt,
+                            evaluatedDeviceGuid: currentDeviceGuid, layer: row.LayerMask) ? 1f : 0f);
+                        continue;
+                    }
                     // "any device": OR the button read across every device on
                     // the slot (this row is evaluated once, so it must span all
                     // devices, not just the first-evaluated one).
@@ -4089,12 +4440,19 @@ namespace PadForge.Common.Input
         /// allocation.
         ///
         /// <para>The index rebuilds when the MappingSet's row LIST is
-        /// republished or its length changes. Length alone was not enough: the
-        /// save and merge paths assign a rebuilt list of the same length, and
-        /// a slot whose rows are replaced wholesale also drops its entry
-        /// through <see cref="ResetSourceKindRuntimeForSlot"/>, so an edit that
-        /// keeps the count cannot leave obsolete Base rows resolving
-        /// forever.</para></summary>
+        /// republished, its length changes, or its last row changes. Length
+        /// alone was not enough: a writer that removes rows assigns a rebuilt
+        /// list (device cleanup, a layer paste, clear or delete, a Nintendo
+        /// slot's wire translation), which can be as long as the one it
+        /// replaces. Rows are appended in place (the motion backfill, the
+        /// grid push, a device paste), and no writer removes one in place
+        /// from a published set. One that did, followed by an append, would
+        /// keep the count and the list and hand back the removed row, so the
+        /// last row stays as the guard for an in-place writer added later. A
+        /// slot whose rows are replaced wholesale also drops its entry through
+        /// <see cref="ResetSourceKindRuntimeForSlot"/>, and any other in-place
+        /// edit, a retarget with no reset, is picked up by the rebuild every
+        /// <see cref="BaseRowCacheRebuildMs"/>.</para></summary>
         private static MappingRow FindBaseRowForTarget(MappingSet mappingSet, string targetName)
         {
             if (mappingSet == null || string.IsNullOrEmpty(targetName)) return null;
@@ -4103,15 +4461,19 @@ namespace PadForge.Common.Input
 
             int currentCount = rows.Count;
             var cache = s_baseRowCaches.GetOrCreateValue(mappingSet);
-            if (cache.Count != currentCount || !ReferenceEquals(cache.BuiltFrom, rows))
+            long nowMs = System.Environment.TickCount64;
+            var last = LastRowOrNull(rows, currentCount);
+            if (cache.Count != currentCount || !ReferenceEquals(cache.BuiltFrom, rows)
+                || !ReferenceEquals(cache.Last, last) || nowMs - cache.BuiltAtMs >= BaseRowCacheRebuildMs)
             {
                 var baseRows = cache.Rows;
                 baseRows.Clear();
 
-                // Defensive read: rows.Count can shrink mid-iteration if the
-                // save path is mutating. Bound by the captured count AND
-                // re-check rows.Count on each step — same pattern SnapshotRows
-                // uses. Stale read in the rare race self-heals next cycle.
+                // Defensive read, the pattern SnapshotRows uses: bound by the
+                // captured count AND by rows.Count on each step. No writer
+                // shrinks a published list in place, so the second bound
+                // guards one added later. A row appended during the walk
+                // changes the count, and the next call rebuilds.
                 for (int i = 0; i < currentCount && i < rows.Count; i++)
                 {
                     var r = rows[i];
@@ -4124,6 +4486,8 @@ namespace PadForge.Common.Input
 
                 cache.Count = currentCount;
                 cache.BuiltFrom = rows;
+                cache.Last = last;
+                cache.BuiltAtMs = nowMs;
             }
 
             return cache.Rows.TryGetValue(targetName, out var row) ? row : null;
@@ -4167,7 +4531,20 @@ namespace PadForge.Common.Input
             if (string.IsNullOrEmpty(activeMask)
                 || string.Equals(activeMask, "Base", System.StringComparison.Ordinal))
                 return FindBaseRowForTarget(mappingSet, targetName);
+            return FindRowUnderLayer(mappingSet, targetName, activeMask, out suppressed);
+        }
 
+        /// <summary>The row <paramref name="targetName"/> reads with the
+        /// non-Base <paramref name="layerMask"/> engaged, the lookup
+        /// <see cref="FindActiveRowForTarget"/> makes for the layer engaged
+        /// now. A layer-exit commit (DC20) makes the same lookup for the layer
+        /// it was made in.</summary>
+        private static MappingRow FindRowUnderLayer(
+            MappingSet mappingSet, string targetName, string layerMask, out bool suppressed)
+        {
+            suppressed = false;
+            if (mappingSet == null || string.IsNullOrEmpty(targetName)) return null;
+            string activeMask = layerMask;
             // A non-Base layer is engaged. Weigh the same two candidates
             // ApplyMappingSetToGamepad does: the layer's own row for the
             // target and the Base row. One walk, race-guarded the same way
@@ -4224,6 +4601,334 @@ namespace PadForge.Common.Input
             return false;
         }
 
+        // ── DC20: menu commits made by leaving a layer ──
+        //
+        // A layered menu sees its layer end one frame late, once
+        // GetEngagedLayerMask names another layer, and Touch Release commits
+        // on that disengage: Steam's mode-shift-end commit. Every row lookup
+        // here reads the layer engaged NOW, so the rows the departed layer
+        // reads, where an imported menu's cell bindings live, never saw the
+        // commit. The passes below evaluate that one commit on the layer it
+        // was made in: the row each target reads under that layer, through
+        // the same row evaluators, with every source but the committed cell
+        // at rest. The rest of the frame keeps the new layer.
+
+        [ThreadStatic] private static MappingRow t_exitCommitRow;
+        [ThreadStatic] private static List<MappingSource> t_exitCommitRest;
+        [ThreadStatic] private static string[] t_exitCommitLayers;
+        [ThreadStatic] private static MappingRow[] t_exitCommitTargetRows;
+        [ThreadStatic] private static string[] t_exitCommitTargetLayers;
+
+        /// <summary>True when <paramref name="src"/> reads a cell whose live
+        /// commit leaving <paramref name="layer"/> made: as its input, as the
+        /// Up or Down key of an Incremental or Ramp source, or, on an Invert
+        /// on Hold modifier, as the button that inverts the row. A key source
+        /// reads its keys alone, so the Descriptor a kind change left on it
+        /// is no input.</summary>
+        private static bool ReadsLayerExitCommit(MappingSource src, string layer, int slotIndex, long nowMs)
+        {
+            if (src == null) return false;
+            if (SourceEvaluator.UsesUpDownKeys(src))
+                return IsLayerExitCommitCell(src.ParamUp, layer, slotIndex, nowMs)
+                       || IsLayerExitCommitCell(src.ParamDown, layer, slotIndex, nowMs);
+            return IsLayerExitCommitCell(IsRowModifierSource(src) ? src.ParamModifier : src.Descriptor,
+                layer, slotIndex, nowMs);
+        }
+
+        /// <summary>True when the commit of <paramref name="layer"/> reaches
+        /// <paramref name="row"/>: the row reads the committed cell, it is the
+        /// row its target reads under that layer (the lookup
+        /// <see cref="FindRowUnderLayer"/> makes), and the engaged layer does
+        /// not read it already. That is the departed layer's own row, or a
+        /// Base row the layer let through and the engaged layer does not.
+        /// <paramref name="activeMask"/> is never <paramref name="layer"/>.</summary>
+        private static bool LayerExitCommitReaches(MappingSet mappingSet, MappingRow row, string layer,
+            string activeMask, int slotIndex, long nowMs)
+        {
+            if (row == null || string.IsNullOrEmpty(row.Target)) return false;
+            bool isBase = string.Equals(row.LayerMask ?? "Base", "Base", System.StringComparison.Ordinal);
+            if (!isBase && !string.Equals(row.LayerMask, layer, System.StringComparison.Ordinal)) return false;
+            bool baseEngaged = string.IsNullOrEmpty(activeMask)
+                || string.Equals(activeMask, "Base", System.StringComparison.Ordinal);
+            if (isBase && baseEngaged) return false;
+
+            var sources = row.Sources;
+            if (sources == null) return false;
+            bool reads = false;
+            for (int i = 0; i < sources.Count && !reads; i++)
+                reads = ReadsLayerExitCommit(sources[i], layer, slotIndex, nowMs);
+            if (!reads) return false;
+
+            if (!ReferenceEquals(FindRowUnderLayer(mappingSet, row.Target, layer, out _), row)) return false;
+            if (isBase)
+            {
+                var readNow = FindRowUnderLayer(mappingSet, row.Target, activeMask, out _);
+                if (readNow != null
+                    && string.Equals(readNow.LayerMask ?? "Base", "Base", System.StringComparison.Ordinal))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>True when <paramref name="descriptor"/> is a menu cell
+        /// whose live commit leaving <paramref name="layer"/> made (DC20).</summary>
+        private static bool IsLayerExitCommitCell(string descriptor, string layer, int slotIndex, long nowMs)
+            => SourceCoercion.TryParseMenuItem(descriptor, out int menuId, out int itemIndex)
+               && string.Equals(LayerExitCommitLayer(slotIndex, menuId, itemIndex, nowMs), layer,
+                   System.StringComparison.Ordinal);
+
+        /// <summary>The row as its layer-exit commit reads it: each source
+        /// that reads the committed cell as it is, every other source a
+        /// stand-in at rest. An Incremental or Ramp source whose key is the
+        /// cell is read from a copy that keeps that key alone, because its
+        /// other key is another input of the departed layer. A stand-in keeps
+        /// its source's place, its input or modifier class, its device and
+        /// its Invert, so Custom positions, per-source runtime state and the
+        /// bipolar pair line up with the real row. It reads nothing: a Direct
+        /// source with no descriptor reads rest, and an Invert on Hold with no
+        /// modifier never inverts. The row's settings come across through
+        /// <see cref="MappingRow.CopySettingsTo"/>, the copy every row-to-row
+        /// lane takes, so a setting added later reaches the commit too. One
+        /// per thread, rebuilt on every use.</summary>
+        private static MappingRow LayerExitCommitStandIn(MappingRow row, string layer, int slotIndex, long nowMs)
+        {
+            var standIn = t_exitCommitRow ??= new MappingRow();
+            var pool = t_exitCommitRest ??= new List<MappingSource>(8);
+            standIn.Target = row.Target;
+            standIn.LayerMask = row.LayerMask;
+            standIn.SuppressBipolarPair = row.SuppressBipolarPair;
+            row.CopySettingsTo(standIn);
+            var list = standIn.Sources;
+            list.Clear();
+            var srcs = SnapshotSources(row, out int count);
+            for (int i = 0; i < count; i++)
+            {
+                var src = srcs[i];
+                if (src == null || ReadsLayerExitCommit(src, layer, slotIndex, nowMs))
+                {
+                    list.Add(src == null || !SourceEvaluator.UsesUpDownKeys(src)
+                        ? src : CommittedKeysOnly(src, layer, slotIndex, nowMs));
+                    continue;
+                }
+                while (pool.Count <= i) pool.Add(new MappingSource());
+                var rest = pool[i];
+                rest.Kind = IsRowModifierSource(src) ? "InvertOnHold" : "Direct";
+                rest.DeviceGuid = src.DeviceGuid;
+                rest.Invert = src.Invert;
+                list.Add(rest);
+            }
+            return standIn;
+        }
+
+        /// <summary>A copy of the key source <paramref name="src"/> with each
+        /// key that is not the cell committed by leaving
+        /// <paramref name="layer"/> emptied, so it reads released. A source
+        /// whose two keys are both the cell keeps both. Its accumulator is
+        /// keyed by the row's target and the source's place, so the copy
+        /// steps the departed row's value. The row the engaged layer reads
+        /// for the target shares that accumulator where it has a key source
+        /// in the same place, and it ticks first in the frame, so each
+        /// evaluation of a stand-in runs as a read of its layer's commit
+        /// (SourceKindRuntime.UseCommitLayer): a reader of its own, whose
+        /// key is read though the engaged row ticked first. The value is
+        /// stepped once a frame with the keys of every reader, so the
+        /// committed key steps it past the engaged row's rest, and a key
+        /// both rows hold steps it once.</summary>
+        private static MappingSource CommittedKeysOnly(MappingSource src, string layer, int slotIndex, long nowMs)
+        {
+            var keys = src.Clone();
+            if (!IsLayerExitCommitCell(keys.ParamUp, layer, slotIndex, nowMs)) keys.ParamUp = "";
+            if (!IsLayerExitCommitCell(keys.ParamDown, layer, slotIndex, nowMs)) keys.ParamDown = "";
+            return keys;
+        }
+
+        /// <summary>The gamepad row loop's layer-exit pass. Each row a live
+        /// commit reaches runs through the per-target row evaluator on its
+        /// stand-in and merges into its target the way a second contributor
+        /// does: a button ORs in, an axis or trigger keeps the larger value.
+        /// A Base row that the commits of two departed layers both reach
+        /// merges once per layer, as the per-target evaluators take it
+        /// (<see cref="LayerExitCommitRowsForTarget"/>). The row evaluators
+        /// read each source on its own device, so every device pass computes
+        /// the same value, and Step 4's merge across the passes keeps it
+        /// once.</summary>
+        private static void ApplyLayerExitCommitRows(CustomInputState state, MappingSet mappingSet,
+            MappingRow[] rows, int count, string activeMask, string thisDeviceGuid, int threshold,
+            int slotIndex, ref Gamepad gp)
+        {
+            long nowMs = MenuClock.NowMs;
+            if (!HasLayerExitCommit(slotIndex, nowMs)) return;
+            int layerCount = LayerExitCommitLayers(slotIndex, activeMask, nowMs, ref t_exitCommitLayers);
+            var layers = t_exitCommitLayers;
+            for (int r = 0; r < count; r++)
+            {
+                var row = rows[r];
+                if (row == null || string.IsNullOrEmpty(row.Target)) continue;
+                if (MappingSetMigrator.IsMotionAxisTarget(row.Target)
+                    || MappingSetMigrator.IsPressureTarget(row.Target)
+                    || string.Equals(row.Target, "DPad", System.StringComparison.Ordinal))
+                    continue;
+                for (int l = 0; l < layerCount; l++)
+                {
+                    string layer = layers[l];
+                    if (!LayerExitCommitReaches(mappingSet, row, layer, activeMask, slotIndex, nowMs)) continue;
+                    var standIn = LayerExitCommitStandIn(row, layer, slotIndex, nowMs);
+                    using var commit = SourceKindRuntime.UseCommitLayer(layer);
+                    switch (TargetKindResolver.Resolve(row.Target))
+                    {
+                        case TargetKind.Button:
+                        case TargetKind.PovDirection:
+                            if (EvaluateButtonRow(state, standIn, thisDeviceGuid, slotIndex, row.Target,
+                                    threshold, out bool pressed) && pressed)
+                                WriteBoolTarget(row.Target, true, ref gp);
+                            break;
+                        case TargetKind.BipolarAxis:
+                            if (EvaluateBipolarAxisRow(state, standIn, thisDeviceGuid, slotIndex, row.Target,
+                                    out short axis))
+                            {
+                                float v = System.Math.Max(-1f, axis / 32767f);
+                                if (System.Math.Abs(v) > System.Math.Abs(ReadBipolarAxisTarget(row.Target, gp)))
+                                    WriteBipolarAxisTarget(row.Target, v, ref gp);
+                            }
+                            break;
+                        case TargetKind.Trigger:
+                            if (EvaluateRawTriggerRow(state, standIn, thisDeviceGuid, slotIndex, row.Target,
+                                    out short pull))
+                            {
+                                float v = (pull - short.MinValue) / 65535f;
+                                if (v > ReadTriggerTarget(row.Target, gp))
+                                    WriteTriggerTarget(row.Target, v, ref gp);
+                            }
+                            break;
+                    }
+                }
+            }
+        }
+
+        /// <summary>The rows live layer-exit commits reach for
+        /// <paramref name="targetName"/>, at most one per commit layer, in
+        /// <c>t_exitCommitTargetRows</c> with each layer beside it in
+        /// <c>t_exitCommitTargetLayers</c>. Returns how many.</summary>
+        private static int LayerExitCommitRowsForTarget(MappingSet mappingSet, string targetName,
+            int slotIndex, long nowMs)
+        {
+            if (mappingSet == null || string.IsNullOrEmpty(targetName)
+                || !HasLayerExitCommit(slotIndex, nowMs))
+                return 0;
+            string activeMask = GetEngagedLayerMask(slotIndex, mappingSet);
+            int layerCount = LayerExitCommitLayers(slotIndex, activeMask, nowMs, ref t_exitCommitLayers);
+            if (layerCount == 0) return 0;
+            var layers = t_exitCommitLayers;
+            var rows = t_exitCommitTargetRows;
+            var rowLayers = t_exitCommitTargetLayers;
+            if (rows == null || rows.Length < layerCount)
+            {
+                rows = t_exitCommitTargetRows = new MappingRow[System.Math.Max(2, layerCount)];
+                rowLayers = t_exitCommitTargetLayers = new string[rows.Length];
+            }
+            int n = 0;
+            for (int l = 0; l < layerCount; l++)
+            {
+                var row = FindRowUnderLayer(mappingSet, targetName, layers[l], out _);
+                if (!LayerExitCommitReaches(mappingSet, row, layers[l], activeMask, slotIndex, nowMs)) continue;
+                rows[n] = row;
+                rowLayers[n] = layers[l];
+                n++;
+            }
+            return n;
+        }
+
+        /// <summary>True when a live layer-exit commit presses the button
+        /// target <paramref name="targetName"/>.</summary>
+        private static bool LayerExitCommitPressesButton(CustomInputState state, MappingSet mappingSet,
+            string thisDeviceGuid, int slotIndex, string targetName, int threshold)
+        {
+            long nowMs = MenuClock.NowMs;
+            int n = LayerExitCommitRowsForTarget(mappingSet, targetName, slotIndex, nowMs);
+            for (int i = 0; i < n; i++)
+            {
+                var standIn = LayerExitCommitStandIn(t_exitCommitTargetRows[i], t_exitCommitTargetLayers[i],
+                    slotIndex, nowMs);
+                using var commit = SourceKindRuntime.UseCommitLayer(t_exitCommitTargetLayers[i]);
+                if (EvaluateButtonRow(state, standIn, thisDeviceGuid, slotIndex, targetName, threshold,
+                        out bool pressed) && pressed)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>The largest deflection live layer-exit commits give the
+        /// bipolar-axis target <paramref name="targetName"/>, in the
+        /// evaluator's signed-short form, and <paramref name="row"/>, the
+        /// departed layer's own row that gave it (never the reused stand-in).
+        /// False when no commit reaches the target.</summary>
+        private static bool TryLayerExitCommitAxis(CustomInputState state, MappingSet mappingSet,
+            string thisDeviceGuid, int slotIndex, string targetName, out short value, out MappingRow row)
+        {
+            value = 0;
+            row = null;
+            long nowMs = MenuClock.NowMs;
+            int n = LayerExitCommitRowsForTarget(mappingSet, targetName, slotIndex, nowMs);
+            bool found = false;
+            for (int i = 0; i < n; i++)
+            {
+                var standIn = LayerExitCommitStandIn(t_exitCommitTargetRows[i], t_exitCommitTargetLayers[i],
+                    slotIndex, nowMs);
+                using var commit = SourceKindRuntime.UseCommitLayer(t_exitCommitTargetLayers[i]);
+                if (!EvaluateBipolarAxisRow(state, standIn, thisDeviceGuid, slotIndex, targetName, out short v))
+                    continue;
+                if (!found || System.Math.Abs((int)v) > System.Math.Abs((int)value))
+                {
+                    value = v;
+                    row = t_exitCommitTargetRows[i];
+                }
+                found = true;
+            }
+            return found;
+        }
+
+        /// <summary>The deepest pull live layer-exit commits give the trigger
+        /// target <paramref name="targetName"/>, in the Extended signed-short
+        /// form. False when no commit reaches it.</summary>
+        private static bool TryLayerExitCommitTrigger(CustomInputState state, MappingSet mappingSet,
+            string thisDeviceGuid, int slotIndex, string targetName, out short value)
+        {
+            value = short.MinValue;
+            long nowMs = MenuClock.NowMs;
+            int n = LayerExitCommitRowsForTarget(mappingSet, targetName, slotIndex, nowMs);
+            bool found = false;
+            for (int i = 0; i < n; i++)
+            {
+                var standIn = LayerExitCommitStandIn(t_exitCommitTargetRows[i], t_exitCommitTargetLayers[i],
+                    slotIndex, nowMs);
+                using var commit = SourceKindRuntime.UseCommitLayer(t_exitCommitTargetLayers[i]);
+                if (!EvaluateRawTriggerRow(state, standIn, thisDeviceGuid, slotIndex, targetName, out short v))
+                    continue;
+                if (!found || v > value) value = v;
+                found = true;
+            }
+            return found;
+        }
+
+        /// <summary>The value <see cref="WriteBipolarAxisTarget"/> last wrote,
+        /// in the same [-1, +1] frame, Y included.</summary>
+        private static float ReadBipolarAxisTarget(string target, in Gamepad gp) => target switch
+        {
+            "LeftThumbAxisX" => gp.ThumbLX / 32767f,
+            "LeftThumbAxisY" => -gp.ThumbLY / 32767f,
+            "RightThumbAxisX" => gp.ThumbRX / 32767f,
+            "RightThumbAxisY" => -gp.ThumbRY / 32767f,
+            _ => 0f,
+        };
+
+        /// <summary>The value <see cref="WriteTriggerTarget"/> last wrote, 0 to 1.</summary>
+        private static float ReadTriggerTarget(string target, in Gamepad gp) => target switch
+        {
+            "LeftTrigger" => gp.LeftTrigger / 65535f,
+            "RightTrigger" => gp.RightTrigger / 65535f,
+            _ => 0f,
+        };
+
         /// <summary>Evaluates a button-class target through the per-VC
         /// MappingSet. <paramref name="value"/> = final combined bool;
         /// returns <c>false</c> when no row exists for the target (caller
@@ -4233,9 +4938,41 @@ namespace PadForge.Common.Input
             int slotIndex, string targetName, int globalAxisToButtonThreshold,
             out bool value)
         {
+            bool owned = TryEvaluateMappingSetButtonCore(state, mappingSet, thisDeviceGuid,
+                slotIndex, targetName, globalAxisToButtonThreshold, out value);
+            // DC20: a menu commit made by leaving a layer presses the target
+            // its row has under that layer too. A press only: one that reads
+            // nothing leaves the target to the row above, legacy fallback
+            // included.
+            if (LayerExitCommitPressesButton(state, mappingSet, thisDeviceGuid, slotIndex,
+                    targetName, globalAxisToButtonThreshold))
+            {
+                value = true;
+                return true;
+            }
+            return owned;
+        }
+
+        private static bool TryEvaluateMappingSetButtonCore(
+            CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
+            int slotIndex, string targetName, int globalAxisToButtonThreshold,
+            out bool value)
+        {
             value = false;
             var row = FindActiveRowForTarget(mappingSet, targetName, slotIndex, out bool shiftSuppressed);
             if (shiftSuppressed) return true; // shift layer forces this target off; skip legacy fallback
+            return EvaluateButtonRow(state, row, thisDeviceGuid, slotIndex, targetName,
+                globalAxisToButtonThreshold, out value);
+        }
+
+        /// <summary>The button evaluation of the row the lookup picked. A
+        /// layer-exit commit's stand-in row (DC20) runs through it too.</summary>
+        private static bool EvaluateButtonRow(
+            CustomInputState state, MappingRow row, string thisDeviceGuid,
+            int slotIndex, string targetName, int globalAxisToButtonThreshold,
+            out bool value)
+        {
+            value = false;
             if (row == null || row.Sources == null || row.Sources.Count == 0)
                 return false;
 
@@ -4278,7 +5015,7 @@ namespace PadForge.Common.Input
             // Returning false instead would fall through to the legacy
             // per-target descriptor read, which has no suppression check
             // and would leak the very press being consumed.
-            if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+            if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false))
                 return true;
             CustomInputState devState;
             if (string.IsNullOrEmpty(src.DeviceGuid))
@@ -4286,9 +5023,10 @@ namespace PadForge.Common.Input
                 // (#431) A pass device that never answers "(Any Device)",
                 // or lacks an axis the source reads, reads rest, the
                 // offline-pinned shape below. A Web Menus phone alone on
-                // the slot still reads its menu cells (#471).
+                // the slot still reads its menu cells (#471), and any pass
+                // reads a key source on a slot no device answers for.
                 if (!AnswersAnyDeviceRead(thisDeviceGuid, src, state)
-                    && !PhoneStandsIn(src, thisDeviceGuid, slotIndex, state)) return true;
+                    && !StandsInForAnyDevice(src, thisDeviceGuid, slotIndex, state)) return true;
                 devState = state;
             }
             else
@@ -4319,10 +5057,54 @@ namespace PadForge.Common.Input
             CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
             int slotIndex, string targetName,
             out short value)
+            => TryEvaluateMappingSetBipolarAxis(state, mappingSet, thisDeviceGuid, slotIndex, targetName,
+                out value, out _);
+
+        /// <summary><see cref="TryEvaluateMappingSetBipolarAxis(CustomInputState, MappingSet, string, int, string, out short)"/>
+        /// with <paramref name="commitRow"/>, the departed layer's row when a
+        /// layer-exit commit gives the value (DC20), and null when the row the
+        /// engaged layer reads gives it. The motion stage shapes the value
+        /// with the settings of the row that gave it.</summary>
+        internal static bool TryEvaluateMappingSetBipolarAxis(
+            CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
+            int slotIndex, string targetName,
+            out short value, out MappingRow commitRow)
+        {
+            commitRow = null;
+            bool owned = TryEvaluateMappingSetBipolarAxisCore(state, mappingSet, thisDeviceGuid,
+                slotIndex, targetName, out value);
+            // DC20: a layer-exit commit's row merges in like a second
+            // contributor, the larger deflection winning.
+            if (TryLayerExitCommitAxis(state, mappingSet, thisDeviceGuid, slotIndex, targetName,
+                    out short commit, out var departed)
+                && System.Math.Abs((int)commit) > System.Math.Abs((int)value))
+            {
+                value = commit;
+                commitRow = departed;
+                return true;
+            }
+            return owned;
+        }
+
+        private static bool TryEvaluateMappingSetBipolarAxisCore(
+            CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
+            int slotIndex, string targetName,
+            out short value)
         {
             value = 0;
             var row = FindActiveRowForTarget(mappingSet, targetName, slotIndex, out bool shiftSuppressed);
             if (shiftSuppressed) return true; // shift layer forces this target off; skip legacy fallback
+            return EvaluateBipolarAxisRow(state, row, thisDeviceGuid, slotIndex, targetName, out value);
+        }
+
+        /// <summary>The bipolar-axis evaluation of the row the lookup picked.
+        /// A layer-exit commit's stand-in row (DC20) runs through it too.</summary>
+        private static bool EvaluateBipolarAxisRow(
+            CustomInputState state, MappingRow row, string thisDeviceGuid,
+            int slotIndex, string targetName,
+            out short value)
+        {
+            value = 0;
             if (row == null || row.Sources == null || row.Sources.Count == 0)
                 return false;
 
@@ -4349,7 +5131,7 @@ namespace PadForge.Common.Input
             {
                 var src = FirstContributingSource(row);
                 if (src == null) return false;
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                 {
                     // Consume/postpone parity (2026-07-25 audit): the row
                     // owns the target and the suppressed source reads
@@ -4366,9 +5148,10 @@ namespace PadForge.Common.Input
                         // (#431) A pass device that never answers "(Any Device)",
                         // or lacks an axis the source reads, reads rest, the
                         // offline-pinned shape below. A Web Menus phone alone on
-                        // the slot still reads its menu cells (#471).
+                        // the slot still reads its menu cells (#471), and any pass
+                        // reads a key source on a slot no device answers for.
                         if (!AnswersAnyDeviceRead(thisDeviceGuid, src, state, stickRead: true)
-                            && !PhoneStandsIn(src, thisDeviceGuid, slotIndex, state, stickRead: true)) return true;
+                            && !StandsInForAnyDevice(src, thisDeviceGuid, slotIndex, state, stickRead: true)) return true;
                         devState = state;
                     }
                     else
@@ -4400,11 +5183,12 @@ namespace PadForge.Common.Input
         /// per-source gating: a touchpad-class source (descriptor starts
         /// with "Touchpad ") contributes ONLY while its paired
         /// TouchpadDown is true on its device's state. An idle touchpad's
-        /// stale finger position can't pollute the combine — Average,
-        /// MaxAbs, Sum, etc. all see active sources only. Non-touchpad
-        /// sources (sticks / buttons / POVs mapped to a touchpad target)
-        /// are always considered active (sticks at rest read 0 and don't
-        /// "win" the combine the way a stale touchpad position would).
+        /// stale finger position can't pollute the combine: Average,
+        /// MaxAbs, Sum and the other modes see active sources only.
+        /// Non-touchpad sources (sticks / buttons / POVs mapped to a
+        /// touchpad target) are always considered active (sticks at rest
+        /// read 0 and don't "win" the combine the way a stale touchpad
+        /// position would).
         ///
         /// <para>Custom mode receives every source plus a parallel
         /// active-flag channel (<c>aD..zD</c> in the formula language)
@@ -4412,16 +5196,38 @@ namespace PadForge.Common.Input
         /// (e.g. <c>aD ? a : (bD ? b : 0.5)</c>).</para>
         ///
         /// <para>Returns <c>false</c> when zero sources are active, so
-        /// the touchpad output path can hold the last position — matches
-        /// the natural sticky behavior of a single physical touchpad.</para>
+        /// the touchpad output path can hold the last position, the
+        /// natural sticky behavior of a single physical touchpad.</para>
         ///
         /// <para><paramref name="defaultFingerIdx"/> is the finger slot
         /// the OUTPUT target represents (0 for X1/Y1, 1 for X2/Y2). It's
         /// used as the fallback finger index when a source's descriptor
         /// is the bare "Touchpad" prefix form without an explicit Finger
-        /// number — current callers always pass parseable descriptors,
-        /// so this is purely defensive.</para></summary>
+        /// number. Current callers always pass parseable descriptors, so
+        /// this is purely defensive.</para>
+        ///
+        /// <para>A menu commit made by leaving a layer (DC20) merges in the
+        /// way it does on the sibling evaluators: the departed layer's row
+        /// for the target gives the larger deflection, and the target holds
+        /// no old position over the commit's pulse.</para></summary>
         public static bool TryEvaluateMappingSetTouchpadAxis(
+            CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
+            int slotIndex, string targetName, int defaultFingerIdx,
+            out short value)
+        {
+            bool owned = TryEvaluateMappingSetTouchpadAxisCore(state, mappingSet, thisDeviceGuid,
+                slotIndex, targetName, defaultFingerIdx, out value);
+            if (TryLayerExitCommitTouchpadAxis(state, mappingSet, thisDeviceGuid, slotIndex, targetName,
+                    defaultFingerIdx, out short commit)
+                && (!owned || System.Math.Abs((int)commit) > System.Math.Abs((int)value)))
+            {
+                value = commit;
+                return true;
+            }
+            return owned;
+        }
+
+        private static bool TryEvaluateMappingSetTouchpadAxisCore(
             CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
             int slotIndex, string targetName, int defaultFingerIdx,
             out short value)
@@ -4429,6 +5235,45 @@ namespace PadForge.Common.Input
             value = 0;
             var row = FindActiveRowForTarget(mappingSet, targetName, slotIndex, out bool shiftSuppressed);
             if (shiftSuppressed) return true; // shift layer forces this target off; skip legacy fallback
+            return EvaluateTouchpadAxisRow(state, row, thisDeviceGuid, slotIndex, targetName,
+                defaultFingerIdx, out value);
+        }
+
+        /// <summary>The deepest deflection live layer-exit commits give the
+        /// touchpad-passthrough target <paramref name="targetName"/>. False
+        /// when no commit reaches it, or none of its rows has an active
+        /// source.</summary>
+        private static bool TryLayerExitCommitTouchpadAxis(CustomInputState state, MappingSet mappingSet,
+            string thisDeviceGuid, int slotIndex, string targetName, int defaultFingerIdx, out short value)
+        {
+            value = 0;
+            long nowMs = MenuClock.NowMs;
+            int n = LayerExitCommitRowsForTarget(mappingSet, targetName, slotIndex, nowMs);
+            bool found = false;
+            for (int i = 0; i < n; i++)
+            {
+                var standIn = LayerExitCommitStandIn(t_exitCommitTargetRows[i], t_exitCommitTargetLayers[i],
+                    slotIndex, nowMs);
+                using var commit = SourceKindRuntime.UseCommitLayer(t_exitCommitTargetLayers[i]);
+                if (!EvaluateTouchpadAxisRow(state, standIn, thisDeviceGuid, slotIndex, targetName,
+                        defaultFingerIdx, out short v))
+                    continue;
+                if (!found || System.Math.Abs((int)v) > System.Math.Abs((int)value)) value = v;
+                found = true;
+            }
+            return found;
+        }
+
+        /// <summary>The touchpad-passthrough evaluation of the row the lookup
+        /// picked, the gating <see cref="TryEvaluateMappingSetTouchpadAxis"/>
+        /// describes. A layer-exit commit's stand-in row (DC20) runs through
+        /// it too. False when the row has no active source.</summary>
+        private static bool EvaluateTouchpadAxisRow(
+            CustomInputState state, MappingRow row, string thisDeviceGuid,
+            int slotIndex, string targetName, int defaultFingerIdx,
+            out short value)
+        {
+            value = 0;
             if (row == null || row.Sources == null || row.Sources.Count == 0) return false;
 
             var slotRuntime = (slotIndex >= 0 && slotIndex < _slotSourceKindRuntime.Length)
@@ -4458,7 +5303,7 @@ namespace PadForge.Common.Input
                 // touchpad loop was the one family member with no check at
                 // all. All-sources-suppressed then lands in the existing
                 // activeCount==0 hold-last-position contract.
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: true))
                 { values.Add(0f); flags.Add(0f); continue; }
 
                 CustomInputState devState;
@@ -4467,9 +5312,10 @@ namespace PadForge.Common.Input
                     // (#431) A pass device that never answers "(Any Device)",
                     // or lacks an axis the source reads, reads rest, the
                     // offline-pinned shape below. A Web Menus phone alone on
-                    // the slot still reads its menu cells (#471).
+                    // the slot still reads its menu cells (#471), and any pass
+                    // reads a key source on a slot no device answers for.
                     if (!AnswersAnyDeviceRead(thisDeviceGuid, src, state, stickRead: true)
-                        && !PhoneStandsIn(src, thisDeviceGuid, slotIndex, state, stickRead: true))
+                        && !StandsInForAnyDevice(src, thisDeviceGuid, slotIndex, state, stickRead: true))
                     { values.Add(0f); flags.Add(0f); continue; }
                     devState = state;
                 }
@@ -4482,9 +5328,12 @@ namespace PadForge.Common.Input
                     if (devState == null) { values.Add(0f); flags.Add(0f); continue; }
                 }
 
-                // "Active" = currently contributing useful data.
+                // "Active" = currently contributing useful data. A source is
+                // gated on its finger only when it reads a touch position:
+                // the Descriptor an Incremental or Ramp source kept is none.
                 bool isActive;
-                bool isTouchpadSrc = !string.IsNullOrEmpty(src.Descriptor)
+                bool isTouchpadSrc = KindReadsDescriptor(src.Kind, stickRead: true)
+                    && !string.IsNullOrEmpty(src.Descriptor)
                     && src.Descriptor.StartsWith("Touchpad ", System.StringComparison.Ordinal);
                 if (isTouchpadSrc)
                 {
@@ -4567,9 +5416,39 @@ namespace PadForge.Common.Input
             int slotIndex, string targetName,
             out short value)
         {
+            bool owned = TryEvaluateMappingSetRawTriggerCore(state, mappingSet, thisDeviceGuid,
+                slotIndex, targetName, out value);
+            // DC20: a layer-exit commit's row merges in, the deeper pull winning.
+            if (TryLayerExitCommitTrigger(state, mappingSet, thisDeviceGuid, slotIndex, targetName,
+                    out short commit)
+                && commit > value)
+            {
+                value = commit;
+                return true;
+            }
+            return owned;
+        }
+
+        private static bool TryEvaluateMappingSetRawTriggerCore(
+            CustomInputState state, MappingSet mappingSet, string thisDeviceGuid,
+            int slotIndex, string targetName,
+            out short value)
+        {
             value = short.MinValue;
             var row = FindActiveRowForTarget(mappingSet, targetName, slotIndex, out bool shiftSuppressed);
             if (shiftSuppressed) return true; // shift layer forces this target off; skip legacy fallback
+            return EvaluateRawTriggerRow(state, row, thisDeviceGuid, slotIndex, targetName, out value);
+        }
+
+        /// <summary>The trigger evaluation of the row the lookup picked, in
+        /// the Extended signed-short form. A layer-exit commit's stand-in row
+        /// (DC20) runs through it too.</summary>
+        private static bool EvaluateRawTriggerRow(
+            CustomInputState state, MappingRow row, string thisDeviceGuid,
+            int slotIndex, string targetName,
+            out short value)
+        {
+            value = short.MinValue;
             if (row == null || row.Sources == null || row.Sources.Count == 0)
                 return false;
 
@@ -4605,7 +5484,7 @@ namespace PadForge.Common.Input
             {
                 var src = FirstContributingSource(row);
                 if (src == null) return false;
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor))
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false))
                 {
                     // Consume/postpone parity (2026-07-25 audit): released,
                     // row still owns the target, and the value flows through
@@ -4622,9 +5501,10 @@ namespace PadForge.Common.Input
                         // (#431) A pass device that never answers "(Any Device)",
                         // or lacks an axis the source reads, reads rest, the
                         // offline-pinned shape below. A Web Menus phone alone on
-                        // the slot still reads its menu cells (#471).
+                        // the slot still reads its menu cells (#471), and any pass
+                        // reads a key source on a slot no device answers for.
                         if (!AnswersAnyDeviceRead(thisDeviceGuid, src, state)
-                            && !PhoneStandsIn(src, thisDeviceGuid, slotIndex, state)) return true;
+                            && !StandsInForAnyDevice(src, thisDeviceGuid, slotIndex, state)) return true;
                         devState = state;
                     }
                     else
@@ -4735,15 +5615,17 @@ namespace PadForge.Common.Input
             foreach (var src in dpadSources)
             {
                 // A row modifier (Invert on Hold) is no source, whatever
-                // descriptor it kept, the row evaluators' rule.
-                if (IsRowModifierSource(src)) continue;
+                // descriptor it kept, the row evaluators' rule. Nor is the
+                // Descriptor an Incremental or Ramp source kept from an
+                // earlier kind: it reads its keys, and this lane reads none.
+                if (IsRowModifierSource(src) || !KindReadsDescriptor(src.Kind, stickRead: false)) continue;
                 if (!SourceMatchesDevice(src, thisDeviceGuid, slotIndex, state)) continue;
                 if (string.IsNullOrEmpty(src.Descriptor)) continue;
                 // Suppression parity (audit 2026-07-25, C11): this was the
                 // one row-source evaluator in the dispatch loop without the
                 // consume/postpone gate, so a suppressed POV source still
                 // wrote all four DPad bits.
-                if (IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                if (IsSourceSuppressedPostpone(slotIndex, src, stickRead: false)) continue;
                 // Construct synthetic POV-direction sources to reuse the coercion path.
                 // The slot and device travel with the read so the hat follows
                 // the grip (#392). Without them EvaluateForButtonTarget took
@@ -4836,6 +5718,12 @@ namespace PadForge.Common.Input
                 _ => cache.Right,
             };
             if (synth == null) return false;
+            // Held back one direction at a time. An activator sits on a
+            // direction ("POV 0 Up"), which the row's own input, the whole
+            // hat ("POV 0"), never equals, so the row's test alone let the
+            // combined row press the direction a layer's activator held,
+            // where the row of that direction alone was held back.
+            if (IsSourceSuppressedPostpone(slotIndex, synth, stickRead: false)) return false;
             return SourceCoercion.EvaluateForButtonTarget(state, synth, 50, slotIndex, evaluatedDeviceGuid);
         }
 

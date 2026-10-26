@@ -78,6 +78,23 @@ namespace PadForge.Common.Input
         private static long _sweepDueTick = long.MaxValue;
         private static bool _sweepWorkerRunning;
 
+        /// <summary>Test seam (InternalsVisibleTo PadForge.Tests): tests that
+        /// drive MidiVirtualController against a fake backend set this so no
+        /// sweep runs. A test process knows none of a running PadForge's live
+        /// endpoints, so a real sweep from it would remove them as
+        /// corpses.</summary>
+        internal static volatile bool SweepDisabledForTest;
+
+        /// <summary>Test seam: set by the test assembly for the life of its
+        /// process, where <see cref="SweepDisabledForTest"/> is set and
+        /// cleared by each MIDI test class and stands open between two of
+        /// them. No sweep is scheduled or run in the test host then, whoever
+        /// asks: an engine a test of another area starts asks for one, and a
+        /// sweep from a process that knows none of a running PadForge's
+        /// endpoints removes them all. False in production, where nothing
+        /// sets it.</summary>
+        internal static bool OffLimitsForTest;
+
         /// <summary>Coalesced background sweep. Safe from any thread; CM
         /// calls talk to PnP, not to the (possibly wedged) MIDI service.
         /// Requests coalesce on the EARLIEST due time, so a short-delay
@@ -86,6 +103,7 @@ namespace PadForge.Common.Input
         /// own pass afterward.</summary>
         public static void ScheduleSweep(int delayMs)
         {
+            if (SweepDisabledForTest || OffLimitsForTest) return;
             long due = Environment.TickCount64 + Math.Max(0, delayMs);
             lock (_sweepLock)
             {
@@ -119,6 +137,7 @@ namespace PadForge.Common.Input
         internal static int Sweep()
         {
             int removed = 0;
+            if (SweepDisabledForTest || OffLimitsForTest) return removed;
             try
             {
                 // Expired abandoned claims stop protecting their devnodes.

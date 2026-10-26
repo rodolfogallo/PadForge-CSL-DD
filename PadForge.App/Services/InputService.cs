@@ -144,9 +144,7 @@ namespace PadForge.Services
         private DispatcherTimer _uiTimer;
         private ForegroundMonitorService _foregroundMonitor;
         private ExternalControlService _externalControl;
-        private ChromaLightbarService _chromaService;
-        private LightsyncLightbarService _lightsyncService;
-        private SensaHapticsService _sensaService;
+        private PadForge.Common.Input.Peripherals.PeripheralOutputHost _peripheralHost;
         private ProfileData _defaultProfileSnapshot;
 
         // Active profile's touchpad custom-gesture working list. Mirrors
@@ -550,6 +548,7 @@ namespace PadForge.Services
         {
             _mainVm = mainVm ?? throw new ArgumentNullException(nameof(mainVm));
             _dispatcher = Dispatcher.CurrentDispatcher;
+            _controllerRelease.RowsPending = EngineIsListing;
 
             // Refresh server status strings when language changes.
             Strings.CultureChanged += OnCultureChanged;
@@ -879,6 +878,7 @@ namespace PadForge.Services
 
             // Create engine with the configured polling interval.
             _inputManager = new InputManager();
+            _inputManager.RemoteMidiInputDemand = HasFreshRemoteMidiDemand;
             _inputManagerStatic = _inputManager;
             ApplyEffectivePollingRate();
             _inputManager.HmInactivityTimeoutSeconds = _mainVm.Settings.HmInactivityDestroyTimeoutSeconds;
@@ -923,6 +923,10 @@ namespace PadForge.Services
             // Voice phrases on mic-bearing pads (issue #317): the engine
             // stamps pulses into the pad's state through this hook.
             PadForge.Engine.SdlDeviceWrapper.ExternalVoiceAugment = PadForge.Common.Input.VoicePulse.Apply;
+            // An XInput pad's identity weighs a node under the usbip-win2
+            // host controller by the persona scope Step 1 and the hiding
+            // side ask.
+            PadForge.Engine.StableXInputInstance.PersonaInScope = PadForge.Common.Input.InputManager.ChecksUsbipAncestry;
             // Bliss-Box ports (#469): the wrapper asks the runtime for a
             // port's names, and a port that opens, closes or finds another
             // controller refreshes its row.
@@ -934,6 +938,7 @@ namespace PadForge.Services
             _inputManager.TabletCaptureChanged += OnTabletCaptureChanged;
             _inputManager.FrequencyUpdated += OnFrequencyUpdated;
             _inputManager.ErrorOccurred += OnErrorOccurred;
+            _inputManager.ErrorResolved += OnErrorResolved;
             _inputManager.HmVcInactivityDestroyed += OnHmVcInactivityDestroyed;
             _inputManager.HmVcWentNonActive += OnHmVcWentNonActive;
 
@@ -1490,6 +1495,11 @@ namespace PadForge.Services
             // The "Gamepad ..." names read a Bliss-Box port read raw through
             // the placement of the controller identified in it (#469).
             PadForge.Engine.Common.Mapping.SourceCoercion.GamepadPlacementProvider = InputManager.GamepadPlacementFor;
+            // An Up or Down key of an Incremental or Ramp source reads the
+            // controller it names, wherever the source is read, and reads
+            // released while the rows hold its input back.
+            PadForge.Engine.Common.Mapping.SourceCoercion.KeyHeldProvider = InputManager.KeyHeld;
+            PadForge.Engine.Common.Mapping.SourceCoercion.KeyHeldBackProvider = InputManager.KeyHeldBack;
 
             PadForge.Engine.Common.Mapping.SourceCoercion.GyroTiltGravityProvider =
                 _inputManager.ReadGyroTiltGravity;
@@ -2316,14 +2326,12 @@ namespace PadForge.Services
             // Serve the external-control pipe (#366) if the user opted in.
             StartExternalControlIfEnabled();
 
-            // Razer Chroma lightbar mirror (#373), opt-in.
-            StartChromaIfEnabled();
-
-            // Logitech LIGHTSYNC lightbar mirror (#382), opt-in.
-            StartLightsyncIfEnabled();
-
-            // Razer Sensa HD haptics translation (#374), opt-in.
-            StartSensaIfEnabled();
+            // Haptic and RGB peripherals (#494): the host links mice,
+            // keyboards and vendor rows to their outputs and runs the
+            // backends, which reach a vendor only while something assigned
+            // uses it. The Razer Chroma (#373) and Logitech LIGHTSYNC (#382)
+            // lightbar mirrors became its vendor rows.
+            StartPeripheralOutputs();
 
             // Capture default profile snapshot before any profile switches.
             // If the app restarted with a named profile active, LoadProfiles
@@ -2372,34 +2380,32 @@ namespace PadForge.Services
             // Start audio bass rumble detector if any slot has it enabled.
             SyncAudioBassDetector();
 
-            // Clear stale HidHide blacklist entries from previous crash/kill.
-            // _managedDeviceIds is in-memory so entries are lost on restart,
-            // making RemoveManagedDevices() unable to clean up stale entries.
+            // Clear the HidHide blacklist entries a session before left
+            // behind, then apply device hiding (HidHide + input hooks) if the
+            // master switch is on. The two are one apply
+            // (ApplyDeviceHidingAtEngineStart, ClearCloaksLeftBehind).
+            // After the clear this hides everything again, so every
+            // hidden USB controller that is connected goes to the release at
+            // each engine start, and the release reconnects it in Windows
+            // where its rules allow (HidHideController.PickUsbDeviceToCycle).
+            // That is intended: it takes the controller from a program that
+            // opened it while PadForge was closed or stopped
+            // (HiddenControllerRelease). Keep Devices Cloaked Between
+            // Launches leaves the entries in place, and then this apply finds
+            // them there, adds nothing and reconnects nothing. The exception
+            // is a controller set to hide whose nodes the kept list does not
+            // carry, such as one moved to another USB port while PadForge
+            // was closed: its nodes are added and go to the release.
             //
-            // Skipped when KeepHidHideCloaksBetweenLaunches is on so the
-            // persisted cloaks survive into the new session and
-            // ApplyDeviceHiding's per-device walk re-asserts them
-            // idempotently — without a visible decloak window between
-            // PadForge restarts.
-            if (!_mainVm.Settings.KeepHidHideCloaksBetweenLaunches)
-            {
-                try
-                {
-                    if (HidHideController.IsAvailable())
-                        HidHideController.ClearAll();
-                }
-                catch { /* best effort */ }
-            }
-            // Cloaks kept on purpose mean this session inherits entries it did
-            // not write, and they have to be adopted or the sync's removal set
-            // is computed from an empty set and the driver's list can only
-            // grow (#397 follow-up). EnsureHidHideCloaksAdopted does it, from
-            // inside ApplyDeviceHiding, so every entry point gets it and not
-            // just this one.
-            _managedWhitelistDosPaths.Clear();
-
-            // Apply device hiding (HidHide + input hooks) if master switch is on.
-            ApplyDeviceHiding();
+            // The poll thread started a moment ago and has marked few rows
+            // online or none, and this apply does not wait for it. So it does
+            // not read an offline row as a device that is gone: a row left
+            // visible holds new hides off its nodes whether or not it is
+            // online yet (BuildHidHideKeepOut, RowsAreCurrent), and the
+            // release waits for the engine to list its devices before it
+            // counts the controllers on a USB device (EngineIsListing,
+            // CountControllerRowsPerUsbDevice).
+            ApplyDeviceHidingAtEngineStart();
 
             // Create UI update timer on the dispatcher.
             _uiTimer = new DispatcherTimer(DispatcherPriority.Render)
@@ -2529,9 +2535,7 @@ namespace PadForge.Services
                 _foregroundMonitor = null;
             }
             StopExternalControl();
-            StopChromaService();
-            StopLightsyncService();
-            StopSensaService();
+            StopPeripheralOutputs();
             StopDsuServer();
             StopWebServer();
             StopRemoteLink();
@@ -2561,6 +2565,7 @@ namespace PadForge.Services
                 _inputManager.TabletCaptureChanged -= OnTabletCaptureChanged;
                 _inputManager.FrequencyUpdated -= OnFrequencyUpdated;
                 _inputManager.ErrorOccurred -= OnErrorOccurred;
+                _inputManager.ErrorResolved -= OnErrorResolved;
                 _inputManager.HmVcInactivityDestroyed -= OnHmVcInactivityDestroyed;
                 _inputManager.HmVcWentNonActive -= OnHmVcWentNonActive;
                 foreach (var pad in _mainVm.Pads)
@@ -2613,6 +2618,8 @@ namespace PadForge.Services
                 PadForge.Engine.Common.Mapping.SourceCoercion.HasGyroAuxProvider = null;
                 PadForge.Engine.Common.Mapping.SourceCoercion.CompassYawCorrectionProvider = null;
                 PadForge.Engine.Common.Mapping.SourceCoercion.ButtonHeldProvider = null;
+                PadForge.Engine.Common.Mapping.SourceCoercion.KeyHeldProvider = null;
+                PadForge.Engine.Common.Mapping.SourceCoercion.KeyHeldBackProvider = null;
                 PadForge.Engine.Common.Mapping.SourceCoercion.BalanceCalibrationProvider = null;
                 PadForge.Engine.Common.Mapping.SourceCoercion.BalanceTareKgProvider = null;
                 PadForge.Engine.Common.Mapping.SourceCoercion.IrTuningProvider = null;
@@ -2642,6 +2649,7 @@ namespace PadForge.Services
                 _remoteNfcDemandMs.Clear();
                 _remoteRingConDemandMs.Clear();
                 _remoteIrDemandMs.Clear();
+                _remoteMidiDemandMs.Clear();
                 PadForge.Common.Input.NfcTagRegistry.SwitchNfcArmed = false;
                 PadForge.Common.Input.NfcTagRegistry.JoyConIrHintOn = false;
                 _joyConIrHintOn = false;
@@ -2917,7 +2925,10 @@ namespace PadForge.Services
 
                 // For KBM slots, push the combined KbmRawState.
                 if (_inputManager.SlotControllerTypes[i] == VirtualControllerType.KeyboardMouse)
+                {
                     padVm.KbmOutputSnapshot = _inputManager.CombinedKbmRawStates[i];
+                    padVm.KbmKeyboardLeds = _inputManager.KbmKeyboardLedsOf(i);
+                }
 
                 // For Vr slots, push the combined VrRawState to the preview.
                 if (_inputManager.SlotControllerTypes[i] == VirtualControllerType.Vr)
@@ -3433,8 +3444,9 @@ namespace PadForge.Services
             // right Joy-Con NFC (#248 audit). When BOTH families are
             // configured for one standalone right Joy-Con, the camera wins
             // by fork arbitration; that conflict is the author's own
-            // mapping choice. Hint changes take effect on the fork's next
-            // sensors-enable edge, worst case a device reconnect.
+            // mapping choice. The fork reads this hint, as it reads the NFC
+            // one, on every device update (SDL_hidapi_switch.c UpdateIR,
+            // UpdateNfc), so a change takes effect on the next update.
             long irReq = PadForge.Engine.Common.Mapping.SourceCoercion.LastJoyConIrReadRequestTick;
             bool irLocal = irReq != 0 && nowTick - irReq < McuDemandWindowMs;
             // Registration preempts the camera (#248 audit round 3): the
@@ -3453,39 +3465,52 @@ namespace PadForge.Services
                     _joyConIrHintOn = irWanted;
                     PadForge.Common.Input.NfcTagRegistry.JoyConIrHintOn = irWanted;
                     PadForge.Engine.SdlDiagLog.WriteLine($"JoyCon IR hint -> {(irWanted ? "ON" : "off")}");
-                    // The fork applies the hint only at the sensors-enable
-                    // edge, so drive every open IR-capable Joy-Con
-                    // (standalone right, or a combined pair whose right
-                    // half runs the camera, #275) through that edge now:
-                    // camera starts on ON, stops on OFF (freeing the MCU
-                    // for NFC) without a reconnect. The combined driver
-                    // forwards the sensors toggle to each child.
-                    // Collected under the lock, bounced OUTSIDE it on a
-                    // worker (#248 audit round 3): the fork's IR bring-up
-                    // is synchronous MCU work that can run for seconds and
-                    // holds SDL's joystick lock, and neither this timer
-                    // thread nor UserDevices.SyncRoot may block on it.
-                    System.Collections.Generic.List<PadForge.Engine.SdlDeviceWrapper> toBounce = null;
-                    var devs = SettingsManager.UserDevices;
-                    if (devs != null)
-                        lock (devs.SyncRoot)
-                        {
-                            foreach (var ud in devs.Items)
-                                if (ud != null && ud.IsOnline && ud.VendorId == 0x057E
-                                    && (ud.ProdId == 0x2007 || ud.ProdId == 0x2008)
-                                    && ud.Device is PadForge.Engine.SdlDeviceWrapper w)
-                                    (toBounce ??= new()).Add(w);
-                        }
-                    if (toBounce != null)
-                        System.Threading.Tasks.Task.Run(() =>
-                        {
-                            foreach (var w in toBounce)
-                                try { w.BounceMotionSensors(); } catch { }
-                        });
+                    // The hint is all the camera needs. Each update, the fork
+                    // starts the camera on a right Joy-Con (standalone, or a
+                    // combined pair's right half, #275) whose sensors are on
+                    // while the hint asks for it, and tears it down when the
+                    // hint stops asking, which frees the MCU for NFC
+                    // (SDL_hidapi_switch.c UpdateIR, since SDL 3f4999d129 in
+                    // 51f408fb). The sensor bounce that once followed a flip
+                    // only turned the IMU off and on, two subcommands that
+                    // wait for the pad's reply under SDL's joystick lock.
                 }
             }
 
             RefreshRingConArming(nowTick);
+            ShipRemoteMidiInputDemand();
+        }
+
+        /// <summary>Consumer half of the MIDI input demand: while a created
+        /// slot here has a peer's MIDI input assigned, its owner hears so about
+        /// once a second (rate-bounded in the router), so an owner on the
+        /// legacy MIDI API opens the port. Letting it lapse is the off. The
+        /// peers are collected under the device lock and their assignments
+        /// read after it, so the two locks never nest.</summary>
+        private void ShipRemoteMidiInputDemand()
+        {
+            var devices = SettingsManager.UserDevices;
+            if (devices == null) return;
+            List<(Guid Guid, string Path)> peers = null;
+            lock (devices.SyncRoot)
+            {
+                foreach (var ud in devices.Items)
+                {
+                    if (ud == null || !ud.IsOnline || ud.CapType != InputDeviceType.Midi) continue;
+                    if (!RemoteLinkOutputRouter.IsPeerPath(ud.DevicePath)) continue;
+                    (peers ??= new List<(Guid, string)>()).Add((ud.InstanceGuid, ud.DevicePath));
+                }
+            }
+            if (peers == null) return;
+            foreach (var (guid, path) in peers)
+            {
+                foreach (int slot in SettingsManager.GetAssignedSlots(guid))
+                {
+                    if (slot < 0 || slot >= SettingsManager.SlotCreated.Length || !SettingsManager.SlotCreated[slot]) continue;
+                    RemoteLinkOutputRouter.ShipMidiInputDemand(path);
+                    break;
+                }
+            }
         }
 
         private bool _ringConHintOn;
@@ -3622,8 +3647,6 @@ namespace PadForge.Services
             UpdateAnalogKeyboardsStatus();
             // Bliss-Box ports (#469): same cadence, same shape.
             UpdateBlissBoxStatus();
-            // Set Chroma Color (#468): the first action starts the service.
-            EnsureChromaForMacros();
 
             // Snapshot devices under lock to avoid cross-thread collection-modified
             // exceptions when the engine's UpdateDevices runs concurrently.
@@ -4537,11 +4560,6 @@ namespace PadForge.Services
         private long _lastGatedDashboardTick;
         private long _lastForegroundUiRefreshTick;
 
-        /// <summary>Pushes the latest per-device battery readings into the
-        /// Devices-page rows and every pad's device-roster items (#167).
-        /// Runs on the UI timer at a 5 s cadence, matching the SDL wrapper's
-        /// own battery cache interval. Offline devices read as no-battery so
-        /// the indicator disappears instead of freezing.</summary>
         /// <summary>The one battery answer for a device (#187): SDL's value
         /// when the backend reports one (HIDAPI pads), else the device's own
         /// Bluetooth devnode battery property (Xbox pads, whose XInput lane is
@@ -4749,6 +4767,11 @@ namespace PadForge.Services
             catch { /* LED writes are cosmetic, never block a tick */ }
         }
 
+        /// <summary>Pushes the latest per-device battery readings into the
+        /// Devices-page rows and every pad's device-roster items (#167).
+        /// Runs on the UI timer at a 5 s cadence, matching the SDL wrapper's
+        /// own battery cache interval. Offline devices read as no-battery so
+        /// the indicator disappears instead of freezing.</summary>
         private void UpdateBatteryIndicators()
         {
             // Memoized per device per tick so both loops below agree; the
@@ -5092,10 +5115,6 @@ namespace PadForge.Services
             catch { }
         }
 
-        /// <summary>
-        /// Updates the raw input state display for the selected device
-        /// on the Devices page using structured observable collections.
-        /// </summary>
         /// <summary>The Head Tracker row's source line (issue #355).</summary>
         private static string BuildHeadTrackerStatus(PadForge.Common.Input.HeadTrackerDevice ht)
         {
@@ -5211,9 +5230,11 @@ namespace PadForge.Services
         /// them are the source's failure states (no SDK, a registered path
         /// whose file is gone, a load failure, a library that is not this SDK,
         /// and an init the SDK refused). The sixth is running but hearing
-        /// nothing, which is the persistent-profile trap and is why the event
-        /// count is in the line at all. The seventh is running with keys
-        /// arriving.</para>
+        /// nothing, which a key without the G-key command, a profile that is
+        /// not persistent and a G600 or G300 mouse in on-board memory mode
+        /// all produce (LogitechGamingGkeySDK.pdf, "User experience"), and is
+        /// why the event count is in the line at all. The seventh is running
+        /// with keys arriving.</para>
         /// </summary>
         private void UpdateGKeysStatus()
         {
@@ -5234,8 +5255,9 @@ namespace PadForge.Services
                     PadForge.Engine.Common.Logitech.LogitechGKeyState.LoadFailed => s.Settings_GKeysStatus_LoadFailed,
                     PadForge.Engine.Common.Logitech.LogitechGKeyState.MissingExports => s.Settings_GKeysStatus_WrongLibrary,
                     PadForge.Engine.Common.Logitech.LogitechGKeyState.InitRefused => s.Settings_GKeysStatus_InitRefused,
-                    // Connected and silent is the persistent-profile trap, so
-                    // it gets its own line instead of a count of zero.
+                    // Connected and silent: no G-key command on the key, a
+                    // profile that is not persistent, or a G600 or G300 in
+                    // on-board memory mode. It gets its own line, not a zero.
                     PadForge.Engine.Common.Logitech.LogitechGKeyState.Running when row.EventCount == 0 =>
                         s.Settings_GKeysStatus_NoKeysYet,
                     PadForge.Engine.Common.Logitech.LogitechGKeyState.Running =>
@@ -5304,6 +5326,10 @@ namespace PadForge.Services
         /// from, beside the row it belongs to (LastRawStateDeviceGuid).</summary>
         private PadForge.Engine.ISdlInputDevice _lastRawStateDevice;
 
+        /// <summary>
+        /// Updates the raw input state display for the selected device
+        /// on the Devices page using structured observable collections.
+        /// </summary>
         private void UpdateDevicesRawState()
         {
             var devVm = _mainVm.Devices;
@@ -6143,11 +6169,6 @@ namespace PadForge.Services
         //  Runtime sync: ViewModel → PadSetting
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Pushes ViewModel slider values (deadzones, force feedback, linear)
-        /// directly to PadSetting objects so the engine picks them up immediately.
-        /// Called at 30Hz on the UI thread. String reference writes are atomic in .NET.
-        /// </summary>
         /// <summary>Cached strings for the mapping grid's live-value
         /// column. The 30 Hz refresh called int.ToString per row per tick
         /// even when the value repeats; MappingItem's setter already stops
@@ -6193,6 +6214,11 @@ namespace PadForge.Services
         private readonly Guid[] _lastSyncedSettingsGuid = new Guid[InputManager.MaxPads];
         private readonly PadSetting[] _lastSyncedPadSetting = new PadSetting[InputManager.MaxPads];
 
+        /// <summary>
+        /// Pushes ViewModel slider values (deadzones, force feedback, linear)
+        /// directly to PadSetting objects so the engine picks them up immediately.
+        /// Called at 30Hz on the UI thread. String reference writes are atomic in .NET.
+        /// </summary>
         private void SyncViewModelToPadSettings()
         {
             bool anyAudioRumble = false;
@@ -6466,6 +6492,7 @@ namespace PadForge.Services
             // Force feedback (int properties — not locale-affected).
             ps.ForceOverall = padVm.ForceOverallGain.ToString();
             ps.RotationRange = padVm.WheelRotationRange.ToString();
+            ps.RotationRangeEnabled = padVm.WheelRotationRangeEnabled ? "1" : "0";
             ps.AutoCenterStrength = padVm.WheelAutoCenter.ToString();
             ps.WheelRpmLeds = padVm.WheelRpmLeds ? "1" : "0";
             ps.LeftMotorStrength = padVm.LeftMotorStrength.ToString();
@@ -6702,7 +6729,7 @@ namespace PadForge.Services
                 return;
             }
 
-            LoadPadSettingIntoViewModel(padVm, ps);
+            LoadPadSettingIntoViewModel(padVm, ps, instanceGuid);
         }
 
         /// <summary>Applies every writer-mirrored tuning field from
@@ -6721,13 +6748,16 @@ namespace PadForge.Services
         /// load from a user edit: the MotionGrip listener in MainWindow
         /// recenters the motion state on a user change only (#392), and a
         /// device selection or profile switch must not drop every device's
-        /// gravity estimate on the slot.</summary>
-        internal static void LoadPadSettingIntoViewModel(PadViewModel padVm, PadSetting ps)
+        /// gravity estimate on the slot. <paramref name="deviceGuid"/> is the
+        /// device <paramref name="ps"/> belongs to, the selected one when
+        /// omitted, whose wheel bounds the rotation range (#512).</summary>
+        internal static void LoadPadSettingIntoViewModel(PadViewModel padVm, PadSetting ps, Guid? deviceGuid = null)
         {
             padVm.IsLoadingPadSetting = true;
             try
             {
-                LoadPadSettingIntoViewModelCore(padVm, ps);
+                LoadPadSettingIntoViewModelCore(padVm, ps,
+                    deviceGuid ?? padVm.SelectedMappedDevice?.InstanceGuid ?? Guid.Empty);
             }
             finally
             {
@@ -6788,7 +6818,7 @@ namespace PadForge.Services
                     guids[i].ToString());
         }
 
-        private static void LoadPadSettingIntoViewModelCore(PadViewModel padVm, PadSetting ps)
+        private static void LoadPadSettingIntoViewModelCore(PadViewModel padVm, PadSetting ps, Guid deviceGuid)
         {
             // Dead zones.
             padVm.LeftDeadZoneShape = (int)Common.Input.InputManager.ParseDeadZoneShape(ps.LeftThumbDeadZoneShape);
@@ -6866,7 +6896,8 @@ namespace PadForge.Services
 
             // Force feedback.
             padVm.ForceOverallGain = TryParseInt(ps.ForceOverall, 100);
-            padVm.WheelRotationRange = TryParseInt(ps.RotationRange, 900);
+            padVm.LoadWheelRotationRange(TryParseInt(ps.RotationRange, 900), WheelRangeLimitsOf(deviceGuid));
+            padVm.WheelRotationRangeEnabled = ps.RotationRangeEnabled != "0";
             padVm.WheelAutoCenter = TryParseInt(ps.AutoCenterStrength, 0);
             padVm.WheelRpmLeds = ps.WheelRpmLeds == "1";
             padVm.LeftMotorStrength = TryParseInt(ps.LeftMotorStrength, 100);
@@ -7050,16 +7081,6 @@ namespace PadForge.Services
             // device added/removed) call RefreshMappingsCore directly.
         }
 
-        /// <summary>Per-VC mapping refresh. Reads the slot's MappingSet
-        /// — the SOLE source of truth — and populates every MappingItem
-        /// in <paramref name="padVm"/>. The Mappings tab is intentionally
-        /// device-agnostic: changing the assigned-device dropdown does
-        /// NOT affect what's shown here. Legacy per-device descriptors
-        /// are converted into the MappingSet at settings load time
-        /// (<see cref="SettingsService.LoadFromFile"/> →
-        /// <c>BuildOneSlotFromLegacy</c>) and on device assignment
-        /// (<see cref="SettingsService.RefreshMappingSetsFromLegacy"/>);
-        /// from that point on the MappingSet is authoritative.</summary>
         /// <summary>#155 re-entrancy guard. RefreshMappingsCore mutates the
         /// live MappingItem instances (Clear then repopulate), and every
         /// watched setter raises PropertyChanged synchronously. The
@@ -7071,6 +7092,16 @@ namespace PadForge.Services
         /// time, so suppressing the push during a reload loses nothing.</summary>
         internal static bool SuppressMappingEditPush;
 
+        /// <summary>Per-VC mapping refresh. Reads the slot's MappingSet
+        /// — the SOLE source of truth — and populates every MappingItem
+        /// in <paramref name="padVm"/>. The Mappings tab is intentionally
+        /// device-agnostic: changing the assigned-device dropdown does
+        /// NOT affect what's shown here. Legacy per-device descriptors
+        /// are converted into the MappingSet at settings load time
+        /// (<see cref="SettingsService.LoadFromFile"/> →
+        /// <c>BuildOneSlotFromLegacy</c>) and on device assignment
+        /// (<see cref="SettingsService.RefreshMappingSetsFromLegacy"/>);
+        /// from that point on the MappingSet is authoritative.</summary>
         private static void RefreshMappingsCore(PadViewModel padVm)
         {
             if (padVm == null) return;
@@ -7235,6 +7266,10 @@ namespace PadForge.Services
                             // showed blank, or once synced against the slot's
                             // inputs borrowed the slot's first concrete controller.
                             extra.DeviceLabel = ResolveDeviceLabel(msRow2.Sources[si]?.DeviceGuid);
+                            // The controller a key kind's kept input was picked
+                            // on is named the same way, so a switch back to
+                            // Direct shows its name under the input.
+                            extra.NameDescriptorController(ResolveDeviceLabel);
                             mapping.ExtraSources.Add(extra);
                         }
                     }
@@ -7457,12 +7492,6 @@ namespace PadForge.Services
             return (p, y, r);
         }
 
-        /// <summary>
-        /// Populates the AvailableInputs dropdown for all mappings in a pad's mapping list.
-        /// Builds the list from the device's DeviceObjects (friendly names for gamepads,
-        /// numbered names for raw/non-gamepad devices). Also wires the dropdown selection
-        /// event for display text resolution.
-        /// </summary>
         /// <summary>One 250 ms config-snapshot mechanism for the per-(device,
         /// slot) setting providers (IR tuning / pointer mode, gyro bias /
         /// tuning, touchpad + mouse gesture settings). Each resolver still
@@ -7593,6 +7622,12 @@ namespace PadForge.Services
             PopulateAvailableInputs(padVm, ud);
         }
 
+        /// <summary>
+        /// Populates the AvailableInputs dropdown for all mappings in a pad's mapping list.
+        /// Builds the list from the device's DeviceObjects (friendly names for gamepads,
+        /// numbered names for raw/non-gamepad devices). Also wires the dropdown selection
+        /// event for display text resolution.
+        /// </summary>
         private void PopulateAvailableInputs(PadViewModel padVm, UserDevice ud)
         {
             if (padVm == null) return;
@@ -7814,6 +7849,7 @@ namespace PadForge.Services
                 mapping.InputSelectedFromDropdown += OnInputSelectedFromDropdown;
                 mapping.UseSharedAvailableInputs(PickerListForRow(padVm, mapping.TargetSettingName));
                 mapping.UseSharedParamInputs(padVm.SlotAvailableInputs);
+                mapping.UseSharedKeyInputs(padVm.SlotKeyInputs);
                 mapping.BeginSharedListRebuild();
             }
             try
@@ -7821,8 +7857,15 @@ namespace PadForge.Services
                 padVm.SlotAvailableInputs.Clear();
                 padVm.SlotMotionGyroInputs.Clear();
                 padVm.SlotMotionAccelInputs.Clear();
+                padVm.SlotKeyInputs.Clear();
                 foreach (var c in flat)
                     PickerListForChoice(padVm, c.Descriptor).Add(c);
+                // The Up and Down pickers of an Incremental or Ramp source
+                // offer only what their reader takes as a key. Each entry is
+                // the full list's own instance, so the stored key a row
+                // resolves from the full list is the item its picker holds.
+                foreach (var c in padVm.SlotAvailableInputs)
+                    if (IsUpDownKeyChoice(c)) padVm.SlotKeyInputs.Add(c);
             }
             finally
             {
@@ -7862,6 +7905,14 @@ namespace PadForge.Services
             PadForge.Engine.Data.MappingSetMigrator.MotionAccelTarget => padVm.SlotMotionAccelInputs,
             _ => padVm.SlotAvailableInputs,
         };
+
+        /// <summary>True for a choice the Up and Down pickers offer: an input
+        /// the key reader of an Incremental or Ramp source can read as held
+        /// (<see cref="PadForge.Engine.Common.Mapping.SourceKindRuntime.ReadsAsKey"/>).
+        /// Incremental and Ramp take discrete inputs by design, and the Record
+        /// button already refuses a stick for them (RecorderService).</summary>
+        internal static bool IsUpDownKeyChoice(PadForge.ViewModels.InputChoice c)
+            => c != null && PadForge.Engine.Common.Mapping.SourceKindRuntime.ReadsAsKey(c.Descriptor);
 
         /// <summary>The list a choice belongs in: a bundled gyro source in the
         /// Motion Gyro row's, a bundled accelerometer source in the Motion
@@ -7986,35 +8037,50 @@ namespace PadForge.Services
         /// report). The descriptors a recording produces are device-specific;
         /// re-tagging them onto a different KIND of device yields garbage, so
         /// we prefer the same-device target whenever one exists.</para>
+        ///
+        /// <para><paramref name="copiedFrom"/> is the layout of the slot the
+        /// settings were copied from, where that is another slot. The copy
+        /// brings the donor's own raw entries along, named on that slot's
+        /// wire, and on another wire they move with the rows
+        /// (<see cref="EntryMoveOf"/>), so a later merge of a device's own
+        /// entries into the table (SettingsService.MergeMappingSetsFromLegacy)
+        /// finds none on a control nobody bound.</para>
         /// </summary>
-        public void ApplyPadSettingToCurrentDeviceTranslated(int padIndex, PadSetting source,
+        internal void ApplyPadSettingToCurrentDeviceTranslated(int padIndex, PadSetting source,
             VirtualControllerType sourceType, bool sourceIsExtended,
             VirtualControllerType targetType, bool targetIsExtended,
-            Guid? targetDeviceGuidOverride = null)
+            Guid? targetDeviceGuidOverride = null, SlotLayout? copiedFrom = null)
         {
             if (source == null || padIndex < 0 || padIndex >= _mainVm.Pads.Count)
                 return;
 
             var padVm = _mainVm.Pads[padIndex];
-            if (!SlotAppearancePersistence.CarriesDeviceSettings(source))
+            // Paste and Copy From replace the slot's rows before this call.
+            // Where no device takes the tuning, the grid must still show
+            // those rows, or the autosave writes its old cells back over them.
+            void ShowRows()
             {
                 RefreshMappingsCore(padVm);
                 var current = padVm.SelectedMappedDevice;
                 PopulateAvailableInputs(padVm, current != null && current.InstanceGuid != Guid.Empty
                     ? FindUserDevice(current.InstanceGuid) : null);
+            }
+            if (!SlotAppearancePersistence.CarriesDeviceSettings(source))
+            {
+                ShowRows();
                 return;
             }
             Guid targetGuid = targetDeviceGuidOverride
                 ?? padVm.SelectedMappedDevice?.InstanceGuid
                 ?? Guid.Empty;
-            if (targetGuid == Guid.Empty)
+            var us = targetGuid == Guid.Empty ? null
+                : SettingsManager.FindSettingByInstanceGuidAndSlot(targetGuid, padIndex);
+            var ps = us?.GetPadSetting();
+            if (ps == null)
+            {
+                ShowRows();
                 return;
-
-            var us = SettingsManager.FindSettingByInstanceGuidAndSlot(targetGuid, padIndex);
-            if (us == null) return;
-
-            var ps = us.GetPadSetting();
-            if (ps == null) return;
+            }
 
             // Copy with cross-layout translation.
             ps.CopyFromTranslated(source, sourceType, sourceIsExtended, targetType, targetIsExtended);
@@ -8027,9 +8093,18 @@ namespace PadForge.Services
             // runtime resolvers miss them and serve defaults.
             RetargetPerDeviceSettingsAfterCopy(ps, targetGuid);
 
+            // On another wire the raw entries the copy brought move with
+            // the rows.
+            var landing = copiedFrom is { } copied ? LandingOf(copied, SlotLayoutOf(padVm)) : RawLanding.AsTheyStand;
+            if (landing != RawLanding.AsTheyStand
+                && SettingsManager.MoveRawEntries(ps, EntryMoveOf(copiedFrom.Value, SlotLayoutOf(padVm))))
+                us.PadSettingChecksum = ps.PadSettingChecksum;
+
             // Multi-source rows only round-trip when source and target
-            // share a layout — cross-layout target names don't line up.
-            if (MappingTranslation.IsSameLayout(sourceType, sourceIsExtended, targetType, targetIsExtended))
+            // share a layout. Cross-layout target names don't line up,
+            // and neither do the indices of two wires.
+            if (landing == RawLanding.AsTheyStand
+                && MappingTranslation.IsSameLayout(sourceType, sourceIsExtended, targetType, targetIsExtended))
             {
                 ApplyMultiSourceRowsToCurrentDevice(padIndex, targetGuid,
                     source.DeviceScopedMultiSourceRows);
@@ -8118,10 +8193,11 @@ namespace PadForge.Services
         /// already ran by the time this helper is called; this method
         /// only carries per-device tuning (deadzones, sensitivity, FFB,
         /// Gyro, TouchpadSettings).</remarks>
-        public void ApplyPerDeviceSettingsToSlot(int targetPadIndex,
+        internal void ApplyPerDeviceSettingsToSlot(int targetPadIndex,
             PadForge.Engine.Data.PerDeviceSettingsEntry[] entries,
             VirtualControllerType sourceLayoutType, bool sourceLayoutIsExtended,
-            VirtualControllerType targetLayoutType, bool targetLayoutIsExtended)
+            VirtualControllerType targetLayoutType, bool targetLayoutIsExtended,
+            SlotLayout? copiedFrom = null)
         {
             if (entries == null || entries.Length == 0) return;
             if (targetPadIndex < 0 || targetPadIndex >= _mainVm.Pads.Count) return;
@@ -8218,7 +8294,7 @@ namespace PadForge.Services
                     targetPadIndex, devicePs,
                     srcType, srcExt,
                     targetLayoutType, targetLayoutIsExtended,
-                    matchTarget);
+                    matchTarget, copiedFrom);
             }
         }
 
@@ -8282,23 +8358,29 @@ namespace PadForge.Services
                     srcRow.CopySettingsTo(targetRow);
                 }
 
-                // Strip the target device's existing Sources — we're
-                // replacing this device's contribution wholesale.
-                if (targetRow.Sources != null)
+                // Strip the target device's existing Sources, since this
+                // device's contribution is replaced wholesale. The kept and
+                // injected sources go into a new list assigned once by
+                // reference: the row may be the live set's, which the poll
+                // thread reads unlocked, and an in-place remove shrank the
+                // list under its reads.
+                var sources = new System.Collections.Generic.List<Engine.Data.MappingSource>(
+                    (previousSources?.Count ?? 0) + (srcRow.Sources?.Count ?? 0));
+                if (previousSources != null)
                 {
-                    targetRow.Sources.RemoveAll(s =>
-                        s != null
-                        && string.Equals(s.DeviceGuid ?? "", targetGuid, StringComparison.OrdinalIgnoreCase));
-                }
-                else
-                {
-                    targetRow.Sources = new System.Collections.Generic.List<Engine.Data.MappingSource>();
+                    foreach (var s in previousSources)
+                    {
+                        if (s != null
+                            && string.Equals(s.DeviceGuid ?? "", targetGuid, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        sources.Add(s);
+                    }
                 }
 
-                bool retainedPrefix = hadPrefix && targetRow.Sources.Count >= 2
-                    && ReferenceEquals(previousFirst, targetRow.Sources[0])
-                    && ReferenceEquals(previousSecond, targetRow.Sources[1]);
-                bool incomingPrefix = targetRow.Sources.Count == 0
+                bool retainedPrefix = hadPrefix && sources.Count >= 2
+                    && ReferenceEquals(previousFirst, sources[0])
+                    && ReferenceEquals(previousSecond, sources[1]);
+                bool incomingPrefix = sources.Count == 0
                     && srcRow.Sources?.Count >= 2
                     && srcRow.Sources[0] != null && srcRow.Sources[1] != null;
                 targetRow.SuppressBipolarPair = srcRow.CombineMode == "Custom"
@@ -8312,10 +8394,16 @@ namespace PadForge.Services
                     {
                         if (s == null) continue;
                         var clonedSrc = s.Clone();
+                        // A key on the copied device moves with it, and a key
+                        // on another controller stays there.
+                        string copiedFrom = s.DeviceGuid ?? "";
+                        clonedSrc.RetargetKeyDevices(g =>
+                            string.Equals(g, copiedFrom, StringComparison.OrdinalIgnoreCase) ? targetGuid : g);
                         clonedSrc.DeviceGuid = targetGuid;   // Clone() carries every Param* field
-                        targetRow.Sources.Add(clonedSrc);
+                        sources.Add(clonedSrc);
                     }
                 }
+                targetRow.Sources = sources;
             }
         }
 
@@ -8381,7 +8469,7 @@ namespace PadForge.Services
                         LayerMask = r.LayerMask ?? "Base",
                     };
                     r.CopySettingsTo(rc);
-                    rc.Sources = CopyRowSources(r, s => s.DeviceGuid ?? "", out bool suppressPair);
+                    rc.Sources = CopyRowSources(r, g => g ?? "", out bool suppressPair);
                     rc.SuppressBipolarPair = suppressPair;
                     copy.Rows.Add(rc);
                 }
@@ -8575,7 +8663,12 @@ namespace PadForge.Services
         /// already fails closed with the selection preserved, so carrying it
         /// is both safe and the only option that keeps the user's choice when
         /// the config comes home.</para></summary>
-        public static void ApplySlotSetExtrasJson(int padIndex, string json, bool sameLayout)
+        /// <param name="wire">The move the copied pairs owe where the copy
+        /// came whole from another wire of the same pads
+        /// (<see cref="WireMoveOf"/>): a raw slot's pairs name their buttons
+        /// by wire index.</param>
+        public static void ApplySlotSetExtrasJson(int padIndex, string json, bool sameLayout,
+            Func<string, string> wire = null)
         {
             if (string.IsNullOrEmpty(json)) return;
             var sets = SettingsManager.SlotMappingSets;
@@ -8592,7 +8685,7 @@ namespace PadForge.Services
             if (sameLayout)
             {
                 ms.SocdMode = snap.SocdMode ?? "";
-                ms.SocdPairs = snap.SocdPairs ?? "";
+                ms.SocdPairs = (wire != null ? SettingsManager.MoveSocdPairs(snap.SocdPairs, wire) : snap.SocdPairs) ?? "";
             }
             ms.KeepAwakeEnabled = snap.KeepAwakeEnabled;
             ms.KeepAwakeAxis = snap.KeepAwakeAxis ?? "";
@@ -8665,7 +8758,7 @@ namespace PadForge.Services
             foreach (var row in ms.Rows)
             {
                 if (row == null) continue;
-                var clonedSources = CopyRowSources(row, s => s.DeviceGuid ?? "", out bool suppressPair);
+                var clonedSources = CopyRowSources(row, g => g ?? "", out bool suppressPair);
                 var copy = new Engine.Data.MappingRow
                 {
                     Target = row.Target,
@@ -8679,16 +8772,529 @@ namespace PadForge.Services
             return result;
         }
 
-        internal static void ApplySlotRowsFromClipboard(int padIndex, PadSetting source, bool sameLayout)
+        /// <summary>What a slot's row targets name: its controller type and
+        /// whether it is a raw surface, the pair <see cref="MappingTranslation"/>
+        /// reads a layout from, on a raw surface which axes are triggers
+        /// (<see cref="CustomControllerLayout.IsTriggerSlot"/>, the engine's
+        /// own test), the targets the slot's grid shows, and the slot's
+        /// profile, which names a lettered slot's wire. A slot that is no raw
+        /// surface leaves the raw layout out, and a clipboard payload carries
+        /// no grid.</summary>
+        internal readonly record struct SlotLayout(
+            VirtualControllerType Type, bool IsExtended, CustomControllerLayout Raw = default,
+            IReadOnlySet<string> Grid = null, string ProfileId = null)
+        {
+            /// <summary>True for an Extended slot on a Valve pad's profile.</summary>
+            public bool Valve => Type == VirtualControllerType.Extended
+                && Models2D.NintendoPreviewMap.IsValve(ProfileId);
+
+            /// <summary>True when the slot's raw positions carry gamepad
+            /// roles: a Nintendo slot, read as the Switch Pro where its
+            /// profile names no wire, and a Valve slot. These are the two the
+            /// automap binds a pad onto by role
+            /// (SettingsManager.CreateDefaultPadSetting). A custom Extended
+            /// slot's positions are numbered and carry none.</summary>
+            public bool HasRoles => Type == VirtualControllerType.Nintendo || Valve;
+
+            /// <summary>True when the slot reads the target as a trigger, a
+            /// pull from released to full with no negative side: a gamepad's
+            /// trigger or a button's pressure, a VR hand's trigger or grip,
+            /// and a raw axis the slot's layout makes one. A MIDI CC and a
+            /// mouse axis are two-sided.</summary>
+            public bool IsTrigger(string target)
+            {
+                const string rawAxis = "RawAxis";
+                if (target != null && target.StartsWith(rawAxis, StringComparison.Ordinal))
+                    return int.TryParse(target.AsSpan(rawAxis.Length), System.Globalization.NumberStyles.None,
+                            System.Globalization.CultureInfo.InvariantCulture, out int axis)
+                        && Raw.IsTriggerSlot(axis);
+                return PadForge.Engine.Common.Mapping.TargetKindResolver.Resolve(target)
+                    == PadForge.Engine.Common.Mapping.TargetKind.Trigger;
+            }
+
+            /// <summary>True when the slot's control rests at the middle of
+            /// its travel: a stick axis, a MIDI CC, a mouse axis or wheel, a
+            /// raw axis the layout makes no trigger, and a motion axis. A
+            /// button, a D-pad direction and a trigger rest at the bottom.</summary>
+            public bool RestsInMiddle(string target)
+            {
+                if (IsTrigger(target)) return false;
+                var position = MappingTranslation.GetPosition(target, Type, IsExtended);
+                return position != null
+                    ? position.Category is ControlCategory.Axis or ControlCategory.AxisNeg
+                    : PadForge.Engine.Common.Mapping.TargetKindResolver.Resolve(target)
+                        == PadForge.Engine.Common.Mapping.TargetKind.BipolarAxis;
+            }
+        }
+
+        /// <summary>The layout of a live slot. The stick and trigger counts
+        /// are the ones the engine builds the slot's raw layout from
+        /// (SyncExtendedConfigToSlot), and the targets are read from the
+        /// slot's grid.</summary>
+        internal static SlotLayout SlotLayoutOf(PadViewModel pad)
+        {
+            bool raw = pad.OutputType is VirtualControllerType.Extended or VirtualControllerType.Nintendo;
+            var grid = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var item in pad.Mappings)
+                if (!string.IsNullOrEmpty(item?.TargetSettingName)) grid.Add(item.TargetSettingName);
+            return new SlotLayout(pad.OutputType, raw, raw
+                ? new CustomControllerLayout
+                {
+                    Sticks = pad.ExtendedConfig.ThumbstickCount,
+                    Triggers = pad.ExtendedConfig.TriggerCount,
+                }
+                : default, grid, pad.ProfileId);
+        }
+
+        /// <summary>How the raw rows of one slot land on another raw slot in
+        /// a Paste or a Copy From.</summary>
+        internal enum RawLanding
+        {
+            /// <summary>Index for index. The two slots are read through the
+            /// same tables, or the raw positions of one of them carry no
+            /// roles: a custom Extended slot's rows are numbered, and have
+            /// nothing to land by.</summary>
+            AsTheyStand,
+            /// <summary>By role, onto another wire of the same pads: a
+            /// Switch Pro and a Switch 2 Pro, or two Valve pads. The two
+            /// share a layout, so the table is copied whole, and a raw index
+            /// names another control on the other wire: raw button 8 is
+            /// Minus on a Switch Pro and D-pad Down on a Switch 2 Pro. So
+            /// everything copied that names a raw position moves to the
+            /// control of its role, as a change of the slot's profile moves
+            /// it (SettingsManager.TranslateNintendoRawMappings).</summary>
+            ByRole,
+            /// <summary>By placement, between a Nintendo wire and a Valve
+            /// one. Their roles are named apart, the south button is B on
+            /// one and A on the other, so the copy goes the way of any two
+            /// layouts (<see cref="ReplaceBaseRowsTranslated"/>).</summary>
+            ByPlacement,
+        }
+
+        internal static RawLanding LandingOf(SlotLayout from, SlotLayout to)
+        {
+            if (!from.HasRoles || !to.HasRoles) return RawLanding.AsTheyStand;
+            if (from.Valve != to.Valve) return RawLanding.ByPlacement;
+            return Models2D.NintendoPreviewMap.SameWireTables(from.ProfileId, to.ProfileId)
+                ? RawLanding.AsTheyStand
+                : RawLanding.ByRole;
+        }
+
+        /// <summary>True when one slot's table replaces another's whole: the
+        /// two share a layout (<see cref="MappingTranslation.IsSameLayout"/>)
+        /// and their raw rows do not have to land by placement. Every place
+        /// a Paste or a Copy From chooses between the whole table and the
+        /// Base rows alone asks this.</summary>
+        internal static bool CopiesWhole(SlotLayout from, SlotLayout to)
+            => MappingTranslation.IsSameLayout(from.Type, from.IsExtended, to.Type, to.IsExtended)
+               && LandingOf(from, to) != RawLanding.ByPlacement;
+
+        /// <summary>The move a table copied whole owes its raw names
+        /// (<see cref="RawLanding.ByRole"/>): a raw target's name on the
+        /// target slot's wire, null where that wire has no such control.
+        /// Null when the copy owes none.</summary>
+        internal static Func<string, string> WireMoveOf(SlotLayout from, SlotLayout to)
+        {
+            if (LandingOf(from, to) != RawLanding.ByRole) return null;
+            string fromWire = from.ProfileId, toWire = to.ProfileId;
+            return name => Models2D.NintendoPreviewMap.TranslateRawTarget(name, fromWire, toWire);
+        }
+
+        /// <summary>The move a copied device's own raw entries owe: by role
+        /// with a table copied whole (<see cref="WireMoveOf"/>), by
+        /// placement with one whose Base rows land that way
+        /// (<see cref="TranslateTarget"/>). Null when they stand as they
+        /// are.</summary>
+        private static Func<string, string> EntryMoveOf(SlotLayout from, SlotLayout to)
+            => LandingOf(from, to) switch
+            {
+                RawLanding.ByRole => WireMoveOf(from, to),
+                RawLanding.ByPlacement => name => TranslateTarget(name, from, to),
+                _ => null,
+            };
+
+        /// <summary>The layout of the slot a clipboard payload was copied
+        /// from. An Extended slot's copy carries its stick and trigger counts
+        /// (SlotExtendedConfigJson). A Nintendo slot has no analog trigger,
+        /// and a payload without the counts reads the same way. The profile
+        /// rides in the payload too (PadSetting.SlotProfileId). A payload
+        /// from before it did reads a Nintendo slot as the Switch Pro.</summary>
+        internal static SlotLayout ClipboardSlotLayout(PadSetting source,
+            VirtualControllerType sourceType, bool sourceIsExtended)
+        {
+            var raw = default(CustomControllerLayout);
+            if (!string.IsNullOrEmpty(source.SlotExtendedConfigJson))
+            {
+                try
+                {
+                    var config = System.Text.Json.JsonSerializer.Deserialize<ExtendedSlotConfigData>(
+                        source.SlotExtendedConfigJson);
+                    if (config != null)
+                        raw = new CustomControllerLayout { Sticks = config.ThumbstickCount, Triggers = config.TriggerCount };
+                }
+                catch { /* malformed counts: no trigger known */ }
+            }
+            return new SlotLayout(sourceType, sourceIsExtended, raw, ProfileId: source.SlotProfileId);
+        }
+
+        /// <summary>The row step of a Paste. On the layout the payload was
+        /// copied from, its table replaces the target's whole
+        /// (<see cref="CopiesWhole"/>), its rows moved by role first where
+        /// the payload came from another wire of the same pads
+        /// (<see cref="RawLanding.ByRole"/>), so the engine never reads one
+        /// on the control that shares its index. On another layout, and
+        /// between a Nintendo slot and a Valve one, its Base rows land by
+        /// position or by placement (<see cref="ReplaceBaseRowsTranslated"/>).</summary>
+        internal static void ApplySlotRowsFromClipboard(int padIndex, PadSetting source,
+            VirtualControllerType sourceType, bool sourceIsExtended, SlotLayout target)
         {
             // Empty whole-slot rows clear the target. Missing rows keep the
             // legacy device-scoped path available to the later tuning copy.
-            if (source?.SlotMultiSourceRows != null && sameLayout)
+            if (source?.SlotMultiSourceRows == null) return;
+            var from = ClipboardSlotLayout(source, sourceType, sourceIsExtended);
+            if (CopiesWhole(from, target))
             {
-                ApplySlotMappingSetFromRows(padIndex, source.SlotMultiSourceRows);
+                ApplySlotMappingSetFromRows(padIndex, WireMoveOf(from, target) is { } wire
+                    ? SettingsManager.MoveRawRows(source.SlotMultiSourceRows, wire)
+                    : source.SlotMultiSourceRows);
                 source.DeviceScopedMultiSourceRows = null;
             }
+            else
+            {
+                ReplaceBaseRowsTranslated(padIndex, source.SlotMultiSourceRows, from, target);
+            }
         }
+
+        /// <summary>Copy From between two slots of different layouts, where
+        /// <see cref="ReplaceSlotMappingSet"/> cannot copy the table as it
+        /// is: the source slot's Base rows land by position, or by role on a
+        /// Nintendo or a Valve slot (<see cref="ReplaceBaseRowsTranslated"/>),
+        /// and its rumble audio and Keep Awake cross as a Paste carries them
+        /// (<see cref="ApplySlotSetExtrasJson"/>), so the two end alike.</summary>
+        internal static void TranslateSlotMappingSet(int targetSlot, int sourceSlot, SlotLayout from, SlotLayout to)
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null) return;
+            if (targetSlot < 0 || targetSlot >= sets.Length) return;
+            if (sourceSlot < 0 || sourceSlot >= sets.Length) return;
+            if (targetSlot == sourceSlot) return;
+
+            ReplaceBaseRowsTranslated(targetSlot, ExtractAllRowsForSlot(sourceSlot), from, to);
+            ApplySlotSetExtrasJson(targetSlot, BuildSlotSetExtrasJson(sourceSlot), sameLayout: false);
+        }
+
+        /// <summary>The row step of a Paste or a Copy From between slots of
+        /// different layouts. On a shared layout the copied table replaces the
+        /// target's whole. Target names differ between layouts, so here each
+        /// part of the target slot goes its own way.
+        ///
+        /// <para>Base rows: replaced by the copied slot's Base rows, each
+        /// under the target's name for its control
+        /// (<see cref="TranslateTarget"/>), by position or by role, and
+        /// dropped where the target layout has no such control. Two copied
+        /// rows can land on one control, the Share button and the mic button
+        /// on a Switch pad's Capture, and the first of them with a source
+        /// keeps it. No other layout has pressure rows, so they never cross.
+        /// A copied slot with no Base row leaves the target's Base empty. A
+        /// paste replaces, here as on a shared layout and as with macros, so
+        /// the result never depends on what the target held.</para>
+        ///
+        /// <para>Rows on shift layers: the target keeps its own and takes
+        /// none. A layer's rows name its layout's targets cell by cell, and
+        /// the callers leave the target's shift activators, menus and SOCD
+        /// pairs alone for the same reason. A kept layer row holds no
+        /// reference to the Base row of its target. It stands in for that
+        /// row while its layer is engaged, so it is left as it would be had
+        /// the user re-bound or cleared the Base row by hand. Rumble audio
+        /// and Keep Awake name no target and cross
+        /// (<see cref="ApplySlotSetExtrasJson"/>).</para>
+        ///
+        /// <para>The set stays the target's own object. Its Base tab's name,
+        /// color and icon and its Workshop ownership (Authoritative and the
+        /// stamps read under it) go with the layers it keeps, so they stay
+        /// as they were.</para>
+        ///
+        /// <para>Sources: each moves to the target slot's devices by the
+        /// shared-layout rule (<see cref="CopyRowSources"/>,
+        /// <see cref="RetargetDeviceGuidForSlot"/>), with every setting of
+        /// its row, and rests where the new control rests
+        /// (<see cref="KeepSourcesAtRest"/>).</para>
+        ///
+        /// <para>The kept layer rows and the new Base rows go into one list
+        /// assigned by reference, the swap a layer paste makes: the poll
+        /// thread reads the slot's rows unlocked.</para></summary>
+        private static void ReplaceBaseRowsTranslated(int padIndex,
+            IList<MappingRow> rows, SlotLayout from, SlotLayout to)
+        {
+            var sets = SettingsManager.SlotMappingSets;
+            if (sets == null || padIndex < 0 || padIndex >= sets.Length || rows == null) return;
+            // The copy replaces the slot's routing, so nothing a Bliss-Box
+            // port owed the slot is filled after.
+            DeviceService.CancelOwedMappingForSlot(padIndex);
+
+            var current = sets[padIndex];
+            var replaced = new List<MappingRow>((current?.Rows?.Count ?? 0) + rows.Count);
+            if (current?.Rows != null)
+            {
+                foreach (var kept in current.Rows)
+                    if (kept != null && !IsBaseRow(kept)) replaced.Add(kept);
+            }
+            var landed = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var r in rows)
+            {
+                if (r == null || !IsBaseRow(r)) continue;
+                var rc = TranslateRow(r, from, to, padIndex);
+                // A motion row emptied by the retarget is left out, as on a
+                // shared layout: an empty one would switch the channel off.
+                if (rc == null || LostEveryMotionInput(r, rc)) continue;
+                if (!landed.TryGetValue(rc.Target, out int at))
+                {
+                    landed[rc.Target] = replaced.Count;
+                    replaced.Add(rc);
+                }
+                else if (!HasSource(replaced[at]) && HasSource(rc)) replaced[at] = rc;
+            }
+            if (current == null) sets[padIndex] = new MappingSet { Rows = replaced };
+            else current.Rows = replaced;
+
+            // The same structural change a shared-layout paste makes: steering
+            // and toggle state, the simulated pose and the Base-row index must
+            // not outlive the rows they were built on.
+            Common.Input.InputManager.ResetSourceKindRuntimeForSlot(padIndex);
+        }
+
+        private static bool IsBaseRow(MappingRow row)
+            => string.Equals(row.LayerMask ?? "Base", "Base", StringComparison.Ordinal);
+
+        /// <summary>One copied Base row under the target's name for its
+        /// control (<see cref="TranslateTarget"/>), or null.
+        ///
+        /// <para>The position table gives an axis two positions, the axis
+        /// and its negative leg, and a row holds both: the leg is the second
+        /// source when it reads the first one's device with the opposite
+        /// Invert (<see cref="Common.Input.InputManager.IsBipolarNegPair"/>),
+        /// the pair a two-button axis is stored as. A trigger and a button
+        /// have no negative side, and a Switch pad's ZL and ZR are buttons.
+        /// Where a two-sided axis lands on one, the leg is dropped and the
+        /// positive leg lands alone: left in place, the leg would read as the
+        /// trigger reads any inverted source, full at rest, and hold the
+        /// button down. PadSetting.CopyFromTranslated dropped the Neg field
+        /// the same way on a gamepad or VR trigger, which has no negative
+        /// position. A raw trigger has one, so the fields kept the leg there,
+        /// and the leg is dropped here as well.</para>
+        ///
+        /// <para>A Custom row's formula names its sources by letter, and a
+        /// stick axis folds the pair into one letter where a trigger, a
+        /// button, a MIDI CC and a mouse axis give each source its own. A
+        /// formula keeps its letters where the leg is dropped from a folded
+        /// pair, and where a pair the copied row read apart is kept apart on a
+        /// stick axis (SuppressBipolarPair). Where neither can be done, a
+        /// folded pair on a control that cannot fold it and a leg read apart
+        /// on a trigger or a button, the row lands without its formula as the
+        /// fields carried it: its first source, with the leg on a two-sided
+        /// control.</para>
+        ///
+        /// <para>A row whose new control rests at the other end of its
+        /// travel keeps its sources at rest (<see cref="KeepSourcesAtRest"/>),
+        /// and a row that step leaves with no source is dropped.</para></summary>
+        private static MappingRow TranslateRow(MappingRow r, SlotLayout from, SlotLayout to, int padIndex)
+        {
+            string target = TranslateTarget(r.Target, from, to);
+            if (target == null) return null;
+
+            var rc = new MappingRow { Target = target, LayerMask = "Base" };
+            r.CopySettingsTo(rc);
+
+            var read = r;
+            bool custom = r.CombineMode == "Custom";
+            bool fromMiddle = from.RestsInMiddle(r.Target), toMiddle = to.RestsInMiddle(target);
+            bool fromFolds = fromMiddle && Common.Input.InputManager.TargetIsBipolarAxis(r.Target);
+            bool toFolds = toMiddle && Common.Input.InputManager.TargetIsBipolarAxis(target);
+            if (r.Sources != null && r.Sources.Count >= 2 && !(custom && r.SuppressBipolarPair)
+                && Common.Input.InputManager.IsBipolarNegPair(r.Sources[0], r.Sources[1]))
+            {
+                if (!toMiddle && fromMiddle && (!custom || fromFolds))
+                {
+                    // The leg is gone, and in a formula what followed it
+                    // stays apart from the positive leg.
+                    var legless = new List<MappingSource>(r.Sources);
+                    legless.RemoveAt(1);
+                    read = new MappingRow
+                    {
+                        Target = r.Target, CombineMode = r.CombineMode,
+                        SuppressBipolarPair = custom || r.SuppressBipolarPair, Sources = legless,
+                    };
+                }
+                else if (custom && fromMiddle && (fromFolds ? !toFolds : !toMiddle))
+                {
+                    custom = false;
+                    rc.CombineMode = "";
+                    rc.CombineExpression = "";
+                    read = new MappingRow { Target = r.Target, Sources = r.Sources.GetRange(0, toMiddle ? 2 : 1) };
+                }
+            }
+
+            rc.Sources = CopyRowSources(read, g => RetargetDeviceGuidForSlot(g, padIndex), out bool apart);
+            rc.SuppressBipolarPair = apart || (custom && toFolds && !fromFolds && rc.Sources.Count >= 2
+                && Common.Input.InputManager.IsBipolarNegPair(rc.Sources[0], rc.Sources[1]));
+            if (fromMiddle != toMiddle && !KeepSourcesAtRest(rc, fromMiddle, padIndex)) return null;
+            return rc;
+        }
+
+        /// <summary>The target a copied Base row lands on, or null where the
+        /// target layout has no such control.
+        ///
+        /// <para>Between two layouts whose positions carry no gamepad roles,
+        /// the target layout's name for the row's position
+        /// (<see cref="MappingTranslation"/>): an Xbox slot's A lands on raw
+        /// button 0 of a custom Extended slot, its left stick X on raw axis
+        /// 0, its D-pad on hat 0.</para>
+        ///
+        /// <para>Onto or from a slot whose raw positions carry gamepad roles
+        /// (<see cref="SlotLayout.HasRoles"/>), by role, through the gamepad
+        /// target and the table the automap binds a pad onto that slot by
+        /// (Models2D.NintendoPreviewMap.GamepadPositions), so a copy and the
+        /// automap place a control alike: an Xbox slot's A lands on a Switch
+        /// pad's B, south on south. A row of a layout with no gamepad targets,
+        /// a MIDI note or a key, goes through the gamepad target of its
+        /// position. A lettered slot's raw row goes through the gamepad target
+        /// whose role it is. Where two share the role, it goes to the one the
+        /// target slot's grid shows: Capture is the Share button on an Xbox
+        /// slot and the mic button on a DualSense. A raw row no gamepad target
+        /// takes is dropped, never carried by its index.</para>
+        ///
+        /// <para>A row the table gives no position, a motion or a touchpad
+        /// row, crosses under its own name where the target slot's grid shows
+        /// a row of that name with no position either (a PlayStation slot
+        /// shares them with a Nintendo or a Valve one), as
+        /// PadSetting.CopyFromTranslated carried those fields.</para></summary>
+        private static string TranslateTarget(string name, SlotLayout from, SlotLayout to)
+        {
+            var position = MappingTranslation.GetPosition(name, from.Type, from.IsExtended);
+            if (position == null)
+                return to.Grid != null && to.Grid.Contains(name)
+                    && MappingTranslation.GetPosition(name, to.Type, to.IsExtended) == null ? name : null;
+            if (!from.HasRoles && !to.HasRoles)
+                return MappingTranslation.GetPropertyName(position, to.Type, to.IsExtended);
+
+            IEnumerable<string> gamepadTargets = from.HasRoles
+                ? Models2D.NintendoPreviewMap.GamepadTargetsForRaw(name, from.ProfileId, from.Valve)
+                : new[] { MappingTranslation.GetPropertyName(position, VirtualControllerType.Xbox, false) };
+            string first = null;
+            foreach (string gamepad in gamepadTargets)
+            {
+                string landed = to.HasRoles
+                    ? Models2D.NintendoPreviewMap.RawForGamepadTarget(gamepad, to.ProfileId, to.Valve)
+                    : MappingTranslation.GetPosition(gamepad, VirtualControllerType.Xbox, false) is { } at
+                        ? MappingTranslation.GetPropertyName(at, to.Type, to.IsExtended)
+                        : null;
+                if (landed == null) continue;
+                if (to.Grid != null && to.Grid.Contains(landed)) return landed;
+                first ??= landed;
+            }
+            return first;
+        }
+
+        /// <summary>The rest step of <see cref="TranslateRow"/>, for a row
+        /// whose new control rests at the other end of its travel from the
+        /// copied one (<see cref="SlotLayout.RestsInMiddle"/>). A source that
+        /// rested on the copied control would drive the new one at rest: a
+        /// released trigger read in full holds a stick to one side, turns a
+        /// wheel without end or pins a CC at its bottom, and a centered stick
+        /// half pulls a trigger or presses a button.
+        ///
+        /// <para>An axis source of that kind is read as a half axis
+        /// (MappingSource.HalfAxis), which reads 0 at rest on every lane, the
+        /// setting the recorder gives a centered axis on a button. The engine
+        /// reads a row the user authored as it stands: a trigger bound to a
+        /// stick by hand reads its full axis until the user sets the half.
+        /// Bidirectional goes off, since a half read with it takes either
+        /// side of the middle, and a released trigger sits at one end. Invert
+        /// stays: on a centered axis it then picks the half, the side that
+        /// drove the copied control. A trigger read as a half axis moves the
+        /// new control over the second half of its pull only.</para>
+        ///
+        /// <para>A slider has no half read on a two-sided axis, and no setting
+        /// rests it at the middle, so it is dropped, a blank keeping its
+        /// letter in a formula. A source that did not rest on the copied
+        /// control, a trigger the user bound to a stick, keeps how it reads.
+        /// Returns false when the step leaves the row with no source.</para></summary>
+        private static bool KeepSourcesAtRest(MappingRow rc, bool copiedRestsInMiddle, int padIndex)
+        {
+            bool custom = rc.CombineMode == "Custom", dropped = false;
+            List<UserDevice> slotDevices = null;
+            for (int i = rc.Sources.Count - 1; i >= 0; i--)
+            {
+                var source = rc.Sources[i];
+                if (source == null || source.HalfAxis
+                    || !PadForge.Engine.Common.Mapping.SourceEvaluator.IsDescriptorKind(source.Kind))
+                    continue;
+                var type = PadForge.Engine.Common.Mapping.SourceCoercion.ClassifyDescriptor(source.Descriptor);
+                bool slider = type == PadForge.Engine.Common.Mapping.SourceCoercion.SourceType.Slider;
+                if (!slider && type != PadForge.Engine.Common.Mapping.SourceCoercion.SourceType.Axis) continue;
+
+                RestsOn(source, padIndex, ref slotDevices, out bool atZero, out bool inMiddle);
+                if (copiedRestsInMiddle ? !inMiddle : !atZero || source.Invert) continue;
+                if (!slider)
+                {
+                    source.HalfAxis = true;
+                    source.Bidirectional = false;
+                    continue;
+                }
+                dropped = true;
+                if (custom) rc.Sources[i] = new MappingSource();
+                else rc.Sources.RemoveAt(i);
+            }
+            // The copied control gave each source its own letter, so a blank
+            // that now looks like the first source's negative leg, or like the
+            // second's positive one, stays apart on a stick axis, as the
+            // blanks of CopyRowSources do (PreserveCopiedPairShape).
+            if (custom && dropped && rc.Sources.Count >= 2
+                && Common.Input.InputManager.IsBipolarNegPair(rc.Sources[0], rc.Sources[1]))
+                rc.SuppressBipolarPair = true;
+            return !dropped || HasSource(rc);
+        }
+
+        /// <summary>Where an axis source rests on the target slot, on the
+        /// devices it reads: its own controller, or for "(Any Device)" each
+        /// controller on the slot (Common.Input.InputManager.AxisRestsAtZero
+        /// for each, the rule the engine and the recorder share). A slider
+        /// rests at zero on every device.</summary>
+        private static void RestsOn(MappingSource source, int padIndex, ref List<UserDevice> slotDevices,
+            out bool atZero, out bool inMiddle)
+        {
+            atZero = inMiddle = false;
+            IReadOnlyList<UserDevice> devices;
+            if (!string.IsNullOrEmpty(source.DeviceGuid))
+            {
+                devices = new[]
+                {
+                    Guid.TryParse(source.DeviceGuid, out var guid) ? SettingsManager.FindDeviceByInstanceGuid(guid) : null,
+                };
+            }
+            else
+            {
+                if (slotDevices == null)
+                {
+                    slotDevices = new List<UserDevice>();
+                    foreach (var setting in SettingsManager.GetSettingsForSlot(padIndex))
+                        if (setting != null && SettingsManager.FindDeviceByInstanceGuid(setting.InstanceGuid) is { } device)
+                            slotDevices.Add(device);
+                }
+                devices = slotDevices.Count > 0 ? slotDevices : new UserDevice[] { null };
+            }
+            foreach (var device in devices)
+            {
+                if (Common.Input.InputManager.AxisRestsAtZero(source.Descriptor, device)) atZero = true;
+                else inMiddle = true;
+            }
+        }
+
+        /// <summary>True when a row has a source that reads an input, a
+        /// formula's blank placeholders aside.</summary>
+        private static bool HasSource(MappingRow row)
+            => row.Sources != null && row.Sources.Exists(s => s != null
+                && !PadForge.Engine.Common.Mapping.SourceEvaluator.IsUnmappedDirect(s));
 
         /// <summary>Paste companion: replaces a target slot's MappingSet
         /// wholesale from a snapshot built by <see cref="ExtractAllRowsForSlot"/>.
@@ -8742,7 +9348,7 @@ namespace PadForge.Services
                 };
                 r.CopySettingsTo(rc);
                 rc.Sources = CopyRowSources(r,
-                    s => RetargetDeviceGuidForSlot(s.DeviceGuid, padIndex), out bool suppressPair);
+                    g => RetargetDeviceGuidForSlot(g, padIndex), out bool suppressPair);
                 rc.SuppressBipolarPair = suppressPair;
                 if (LostEveryMotionInput(r, rc)) continue;
                 copy.Rows.Add(rc);
@@ -8773,8 +9379,15 @@ namespace PadForge.Services
             && !MappingSetMigrator.IsEmptyMotionRow(original)
             && !copy.NoInherit;
 
+        /// <summary>Copies a row's sources, each source's device and each
+        /// key's controller moved through <paramref name="retarget"/> (a device
+        /// guid to the copy's, null where the copy has none). A source whose
+        /// device has none, or whose every key lost its controller, is dropped,
+        /// and a Custom row keeps a blank in its place. The controller a key
+        /// kind's kept input was picked on moves with the keys
+        /// (MappingSource.RetargetKeyDevices).</summary>
         internal static List<MappingSource> CopyRowSources(MappingRow row,
-            Func<MappingSource, string> retarget, out bool suppressBipolarPair)
+            Func<string, string> retarget, out bool suppressBipolarPair)
         {
             bool custom = row.CombineMode == "Custom";
             suppressBipolarPair = row.SuppressBipolarPair;
@@ -8793,8 +9406,9 @@ namespace PadForge.Services
                     result.Add(new MappingSource());
                     continue;
                 }
-                string guid = retarget(source);
-                if (guid == null)
+                string guid = retarget(source.DeviceGuid);
+                var clone = guid == null ? null : source.Clone();
+                if (clone == null || clone.RetargetKeyDevices(retarget))
                 {
                     if (custom)
                         result.Add(source.Kind == "InvertOnHold"
@@ -8802,7 +9416,6 @@ namespace PadForge.Services
                             : new MappingSource());
                     continue;
                 }
-                var clone = source.Clone();
                 clone.DeviceGuid = guid;
                 result.Add(clone);
             }
@@ -8932,8 +9545,13 @@ namespace PadForge.Services
         /// "variation") device — see <see cref="RetargetDeviceGuidForSlot"/>
         /// for the exact rule. Carries every device's contribution, every
         /// extra source, combine modes, and Custom formulas. Unmatched sources
-        /// become neutral positions in Custom rows and are dropped from other rows.</summary>
-        public static void ReplaceSlotMappingSet(int targetSlot, int sourceSlot)
+        /// become neutral positions in Custom rows and are dropped from other rows.
+        /// <paramref name="wire"/> is the move the copy owes where the two
+        /// slots are on different wires of the same pads
+        /// (<see cref="WireMoveOf"/>): its rows, on every layer, and the
+        /// buttons its SOCD pairs name move by role before the table is
+        /// installed.</summary>
+        public static void ReplaceSlotMappingSet(int targetSlot, int sourceSlot, Func<string, string> wire = null)
         {
             var sets = SettingsManager.SlotMappingSets;
             if (sets == null) return;
@@ -9007,11 +9625,16 @@ namespace PadForge.Services
                     };
                     r.CopySettingsTo(rc);
                     rc.Sources = CopyRowSources(r,
-                        s => RetargetDeviceGuidForSlot(s.DeviceGuid, targetSlot), out bool suppressPair);
+                        g => RetargetDeviceGuidForSlot(g, targetSlot), out bool suppressPair);
                     rc.SuppressBipolarPair = suppressPair;
                     if (LostEveryMotionInput(r, rc)) continue;
                     copy.Rows.Add(rc);
                 }
+            }
+            if (wire != null)
+            {
+                copy.Rows = SettingsManager.MoveRawRows(copy.Rows, wire);
+                copy.SocdPairs = SettingsManager.MoveSocdPairs(copy.SocdPairs, wire) ?? "";
             }
             sets[targetSlot] = copy;
 
@@ -9587,6 +10210,10 @@ namespace PadForge.Services
             _dispatcher.BeginInvoke(new Action(() =>
             {
                 if (!ReferenceEquals(sender, _inputManager)) return;
+                // A device that came or went may carry outputs (#494), and
+                // may be one a direct backend finds by its own collection,
+                // so the host walks the present collections again as well.
+                _peripheralHost?.DevicesChanged();
                 SyncDevicesList();
                 RefreshVoiceObjects();
                 UpdatePadDeviceInfo();
@@ -9744,10 +10371,47 @@ namespace PadForge.Services
         /// </summary>
         private void OnErrorOccurred(object sender, InputExceptionEventArgs e)
         {
-            _dispatcher.BeginInvoke(new Action(() =>
-            {
-                _mainVm.SetStatus(string.Format(Strings.Instance.Status_Error_Format, e.Message), persist: true);
-            }));
+            _dispatcher.BeginInvoke(new Action(() => ShowError(e.Message)));
+        }
+
+        /// <summary>The engine error last written to the status bar: the
+        /// message it reported and the line as written. The bar holds one
+        /// line, so only the last error written can still be showing.</summary>
+        private string _shownErrorMessage;
+        private string _shownErrorLine;
+
+        /// <summary>Writes an engine error to the status bar and records the
+        /// line, so <see cref="ClearResolvedError"/> takes back the text that
+        /// was written. Re-formatting it in the current language would miss a
+        /// line written before a language change.</summary>
+        internal void ShowError(string message)
+        {
+            string line = string.Format(Strings.Instance.Status_Error_Format, message);
+            _shownErrorMessage = message;
+            _shownErrorLine = line;
+            _mainVm.SetStatus(line, persist: true);
+        }
+
+        /// <summary>
+        /// Called on the background thread when a reported failure recovered,
+        /// such as a HIDMaestro setup that a later retry completed.
+        /// </summary>
+        private void OnErrorResolved(object sender, string message)
+        {
+            _dispatcher.BeginInvoke(new Action(() => ClearResolvedError(message)));
+        }
+
+        /// <summary>Clears the status line when it still shows the error that
+        /// recovered, compared with the line as written, and leaves any later
+        /// message alone. The record goes either way.</summary>
+        internal void ClearResolvedError(string message)
+        {
+            if (_shownErrorMessage == null || !string.Equals(_shownErrorMessage, message, StringComparison.Ordinal))
+                return;
+            if (_mainVm.StatusText == _shownErrorLine)
+                _mainVm.SetStatus(string.Empty);
+            _shownErrorMessage = null;
+            _shownErrorLine = null;
         }
 
         /// <summary>
@@ -9979,34 +10643,6 @@ namespace PadForge.Services
                     StartDsuServerIfEnabled();
                 }
             }
-            else if (e.PropertyName == nameof(DashboardViewModel.EnableChromaLightbar))
-            {
-                if (_mainVm.Dashboard.EnableChromaLightbar)
-                    StartChromaIfEnabled();
-                else if (ChromaLightbarService.MacroColorRequested && _chromaService != null)
-                {
-                    // Set Chroma Color actions (#468) still use the service:
-                    // switch the mirror off and keep painting their colors.
-                    _chromaService.MirrorEnabled = false;
-                    _mainVm.Dashboard.ChromaStatus = Strings.Instance.Common_Stopped;
-                }
-                else
-                    StopChromaService();
-            }
-            else if (e.PropertyName == nameof(DashboardViewModel.EnableLightsyncLightbar))
-            {
-                if (_mainVm.Dashboard.EnableLightsyncLightbar)
-                    StartLightsyncIfEnabled();
-                else
-                    StopLightsyncService();
-            }
-            else if (e.PropertyName == nameof(DashboardViewModel.EnableSensaHaptics))
-            {
-                if (_mainVm.Dashboard.EnableSensaHaptics)
-                    StartSensaIfEnabled();
-                else
-                    StopSensaService();
-            }
             else if (e.PropertyName == nameof(DashboardViewModel.EnableWebController))
             {
                 if (_mainVm.Dashboard.EnableWebController)
@@ -10188,138 +10824,50 @@ namespace PadForge.Services
             return "ok default";
         }
 
-        // ── Razer Chroma lightbar mirror (#373) ──
+        // ── Haptic and RGB peripherals (#494) ──
 
-        /// <summary>Runs the Chroma service while the lightbar mirror is on,
-        /// or once a Set Chroma Color action has run (#468). The service holds
-        /// a Synapse session only while it has something to paint, so running
-        /// it for macros costs an idle loop between presses.</summary>
-        private void StartChromaIfEnabled()
+        /// <summary>Starts the peripheral host with the engine. Every output
+        /// follows assignment, so there is no switch: the host costs a link
+        /// pass every half second and an idle worker per backend until a
+        /// device that uses one is assigned.</summary>
+        private void StartPeripheralOutputs()
         {
-            bool mirror = _mainVm.Dashboard.EnableChromaLightbar;
-            PadForge.Engine.SdlDiagLog.WriteLine(
-                $"CHROMA start? enabled={mirror} macros={ChromaLightbarService.MacroColorRequested} engine={_inputManager != null} live={_chromaService != null}");
-            if ((!mirror && !ChromaLightbarService.MacroColorRequested) || _inputManager == null)
-                return;
-            if (_chromaService != null)
+            if (_inputManager == null || _peripheralHost != null) return;
+            var host = new PadForge.Common.Input.Peripherals.PeripheralOutputHost();
+            var inputManager = _inputManager;
+            host.SlotHasController = pad => inputManager.HasVirtualControllerAt(pad);
+            host.CapabilitiesChanged += OnPeripheralCapabilitiesChanged;
+            _peripheralHost = host;
+            host.Start();
+        }
+
+        private void StopPeripheralOutputs()
+        {
+            var host = _peripheralHost;
+            _peripheralHost = null;
+            if (host == null) return;
+            host.CapabilitiesChanged -= OnPeripheralCapabilitiesChanged;
+            host.Dispose();
+        }
+
+        /// <summary>Windows reported a HID interface arriving (#494). A
+        /// direct backend finds a device by its own collection, and a lit
+        /// device with no row of its own, a light strip or a headset,
+        /// changes no device list when it is plugged in, so the peripheral
+        /// host is asked to walk the present collections again. Nothing to
+        /// ask while the engine is stopped.</summary>
+        public void RequestPeripheralRescan() => _peripheralHost?.RequestRescan();
+
+        /// <summary>A row found or lost an output. The record is persisted
+        /// so the row's tabs stay up while it sleeps, and the device list
+        /// shows its rumble chip by it.</summary>
+        private void OnPeripheralCapabilitiesChanged()
+        {
+            _dispatcher.BeginInvoke(new Action(() =>
             {
-                _chromaService.MirrorEnabled = mirror;
-                return; // Already running.
-            }
-
-            _chromaService = new ChromaLightbarService { MirrorEnabled = mirror };
-            _chromaService.StateChanged += state =>
-            {
-                _dispatcher.BeginInvoke(() =>
-                {
-                    // The Dashboard line describes the mirror. A service that
-                    // runs for macro colors alone reads Stopped there.
-                    if (!_mainVm.Dashboard.EnableChromaLightbar)
-                    {
-                        _mainVm.Dashboard.ChromaStatus = Strings.Instance.Common_Stopped;
-                        return;
-                    }
-                    _mainVm.Dashboard.ChromaStatus = state switch
-                    {
-                        ChromaServiceState.Connected => Strings.Instance.Dashboard_ChromaConnected,
-                        ChromaServiceState.WaitingForSynapse => Strings.Instance.Dashboard_ChromaWaiting,
-                        _ => Strings.Instance.Common_Stopped,
-                    };
-                });
-            };
-            _chromaService.Start();
-        }
-
-        /// <summary>Starts the Chroma service the first time a Set Chroma
-        /// Color action runs with the mirror off (#468). On the dashboard
-        /// cadence: one volatile read while nothing has asked.</summary>
-        private void EnsureChromaForMacros()
-        {
-            if (_chromaService != null || !ChromaLightbarService.MacroColorRequested) return;
-            if (_inputManager == null || !_inputManager.IsRunning) return;
-            StartChromaIfEnabled();
-        }
-
-        private void StopChromaService()
-        {
-            if (_chromaService == null) return;
-            _chromaService.Dispose();
-            _chromaService = null;
-            _dispatcher.BeginInvoke(() =>
-                _mainVm.Dashboard.ChromaStatus = Strings.Instance.Common_Stopped);
-        }
-
-        // ── Logitech LIGHTSYNC lightbar mirror (#382) ──
-
-        private void StartLightsyncIfEnabled()
-        {
-            PadForge.Engine.SdlDiagLog.WriteLine(
-                $"LIGHTSYNC start? enabled={_mainVm.Dashboard.EnableLightsyncLightbar} engine={_inputManager != null} live={_lightsyncService != null}");
-            if (!_mainVm.Dashboard.EnableLightsyncLightbar || _inputManager == null)
-                return;
-            if (_lightsyncService != null)
-                return; // Already running.
-
-            _lightsyncService = new LightsyncLightbarService();
-            _lightsyncService.StateChanged += state =>
-            {
-                _dispatcher.BeginInvoke(() =>
-                {
-                    _mainVm.Dashboard.LightsyncStatus = state switch
-                    {
-                        LightsyncServiceState.Connected => Strings.Instance.Dashboard_LightsyncConnected,
-                        LightsyncServiceState.WaitingForGHub => Strings.Instance.Dashboard_LightsyncWaiting,
-                        _ => Strings.Instance.Common_Stopped,
-                    };
-                });
-            };
-            _lightsyncService.Start();
-        }
-
-        private void StopLightsyncService()
-        {
-            if (_lightsyncService == null) return;
-            _lightsyncService.Dispose();
-            _lightsyncService = null;
-            _dispatcher.BeginInvoke(() =>
-                _mainVm.Dashboard.LightsyncStatus = Strings.Instance.Common_Stopped);
-        }
-
-        // ── Razer Sensa HD haptics translation (#374) ──
-
-        private void StartSensaIfEnabled()
-        {
-            PadForge.Engine.SdlDiagLog.WriteLine(
-                $"SENSA start? enabled={_mainVm.Dashboard.EnableSensaHaptics} engine={_inputManager != null} live={_sensaService != null}");
-            if (!_mainVm.Dashboard.EnableSensaHaptics || _inputManager == null)
-                return;
-            if (_sensaService != null)
-                return; // Already running.
-
-            _sensaService = new SensaHapticsService();
-            _sensaService.StateChanged += state =>
-            {
-                _dispatcher.BeginInvoke(() =>
-                {
-                    _mainVm.Dashboard.SensaStatus = state switch
-                    {
-                        SensaServiceState.Active => Strings.Instance.Dashboard_SensaActive,
-                        SensaServiceState.WaitingForRuntime => Strings.Instance.Dashboard_SensaWaiting,
-                        SensaServiceState.Unsupported => Strings.Instance.Common_NotAvailableOnArm64,
-                        _ => Strings.Instance.Common_Stopped,
-                    };
-                });
-            };
-            _sensaService.Start();
-        }
-
-        private void StopSensaService()
-        {
-            if (_sensaService == null) return;
-            _sensaService.Dispose();
-            _sensaService = null;
-            _dispatcher.BeginInvoke(() =>
-                _mainVm.Dashboard.SensaStatus = Strings.Instance.Common_Stopped);
+                _settingsService?.MarkDirty();
+                SyncDevicesList();
+            }));
         }
 
         private void StartDsuServerIfEnabled()
@@ -11022,17 +11570,6 @@ namespace PadForge.Services
             catch { }
         }
 
-        /// <summary>This PC's real LAN address for the same-network punch
-        /// candidate. Only interfaces with a DEFAULT GATEWAY qualify: Hyper-V
-        /// and WSL virtual switches have none, and picking one advertised an
-        /// unreachable private address (observed in the field: 172.25.80.1).</summary>
-        /// <summary>This PC's real LAN address for the same-network punch
-        /// candidate. Asks the OS which interface it would actually use to
-        /// reach the internet (a connected UDP socket picks the routed source
-        /// address without sending anything). Enumerating adapters by hand got
-        /// this wrong twice in the field: it chose a Hyper-V/WSL switch, then a
-        /// Hamachi VPN adapter, because the REAL Wi-Fi had only an IPv6
-        /// link-local gateway and an IPv4-gateway test rejected it.</summary>
         /// <summary>Caller half of the code rendezvous (#294): announce our own
         /// endpoints at the DHT slot the HOST'S code addresses, so the host
         /// learns where to punch back. Best-effort: a DHT failure just leaves
@@ -11069,11 +11606,6 @@ namespace PadForge.Services
             catch (Exception ex) { PadForge.Engine.SdlDiagLog.WriteLine("RDV publish failed: " + ex.Message); }
         }
 
-        /// <summary>Arms the code-derived relay listener (#294). The host
-        /// connects to the relay AS the identity its connection code addresses
-        /// and waits there. A caller derives the same key from the code it
-        /// dialed, so no lookup, no DHT convergence, and no NAT traversal is
-        /// involved on this lane. Restarted whenever the code changes.</summary>
         /// <summary>Arms the STABLE identity relay listener: the address a
         /// paired peer reconnects to after a restart. Derived from our own
         /// long-term identity key, so unlike the code listener it survives
@@ -11102,6 +11634,11 @@ namespace PadForge.Services
             catch (Exception ex) { PadForge.Engine.SdlDiagLog.WriteLine("RELAY identity listen arm failed: " + ex.Message); }
         }
 
+        /// <summary>Arms the code-derived relay listener (#294). The host
+        /// connects to the relay AS the identity its connection code addresses
+        /// and waits there. A caller derives the same key from the code it
+        /// dialed, so no lookup, no DHT convergence, and no NAT traversal is
+        /// involved on this lane. Restarted whenever the code changes.</summary>
         private void StartCodeRelayListener(string code, LinkServer server)
         {
             try
@@ -11183,6 +11720,13 @@ namespace PadForge.Services
             finally { System.Threading.Interlocked.Exchange(ref _rdvPolling, 0); }
         }
 
+        /// <summary>This PC's real LAN address for the same-network punch
+        /// candidate. Asks the OS which interface it would actually use to
+        /// reach the internet (a connected UDP socket picks the routed source
+        /// address without sending anything). Enumerating adapters by hand got
+        /// this wrong twice in the field: it chose a Hyper-V/WSL switch, then a
+        /// Hamachi VPN adapter, because the REAL Wi-Fi had only an IPv6
+        /// link-local gateway and an IPv4-gateway test rejected it.</summary>
         private static System.Net.IPEndPoint LocalLanEndpoint(int port)
         {
             try
@@ -11594,6 +12138,32 @@ namespace PadForge.Services
             return axes;
         }
 
+        /// <summary>The device class a peer's copy of the row takes. A pad
+        /// SDL opened as its gamepad and its owner reads raw (Force Raw
+        /// Joystick Mode) ships the joystick's own axes and buttons in their
+        /// own order (<see cref="RawModeAxes"/>), so it goes out as a
+        /// joystick, the class SdlDeviceWrapper.InputDeviceTypeFor gives a
+        /// Bliss-Box port opened raw. Typed a gamepad, the copy answered the
+        /// "(Any Device)" Gamepad names on the peer, and "Gamepad A" read raw
+        /// button 0, the read the owner's own PC refuses
+        /// (InputManager.SpeaksGamepadLayout). The trigger rest rule and the
+        /// gamepad auto-map misread it the same way. Only a device that
+        /// would go out as a gamepad is retyped. SDL opens some wheels,
+        /// flight sticks and instrument pads through its gamepad API and
+        /// types each for what it is. The trigger rest rule and the gamepad
+        /// auto-map take no copy of such a type for a gamepad, and the
+        /// Gamepad names read one by the layout its list entry carries
+        /// (RemotePeerDeviceInfo.GamepadLayout), which a raw read turns
+        /// off, so one read raw keeps its own type, the one the Devices
+        /// page lists it under on both PCs.</summary>
+        internal static int ExposedDeviceType(UserDevice ud, ISdlInputDevice dev)
+        {
+            int type = dev.GetInputDeviceType();
+            return type == InputDeviceType.Gamepad && ud.ForceRawJoystickMode && dev.GamepadHandle != IntPtr.Zero
+                ? InputDeviceType.Joystick
+                : type;
+        }
+
         /// <summary>Build the shared source snapshot. Each connection translates these
         /// stable source IDs to its own reserved wire slots.</summary>
         private IReadOnlyList<RemotePeerDeviceInfo> BuildExposedDevices()
@@ -11649,7 +12219,7 @@ namespace PadForge.Services
                             // 4 KB receive buffer on old peers, so shipping every
                             // device's objects could push past it and silently
                             // kill device sync (audit F1).
-                            int devType = dev.GetInputDeviceType();
+                            int devType = ExposedDeviceType(ud, dev);
                             DeviceObjectItem[] objects = null;
                             // Microphone rows join the gate (#317): their
                             // buttons are named from THIS machine's phrase
@@ -11686,7 +12256,12 @@ namespace PadForge.Services
                                 RawAxisCount = dev.RawAxisCount,
                                 HasExtraGenericAxes = dev.HasExtraGenericAxes,
                                 NumHats = dev.NumHats,
-                                HasRumble = dev.HasRumble,
+                                // A haptic mouse or keyboard (#494) has no SDL
+                                // rumble, and its level reaches the device
+                                // through the apply below. Its saved record
+                                // holds while it sleeps, so the consumer's
+                                // capability does not flap with it.
+                                HasRumble = dev.HasRumble || ud.HasPeripheralHaptics,
                                 HasRumbleTriggers = dev.HasRumbleTriggers,
                                 HasHaptic = dev.HasHaptic,
                                 HasGyro = dev.HasGyro,
@@ -11711,9 +12286,14 @@ namespace PadForge.Services
                                 HasTouchpad = dev.HasTouchpad,
                                 NumTouchpads = dev.NumTouchpads,
                                 TouchpadFingerCounts = dev.TouchpadFingerCounts,
+                                CapSenseChannelMask = dev.CapSenseChannelMask,
                                 TouchpadPressureSupported = dev.TouchpadPressureSupported,
                                 TouchpadClickSupported = dev.TouchpadClickSupported,
-                                InputDeviceType = dev.GetInputDeviceType(),
+                                InputDeviceType = devType,
+                                // The layout the Gamepad names read here, which
+                                // the type alone does not tell the peer.
+                                GamepadLayout = InputManager.InSdlGamepadLayout(
+                                    ud.ForceRawJoystickMode, dev, dev.GetInputDeviceType()),
                                 // Forward the owner's named inputs so the peer's
                                 // mapping picker and Devices preview read identically
                                 // to local (consumer-control names, wheel axes, NFC
@@ -11776,19 +12356,33 @@ namespace PadForge.Services
             return inventory;
         }
 
-        /// <summary>Share every device the user sees in Devices — gamepads, joysticks,
-        /// wheels, keyboards, mice, MIDI, web, overlay. The ONE exclusion is a device
-        /// that is itself a remote peer's (peer://): re-sharing it would loop / relay.</summary>
+        /// <summary>Whether Remote Link shares a device: gamepads, joysticks,
+        /// wheels, keyboards, mice, MIDI, web and overlay devices are shared.
+        /// Three kinds are not. A Web Menus phone fires only this PC's menus.
+        /// A vendor row or a unit row stands for lighting or rumble this PC
+        /// delivers and has no input. A remote peer's own device (peer://)
+        /// would loop back to the peer if it were shared again.</summary>
         private static bool IsShareableDevice(ISdlInputDevice dev)
         {
             // A Web Menus phone (#471) fires only this PC's menus, so another
             // PC would get a device that does nothing.
             if (dev is WebControllerDevice web && web.IsMenuSurface) return false;
+            // A vendor row or a unit row (#494) stands for output this PC
+            // delivers and has no input, the same case.
+            if (dev is PadForge.Common.Input.Peripherals.IOutputOnlyRow) return false;
             string path = dev.DevicePath ?? "";
             return !path.StartsWith("peer://", StringComparison.Ordinal);
         }
 
         private int _streamTickGuard;
+
+        /// <summary>Whether a shared device publishes a mouse's per-poll
+        /// counts, which the delta bridge sums between two frames: a Raw
+        /// Input mouse, or a TouchSense mouse bound to WinUSB (#494), whose
+        /// row builds its state the same way.</summary>
+        internal static bool ReadsAsMouse(ISdlInputDevice source)
+            => source is PadForge.Engine.SdlMouseWrapper
+               || source is PadForge.Common.Input.Peripherals.TouchSenseMouseDevice;
 
         /// <summary>Poll-thread half of the Remote Link delta bridge, invoked
         /// once per polling tick via <see cref="InputManager.RemoteLinkPollTick"/>
@@ -11804,7 +12398,7 @@ namespace PadForge.Services
                 var e = exposed[i];
                 var s = e.ud?.InputState;
                 if (s == null) continue;
-                try { e.acc.Accumulate(s, e.ud.InputStateSeq, e.source is PadForge.Engine.SdlMouseWrapper); }
+                try { e.acc.Accumulate(s, e.ud.InputStateSeq, ReadsAsMouse(e.source)); }
                 catch { /* teardown race: never disturb the poll loop */ }
             }
         }
@@ -11845,7 +12439,7 @@ namespace PadForge.Services
                     var snap = e.ud?.InputState;
                     if (snap == null || !e.ud.IsOnline) continue;
                     var s = snap.Clone();
-                    e.acc.DrainInto(s, e.source is PadForge.Engine.SdlMouseWrapper);
+                    e.acc.DrainInto(s, ReadsAsMouse(e.source));
                     var caps = new CustomInputStateCodec.Caps(e.source.HasGyro, e.source.HasAccel, e.source.HasAccelAux, e.source.HasGyroAux);
                     server.PushLocalFrame(recipients, e.info.PeerLocalDeviceId, s, caps, ts);
                 }
@@ -11889,6 +12483,19 @@ namespace PadForge.Services
         private bool HasFreshRemoteNfcDemand(Guid deviceGuid)
             => deviceGuid != Guid.Empty
             && _remoteNfcDemandMs.TryGetValue(deviceGuid, out long ms)
+            && Environment.TickCount64 - ms < McuDemandWindowMs;
+
+        /// <summary>Per-device stamp of the most recent peer demand for a MIDI
+        /// input, the NFC stamps' twin.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, long> _remoteMidiDemandMs = new();
+
+        /// <summary>True while a peer's slot has THIS MIDI input assigned: its
+        /// demand is inside the shared demand window. The legacy MIDI sweep
+        /// then opens the port as for a slot on this PC, and closes it once
+        /// the demand lapses.</summary>
+        internal bool HasFreshRemoteMidiDemand(Guid deviceGuid)
+            => deviceGuid != Guid.Empty
+            && _remoteMidiDemandMs.TryGetValue(deviceGuid, out long ms)
             && Environment.TickCount64 - ms < McuDemandWindowMs;
 
         /// <summary>Per-device stamp of the most recent peer Ring-Con demand,
@@ -11951,6 +12558,9 @@ namespace PadForge.Services
                     else if (frame.Type == LinkMessageType.SourceDemand && frame.Payload.Length > 0
                         && frame.Payload[0] == RemoteLinkOutputRouter.DemandKindIr)
                         _remoteIrDemandMs[device.InstanceGuid] = Environment.TickCount64;
+                    else if (frame.Type == LinkMessageType.SourceDemand && frame.Payload.Length > 0
+                        && frame.Payload[0] == RemoteLinkOutputRouter.DemandKindMidiInput)
+                        _remoteMidiDemandMs[device.InstanceGuid] = Environment.TickCount64;
                 });
             }
         }
@@ -12049,6 +12659,31 @@ namespace PadForge.Services
                             {
                                 PadForge.Common.Input.BlissBoxRuntime.SetRumble(
                                     ud.DevicePath, bvib.LeftMotorSpeed, bvib.RightMotorSpeed);
+                            }
+                        }
+                        else if (ud != null
+                            && PadForge.Common.Input.Peripherals.PeripheralOutputs.TakesHaptics(ud))
+                        {
+                            // Haptic mouse or keyboard sole-writer path (#494,
+                            // mirrors InputManager.Step2's isPeripheralHaptic
+                            // gate): the relayed level goes to the device's
+                            // backend worker, and is kept while the device
+                            // sleeps, since the peer sends only changes. The
+                            // consumer folded trigger rumble before it shipped
+                            // the frame.
+                            var hvib = effect.Vibration;
+                            // A silence edge zeroed a level the snapshot still
+                            // holds, so a peer's equal level is owed a write,
+                            // as Step 2 pays it.
+                            if (ud.ForceFeedbackState != null
+                                && PadForge.Common.Input.Peripherals.PeripheralOutputs.ConsumeResend(ud.InstanceGuid))
+                                ud.ForceFeedbackState.MarkDirectWriteFailed();
+                            if (ud.ForceFeedbackState != null
+                                && ud.ForceFeedbackState.TryRecordMotorSnapshot(
+                                    hvib.LeftMotorSpeed, hvib.RightMotorSpeed))
+                            {
+                                PadForge.Common.Input.Peripherals.PeripheralOutputs.SetMotors(
+                                    ud.InstanceGuid, hvib.LeftMotorSpeed, hvib.RightMotorSpeed, relayed: true);
                             }
                         }
                         else if (ud != null
@@ -12184,14 +12819,17 @@ namespace PadForge.Services
                 else ThrustmasterRawHidWriter.WriteConstantForce(path, w.Force);
             }
 
-            // Range + auto-center + RPM LEDs — re-send only when changed.
+            // Range, auto-center and RPM LEDs. Each is re-sent only when it changes. A
+            // range the consumer leaves to the wheel (#512) is never sent, and
+            // 0 stands for it so turning the range back on sends it again.
             var prev = _remoteWheelOneShot.TryGetValue(source.InstanceGuid, out var p) ? p : (-1, -1, -1, false);
-            if (prev.Item1 != w.RangeDeg || prev.Item2 != w.Ac)
+            int range = RemoteWheelRange(w);
+            if (prev.Item1 != range || prev.Item2 != w.Ac)
             {
                 int acMag = w.Ac;
-                if (isLogi) { LogitechRawHidWriter.WriteRange(path, w.RangeDeg, pid); LogitechRawHidWriter.WriteAutocenter(path, acMag, LogitechRawHidWriter.IsMomo(pid)); }
-                else if (isFan) { FanatecRawHidWriter.WriteRange(path, w.RangeDeg, pid); FanatecRawHidWriter.WriteAutocenter(path, acMag); }
-                else { ThrustmasterRawHidWriter.WriteRange(path, w.RangeDeg, pid); ThrustmasterRawHidWriter.WriteAutocenter(path, acMag); }
+                if (isLogi) { if (range != 0) LogitechRawHidWriter.WriteRange(path, range, pid); LogitechRawHidWriter.WriteAutocenter(path, acMag, LogitechRawHidWriter.IsMomo(pid)); }
+                else if (isFan) { if (range != 0) FanatecRawHidWriter.WriteRange(path, range, pid); FanatecRawHidWriter.WriteAutocenter(path, acMag); }
+                else { if (range != 0) ThrustmasterRawHidWriter.WriteRange(path, range, pid); ThrustmasterRawHidWriter.WriteAutocenter(path, acMag); }
             }
             if (prev.Item3 != w.LedMask || prev.Item4 != w.LedValid)
             {
@@ -12200,8 +12838,12 @@ namespace PadForge.Services
                 else if (isFan) FanatecRawHidWriter.WriteRpmLeds(path, mask);
                 else ThrustmasterRawHidWriter.WriteRpmLeds(path, mask);
             }
-            _remoteWheelOneShot[source.InstanceGuid] = (w.RangeDeg, w.Ac, w.LedMask, w.LedValid);
+            _remoteWheelOneShot[source.InstanceGuid] = (range, w.Ac, w.LedMask, w.LedValid);
         }
+
+        /// <summary>The range a relayed wheel frame asks the owner to send, or
+        /// 0 when the consumer leaves the range to the wheel (#512).</summary>
+        internal static int RemoteWheelRange(in OutputEffectCodec.WheelFrame w) => w.RangeLeftToWheel ? 0 : w.RangeDeg;
 
         // ─────────────────────────────────────────────
         //  Touchpad Overlay lifecycle
@@ -12231,7 +12873,7 @@ namespace PadForge.Services
             // (audit 2026-07-16). Anything the poll thread has not
             // stamped within its own staleness window is treated as gone.
             if (snap == null || !_mainVm.Dashboard.EnableMenuOverlay
-                || Environment.TickCount64 - snap.StampMs > 250)
+                || PadForge.Engine.Menus.MenuClock.NowMs - snap.StampMs > 250)
             {
                 _menuOverlay?.UpdateFromSnapshot(null);
                 return;
@@ -12653,16 +13295,6 @@ namespace PadForge.Services
         //  Device hiding (HidHide + input hooks)
         // ─────────────────────────────────────────────
 
-        /// <summary>Resolves a device's live PnP instance IDs by VID/PID for the
-        /// synthetic-path fallbacks (blacklist sync and the details pane). The
-        /// combined Joy-Con pair (issue #184 sibling) is an SDL-manufactured
-        /// virtual device whose PID exists on no PnP node, so it searches the
-        /// physical children's PIDs instead; the halves are what games see.
-        /// Per SDL usb_ids.h: gen-1 pair 0x2008 has children 0x2006 (Left) and
-        /// 0x2007 (Right); pair PID 0x2068 covers a real Switch 2 pair (children
-        /// 0x2067 Left / 0x2066 Right) AND a gen-1 pair docked in the charging
-        /// grip, whose only PnP node is the grip itself (0x200E), so all three
-        /// are searched.</summary>
         /// <summary>Whether the present-node sweep may widen a record's
         /// hide list to every present node of its VID/PID (#391). True when
         /// the record is the only one of its VID/PID that is HERE, so
@@ -12889,26 +13521,157 @@ namespace PadForge.Services
         /// <see cref="HidHideController.ChainInstanceIds"/>.</para></summary>
         internal static HashSet<string> BuildHidHideKeepOut(
             UserDevice[] snapshot, Func<string, IReadOnlyList<string>> chainOf)
+            => BuildHidHideKeepOut(snapshot, chainOf, rowsCurrent: true, alreadyHidden: null);
+
+        /// <summary>The keep-out set above, for an apply that can run before
+        /// the engine has marked its rows online.
+        ///
+        /// <para>Offline means a memory only once the engine has listed its
+        /// devices (<paramref name="rowsCurrent"/>,
+        /// <see cref="RowsAreCurrent"/>). Before that, and while the engine
+        /// is stopped, every row reads offline whatever is connected, so the
+        /// set was empty and the apply hid the nodes of rows the user had
+        /// left visible, then showed them again once the rows came online.
+        /// With Keep Devices Cloaked Between Launches on, each engine start
+        /// added those nodes to a list that needed nothing and cycled the
+        /// controller's USB port for them.</para>
+        ///
+        /// <para>So while the rows are not current, an offline row left
+        /// visible holds new hides off its nodes too. It takes no hide away:
+        /// a node PadForge already hides
+        /// (<paramref name="alreadyHidden"/>, the managed set) stays as the
+        /// online rule left it until the rows are current, so nothing is
+        /// shown for a few seconds and hidden again.</para>
+        ///
+        /// <para>That holds for a node a row set to hide names as well. Two
+        /// rows can name one node, the pads of a GameCube adapter or two pads
+        /// of one model remembered on the same port, and nothing says which
+        /// of them is there until the engine has listed its devices. The row
+        /// left visible decides until then, so a controller the user left
+        /// visible is never hidden for those seconds. If the hidden row
+        /// turns out to be the one there, the apply that follows the listing
+        /// hides its node and hands it to the release, which takes it from
+        /// whatever opened it meanwhile.</para></summary>
+        internal static HashSet<string> BuildHidHideKeepOut(
+            UserDevice[] snapshot, Func<string, IReadOnlyList<string>> chainOf,
+            bool rowsCurrent, Func<string, bool> alreadyHidden)
         {
             var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (snapshot == null) return set;
             chainOf ??= HidHideController.ChainInstanceIds;
             foreach (var ud in snapshot)
             {
-                if (ud == null || ud.HidHideEnabled || !ud.IsOnline) continue;
+                if (ud == null || ud.HidHideEnabled) continue;
+                bool offline = !ud.IsOnline;
+                if (offline && rowsCurrent) continue;
                 string id = HidHideController.DevicePathToInstanceId(ud.DevicePath);
-                if (id == null) continue;
-                if (!id.Contains("VID_", StringComparison.OrdinalIgnoreCase)
-                    && !id.Contains("VID&", StringComparison.OrdinalIgnoreCase))
-                    continue;
+                if (!HidHideController.IsDeviceNodeId(id)) continue;
                 IReadOnlyList<string> chain;
                 try { chain = chainOf(id); }
                 catch { chain = new[] { id }; }
                 if (chain == null) continue;
                 foreach (var node in chain)
-                    if (!string.IsNullOrEmpty(node)) set.Add(node);
+                {
+                    if (string.IsNullOrEmpty(node)) continue;
+                    if (offline && alreadyHidden != null && alreadyHidden(node)) continue;
+                    set.Add(node);
+                }
             }
             return set;
+        }
+
+        /// <summary>How many of PadForge's controller rows sit on each device
+        /// node, keyed by instance id, for the release's receiver rule
+        /// (<see cref="HiddenControllerRelease"/>). A receiver whose pads are
+        /// HID interfaces of one USB device, such as a Steam Controller
+        /// dongle, carries no XUSB node for the device tree to count, but each
+        /// paired pad is a row here and every row's chain runs up through the
+        /// receiver.
+        ///
+        /// <para>A controller row has a class the settings migration counts as
+        /// a controller (SettingsService, IsControllerClass): gamepad,
+        /// joystick, wheel, flight stick, first person or supplemental, the
+        /// class SDL's dance pads, guitars and drum kits take
+        /// (SdlDeviceWrapper). A handheld's touchpad,
+        /// keyboard and mouse rows are not, so its built-in pad still counts
+        /// as one. Rows with a real HID path only, walked the way
+        /// <see cref="BuildHidHideKeepOut"/> walks them.</para>
+        ///
+        /// <para>The controllers on a HID node are the rows the engine has
+        /// online there. SDL reads up to four pads from the one HID node of a
+        /// GameCube adapter and gives each that node's path
+        /// (SDL_hidapi_gamecube.c, HIDAPI_JoystickGetDevicePath), so they are
+        /// four rows on one node. A row that is not online beside one that is
+        /// names a controller that sat there before: two pads of one model
+        /// plugged into the same port in turn leave two rows with one path,
+        /// and they are one controller.</para>
+        ///
+        /// <para>A node with no row online is counted from the rows that
+        /// remember it, while Windows lists the node as present. Rows with
+        /// one serial number, or none, are one device's controllers and
+        /// count each: SDL gives every joystick it reads from a HID device
+        /// that device's serial (SDL_hidapijoystick.c,
+        /// HIDAPI_UpdateJoystickSerial). Rows with different serial numbers
+        /// are different devices that sat on the node in turn, so the
+        /// largest group with one serial is the count.</para>
+        ///
+        /// <para>IsOnline alone is the poll thread's progress and not a fact
+        /// about the device: no row is online while the engine is stopped,
+        /// and SDL reports a pad on a wireless dongle only once it has read
+        /// the dongle's connect packet, which can come after an enumeration
+        /// (SDL_hidapi_steam.c, InitDevice and UpdateDevice). A count of
+        /// online rows alone reads a dongle with two pads as empty or as one
+        /// controller in those cases, and a device that reads so is cycled.
+        /// The cost is that a remembered row on a dongle's unused slot
+        /// counts, since the dongle keeps that interface present, and such a
+        /// dongle is left alone, as the Xbox 360 receiver is with its four
+        /// XUSB nodes whatever is connected. Production passes null for
+        /// <paramref name="chainOf"/> and gets
+        /// <see cref="HidHideController.ChainInstanceIds"/>, and presence is
+        /// <see cref="HidHideController.IsInstancePresent"/>.</para></summary>
+        internal static Dictionary<string, int> CountControllerRowsPerUsbDevice(
+            UserDevice[] snapshot, Func<string, IReadOnlyList<string>> chainOf)
+        {
+            var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (snapshot == null) return counts;
+            chainOf ??= HidHideController.ChainInstanceIds;
+
+            // Controller rows per HID node: how many are online, and the
+            // serial number of each one that is not.
+            var rowsOn = new Dictionary<string, (int online, List<string> remembered)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var ud in snapshot)
+            {
+                if (ud == null) continue;
+                bool controller = ud.CapType == InputDeviceType.Gamepad
+                    || ud.CapType == InputDeviceType.Joystick
+                    || ud.CapType == InputDeviceType.Driving
+                    || ud.CapType == InputDeviceType.Flight
+                    || ud.CapType == InputDeviceType.FirstPerson
+                    || ud.CapType == InputDeviceType.Supplemental;
+                if (!controller) continue;
+                string id = HidHideController.DevicePathToInstanceId(ud.DevicePath);
+                if (!HidHideController.IsDeviceNodeId(id)) continue;
+                rowsOn.TryGetValue(id, out var rows);
+                if (ud.IsOnline) rows.online++;
+                else (rows.remembered ??= new List<string>()).Add(ud.SerialNumber?.Trim() ?? string.Empty);
+                rowsOn[id] = rows;
+            }
+
+            foreach (var (id, rows) in rowsOn)
+            {
+                int controllers = rows.online > 0 ? rows.online
+                    : HidHideController.IsInstancePresent(id)
+                        ? rows.remembered.GroupBy(serial => serial, StringComparer.OrdinalIgnoreCase).Max(sameDevice => sameDevice.Count())
+                        : 0;
+                if (controllers == 0) continue;
+                IReadOnlyList<string> chain;
+                try { chain = chainOf(id); }
+                catch { chain = new[] { id }; }
+                if (chain == null) continue;
+                foreach (var node in chain.Where(n => !string.IsNullOrEmpty(n)).Distinct(StringComparer.OrdinalIgnoreCase))
+                    counts[node] = counts.TryGetValue(node, out int n) ? n + controllers : controllers;
+            }
+            return counts;
         }
 
         /// <summary>The diag suffix naming what the keep-out set removed
@@ -12916,6 +13679,16 @@ namespace PadForge.Services
         private static string HidHideKeptNote(List<string> kept)
             => kept == null || kept.Count == 0 ? "" : $" kept={kept.Count} [{string.Join(" | ", kept)}]";
 
+        /// <summary>Resolves a device's live PnP instance IDs by VID/PID for the
+        /// synthetic-path fallbacks (blacklist sync and the details pane). The
+        /// combined Joy-Con pair (issue #184 sibling) is an SDL-manufactured
+        /// virtual device whose PID exists on no PnP node, so it searches the
+        /// physical children's PIDs instead; the halves are what games see.
+        /// Per SDL usb_ids.h: gen-1 pair 0x2008 has children 0x2006 (Left) and
+        /// 0x2007 (Right); pair PID 0x2068 covers a real Switch 2 pair (children
+        /// 0x2067 Left / 0x2066 Right) AND a gen-1 pair docked in the charging
+        /// grip, whose only PnP node is the grip itself (0x200E), so all three
+        /// are searched.</summary>
         private static List<string> FindInstanceIdsForDevice(UserDevice ud)
         {
             var pidLookups = (ud.VendorId, ud.ProdId) switch
@@ -12931,12 +13704,6 @@ namespace PadForge.Services
             return realIds;
         }
 
-        /// <summary>
-        /// Applies device hiding based on per-device toggle settings.
-        /// HidHide: Adds devices with HidHideEnabled to the blacklist, whitelists PadForge, activates cloaking.
-        /// Hooks: Starts input hook manager for devices with ConsumeInputEnabled.
-        /// Only acts if the master switch (EnableInputHiding) is on.
-        /// </summary>
         /// <summary>Player-identity idle floor (#191): re-seeds every
         /// assigned device's player number. Nintendo-family pads get the
         /// SDL player index (wrapper-allowlisted to VID 0x057E; the SDL
@@ -13023,6 +13790,12 @@ namespace PadForge.Services
         public void PanicQuiesceOutputs()
         {
             try { _inputManager?.QuiesceOutputs(); } catch { }
+            // A tactile Rival (#494) plays until GG hears a zero, which only
+            // the GameSense worker sends, and the Razer Sensa row's worker
+            // renders the zero only on its next tick, so both are waited for
+            // inside the one budget.
+            try { _peripheralHost?.WaitForSilence(250); } catch { }
+            try { _peripheralHost?.ReleaseLightingNow(); } catch { }
             try { PadForge.Common.Input.HapticToneService.Shutdown(); } catch { }
             // #236: quiesce is an explicit silence edge; the shaker tone
             // must die with the other outputs.
@@ -13053,18 +13826,162 @@ namespace PadForge.Services
         /// were the HIDHIDE apply block, five seconds apart, all identical).
         /// The sync still runs on every apply, since after the driver-first
         /// diff it is a cheap read and no write, but the block prints only
-        /// when the desired set differs from the last one, or once a minute
-        /// while the sync or read-back reports trouble. Otherwise one
-        /// "unchanged" line at most once a minute keeps the trace showing
-        /// the path is alive.</summary>
+        /// when the desired set differs from the last one, when the apply
+        /// carries a line that happens once (a refusal, the inverse cloak
+        /// coming on or going off, hiding resuming, a reach check that
+        /// passed), or once a minute while the sync or read-back reports
+        /// trouble. Otherwise one "unchanged" line at most once a minute
+        /// keeps the trace showing the path is alive.</summary>
         private HashSet<string> _lastHidHideDesired;
         private long _lastHidHideUnchangedLogTick;
         private long _lastHidHideTroubleLogTick;
+
+        /// <summary>The inverse flag the last printed block read, null before
+        /// the first. A change prints the block, since the line that says the
+        /// cloak is on rides in it and an apply under the cloak can leave the
+        /// desired set as it was.</summary>
+        private bool? _lastHidHideInversePrinted;
 
         /// <summary>Whether this process has already taken ownership of the
         /// cloaks a previous session left behind. One adoption per process:
         /// after it, the managed set tracks what we wrote.</summary>
         private bool _hidHideCloaksAdopted;
+
+        /// <summary>HidHide refused this process its own open of a device it
+        /// had just hidden (#484), so PadForge hides nothing until the
+        /// driver's whitelist changes or HidHide's inverse application cloak
+        /// goes off. HidHide keeps its verdict on a process until a whitelist
+        /// write clears it (Config.c evaluationCache, Logic.c SetWhitelist),
+        /// so hiding again before then is refused again. The cloak is read at
+        /// every open (Logic.c Whitelisted) and turning it off flushes nothing
+        /// (Logic.c SetInverse), so a refusal the cloak explains lifts when an
+        /// apply reads it off, and the apply hides and checks again. The list
+        /// as it stood at the refusal is kept to tell when it changed, null
+        /// when it could not be read.</summary>
+        private bool _hidHideRefusedPadForge;
+        private List<string> _hidHideRefusalWhitelist;
+
+        private readonly HiddenControllerRelease _controllerRelease = new() { ControllerRows = CountControllerRowsNow };
+
+        /// <summary>The release worker, so tests can replace its device seams.</summary>
+        internal HiddenControllerRelease ControllerRelease => _controllerRelease;
+
+        /// <summary>Test seam for <see cref="RowsAreCurrent"/>. Null in
+        /// production, where the engine answers.</summary>
+        internal Func<bool> RowsCurrentSeam;
+
+        /// <summary>Whether a row's IsOnline says what is connected: the
+        /// engine runs and its poll thread has finished a device enumeration
+        /// (<see cref="InputManager.DevicesEnumerated"/>). Before that, and
+        /// while the engine is stopped, every row reads offline, and the
+        /// apply that follows an engine start does not wait for it.</summary>
+        private bool RowsAreCurrent()
+            => RowsCurrentSeam?.Invoke() ?? (_inputManager?.DevicesEnumerated == true);
+
+        /// <summary>Test seam for <see cref="EngineIsListing"/>. Null in
+        /// production, where the engine answers.</summary>
+        internal Func<bool> EngineListingSeam;
+
+        /// <summary>Whether the engine has started and not yet listed its
+        /// devices, for the release
+        /// (<see cref="HiddenControllerRelease.RowsPending"/>) and for the
+        /// apply's keep-out line. A batch asks from the thread pool. A
+        /// stopped engine is not listing: no listing is coming for a batch
+        /// to wait on.</summary>
+        private bool EngineIsListing()
+            => EngineListingSeam?.Invoke() ?? (_inputManager is { IsRunning: true, DevicesEnumerated: false });
+
+        /// <summary>PadForge's controller rows per device node as they stand
+        /// at the call, for the release
+        /// (<see cref="HiddenControllerRelease.ControllerRows"/>). A batch
+        /// calls it from the thread pool when it runs, so it takes its own
+        /// snapshot of the rows.</summary>
+        private static IReadOnlyDictionary<string, int> CountControllerRowsNow()
+        {
+            var devices = SettingsManager.UserDevices;
+            var items = devices?.Items;
+            if (items == null) return null;
+            UserDevice[] snapshot;
+            lock (devices.SyncRoot)
+            {
+                snapshot = items.ToArray();
+            }
+            return CountControllerRowsPerUsbDevice(snapshot, null);
+        }
+
+        /// <summary>A probe has shown that this process passes HidHide's
+        /// gate, so an apply that hides nothing new and finds no hidden
+        /// controller back on a new device stack need not probe.</summary>
+        private bool _hidHideReachConfirmed;
+
+        /// <summary>Hidden HID ids whose USB device the release cycled, not
+        /// yet opened since, each with the time of its cycle. HidHide is a
+        /// class upper filter (its Setup/install.cmd runs devcon classfilter
+        /// HIDClass upper -HidHide), and a device stack takes a class filter
+        /// only when it is built. A controller connected before HidHide was
+        /// installed is opened through a stack HidHide never sees, so a check
+        /// that opened it proved nothing about HidHide's verdict on PadForge.
+        /// The cycle builds the stack again, and the apply after the
+        /// controller returns opens it there
+        /// (<see cref="ReturnedSinceCycle"/>).</summary>
+        private readonly Dictionary<string, DateTime> _hidHideReprobeIds = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>The arrival date each hidden HID id carried when an
+        /// apply first saw it hidden or last opened it on a new stack, and
+        /// the default date for an id that was not there or whose date did
+        /// not read. A controller that leaves Windows and comes back by
+        /// itself, a replug, has its device stack built again just as a port
+        /// cycle builds it, and no release names it. A date that differs
+        /// from the one kept here says so, and the apply opens that
+        /// controller once more
+        /// (<see cref="HidHideController.LastArrivalUtc"/>). The dates are
+        /// compared for a difference and not for which is later, so a clock
+        /// set back between two arrivals hides neither.</summary>
+        private readonly Dictionary<string, DateTime> _hidHideSeenArrivals = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>How long after a cycle a controller is opened again
+        /// whatever its arrival date reads. By then it is back or it never
+        /// left.</summary>
+        internal static readonly TimeSpan ReprobeWithoutArrival = TimeSpan.FromSeconds(30);
+
+        /// <summary>Whether a controller whose port was cycled is back on a
+        /// new device stack: Windows dates its arrival later than the cycle.
+        /// Until then an open would reach the stack it had before the cycle,
+        /// which is still there for a moment after the cycle is asked for,
+        /// and would settle the check on the very stack the cycle replaces.
+        /// A date that does not read stops holding the check
+        /// <see cref="ReprobeWithoutArrival"/> after the cycle. Both times
+        /// are readings of the wall clock, so a clock set back between the
+        /// cycle and the return can date the arrival before the cycle, and
+        /// this test then says no for the set-back plus that limit. The
+        /// apply does not wait that out: it also opens a controller whose
+        /// arrival date differs from the one it last saw
+        /// (<see cref="_hidHideSeenArrivals"/>).</summary>
+        internal static bool ReturnedSinceCycle(DateTime cycledUtc, DateTime? arrivalUtc, DateTime nowUtc)
+            => (arrivalUtc is DateTime arrived && arrived > cycledUtc)
+                || nowUtc - cycledUtc > ReprobeWithoutArrival;
+
+        /// <summary>The cloak was on at the last apply that read the flag,
+        /// and whether its notice has shown since it came on.</summary>
+        private bool _hidHideInverseOn;
+        private bool _hidHideInverseNoticeShown;
+
+        /// <summary>The status lines the hiding path wrote, so taking one back
+        /// compares the bar with the text written, never with the current
+        /// language's text (UpdateController.WithdrawAnnouncement does the
+        /// same). Null when nothing is out.</summary>
+        private string _hidHideRefusalStatus;
+        private string _hidHideInverseStatus;
+
+        /// <summary>Clears the status bar when it still shows the line in
+        /// <paramref name="written"/>, and forgets the line either way. A
+        /// message written since is left alone.</summary>
+        private void TakeBackStatus(ref string written)
+        {
+            if (written != null && _mainVm.StatusText == written)
+                _mainVm.SetStatus(string.Empty);
+            written = null;
+        }
 
         /// <summary>Takes ownership of blacklist entries this process did not
         /// write, so the sync can retire them. Runs once, and only while
@@ -13122,7 +14039,110 @@ namespace PadForge.Services
             (apply ?? ApplyDeviceHiding)();
         }
 
-        public void ApplyDeviceHiding()
+        /// <summary>Whether an apply is running, and whether another was
+        /// asked for while it ran. UI thread only.
+        ///
+        /// <para>The apply waits on locks other threads take, above all the
+        /// control device gate, which the release's batches take from the
+        /// thread pool (HidHideController, HiddenControllerRelease). A lock
+        /// the UI thread waits on dispatches the window messages other
+        /// threads have sent it (WPF, DispatcherSynchronizationContext.Wait),
+        /// and WM_DEVICECHANGE is one of them: its handler calls
+        /// <see cref="ApplyAutomaticDeviceHiding"/> (MainWindow
+        /// OnDeviceChangeMessage). An apply that ran inside another at the
+        /// write of HidHide's list wrote the list itself and handed the new
+        /// ids to the release. The outer apply then wrote the same list and
+        /// handed them over again, and the release held a second cycle for
+        /// the controller until the cooldown ended.</para>
+        ///
+        /// <para>So an apply asked for while one runs is noted and runs once
+        /// the first is done, through the lifetime checks every automatic
+        /// apply passes.</para>
+        ///
+        /// <para>An engine start's clear of the list counts as part of its
+        /// apply (<see cref="ApplyDeviceHidingAtEngineStart"/>). The clear
+        /// waits on the same gate, and an apply that ran inside it hid
+        /// everything and handed it to the release, the clear then emptied
+        /// the list, and the start's own apply hid and handed over the same
+        /// ids a second time.</para>
+        ///
+        /// <para>An apply that throws leaves neither flag set. What it owed
+        /// goes with it: the next request applies afresh.</para></summary>
+        private bool _deviceHidingApplying;
+        private bool _deviceHidingApplyOwed;
+
+        /// <summary>
+        /// Applies device hiding based on per-device toggle settings.
+        /// HidHide: Adds devices with HidHideEnabled to the blacklist, whitelists PadForge, activates cloaking.
+        /// Hooks: Starts input hook manager for devices with ConsumeInputEnabled.
+        /// Only acts if the master switch (EnableInputHiding) is on.
+        /// </summary>
+        public void ApplyDeviceHiding() => ApplyDeviceHiding(clearFirst: false);
+
+        /// <summary>The apply an engine start makes: the clear of the
+        /// entries a session before left behind
+        /// (<see cref="ClearCloaksLeftBehind"/>), then the apply, as one
+        /// apply. A request that arrives during either is owed and runs
+        /// after both. Start is reached from a command or from the window's
+        /// load, never from inside an apply, since a lock the UI thread
+        /// waits on dispatches sent messages only. Called inside one, it
+        /// would be owed like any request, and the clear would be left to
+        /// the next engine start.</summary>
+        internal void ApplyDeviceHidingAtEngineStart() => ApplyDeviceHiding(clearFirst: true);
+
+        private void ApplyDeviceHiding(bool clearFirst)
+        {
+            if (_deviceHidingApplying)
+            {
+                _deviceHidingApplyOwed = true;
+                return;
+            }
+            _deviceHidingApplying = true;
+            _deviceHidingApplyOwed = false;
+            bool finished = false;
+            try
+            {
+                if (clearFirst) ClearCloaksLeftBehind();
+                ApplyDeviceHidingOnce();
+                finished = true;
+            }
+            finally
+            {
+                _deviceHidingApplying = false;
+                if (!finished) _deviceHidingApplyOwed = false;
+            }
+            if (_deviceHidingApplyOwed) ApplyAutomaticDeviceHiding();
+        }
+
+        /// <summary>Clears stale HidHide blacklist entries from a previous
+        /// crash or kill. The set of entries PadForge counts as its own is
+        /// in memory and lost when PadForge closes, so RemoveManagedDevices
+        /// cannot clean them up.
+        ///
+        /// <para>Skipped when Keep Devices Cloaked Between Launches is on,
+        /// so the persisted cloaks survive into the new session and the
+        /// apply asserts them again, with no moment between two sessions of
+        /// PadForge in which the devices show. Cloaks kept on purpose mean
+        /// this session inherits entries it did not write, and they have to
+        /// be adopted or the sync's removal set is computed from an empty
+        /// set and the driver's list can only grow (#397 follow-up).
+        /// EnsureHidHideCloaksAdopted does it, from inside the apply, so
+        /// every entry point gets it, engine start among them.</para></summary>
+        private void ClearCloaksLeftBehind()
+        {
+            if (!_mainVm.Settings.KeepHidHideCloaksBetweenLaunches)
+            {
+                try
+                {
+                    if (HidHideController.IsAvailable())
+                        HidHideController.ClearAll();
+                }
+                catch { /* best effort */ }
+            }
+            _managedWhitelistDosPaths.Clear();
+        }
+
+        private void ApplyDeviceHidingOnce()
         {
             if (!_mainVm.Settings.EnableInputHiding)
             {
@@ -13158,7 +14178,6 @@ namespace PadForge.Services
             }
             if (hidHideUp)
             {
-                PrepareTabletVisibilityChanges(snapshot);
                 // Adoption belongs to the OPERATION, not to Start(). Kept
                 // cloaks mean this session inherits entries it did not write,
                 // and the sync's removal set is computed from _managedDeviceIds,
@@ -13171,20 +14190,104 @@ namespace PadForge.Services
                 EnsureHidHideCloaksAdopted();
 
                 // Buffered, printed at the end only when the desired set
-                // moved or the sync misbehaved (see _lastHidHideDesired).
+                // moved, a one-time line came, or the sync misbehaved (see
+                // _lastHidHideDesired).
                 var hidLog = new List<string>();
                 hidLog.Add($"HIDHIDE apply devices={snapshot.Length} wantHiding={wantHiding}");
-                // Build the set of desired whitelist paths (PadForge + user list).
-                var desiredPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 string exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
-                if (!string.IsNullOrEmpty(exePath))
-                    desiredPaths.Add(exePath);
-                foreach (var path in _mainVm.Settings.HidHideWhitelistPaths)
+                string nativeSelf = HidHideController.CurrentProcessNativeImagePath();
+                bool whitelistTrouble = false;
+
+                // #484: with Inverse application cloak on, the list names the
+                // applications HidHide hides devices FROM. With PadForge on it,
+                // every device PadForge hid was hidden from PadForge and from
+                // no game. PadForge's own entries come off, nothing is hidden,
+                // and the user is told once each time the cloak comes on.
+                //
+                // A read that failed says nothing about the flag, so the last
+                // answer stands. Reading it as off would put PadForge back on
+                // a list that may still hide devices from it, and would take
+                // the cloak's line and a refusal back as if the cloak had
+                // gone. A driver older than the flag never answers, which
+                // leaves it off.
+                bool inverseRead = HidHideController.TryGetInverse(out bool inverted);
+                bool inverse = inverseRead ? inverted : _hidHideInverseOn;
+                bool inverseUnread = !inverseRead && inverse;
+                // Set by a line that happens once (the cloak going off, hiding
+                // resuming, a reach check that passed), so the block prints
+                // although the desired set may not have moved.
+                bool oneTimeLine = false;
+                if (inverse)
                 {
-                    if (!string.IsNullOrWhiteSpace(path))
-                        desiredPaths.Add(path);
+                    var own = new List<string> { nativeSelf };
+                    if (!string.IsNullOrEmpty(exePath))
+                        own.Add(HidHideController.ToDosDevicePathPublic(exePath));
+                    bool cleared = HidHideController.RemoveWhitelistEntries(own);
+                    // A removal that failed leaves PadForge on a list that now
+                    // hides devices from it. That is whitelist trouble, and it
+                    // prints at the trouble cadence like a failed sync.
+                    whitelistTrouble = !cleared;
+                    if (inverseUnread)
+                        hidLog.Add("HIDHIDE inverse flag did not read, so the last answer stands and the cloak counts as on");
+                    hidLog.Add($"HIDHIDE inverse application cloak is on: PadForge hides nothing and keeps itself off the list (cleared={cleared})");
+                    if (wantHiding > 0 && !_hidHideInverseNoticeShown)
+                    {
+                        _hidHideInverseNoticeShown = true;
+                        _hidHideInverseStatus = Strings.Instance.Status_HidHideInverse;
+                        _mainVm.SetStatus(_hidHideInverseStatus, persist: true);
+                    }
                 }
-                SyncWhitelist(desiredPaths);
+                else
+                {
+                    if (_hidHideInverseOn)
+                    {
+                        // The cloak went off. Its line goes with it, and the
+                        // next time it comes on it is announced again. HidHide
+                        // reads the flag at every open (Logic.c Whitelisted)
+                        // and turning it off flushes nothing (Logic.c
+                        // SetInverse), so a refusal still latched may be the
+                        // cloak's own doing. PadForge hides again and checks
+                        // afresh that it can open what it hides, and a
+                        // refusal that still holds latches again with the
+                        // list as it then stands.
+                        _hidHideInverseNoticeShown = false;
+                        TakeBackStatus(ref _hidHideInverseStatus);
+                        _hidHideReachConfirmed = false;
+                        if (_hidHideRefusedPadForge)
+                        {
+                            _hidHideRefusedPadForge = false;
+                            TakeBackStatus(ref _hidHideRefusalStatus);
+                        }
+                        hidLog.Add("HIDHIDE inverse application cloak is off: PadForge hides again and checks that it can still open what it hides");
+                        oneTimeLine = true;
+                    }
+
+                    // Build the set of desired whitelist paths (PadForge + user list).
+                    var desiredPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!string.IsNullOrEmpty(exePath))
+                        desiredPaths.Add(exePath);
+                    foreach (var path in _mainVm.Settings.HidHideWhitelistPaths)
+                    {
+                        if (!string.IsNullOrWhiteSpace(path))
+                            desiredPaths.Add(path);
+                    }
+                    whitelistTrouble = !SyncWhitelist(desiredPaths, nativeSelf, out var whitelistNow);
+                    if (whitelistTrouble)
+                        hidLog.Add("HIDHIDE whitelist could not be read or written, so PadForge may be missing from it and hides nothing new");
+                    else if (_hidHideRefusedPadForge && !SameWhitelist(whitelistNow, _hidHideRefusalWhitelist))
+                    {
+                        // A changed list cleared HidHide's verdict on this
+                        // process, so PadForge hides again and probes again.
+                        _hidHideRefusedPadForge = false;
+                        _hidHideReachConfirmed = false;
+                        TakeBackStatus(ref _hidHideRefusalStatus);
+                        hidLog.Add("HIDHIDE whitelist changed since HidHide refused PadForge, so PadForge hides again");
+                        oneTimeLine = true;
+                    }
+                }
+                _hidHideInverseOn = inverse;
+                bool standDown = inverse || _hidHideRefusedPadForge;
+                PrepareTabletVisibilityChanges(snapshot, standDown);
 
                 // Collect all desired blacklist IDs first, then sync atomically
                 // to avoid a window where devices briefly become visible.
@@ -13193,13 +14296,30 @@ namespace PadForge.Services
 
                 // #400: rows the user left visible own their nodes. Built
                 // once per apply from the same snapshot, consulted by every
-                // expansion and sweep below.
-                var keepOutSet = BuildHidHideKeepOut(snapshot, null);
+                // expansion and sweep below. Until the engine has listed its
+                // devices no row is online, so a row left visible then holds
+                // new hides off its nodes whether it is online or not.
+                bool rowsCurrent = RowsAreCurrent();
+                var keepOutSet = BuildHidHideKeepOut(snapshot, null, rowsCurrent, HidHideController.IsManagedDevice);
                 Func<string, bool> keepOut = id => keepOutSet.Contains(id);
                 if (keepOutSet.Count > 0)
-                    hidLog.Add($"HIDHIDE keepout n={keepOutSet.Count} [{string.Join(" | ", keepOutSet)}]");
+                {
+                    // The rows are not current in two states, and the line
+                    // says which: the engine has started and not listed its
+                    // devices, or it is stopped.
+                    string offlineRows = rowsCurrent ? ""
+                        : EngineIsListing() ? " offline rows included, the engine has not listed its devices yet"
+                        : " offline rows included, the engine is stopped";
+                    hidLog.Add($"HIDHIDE keepout n={keepOutSet.Count} [{string.Join(" | ", keepOutSet)}]" + offlineRows);
+                }
 
-                foreach (var ud in snapshot)
+                // A tablet's collection has its own capture and restart path
+                // (RefreshTabletCapture), so the release below leaves it alone.
+                var tabletIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Stood down, no device is hidden, and the sync below takes
+                // back every entry PadForge wrote.
+                foreach (var ud in standDown ? Array.Empty<UserDevice>() : snapshot)
                 {
                     if (ud.HidHideEnabled && !string.IsNullOrEmpty(ud.DevicePath))
                     {
@@ -13213,6 +14333,7 @@ namespace PadForge.Services
                                 && !keepOut(instanceId) && !HidHideController.IsHidMaestroDeviceInstance(instanceId))
                             {
                                 desiredIds.Add(instanceId);
+                                tabletIds.Add(instanceId);
                                 if (!ud.HidHideInstanceIds.Contains(instanceId))
                                 {
                                     ud.HidHideInstanceIds.Add(instanceId);
@@ -13222,16 +14343,17 @@ namespace PadForge.Services
                             continue;
                         }
 
-                        // If the DevicePath produced a valid HID instance ID, use it directly.
-                        // Match three transports:
+                        // If the DevicePath produced a device node's instance ID, use it directly.
+                        // Match three transports and a root-enumerated HID device:
                         //   USB:        HID\VID_054C&PID_0CE6\...           (underscore form)
                         //   BLE:        HID\{...}&DEV&VID_045E&PID_0B13&... (underscore form, GATT)
                         //   BT Classic: HID\{...}_VID&0002054c_PID&0ce6\... (ampersand form, BR/EDR over RFCOMM)
+                        //   Root:       HID\HIDCLASS&COL01\...              (vJoy, no vendor id, #515)
                         // The previous "VID_" substring check rejected BT Classic outright,
-                        // so DualSense over Bluetooth was never blacklisted.
-                        if (instanceId != null
-                            && (instanceId.Contains("VID_", StringComparison.OrdinalIgnoreCase)
-                                || instanceId.Contains("VID&", StringComparison.OrdinalIgnoreCase)))
+                        // so DualSense over Bluetooth was never blacklisted, and a test for a
+                        // vendor id at all sent every vJoy row to the VID/PID lookup below,
+                        // where no node matched and nothing was hidden.
+                        if (HidHideController.IsDeviceNodeId(instanceId))
                         {
                             // Expand to base-container + sibling HIDs, mirroring
                             // HidHide Configuration Client. Without this, only
@@ -13343,7 +14465,13 @@ namespace PadForge.Services
                             for (int i = ud.HidHideInstanceIds.Count - 1; i >= 0; i--)
                             {
                                 string cachedId = ud.HidHideInstanceIds[i];
-                                bool scrub = HidHideController.IsHidMaestroDeviceInstance(cachedId);
+                                // What the lookup leaves out today leaves
+                                // the cache it once filled: a HIDMaestro
+                                // node, and a node PadForge reads nothing
+                                // from, such as a pad attached under a
+                                // usbip-win2 host controller HIDMaestro
+                                // stamped since.
+                                bool scrub = HidHideController.IsOutsideVidPidLookup(cachedId);
 
                                 if (!scrub && hmVidPidIgs.Count > 0
                                     && cachedId.StartsWith(@"HID\VID_", StringComparison.OrdinalIgnoreCase))
@@ -13432,7 +14560,9 @@ namespace PadForge.Services
                 // Sync the diff against the DRIVER's list, never clearing the
                 // blacklist. False means the read or the write failed and the
                 // managed set was left as it was, so the next apply retries.
-                bool synced = HidHideController.SyncManagedDevices(desiredIds, out var added, out var removed);
+                // An unconfirmed whitelist holds new hides back, since a device
+                // hidden then can be hidden from PadForge itself.
+                bool synced = HidHideController.SyncManagedDevices(desiredIds, out var added, out var removed, out var heldBack, allowAdditions: !whitelistTrouble);
 
                 // Persist updated cache to settings.
                 if (cacheUpdated)
@@ -13441,31 +14571,169 @@ namespace PadForge.Services
                 if (desiredIds.Count > 0)
                     HidHideController.SetActive(true);
 
+                // #484: PadForge reads every device it hides, and SDL opens each
+                // HID device again on every enumeration and drops one it cannot
+                // open. A device HidHide hides from PadForge itself is dead at
+                // the next device arrival: in the reporter's trace the Wii
+                // Remote was hidden at 22:13:30.242 and SDL removed it at
+                // 30.982, while the virtual pad was being created. So after a
+                // write, PadForge opens one hidden device itself. Refused, it
+                // takes every entry back, stops hiding, and says so. With its
+                // own entry unconfirmed, a refusal would prove nothing.
+                //
+                // A controller that comes back does so on a device stack
+                // built after the hide, which can be the first of its stacks
+                // HidHide's filter sits on (see _hidHideReprobeIds). That is
+                // so after the release cycled its port, and just as much when
+                // it left and came back by itself, a replug, which the
+                // release never hears of (see _hidHideSeenArrivals). The ids
+                // that are back are opened first, by themselves, and only
+                // once Windows dates their arrival anew, so the open never
+                // lands on the stack the controller had before. Until it is
+                // back the next apply asks again.
+                foreach (var cycled in _controllerRelease.TakeCycledIds())
+                    _hidHideReprobeIds[cycled.Key] = cycled.Value;
+                foreach (var id in _hidHideReprobeIds.Keys.Where(id => !desiredIds.Contains(id)).ToList())
+                    _hidHideReprobeIds.Remove(id);
+                foreach (var id in _hidHideSeenArrivals.Keys.Where(id => !desiredIds.Contains(id)).ToList())
+                    _hidHideSeenArrivals.Remove(id);
+                bool refusedNow = false;
+                if (synced && !whitelistTrouble && desiredIds.Count > 0)
+                {
+                    bool? reach = null;
+                    string probed = null;
+                    int probeError = 0;
+                    DateTime nowUtc = DateTime.UtcNow;
+                    var returned = new List<string>();
+                    var newArrivals = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+                    bool afterRelease = false;
+                    foreach (var id in desiredIds)
+                    {
+                        if (!id.StartsWith(@"HID\", StringComparison.OrdinalIgnoreCase)) continue;
+                        DateTime? arrival = HidHideController.LastArrivalUtc(id);
+                        bool cycledBack = _hidHideReprobeIds.TryGetValue(id, out DateTime cycledUtc)
+                            && ReturnedSinceCycle(cycledUtc, arrival, nowUtc);
+                        bool cameBack = false;
+                        if (!_hidHideSeenArrivals.TryGetValue(id, out DateTime seen))
+                            _hidHideSeenArrivals[id] = arrival ?? default;
+                        else if (arrival is DateTime dated && dated != seen)
+                        {
+                            cameBack = true;
+                            newArrivals[id] = dated;
+                        }
+                        if (cycledBack || cameBack) returned.Add(id);
+                        afterRelease |= cycledBack;
+                    }
+                    if (returned.Count > 0)
+                    {
+                        reach = ProbeOwnHidHideReach(returned, HidHideController.HidInterfaceOf,
+                            HidHideController.TryOpenAsThisProcess, out probed, out probeError);
+                        if (reach == true)
+                        {
+                            // The verdict belongs to the process, so one open
+                            // on a new stack answers for every id that is
+                            // back.
+                            _hidHideReprobeIds.Clear();
+                            foreach (var back in newArrivals)
+                                _hidHideSeenArrivals[back.Key] = back.Value;
+                            _hidHideReachConfirmed = true;
+                            hidLog.Add($"HIDHIDE reach ok after {(afterRelease ? "the release" : "a reconnect")}: PadForge opened {probed}");
+                            oneTimeLine = true;
+                        }
+                    }
+                    if (reach == null && (added.Count > 0 || !_hidHideReachConfirmed))
+                    {
+                        reach = ProbeOwnHidHideReach(desiredIds, HidHideController.HidInterfaceOf,
+                            HidHideController.TryOpenAsThisProcess, out probed, out probeError);
+                        if (reach == true)
+                        {
+                            _hidHideReachConfirmed = true;
+                            hidLog.Add($"HIDHIDE reach ok: PadForge opened {probed}");
+                            oneTimeLine = true;
+                        }
+                        else if (reach == null)
+                        {
+                            hidLog.Add("HIDHIDE reach unknown: no hidden HID interface answered the probe");
+                        }
+                    }
+                    if (reach == false)
+                    {
+                        _hidHideRefusedPadForge = true;
+                        refusedNow = true;
+                        _hidHideReprobeIds.Clear();
+                        // Listed and still refused means the driver does not
+                        // know this process by that path. Not listed means
+                        // the entry never landed.
+                        var listNow = HidHideController.GetWhitelist();
+                        _hidHideRefusalWhitelist = listNow;
+                        string listed = listNow == null ? "unreadable"
+                            : !string.IsNullOrEmpty(nativeSelf) && listNow.Contains(nativeSelf, StringComparer.OrdinalIgnoreCase) ? "yes" : "no";
+                        PrepareTabletVisibilityChanges(snapshot, hideNone: true);
+                        desiredIds.Clear();
+                        synced = HidHideController.SyncManagedDevices(desiredIds, out _, out var undone);
+                        hidLog.Add($"HIDHIDE REFUSED: HidHide would not let PadForge open {probed} (err={probeError}) after hiding it. "
+                            + $"PadForge took back {undone.Count} entr{(undone.Count == 1 ? "y" : "ies")} (write={(synced ? "ok" : "REFUSED")}) and hides nothing until the whitelist changes or the inverse application cloak goes off. "
+                            + $"native={nativeSelf ?? "unknown"} listed={listed}");
+                        _hidHideRefusalStatus = Strings.Instance.Status_HidHideRefusedPadForge;
+                        _mainVm.SetStatus(_hidHideRefusalStatus, persist: true);
+                    }
+                }
+
+                // HidHide decides access only at open (Logic.c
+                // OnDeviceFileCreate), so a program that opened a controller
+                // before this hide keeps it. Once PadForge knows it can still
+                // open what it hides, a USB controller that was already
+                // connected has its port cycled and comes back where only
+                // whitelisted programs open it (HiddenControllerRelease). The
+                // release takes the ids alone. When its batch runs it reads
+                // for itself whether HidHide still hides them and how many of
+                // PadForge's controller rows sit on each USB device
+                // (CountControllerRowsNow), so a controller shown again by
+                // then, or a receiver carrying another controller, stays
+                // connected.
+                if (synced && !refusedNow && _hidHideReachConfirmed && added.Count > 0)
+                    _controllerRelease.Release(added.Where(id => !tabletIds.Contains(id)));
+
                 // #391: read the driver's list back. A write the caller
                 // believes landed but the driver dropped is the one failure
-                // no other signal catches.
-                var missing = HidHideController.MissingFromBlacklist(desiredIds);
+                // no other signal catches. An id the sync held back was never
+                // written, so it is named as held and not read back.
+                var held = new HashSet<string>(heldBack, StringComparer.OrdinalIgnoreCase);
+                var missing = HidHideController.MissingFromBlacklist(desiredIds.Where(id => !held.Contains(id)));
                 bool active = HidHideController.GetActive();
                 RefreshTabletCapture(snapshot, synced, added);
                 hidLog.Add(
                     $"HIDHIDE sync desired={desiredIds.Count} added={added.Count} removed={removed.Count} active={active}"
                     + (synced ? "" : " write=REFUSED")
+                    + (heldBack.Count > 0 ? $" held={heldBack.Count} [{string.Join(" | ", heldBack)}]" : "")
                     + (missing == null ? " readback=FAILED"
                         : missing.Count == 0 ? " readback=ok"
                         : $" readback=MISSING {missing.Count} [{string.Join(" | ", missing)}]"));
 
-                // Print the block when the desired set moved, or once a
-                // minute while something is wrong (a persistent MISSING was
-                // the flood itself, so trouble repeats at the heartbeat's
-                // rate, not the enumeration's). Else the heartbeat line.
+                // Print the block when the desired set moved, when HidHide
+                // refused PadForge in this apply, when the inverse flag
+                // differs from the one the last printed block read, when the
+                // apply added a one-time line, or once a minute while
+                // something is wrong (a persistent MISSING was the flood
+                // itself, so trouble repeats at the heartbeat's rate, not the
+                // enumeration's). Else the heartbeat line. A refusal takes
+                // the hide back, so the set it leaves can equal the last one
+                // printed, and the move test alone would drop the REFUSED
+                // line in the report's order: nothing hidden at launch, the
+                // remote hidden on a later drag. The cloak's line has the
+                // same problem, since a cloak that comes on while nothing is
+                // hidden leaves the empty set as it was.
                 long tick = Environment.TickCount64;
                 bool desiredMoved = _lastHidHideDesired == null || !_lastHidHideDesired.SetEquals(desiredIds);
-                bool trouble = !synced || missing == null || missing.Count > 0;
-                if (desiredMoved || (trouble && tick - _lastHidHideTroubleLogTick >= 60_000))
+                bool inverseMoved = _lastHidHideInversePrinted != inverse;
+                bool trouble = whitelistTrouble || inverseUnread || !synced || missing == null || missing.Count > 0;
+                if (desiredMoved || refusedNow || inverseMoved || oneTimeLine
+                    || (trouble && tick - _lastHidHideTroubleLogTick >= 60_000))
                 {
                     foreach (var line in hidLog)
                         PadForge.Engine.SdlDiagLog.WriteLine(line);
                     _lastHidHideDesired = new HashSet<string>(desiredIds, StringComparer.OrdinalIgnoreCase);
+                    _lastHidHideInversePrinted = inverse;
                     if (trouble) _lastHidHideTroubleLogTick = tick;
                 }
                 else if (tick - _lastHidHideUnchangedLogTick >= 60_000)
@@ -13542,23 +14810,22 @@ namespace PadForge.Services
         /// Only adds/removes entries that PadForge manages — entries added by HidHide Client
         /// or other tools are left untouched.
         /// </summary>
-        private void SyncWhitelist(HashSet<string> desiredWinPaths)
+        /// <param name="listNow">The driver's list once the sync is done, or
+        /// null when it failed.</param>
+        /// <returns>False when the driver's list could not be read or the
+        /// write was refused, which can leave PadForge off it (#484).</returns>
+        private bool SyncWhitelist(HashSet<string> desiredWinPaths, string nativeSelfPath, out List<string> listNow)
         {
-            // Convert desired Windows paths to DOS device paths.
-            var desiredDosPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var winPath in desiredWinPaths)
-            {
-                string dosPath = HidHideController.ToDosDevicePathPublic(winPath);
-                if (dosPath != null)
-                    desiredDosPaths.Add(dosPath);
-            }
+            listNow = null;
+            var desiredDosPaths = DesiredWhitelistEntries(desiredWinPaths, nativeSelfPath,
+                HidHideController.ToDosDevicePathPublic);
 
             var currentWhitelist = HidHideController.GetWhitelist();
             // Null means the driver could not be read, which is not the same as
             // an empty whitelist. This method edits the list and writes it back,
             // so proceeding on a failed read would push an empty whitelist and
             // strip every entry, including paths PadForge never added.
-            if (currentWhitelist == null) return;
+            if (currentWhitelist == null) return false;
             bool changed = false;
 
             // Remove PadForge-managed entries that are no longer desired.
@@ -13616,10 +14883,85 @@ namespace PadForge.Services
             // A refused write leaves the driver's list as it was, so the managed
             // set stays as it was too and the next sync diffs and retries.
             if (changed && !HidHideController.SetWhitelist(currentWhitelist))
-                return;
+                return false;
 
             foreach (var path in toRemove)
                 _managedWhitelistDosPaths.Remove(path);
+            listNow = currentWhitelist;
+            return true;
+        }
+
+        /// <summary>Whether two reads of HidHide's whitelist hold the same
+        /// entries, in any order and case. A failed read matches
+        /// nothing.</summary>
+        internal static bool SameWhitelist(List<string> a, List<string> b)
+            => a != null && b != null && new HashSet<string>(a, StringComparer.OrdinalIgnoreCase).SetEquals(b);
+
+        /// <summary>The whitelist entries PadForge asks for, in the driver's
+        /// form: each path converted from its drive letter, plus this
+        /// process's native image path (#484). The driver matches a process
+        /// by the native path of its image, which the drive-letter conversion
+        /// can miss, and that path needs no conversion.</summary>
+        internal static HashSet<string> DesiredWhitelistEntries(IEnumerable<string> winPaths,
+            string nativeSelfPath, Func<string, string> toDriverForm)
+        {
+            var desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var winPath in winPaths ?? Array.Empty<string>())
+            {
+                string dosPath = toDriverForm(winPath);
+                if (dosPath != null)
+                    desired.Add(dosPath);
+            }
+            if (!string.IsNullOrEmpty(nativeSelfPath))
+                desired.Add(nativeSelfPath);
+            return desired;
+        }
+
+        internal delegate bool HidOpenProbe(string devicePath, out int error);
+
+        private const int ERROR_ACCESS_DENIED = 5;
+
+        /// <summary>Whether this process can open a device it has hidden
+        /// (#484). HidHide refuses the open of a blacklisted HID node to any
+        /// process it does not find on its list (Logic.c OnDeviceFileCreate),
+        /// and the verdict belongs to the process, not to the device, so the
+        /// first hidden HID interface that answers settles it. True: the open
+        /// worked. False: it was refused with ERROR_ACCESS_DENIED. Null: no
+        /// hidden id has a present HID interface, or every open failed for
+        /// another reason.
+        ///
+        /// <para>An open that works settles it only on a device stack
+        /// HidHide's filter sits on. The caller therefore asks again, with the
+        /// ids of a controller that is back on a new stack and no others,
+        /// whether the release reconnected it
+        /// (<see cref="_hidHideReprobeIds"/>) or it came back by itself
+        /// (<see cref="_hidHideSeenArrivals"/>).</para></summary>
+        internal static bool? ProbeOwnHidHideReach(IEnumerable<string> hiddenIds,
+            Func<string, string> interfaceOf, HidOpenProbe open, out string probedPath, out int error)
+        {
+            probedPath = null;
+            error = 0;
+            foreach (var id in hiddenIds ?? Array.Empty<string>())
+            {
+                // Only HID collections carry the interface SDL opens. A
+                // Bluetooth or USB parent on the list has none.
+                if (string.IsNullOrEmpty(id) || !id.StartsWith(@"HID\", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                string path = interfaceOf(id);
+                if (string.IsNullOrEmpty(path)) continue;
+                if (open(path, out int err))
+                {
+                    probedPath = path;
+                    return true;
+                }
+                if (err == ERROR_ACCESS_DENIED)
+                {
+                    probedPath = path;
+                    error = err;
+                    return false;
+                }
+            }
+            return null;
         }
 
         /// <summary>
@@ -13696,6 +15038,16 @@ namespace PadForge.Services
                 }
             }
 
+            // A key reads the controller it names, or any controller when it
+            // names none (SourceKindRuntime.KeyDevice), so it is consumed
+            // there, whatever device its source names.
+            void AddKey(string descriptor, string keyDeviceGuid, MappingSource src)
+            {
+                string dev = PadForge.Engine.Common.Mapping.SourceKindRuntime.KeyDevice(keyDeviceGuid, src);
+                if (dev.Length == 0 || string.Equals(dev, deviceGuidStr, StringComparison.OrdinalIgnoreCase))
+                    AddDescriptor(descriptor);
+            }
+
             foreach (int slotIndex in assignedSlots)
             {
                 // Legacy single-source PadSetting descriptors. These hold the
@@ -13729,13 +15081,6 @@ namespace PadForge.Services
                             {
                                 if (src == null) continue;
 
-                                // Same device scoping the engine uses for a
-                                // per-device pass: empty DeviceGuid means "any
-                                // device" (it resolves to this one at runtime).
-                                if (!string.IsNullOrEmpty(src.DeviceGuid) &&
-                                    !string.Equals(src.DeviceGuid, deviceGuidStr, StringComparison.OrdinalIgnoreCase))
-                                    continue;
-
                                 // A row modifier (Invert on Hold) reads only its
                                 // modifier input (IsInvertOnHoldActive). The
                                 // descriptor and gates it kept from its source
@@ -13743,9 +15088,21 @@ namespace PadForge.Services
                                 // keys no mapping used.
                                 if (string.Equals(src.Kind, "InvertOnHold", StringComparison.Ordinal))
                                 {
-                                    AddDescriptor(src.ParamModifier);
+                                    AddKey(src.ParamModifier, src.ParamModifierDeviceGuid, src);
                                     continue;
                                 }
+                                if (PadForge.Engine.Common.Mapping.SourceEvaluator.UsesUpDownKeys(src))
+                                {
+                                    AddKey(src.ParamUp, src.ParamUpDeviceGuid, src);
+                                    AddKey(src.ParamDown, src.ParamDownDeviceGuid, src);
+                                }
+
+                                // Same device scoping the engine uses for a
+                                // per-device pass: empty DeviceGuid means "any
+                                // device" (it resolves to this one at runtime).
+                                if (!string.IsNullOrEmpty(src.DeviceGuid) &&
+                                    !string.Equals(src.DeviceGuid, deviceGuidStr, StringComparison.OrdinalIgnoreCase))
+                                    continue;
 
                                 // The gate legs first. They are read as input on
                                 // this same device, whatever the kind, and were
@@ -13757,25 +15114,30 @@ namespace PadForge.Services
                                 AddDescriptor(src.Gate2Descriptor);
 
                                 // Then exactly the descriptors each kind reads
-                                // as input, mirroring SourceEvaluator's dispatch.
-                                switch (src.Kind ?? "Direct")
-                                {
-                                    case "Incremental":
-                                    case "Ramped":
-                                        AddDescriptor(src.ParamUp);
-                                        AddDescriptor(src.ParamDown);
-                                        break;
-                                    case "WindingStick":
-                                    case "AngleToAxisX":
-                                    case "AngleToAxisY":
-                                    case "MotionLeanX":
-                                        AddDescriptor(src.Descriptor);
-                                        AddDescriptor(src.ParamYDescriptor);
-                                        break;
-                                    default: // Direct, Toggle and Rapid Trigger (the same input), unknown kinds
-                                        AddDescriptor(src.Descriptor);
-                                        break;
-                                }
+                                // on the row, by the rule its lanes apply
+                                // (InputManager KindReadsDescriptor and
+                                // ReadsStickPair). A
+                                // stick row is read on the stick lane, a trigger
+                                // or a D-pad direction on the others. The rest
+                                // resolve as buttons, and some outputs read
+                                // those as sticks (a mouse axis, a scroll wheel,
+                                // a touchpad position, a MIDI CC, an Extended
+                                // axis), so both lanes count there. An
+                                // Incremental or Ramp source reads its keys,
+                                // above, and a motion kind on a stick reads
+                                // gravity or the shake envelope: the Descriptor
+                                // either kept from an earlier kind is no input,
+                                // and neither is a ParamYDescriptor no steering
+                                // stick reads.
+                                var rowKind = PadForge.Engine.Common.Mapping.TargetKindResolver.Resolve(row.Target);
+                                bool stickLane = rowKind is PadForge.Engine.Common.Mapping.TargetKind.BipolarAxis
+                                    or PadForge.Engine.Common.Mapping.TargetKind.Button;
+                                bool otherLane = rowKind != PadForge.Engine.Common.Mapping.TargetKind.BipolarAxis;
+                                if ((otherLane && InputManager.KindReadsDescriptor(src.Kind, stickRead: false))
+                                    || (stickLane && InputManager.KindReadsDescriptor(src.Kind, stickRead: true)))
+                                    AddDescriptor(src.Descriptor);
+                                if (stickLane && InputManager.ReadsStickPair(src.Kind))
+                                    AddDescriptor(src.ParamYDescriptor);
                             }
                         }
                     }
@@ -13787,16 +15149,6 @@ namespace PadForge.Services
         //  Device list sync
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Synchronizes the DevicesViewModel.Devices collection with
-        /// SettingsManager.UserDevices. Called on the UI thread.
-        /// 
-        /// Filtering strategy:
-        ///   Virtual controllers (HIDMaestro today, or v2 ViGEm residue on
-        ///   upgraders' machines) are already filtered out by Step 1
-        ///   (IsHidMaestroVirtualDevice) via device path inspection. This
-        ///   is a defense-in-depth layer that catches any that leak through.
-        /// </summary>
         /// <summary>Last-seen shape of the persisted device registry. Null
         /// until the first refresh, so the first one always persists.</summary>
         private string _deviceRegistrySignature;
@@ -13839,6 +15191,7 @@ namespace PadForge.Services
                   .Append(d.CapTouchpadCount).Append('|')
                   .Append(d.CapTouchpadPressure).Append('|')
                   .Append(d.CapTouchpadClick).Append('|')
+                  .Append(d.CapSenseChannelMask).Append('|')
                   .Append(d.HasGyro).Append(d.HasAccel)
                   .Append(d.HasGyroAux).Append(d.HasAccelAux)
                   .Append(d.HasTouchpad).Append(d.HasRumbleTriggers)
@@ -13870,6 +15223,16 @@ namespace PadForge.Services
                 return BuildDeviceRegistrySignature(devices.Items);
         }
 
+        /// <summary>
+        /// Synchronizes the DevicesViewModel.Devices collection with
+        /// SettingsManager.UserDevices. Called on the UI thread.
+        /// 
+        /// Filtering strategy:
+        ///   Virtual controllers (HIDMaestro today, or v2 ViGEm residue on
+        ///   upgraders' machines) are already filtered out by Step 1
+        ///   (IsHidMaestroVirtualDevice) via device path inspection. This
+        ///   is a defense-in-depth layer that catches any that leak through.
+        /// </summary>
         private void SyncDevicesList()
         {
             var devVm = _mainVm.Devices;
@@ -14055,10 +15418,13 @@ namespace PadForge.Services
                 || ud.CapType == InputDeviceType.Flight
                 || ud.CapType == InputDeviceType.FirstPerson
                 || ud.CapType == InputDeviceType.Supplemental;
-            row.HasRumble = rumbleClass
+            // A haptic mouse, keyboard or vendor row (#494) rumbles through
+            // its own Force Feedback tab, the Pad page's peripheral gate.
+            row.HasRumble = (rumbleClass
                 && (ud.HasForceFeedback || ud.HasRumbleTriggers || sonyLightbarPad
                     || switch2Pad
-                    || PadForge.Common.Input.HapticToneService.DeviceHasHaptics(ud));
+                    || PadForge.Common.Input.HapticToneService.DeviceHasHaptics(ud)))
+                || PadForge.Common.Input.Peripherals.PeripheralOutputs.IsHapticPeripheral(ud);
             row.HasGyro = ud.HasGyro;
             row.HasAccel = ud.HasAccel;
             row.HasTouchpad = ud.HasTouchpad;
@@ -14206,6 +15572,8 @@ namespace PadForge.Services
                 InputDeviceType.LogitechGKeys => "LogitechGKeys",
                 InputDeviceType.AnalogKeyboard => "AnalogKeyboard",
                 InputDeviceType.WebMenus => "WebMenus",
+                InputDeviceType.PeripheralLighting => "PeripheralLighting",
+                InputDeviceType.PeripheralHaptics => "PeripheralHaptics",
                 _ => "Device"
             };
             // Vendor daemon notice (#343): the sweep scans on its cadence;
@@ -14221,15 +15589,29 @@ namespace PadForge.Services
         }
 
         /// <summary>
-        /// Updates PadViewModel device info (name, online status) for all pads.
-        /// Populates the MappedDevices collection with ALL devices assigned to each slot.
-        /// Called after the device list changes or after a device is assigned to a slot.
-        /// </summary>
-        /// <summary>
         /// Tears down all MIDI input connections and suppresses their
-        /// re-enumeration. Called before uninstalling Windows MIDI Services.
+        /// re-enumeration. Called before uninstalling the older Windows MIDI
+        /// Services runtime.
         /// </summary>
         public void ShutdownMidiInputs() => _inputManager?.ShutdownMidiInputs();
+
+        /// <summary>Lifts <see cref="ShutdownMidiInputs"/> once that
+        /// uninstall's uninstaller has exited, whatever its outcome, and for
+        /// a release that missed its bound: at once as it gives up, and again
+        /// when its worker undoes itself.</summary>
+        public void ResumeMidiInputs() => _inputManager?.ResumeMidiInputs();
+
+        /// <summary>Moves MIDI onto the API the next probe picks, after the
+        /// runtime is installed. The probe resets, which starts a new MIDI
+        /// generation, so the input sweep closes MIDI input and its session
+        /// without waiting on them and enumerates again through the new API,
+        /// and Step 5 rebuilds each MIDI slot on it once the probe settles.
+        /// The reset waits behind a probe that hangs on a dead service, so
+        /// this runs on a worker, never the UI thread. It leaves an
+        /// uninstall's latch up: only the end of the release that set the
+        /// latch lifts it.</summary>
+        public void SwitchMidiApi()
+            => PadForge.Common.Input.MidiVirtualController.ResetAvailability();
 
         /// <summary>Refreshes device lists and mapping grids after a topology change.
         /// DeviceService flushes hydrated edits before changing the topology.</summary>
@@ -15123,6 +16505,11 @@ namespace PadForge.Services
             }
         }
 
+        /// <summary>
+        /// Updates PadViewModel device info (name, online status) for all pads.
+        /// Populates the MappedDevices collection with ALL devices assigned to each slot.
+        /// Called after the device list changes or after a device is assigned to a slot.
+        /// </summary>
         public void UpdatePadDeviceInfo()
         {
             var settings = SettingsManager.UserSettings;
@@ -15488,6 +16875,16 @@ namespace PadForge.Services
             return dense;
         }
 
+        /// <summary>The rotation range the device's wheel takes, from the
+        /// writer that drives it, or null for a device no native writer
+        /// drives or none recorded (#512).</summary>
+        internal static (int Min, int Max)? WheelRangeLimitsOf(Guid instanceGuid)
+        {
+            if (instanceGuid == Guid.Empty) return null;
+            var ud = FindUserDevice(instanceGuid);
+            return ud == null ? null : WheelRangeLimits.For(ud.VendorId, ud.ProdId);
+        }
+
         /// <summary>
         /// Finds a UserDevice by instance GUID from the SettingsManager collection.
         /// </summary>
@@ -15775,13 +17172,19 @@ namespace PadForge.Services
         /// when the row is gone, and an Xbox One+ pad takes that level
         /// through its raw writer. A Remote Link peer's row buzzes the pad on
         /// the PC it is on: a mapped row's slot relays its rumble there, and
-        /// an unmapped row's train goes through the relay itself.</summary>
+        /// an unmapped row's train goes through the relay itself. A haptic
+        /// mouse, keyboard or the Razer Sensa row (#494) takes its shared
+        /// haptic path for the train
+        /// (<see cref="PadForge.Common.Input.Peripherals.PeripheralOutputs.BeginIdentify(Guid, int)"/>),
+        /// since GameSense plays only the Rival that rules its path and the
+        /// Sensa engine runs only for a row that needs it.</summary>
         public void IdentifyDevice(Guid instanceGuid)
         {
             if (instanceGuid == Guid.Empty) return;
             if (!_identifyInFlight.TryAdd(instanceGuid, 0)) return;
             _ = System.Threading.Tasks.Task.Run(async () =>
             {
+                bool identifying = false;
                 try
                 {
                     var ud = FindUserDevice(instanceGuid);
@@ -15812,6 +17215,16 @@ namespace PadForge.Services
 
                     if (pad >= 0)
                     {
+                        // A tactile Rival on a controller that does not rule
+                        // GG's tactile path would play its test pulses
+                        // nowhere, since GG plays the ruling Rival's level, so
+                        // the row takes the path for the train.
+                        if (PadForge.Common.Input.Peripherals.PeripheralOutputs.TakesHaptics(ud))
+                        {
+                            PadForge.Common.Input.Peripherals.PeripheralOutputs.BeginIdentify(instanceGuid,
+                                3 * 700 + IdentifyClaimSlackMs);
+                            identifying = true;
+                        }
                         // Sole-writer lane: three test pulses. Each sets the
                         // slot's vibration state with the device filter and
                         // self-clears after 500 ms, so 700 ms spacing reads as
@@ -15855,6 +17268,22 @@ namespace PadForge.Services
                         // through.
                         bool impulse = !peer && !padix && !blissBox
                             && PadForge.Engine.XboxControllerIdentity.IsImpulseTriggerDevice(ud.VendorId, ud.ProdId);
+                        // A haptic mouse or keyboard (#494) plays through its
+                        // backend worker, which takes the level the same way
+                        // Step 2's peripheral branch hands it over.
+                        bool peripheral = !peer && !padix && !blissBox && !impulse
+                            && PadForge.Common.Input.Peripherals.PeripheralOutputs.TakesHaptics(ud);
+                        // An unassigned row ranks nowhere on a shared haptic
+                        // path, so GG would play no Rival's pulses and the
+                        // Razer Sensa row's engine would not run. The row
+                        // takes its path for the train, and the host runs the
+                        // Sensa worker for it.
+                        if (peripheral)
+                        {
+                            PadForge.Common.Input.Peripherals.PeripheralOutputs.BeginIdentify(instanceGuid,
+                                2 * (200 + 200) + 500 + IdentifyClaimSlackMs);
+                            identifying = true;
+                        }
                         void Buzz(ushort left, ushort right)
                         {
                             // The crash path's quiesce ends every level, a
@@ -15887,6 +17316,21 @@ namespace PadForge.Services
                             else if (blissBox)
                             {
                                 PadForge.Common.Input.BlissBoxRuntime.SetRumble(ud.DevicePath, left, right);
+                            }
+                            else if (peripheral)
+                            {
+                                // Under the row's gate, which the crash quiesce
+                                // takes for its stop, so a pulse decided before
+                                // the quiesce cannot land after it.
+                                lock (ud.OutputSync)
+                                {
+                                    if (_inputManager?.OutputsQuiesced == true && (left != 0 || right != 0)) return;
+                                    // A level a peer drives stays the peer's, so
+                                    // the restore at the end of the train keeps
+                                    // it through the focus edge.
+                                    PadForge.Common.Input.Peripherals.PeripheralOutputs.SetMotors(ud.InstanceGuid, left, right,
+                                        relayed: PadForge.Common.Input.RemoteLinkOutputRouter.PeerWroteLast(ud.DevicePath));
+                                }
                             }
                             else
                             {
@@ -15929,7 +17373,7 @@ namespace PadForge.Services
                                 Buzz(0, 0);
                                 ushort lt = fs?.LeftTriggerMotorSpeed ?? 0, rt = fs?.RightTriggerMotorSpeed ?? 0;
                                 if (_inputManager?.OutputsQuiesced == true && (left | right | lt | rt) != 0) return;
-                                PadForge.Common.Input.XboxImpulseHidWriter.Write(row, left, right, lt, rt);
+                                PadForge.Common.Input.XboxImpulseHidWriter.Write(row, left, right, lt, rt, force: true);
                             }
                         }
                         for (int i = 0; i < 2; i++)
@@ -15957,9 +17401,19 @@ namespace PadForge.Services
                     }
                 }
                 catch { /* identify is best-effort */ }
-                finally { _identifyInFlight.TryRemove(instanceGuid, out _); }
+                finally
+                {
+                    if (identifying) PadForge.Common.Input.Peripherals.PeripheralOutputs.EndIdentify(instanceGuid);
+                    _identifyInFlight.TryRemove(instanceGuid, out _);
+                }
             });
         }
+
+        /// <summary>How long Identify's claim on a shared haptic path may
+        /// outlast its train's own length (#494): a train held up under load
+        /// still plays, and a claim the train never ended lapses soon after,
+        /// handing an assigned Rival's rumble back to its controller.</summary>
+        private const int IdentifyClaimSlackMs = 1000;
 
         // ─────────────────────────────────────────────
         //  Macro trigger recording
@@ -17226,7 +18680,8 @@ namespace PadForge.Services
                     CcCount = cfg.CcCount,
                     StartCc = cfg.StartCc,
                     NoteCount = cfg.NoteCount,
-                    StartNote = cfg.StartNote
+                    StartNote = cfg.StartNote,
+                    OutputPort = cfg.OutputPortSnapshot
                 });
             }
             return list.Count > 0 ? list.ToArray() : null;
@@ -17249,7 +18704,9 @@ namespace PadForge.Services
                     SlotIndex = i,
                     Surfaces = cfg.Surfaces,
                     SocdMode = cfg.SocdMode,
-                    SocdPairs = cfg.SocdPairs
+                    SocdPairs = cfg.SocdPairs,
+                    KeyboardDevice = cfg.KeyboardDevice,
+                    MouseDevice = cfg.MouseDevice,
                 });
             }
             return list.Count > 0 ? list.ToArray() : null;
@@ -17393,10 +18850,11 @@ namespace PadForge.Services
             p.SlotCreated = newCreated;
             p.SlotEnabled = newEnabled;
             // Null-guarded like the two below: on a profile captured before
-            // multi-source rows landed, null MEANS "leave the live sets
-            // alone" (ApplyProfile keys on exactly that). Handing back a
-            // fresh all-null array reads as "this profile has no mappings",
-            // and the apply then clones null over every live slot.
+            // multi-source rows landed, null MEANS "rebuild the sets from
+            // this profile's PadSettings" (ApplyProfile keys on exactly
+            // that). Handing back a fresh all-null array reads as "this
+            // profile has no mappings", and the apply then clones null over
+            // every live slot.
             if (p.SlotMappingSets != null) p.SlotMappingSets = newMappingSets;
             if (p.SlotControllerTypes != null) p.SlotControllerTypes = newControllerTypes;
             if (p.SlotProfileIds != null) p.SlotProfileIds = newProfileIds;
@@ -17484,11 +18942,6 @@ namespace PadForge.Services
                     arr[i] = ni;
         }
 
-        /// <summary>
-        /// Loads a profile's PadSettings and slot assignments into the runtime state.
-        /// For each ProfileEntry, finds the matching UserSetting and swaps its
-        /// PadSetting and MapTo slot.
-        /// </summary>
         /// <summary>Merges the profile's custom touchpad gestures with
         /// the in-box shape catalog and hands the combined list to the
         /// InputManager. Called from ApplyProfile and on initial
@@ -17668,9 +19121,11 @@ namespace PadForge.Services
         /// still name the old instance, and every runtime consumer matches the
         /// guid exactly (empty = "any device on the slot"), so the rebound pad
         /// would produce no output, engage no shift layer, and open no menu.
-        /// This is the whole set of guid-bearing fields: sources, all three
-        /// activator legs, and menu entries. A new guid-carrying field on any
-        /// of them needs a leg here.</para></summary>
+        /// This is the whole set of guid-bearing fields: sources, their keys
+        /// and the controller of a kept input
+        /// (MappingSource.DescriptorDeviceGuid, moved with the keys), all
+        /// three activator legs, and menu entries. A new guid-carrying field
+        /// on any of them needs a leg here.</para></summary>
         // Internal so the round-eight adoption-drain wiring is testable
         // against a live mapping set.
         internal static void RemapDeviceGuidsInSlotMappingSets(
@@ -17693,7 +19148,11 @@ namespace PadForge.Services
                     {
                         if (row?.Sources == null) continue;
                         foreach (var s in row.Sources)
-                            if (s != null) s.DeviceGuid = Map(s.DeviceGuid);
+                        {
+                            if (s == null) continue;
+                            s.DeviceGuid = Map(s.DeviceGuid);
+                            s.RetargetKeyDevices(Map);
+                        }
                     }
                 }
 
@@ -17716,6 +19175,11 @@ namespace PadForge.Services
             }
         }
 
+        /// <summary>
+        /// Loads a profile's PadSettings and slot assignments into the runtime state.
+        /// For each ProfileEntry, finds the matching UserSetting and swaps its
+        /// PadSetting and MapTo slot.
+        /// </summary>
         public void ApplyProfile(ProfileData profile)
         {
             if (profile == null)
@@ -17747,9 +19211,9 @@ namespace PadForge.Services
             // (Issue #61). Multi-source rows + per-row CombineMode +
             // ShiftActivator round-trip with the profile. Profiles
             // captured before multi-source landed have null
-            // SlotMappingSets — leave the live array untouched in that
-            // case so it falls back to whatever the loader (legacy
-            // migration or persisted-XML state) set up.
+            // SlotMappingSets. Their mappings live in the per-device
+            // PadSettings, so the live sets are rebuilt from those once
+            // the assignments below have applied them.
             // DEEP CLONE on apply so live mutations (auto-map on device
             // reassignment, in-tab edits) don't poison the profile's
             // stored snapshot.
@@ -17974,6 +19438,24 @@ namespace PadForge.Services
                 }
             }
 
+            // A profile saved before mapping sets existed keeps its mappings
+            // in the PadSettings the loop above just applied. Rebuild the
+            // live sets from them through the legacy migrator, as the
+            // ProfileData.SlotMappingSets contract says. Leaving the sets
+            // alone ran the OUTGOING profile's rows, activators and menus
+            // under this profile, and the next switch away saved them into
+            // it. The merge keeps a slot's current activators, menus and rows
+            // whenever the slot already has a set, so every set is nulled
+            // first, the way ApplyDefaultProfile's no-snapshot branch does.
+            if (profile.SlotMappingSets == null)
+            {
+                var liveSets = SettingsManager.SlotMappingSets;
+                if (liveSets != null)
+                    for (int s = 0; s < liveSets.Length; s++)
+                        liveSets[s] = null;
+                SettingsService.RefreshMappingSetsFromLegacy();
+            }
+
             // Point the just-cloned mapping sets at the instances the
             // same-product fallback actually bound (see the remap note above).
             RemapDeviceGuidsInSlotMappingSets(deviceGuidRemap);
@@ -18064,6 +19546,7 @@ namespace PadForge.Services
                         cfg.CcCount = cfgData.CcCount;
                         cfg.StartNote = cfgData.StartNote;
                         cfg.NoteCount = cfgData.NoteCount;
+                        cfgData.ApplyOutputPortTo(cfg);
                         _mainVm.Pads[idx].RebuildMappings();
                     }
                 }
@@ -18082,6 +19565,7 @@ namespace PadForge.Services
                         cfg.Surfaces = cfgData.Surfaces;
                         cfg.SocdMode = cfgData.SocdMode;
                         cfg.SocdPairs = cfgData.SocdPairs;
+                        cfg.SetDevices(cfgData.KeyboardDevice, cfgData.MouseDevice);
                         // The mode narrows the mapping table, so the view has
                         // to hear about a profile apply too (#408).
                         _mainVm.Pads[idx].NotifyKbmSurfacesChanged();
@@ -18100,11 +19584,12 @@ namespace PadForge.Services
             if (profile.Macros != null)
                 _settingsService?.LoadMacros(profile.Macros);
 
-            // The three Dashboard service toggles ride profiles with a
-            // no-opinion default: a non-null leg starts or stops the mirror
-            // through the Dashboard setter, a null leg leaves the current
-            // value alone, so the Default snapshot and pre-existing profiles
-            // never stomp the global. Every switch lane funnels through here.
+            // The head tracking service toggles ride profiles with a
+            // no-opinion default: a non-null leg sets the toggle through the
+            // Dashboard setter, which writes the runtime flag the engine
+            // sweep reads, and a null leg leaves the current value alone, so
+            // the Default snapshot and pre-existing profiles never stomp the
+            // global. Every switch lane funnels through here.
             _settingsService?.ApplyProfileServiceToggles(profile);
 
             // NOW the macro re-key lands (round ten): the macros that
@@ -18369,18 +19854,6 @@ namespace PadForge.Services
             }
         }
 
-        /// <summary>Drops every stateful accumulator a profile switch must not
-        /// carry across: source-kind runtime (Incremental cruise / ramp
-        /// throttle), shift-toggle latches, gyro engage stickies, trigger-route
-        /// engage, and gesture contexts.
-        ///
-        /// <para>This exists as ONE method because the reset set had drifted
-        /// three ways (round 34): the named-profile auto lane ran all five, the
-        /// default auto lane omitted ResetGestureContexts, and the MANUAL lanes
-        /// (LoadProfile, RevertToDefaultProfile, DeleteProfile's fallback) ran
-        /// none of them, so switching profiles from the UI carried a latched
-        /// shift layer or an engaged gyro into the new profile while the
-        /// foreground-monitor lane doing the same switch did not.</para></summary>
         /// <summary>The ONE owner of the live polling interval (#365). The
         /// active profile's override wins when it has one (nonzero), the
         /// global Settings value applies otherwise, and both clamp to the
@@ -18428,6 +19901,18 @@ namespace PadForge.Services
         internal static int ResolvePollingMs(int overrideMs, int globalMs)
             => Math.Clamp(overrideMs > 0 ? overrideMs : globalMs, 1, 16);
 
+        /// <summary>Drops every stateful accumulator a profile switch must not
+        /// carry across: source-kind runtime (Incremental cruise / ramp
+        /// throttle), shift-toggle latches, gyro engage stickies, trigger-route
+        /// engage, and gesture contexts.
+        ///
+        /// <para>This exists as ONE method because the reset set had drifted
+        /// three ways (round 34): the named-profile auto lane ran all five, the
+        /// default auto lane omitted ResetGestureContexts, and the MANUAL lanes
+        /// (LoadProfile, RevertToDefaultProfile, DeleteProfile's fallback) ran
+        /// none of them, so switching profiles from the UI carried a latched
+        /// shift layer or an engaged gyro into the new profile while the
+        /// foreground-monitor lane doing the same switch did not.</para></summary>
         private void ResetRuntimeStateForProfileSwitch()
         {
             // Polling rate follows the profile (#365): resolved here because
@@ -18444,16 +19929,16 @@ namespace PadForge.Services
             _inputManager?.ResetGyroSimulation();
         }
 
-        /// <summary>
-        /// Saves the current runtime state into the active profile (or the
-        /// default snapshot if no named profile is active).  Call before
-        /// switching away from any profile so changes are preserved.
-        /// </summary>
         /// <summary>Test seam: the grid-to-set push the debounced save runs
         /// immediately before SaveActiveProfileState.</summary>
         internal void PushUiIntoSlotMappingSetsForTest()
             => _settingsService?.PushUiExtraSourcesIntoSlotMappingSets();
 
+        /// <summary>
+        /// Saves the current runtime state into the active profile (or the
+        /// default snapshot if no named profile is active).  Call before
+        /// switching away from any profile so changes are preserved.
+        /// </summary>
         public void SaveActiveProfileState()
         {
             var snapshot = SnapshotCurrentProfile();
@@ -18529,10 +20014,6 @@ namespace PadForge.Services
             SettingsManager.PendingDefaultSnapshot = _defaultProfileSnapshot;
         }
 
-        /// <summary>
-        /// Applies the default profile snapshot, reverting to the state before
-        /// any named profile was loaded.
-        /// </summary>
         /// <summary>Test seam: reproduces the post-restart state where no
         /// default snapshot was ever persisted.</summary>
         internal void ClearDefaultProfileSnapshotForTest()
@@ -18581,6 +20062,10 @@ namespace PadForge.Services
             catch { /* diagnostics must never break a transition */ }
         }
 
+        /// <summary>
+        /// Applies the default profile snapshot, reverting to the state before
+        /// any named profile was loaded.
+        /// </summary>
         public void ApplyDefaultProfile()
         {
             _settingsService?.InvalidateAssignmentSnapshot();
@@ -18648,10 +20133,6 @@ namespace PadForge.Services
         }
 
         /// <summary>
-        /// Updates the TopologyLabel on the active profile's list item so the
-        /// Profiles page reflects slot create/delete/type changes immediately.
-        /// </summary>
-        /// <summary>
         /// Public wrapper so callers (e.g. MainWindow) can refresh the profile
         /// topology label after controller type changes.
         /// </summary>
@@ -18682,14 +20163,15 @@ namespace PadForge.Services
                 SlotControllerTypes = new int[InputManager.MaxPads],
                 SlotModel3DAppearances = SlotAppearancePersistence.Empty(),
                 // Empty, NOT null. On ProfileData both of these use null as the
-                // legacy sentinel for "saved before this rode profiles, leave
-                // the live state alone" (ApplyProfile keys on exactly that), so
-                // leaving them unset made a brand-new empty profile INHERIT the
-                // outgoing profile's mappings and macros, then persist them as
-                // its own on the next switch-away. An authored-empty profile
-                // owns zero of each and must say so. Null elements are the
-                // established no-mappings shape: Reset to Defaults assigns the
-                // live array exactly this way.
+                // legacy sentinel for "saved before this rode profiles". For
+                // Macros, ApplyProfile then leaves the live macros alone, so
+                // leaving it unset made a brand-new empty profile INHERIT the
+                // outgoing profile's macros and persist them as its own on the
+                // next switch-away. For SlotMappingSets it rebuilds the sets
+                // from the profile's PadSettings, which an empty profile has
+                // none of. An authored-empty profile owns zero of each and must
+                // say so. Null elements are the established no-mappings shape:
+                // Reset to Defaults assigns the live array exactly this way.
                 SlotMappingSets = new Engine.Data.MappingSet[InputManager.MaxPads],
                 Macros = Array.Empty<MacroData>(),
             };
@@ -19019,6 +20501,10 @@ namespace PadForge.Services
             _mainVm.Settings.RefreshDriverGuards();
         }
 
+        /// <summary>
+        /// Updates the TopologyLabel on the active profile's list item so the
+        /// Profiles page reflects slot create/delete/type changes immediately.
+        /// </summary>
         private void RefreshActiveProfileTopologyLabel()
         {
             string activeId = SettingsManager.ActiveProfileId;
@@ -19057,6 +20543,7 @@ namespace PadForge.Services
             // already halted. Doing it here, after Stop() disposed the manager,
             // risked a use-after-dispose (round-4 finding), so it lives there.
             try { Stop(); } catch { /* Best effort on shutdown */ }
+            _controllerRelease.Dispose();
 
             // The adoption-migration queue is STATIC on InputManager, so
             // anything queued while the poll loop was still winding down
@@ -19187,8 +20674,12 @@ namespace PadForge.Services
                 {
                     var src = row.Sources[s];
                     // A row modifier (Invert on Hold) is no source, whatever
-                    // descriptor it kept, the row evaluators' rule.
-                    if (src == null || string.Equals(src.Kind, "InvertOnHold", StringComparison.Ordinal)) continue;
+                    // descriptor it kept, the row evaluators' rule. Nor is a
+                    // Descriptor the kind does not read on a stick, such as
+                    // the one an Incremental or Ramp source kept: it came
+                    // first and showed the stick centered.
+                    if (src == null || string.Equals(src.Kind, "InvertOnHold", StringComparison.Ordinal)
+                        || !InputManager.KindReadsDescriptor(src.Kind, stickRead: true)) continue;
                     // Device match is the RUNTIME rule, not an exact compare:
                     // an empty DeviceGuid is (Any Device), which a mouse answers
                     // (#431). The old compare skipped it, so a wildcard Mouse
@@ -19200,7 +20691,7 @@ namespace PadForge.Services
                     // Consumed and postponed sources are suppressed in dispatch,
                     // so the preview suppresses them too, the same rule the
                     // trigger preview applies one tab over.
-                    if (InputManager.IsSourceSuppressedPostpone(slotIndex, src.DeviceGuid, src.Descriptor)) continue;
+                    if (InputManager.IsSourceSuppressedPostpone(slotIndex, src, stickRead: true)) continue;
 
                     // Read through the evaluator instead of repeating its math.
                     // The hand-rolled copy reproduced the component select, the

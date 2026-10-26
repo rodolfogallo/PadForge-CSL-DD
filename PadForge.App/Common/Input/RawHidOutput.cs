@@ -38,6 +38,8 @@ namespace PadForge.Common.Input
         {
             if (string.IsNullOrEmpty(devicePath) || buf == null || buf.Length == 0)
                 return false;
+            // The test host writes to no device (RealHidAccess).
+            if (RealHidAccess.Refused) return false;
 
             var io = s_ioCache.GetOrAdd(devicePath, _ => new CachedIo());
             lock (io.Gate)
@@ -111,6 +113,7 @@ namespace PadForge.Common.Input
         {
             if (string.IsNullOrEmpty(devicePath) || buf == null || buf.Length == 0)
                 return false;
+            if (RealHidAccess.Refused) return false;
 
             IntPtr handle = CreateFileW(
                 devicePath,
@@ -220,6 +223,7 @@ namespace PadForge.Common.Input
         {
             if (string.IsNullOrEmpty(devicePath) || buf == null || buf.Length == 0)
                 return false;
+            if (RealHidAccess.Refused) return false;
 
             IntPtr handle = CreateFileW(
                 devicePath,

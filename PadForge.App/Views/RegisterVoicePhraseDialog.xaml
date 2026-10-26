@@ -1,4 +1,4 @@
-<ui:FluentWindow x:Class="PadForge.Views.RegisterVoicePhraseDialog"
+<ui:FluentWindow AutomationProperties.IsDialog="True" x:Class="PadForge.Views.RegisterVoicePhraseDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
@@ -40,7 +40,7 @@
                 <ui:Button Grid.Column="2" Style="{StaticResource EmberIconButton}"
                            VerticalAlignment="Center" Click="CloseButton_Click"
                            ToolTip="{Binding Common_Close, Source={x:Static strings:Strings.Instance}}">
-                    <TextBlock Text="&#xE8BB;" FontFamily="Segoe MDL2 Assets" FontSize="10"/>
+                    <reset:GlyphText Text="&#xE8BB;" FontFamily="Segoe MDL2 Assets" FontSize="10"/>
                 </ui:Button>
             </Grid>
         </Border>

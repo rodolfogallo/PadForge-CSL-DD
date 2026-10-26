@@ -99,9 +99,20 @@
   <data name="Common_Record" xml:space="preserve"><value>Registra</value></data>
   <data name="Common_Recording" xml:space="preserve"><value>Registrazione...</value></data>
   <data name="Common_Clear" xml:space="preserve"><value>Cancella</value></data>
+  <data name="Common_Increase" xml:space="preserve"><value>Aumenta</value></data>
+  <data name="Common_Decrease" xml:space="preserve"><value>Diminuisci</value></data>
+  <data name="Common_ScrollUp" xml:space="preserve"><value>Scorri su</value></data>
+  <data name="Common_ScrollDown" xml:space="preserve"><value>Scorri giù</value></data>
+  <data name="Common_ScrollLeft" xml:space="preserve"><value>Scorri a sinistra</value></data>
+  <data name="Common_ScrollRight" xml:space="preserve"><value>Scorri a destra</value></data>
+  <data name="Common_PageUp" xml:space="preserve"><value>Pagina su</value></data>
+  <data name="Common_PageDown" xml:space="preserve"><value>Pagina giù</value></data>
+  <data name="Common_PageLeft" xml:space="preserve"><value>Pagina a sinistra</value></data>
+  <data name="Common_PageRight" xml:space="preserve"><value>Pagina a destra</value></data>
   <data name="Common_None" xml:space="preserve"><value>Nessuno</value></data>
   <data name="Common_Ms" xml:space="preserve"><value>ms</value></data>
   <data name="Common_Unassigned" xml:space="preserve"><value>Non assegnato</value></data>
+  <data name="Common_DoesNotApply" xml:space="preserve"><value>Non applicabile</value></data>
   <data name="Common_PadForge" xml:space="preserve"><value>PadForge</value></data>
 
   <!-- ═══ Controller Types ═══ -->
@@ -121,6 +132,10 @@
   <data name="Main_AddController" xml:space="preserve"><value>Aggiungi controller</value></data>
   <data name="Main_DeleteVC" xml:space="preserve"><value>Elimina controller virtuale</value></data>
   <data name="Main_FullScreen" xml:space="preserve"><value>Schermo intero</value></data>
+  <data name="Main_Minimize" xml:space="preserve"><value>Riduci a icona</value></data>
+  <data name="Main_Maximize" xml:space="preserve"><value>Ingrandisci</value></data>
+  <data name="Main_Restore" xml:space="preserve"><value>Ripristina</value></data>
+  <data name="Main_NavigationPane" xml:space="preserve"><value>Riquadro di navigazione</value></data>
   <data name="Main_ShowPadForge" xml:space="preserve"><value>Mostra PadForge</value></data>
   <data name="Main_VirtualController_Format" xml:space="preserve"><value>Controller virtuale {0}</value></data>
   <data name="Main_EngineStopped" xml:space="preserve"><value>Motore arrestato</value></data>
@@ -136,7 +151,7 @@
   <data name="Main_Nintendo_Max_Format" xml:space="preserve"><value>Nintendo (max {0})</value></data>
   <data name="Main_Extended_Max_Format" xml:space="preserve"><value>Esteso (max {0})</value></data>
   <data name="Main_KBM_Max_Format" xml:space="preserve"><value>Tastiera + Mouse (max {0})</value></data>
-  <data name="Main_MIDI_RequiresMidiServices" xml:space="preserve"><value>MIDI (richiede Windows MIDI Services)</value></data>
+  <data name="Main_MIDI_NotRunning" xml:space="preserve"><value>MIDI (non avviato, vedi la scheda Windows MIDI Services nelle Impostazioni)</value></data>
   <data name="Main_MIDI_Max_Format" xml:space="preserve"><value>MIDI (max {0})</value></data>
   <data name="Main_VR_RequiresSteamVR" xml:space="preserve"><value>VR (richiede SteamVR)</value></data>
   <data name="Main_VR_Max_Format" xml:space="preserve"><value>VR (max {0})</value></data>
@@ -144,16 +159,35 @@
   <!-- ═══ MainWindow Status Messages ═══ -->
   <data name="Status_InstallingHidHide" xml:space="preserve"><value>Installazione di HidHide in corso…</value></data>
   <data name="Status_UninstallingHidHide" xml:space="preserve"><value>Disinstallazione di HidHide in corso…</value></data>
-  <data name="Status_DownloadingMidi" xml:space="preserve"><value>Download di Windows MIDI Services in corso…</value></data>
-  <data name="Status_DownloadingInstallingMidi" xml:space="preserve"><value>Download e installazione di Windows MIDI Services in corso…</value></data>
-  <data name="Status_UninstallingMidi" xml:space="preserve"><value>Disinstallazione di Windows MIDI Services in corso…</value></data>
+  <data name="Status_HidHideRefusedPadForge" xml:space="preserve"><value>HidHide ha bloccato l'accesso di PadForge a un dispositivo che PadForge aveva nascosto, quindi PadForge ha smesso di nascondere dispositivi.</value></data>
+  <data name="Status_HidHideInverse" xml:space="preserve"><value>In HidHide è attiva l'opzione «Inverse application cloak», quindi PadForge non nasconde dispositivi.</value></data>
+  <data name="Status_UninstallingMidi" xml:space="preserve"><value>Disinstallazione del runtime di Windows MIDI Services in corso…</value></data>
+  <data name="Status_MidiNotRunning_Format" xml:space="preserve"><value>{0} non si è avviato perché MIDI non è attivo. La scheda Windows MIDI Services nelle Impostazioni ne indica il motivo.</value></data>
+  <data name="Status_MidiCreateFailed_Format" xml:space="preserve"><value>{0} non si è avviato perché Windows MIDI Services non ha creato la sua porta.</value></data>
+  <data name="Status_MidiPortNotPicked_Format" xml:space="preserve"><value>{0} non ha una porta di uscita. Scegline una nella sua pagina.</value></data>
+  <data name="Status_MidiPortNotConnected_Format" xml:space="preserve"><value>La porta di uscita «{1}» di {0} non è collegata. Lo slot si avvia non appena la porta torna disponibile.</value></data>
+  <data name="Status_MidiPortInUse_Format" xml:space="preserve"><value>La porta di uscita «{1}» di {0} è già in uso.</value></data>
+  <data name="Status_MidiPortShared_Format" xml:space="preserve"><value>{0} e {2} sono impostati sulla stessa porta di uscita «{1}». Scegli un'altra porta per uno dei due.</value></data>
+  <data name="Status_MidiPortDidNotOpen_Format" xml:space="preserve"><value>La porta di uscita «{1}» di {0} non si è aperta.</value></data>
+  <data name="Status_MidiReleaseTimedOut" xml:space="preserve"><value>Il servizio MIDI di Windows non ha risposto, quindi il runtime non è stato disinstallato. Seleziona di nuovo Disinstalla tra un momento.</value></data>
+  <data name="Status_MidiReleaseTimedOutDriver" xml:space="preserve"><value>Un driver MIDI non ha risposto, quindi il runtime non è stato disinstallato. Seleziona di nuovo Disinstalla quando MIDI è attivo.</value></data>
+  <data name="Status_DownloadingInstallingMidi" xml:space="preserve"><value>Download e installazione del runtime di Windows MIDI Services in corso, preceduti dal Visual C++ Redistributable di Microsoft se questo PC ne ha bisogno…</value></data>
   <data name="Status_OperationCanceled" xml:space="preserve"><value>Operazione annullata dall'utente.</value></data>
-  <data name="Status_MidiInstallFailed_Format" xml:space="preserve"><value>Installazione MIDI Services non riuscita: {0}</value></data>
   <data name="Status_DownloadingSteamVR" xml:space="preserve"><value>Download di SteamVR in corso…</value></data>
   <data name="Status_DownloadingInstallingSteamVR" xml:space="preserve"><value>Download e installazione di SteamVR dai server di Valve… Sono diversi GB e può richiedere tempo.</value></data>
   <data name="Status_SteamVRInstallFailed_Format" xml:space="preserve"><value>Installazione di SteamVR non riuscita: {0}</value></data>
   <data name="Status_UninstallingSteamVR" xml:space="preserve"><value>Disinstallazione di SteamVR…</value></data>
   <data name="Status_SteamVRRunningCloseFirst" xml:space="preserve"><value>SteamVR è in esecuzione. Chiudilo prima di disinstallare.</value></data>
+  <data name="Status_RemovingHIDMaestro" xml:space="preserve"><value>Rimozione di HIDMaestro in corso…</value></data>
+  <data name="Status_HIDMaestroRemoved" xml:space="preserve"><value>HIDMaestro è stato rimosso.</value></data>
+  <data name="Status_HIDMaestroRemovedRestart" xml:space="preserve"><value>HIDMaestro è stato rimosso. Windows completa la rimozione al prossimo avvio.</value></data>
+  <data name="Status_HIDMaestroRemovalBlocked_Format" xml:space="preserve"><value>Rimozione di HIDMaestro interrotta. Chiudi {0}, quindi disinstalla di nuovo.</value></data>
+  <data name="Status_HIDMaestroRemovalFailed" xml:space="preserve"><value>HIDMaestro è stato rimosso solo in parte. L'elenco mostra cosa è rimasto e perché.</value></data>
+  <data name="Status_RemovingBthPS3" xml:space="preserve"><value>Rimozione di BthPS3 in corso…</value></data>
+  <data name="Status_BthPS3Removed" xml:space="preserve"><value>BthPS3 è stato rimosso.</value></data>
+  <data name="Status_BthPS3RemovedRestart" xml:space="preserve"><value>BthPS3 è stato rimosso. Windows completa la rimozione al prossimo avvio.</value></data>
+  <data name="Status_BthPS3RemovalBlocked_Format" xml:space="preserve"><value>Rimozione di BthPS3 interrotta. {0}</value></data>
+  <data name="Status_BthPS3RemovalFailed" xml:space="preserve"><value>BthPS3 è stato rimosso solo in parte. L'elenco mostra cosa è rimasto e perché.</value></data>
   <data name="Status_DeviceListRefreshed" xml:space="preserve"><value>Elenco dispositivi aggiornato.</value></data>
   <data name="Status_Recorded_Format" xml:space="preserve"><value>Registrato "{0}" ← {1}</value></data>
   <data name="Status_NowMap_Format" xml:space="preserve"><value>Ora assegna: {0} {1}</value></data>
@@ -197,6 +231,7 @@
   <data name="Status_EngineStopped" xml:space="preserve"><value>Motore arrestato.</value></data>
   <data name="Status_NoMapping" xml:space="preserve"><value>Nessuna mappatura</value></data>
   <data name="Status_Error_Format" xml:space="preserve"><value>Errore: {0}</value></data>
+  <data name="Status_SlotCreateFailed_Format" xml:space="preserve"><value>Non è stato possibile creare {0}.</value></data>
   <data name="Status_ProfileSwitched_Format" xml:space="preserve"><value>Profilo cambiato: {0}</value></data>
   <data name="Status_ProfileSwitchedDefault" xml:space="preserve"><value>Profilo cambiato: Predefinito</value></data>
   <data name="Profile_Default" xml:space="preserve"><value>Predefinito</value></data>
@@ -233,25 +268,6 @@
   <data name="Dashboard_SlotCard_Configure" xml:space="preserve"><value>Configura questo controller</value></data>
   <data name="Dashboard_MotionServer" xml:space="preserve"><value>Server di movimento</value></data>
   <data name="Dashboard_DsuDescription" xml:space="preserve"><value>Server DSU/CemuHook Motion Provider protocol per dati di giroscopio e accelerometro.</value></data>
-  <data name="Dashboard_Chroma" xml:space="preserve"><value>Razer Chroma</value></data>
-  <data name="Dashboard_ChromaDescription" xml:space="preserve"><value>Inoltra il colore della barra luminosa che un gioco imposta su un controller PlayStation virtuale ai dispositivi Razer Chroma. PadForge compare in Razer Synapse come app Chroma, dove puoi limitarlo o disattivarlo.</value></data>
-  <data name="Dashboard_EnableChroma" xml:space="preserve"><value>Rispecchia la barra luminosa su Razer Chroma</value></data>
-  <data name="Dashboard_ChromaWaiting" xml:space="preserve"><value>Razer Synapse non rilevato. Nuovo tentativo in corso.</value></data>
-  <data name="Dashboard_ChromaConnected" xml:space="preserve"><value>Connesso a Razer Chroma</value></data>
-  <data name="Dashboard_ChromaFooter" xml:space="preserve"><value>Richiede Razer Synapse con Chroma Connect. Funziona con qualsiasi controller fisico: il colore proviene dal pad virtuale che il gioco colora.</value></data>
-  <data name="Dashboard_Sensa" xml:space="preserve"><value>Razer Sensa HD Haptics</value></data>
-  <data name="Dashboard_SensaDescription" xml:space="preserve"><value>Traduce la vibrazione del controller in feedback aptico Razer Sensa HD, così i dispositivi Sensa come la linea Wolverine V3, il Kraken V4 Pro e il Freyja vibrano con i tuoi giochi.</value></data>
-  <data name="Dashboard_EnableSensa" xml:space="preserve"><value>Invia la vibrazione a Sensa HD Haptics</value></data>
-  <data name="Dashboard_SensaWaiting" xml:space="preserve"><value>Runtime Razer Sensa non trovato. Nuovo tentativo in corso.</value></data>
-  <data name="Dashboard_SensaActive" xml:space="preserve"><value>Vibrazione in streaming verso Sensa HD Haptics</value></data>
-  <data name="Dashboard_SensaFooter" xml:space="preserve"><value>Richiede Razer Synapse 4 con Sensa HD Haptics. In Synapse imposta la sorgente aptica del dispositivo su Sensa HD Games.</value></data>
-  <data name="Dashboard_Lightsync" xml:space="preserve"><value>Logitech LIGHTSYNC</value></data>
-  <data name="Dashboard_LightsyncDescription" xml:space="preserve"><value>Inoltra il colore della barra luminosa che un gioco imposta su un controller PlayStation virtuale ai tuoi dispositivi Logitech LIGHTSYNC tramite Logitech G HUB.</value></data>
-  <data name="Dashboard_EnableLightsync" xml:space="preserve"><value>Rifletti la barra luminosa su Logitech LIGHTSYNC</value></data>
-  <data name="Dashboard_LightsyncWaiting" xml:space="preserve"><value>Logitech G HUB non rilevato. Nuovo tentativo.</value></data>
-  <data name="Dashboard_LightsyncConnected" xml:space="preserve"><value>Connesso a Logitech LIGHTSYNC</value></data>
-  <data name="Dashboard_LightsyncFooter" xml:space="preserve"><value>Richiede Logitech G HUB (o Logitech Gaming Software). Funziona con qualsiasi controller fisico: il colore proviene dal pad virtuale che il gioco colora.</value></data>
-  <data name="Dashboard_LightbarMirrors" xml:space="preserve"><value>Riflessi della barra luminosa</value></data>
   <data name="Dashboard_EnableDsu" xml:space="preserve"><value>Abilita server di movimento DSU (CemuHook Motion Provider protocol)</value></data>
   <data name="Dashboard_Port" xml:space="preserve"><value>Porta</value></data>
   <data name="Dashboard_WebControllerPort" xml:space="preserve"><value>Porta del controller web</value></data>
@@ -260,13 +276,13 @@
   <data name="Dashboard_DsuFooter" xml:space="preserve"><value>Fornisce dati di giroscopio e accelerometro a Cemu, Dolphin, Yuzu, ecc.</value></data>
   <data name="Dashboard_HeadTrackingFooter" xml:space="preserve"><value>Funziona con OpenTrack e con qualsiasi tracker che invii la propria uscita UDP o scriva nella memoria condivisa FreeTrack 2.0, e con un runtime OpenXR installato su questa macchina in grado di eseguire una sessione in background.</value></data>
   <data name="Settings_GKeys" xml:space="preserve"><value>Leggi i tasti G Logitech</value></data>
-  <data name="Settings_GKeysTooltip" xml:space="preserve"><value>Legge i tasti G tramite l’SDK G-key di Logitech. Richiede Logitech Gaming Software 8.55 o successivo in esecuzione. In quel programma, rendi PadForge il profilo persistente, altrimenti i tasti raggiungono PadForge solo mentre la sua finestra è in primo piano.</value></data>
+  <data name="Settings_GKeysTooltip" xml:space="preserve"><value>Legge i tasti G tramite l’SDK G-key di Logitech. Richiede Logitech Gaming Software 8.55 o successivo in esecuzione. In quel programma, trascina il comando G-key su ogni tasto del profilo PadForge. Rendi persistente quel profilo, altrimenti i tasti raggiungono PadForge solo mentre la sua finestra è in primo piano. Inoltre, un mouse G600 o G300 non deve essere in modalità memoria integrata.</value></data>
   <data name="Settings_GKeysStatus_NoSdk" xml:space="preserve"><value>Nessun SDK G-key Logitech su questo PC. Si installa con Logitech Gaming Software 8.55 o successivo.</value></data>
   <data name="Settings_GKeysStatus_PathStale" xml:space="preserve"><value>L'SDK G-key è registrato ma il file non c'è. Reinstalla Logitech Gaming Software.</value></data>
   <data name="Settings_GKeysStatus_LoadFailed" xml:space="preserve"><value>SDK G-key trovato, caricamento non riuscito.</value></data>
   <data name="Settings_GKeysStatus_WrongLibrary" xml:space="preserve"><value>Quella libreria non è l'SDK G-key previsto.</value></data>
   <data name="Settings_GKeysStatus_InitRefused" xml:space="preserve"><value>L'SDK G-key non è partito. Di solito Logitech Gaming Software non è in esecuzione.</value></data>
-  <data name="Settings_GKeysStatus_NoKeysYet" xml:space="preserve"><value>Connesso, nessun tasto rilevato. In Logitech Gaming Software, rendi PadForge il profilo persistente.</value></data>
+  <data name="Settings_GKeysStatus_NoKeysYet" xml:space="preserve"><value>Connesso, nessun tasto rilevato. In Logitech Gaming Software, trascina il comando G-key su ogni tasto del profilo PadForge e rendi persistente quel profilo. Inoltre, un mouse G600 o G300 non deve essere in modalità memoria integrata.</value></data>
   <data name="Settings_GKeysStatus_Running_Format" xml:space="preserve"><value>In esecuzione, {0} eventi tasto</value></data>
   <data name="Settings_AnalogKeyboards" xml:space="preserve"><value>Leggi le tastiere analogiche</value></data>
   <data name="Settings_AnalogKeyboardsTooltip" xml:space="preserve"><value>Legge quanto è premuto ogni tasto sulle tastiere analogiche di Wooting, Razer, SteelSeries, Keychron, NuPhy, DrunkDeer, AULA e altri produttori, ciascuna come riga dispositivo a sé. La documentazione elenca ogni modello supportato. Le tastiere Razer richiedono Razer Synapse in esecuzione. La maggior parte delle altre viene interrogata sul canale usato dal loro software di configurazione, quindi chiudi quel software mentre questa opzione è attiva.</value></data>
@@ -364,14 +380,59 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Settings_AddDots" xml:space="preserve"><value>Aggiungi...</value></data>
   <data name="Settings_HIDMaestro" xml:space="preserve"><value>Driver HIDMaestro</value></data>
   <data name="Settings_HIDMaestroDesc" xml:space="preserve"><value>Motore di controller HID virtuale in modalità utente. Integrato in PadForge.App. Installato automaticamente alla prima creazione di un controller virtuale. Sostituisce ViGEmBus e vJoy in v3.</value></data>
+  <data name="HIDMaestroUninstall_Title" xml:space="preserve"><value>Disinstalla HIDMaestro</value></data>
+  <data name="HIDMaestroUninstall_Message" xml:space="preserve"><value>Questa operazione rimuove HIDMaestro da questo PC: controller virtuali, driver, certificato di firma, chiavi del registro e file. PadForge arresta prima il proprio motore. Gli altri programmi che usano HIDMaestro perdono il driver fino al loro prossimo avvio. PadForge lo installa di nuovo la prossima volta che avvia un controller virtuale.</value></data>
+  <data name="HIDMaestroUninstall_IncludeUsbip" xml:space="preserve"><value>Rimuovi anche usbip-win2 installato con il suo programma di installazione</value></data>
+  <data name="HIDMaestroUninstall_IncludeUsbipDesc" xml:space="preserve"><value>Le versioni precedenti di PadForge installavano usbip-win2 con il relativo programma di installazione. Questa opzione rimuove anche quell'installazione, compreso il filtro dell'hub radice USB, a meno che un altro programma non usi usbip-win2. Rimuovere il filtro riavvia ogni hub radice USB 3, quindi i dispositivi USB si disconnettono per un istante.</value></data>
+  <data name="HIDMaestroUninstall_Reading" xml:space="preserve"><value>Lettura di ciò che HIDMaestro ha lasciato su questo PC…</value></data>
+  <data name="HIDMaestroUninstall_Nothing" xml:space="preserve"><value>HIDMaestro non ha lasciato nulla da rimuovere su questo PC.</value></data>
+  <data name="HIDMaestroUninstall_Blocked" xml:space="preserve"><value>Questi programmi usano HIDMaestro. Chiudili, quindi seleziona Aggiorna.</value></data>
+  <data name="HIDMaestroUninstall_Process_Format" xml:space="preserve"><value>Processo {0}</value></data>
+  <data name="HIDMaestroUninstall_Stays_Format" xml:space="preserve"><value>Resta: {0}</value></data>
+  <data name="HIDMaestroUninstall_CannotRead_Format" xml:space="preserve"><value>Impossibile leggere: {0}</value></data>
+  <data name="HIDMaestroUninstall_NotRemoved_Format" xml:space="preserve"><value>Non rimosso: {0}</value></data>
+  <data name="Settings_BthPS3" xml:space="preserve"><value>Driver Bluetooth BthPS3</value></data>
+  <data name="Settings_BthPS3Desc" xml:space="preserve"><value>Consente ai controller PlayStation 3, a PlayStation Move e al controller Navigation di connettersi tramite Bluetooth. Integrato in PadForge e installato la prima volta che uno di essi viene associato.</value></data>
+  <data name="BthPS3Uninstall_Title" xml:space="preserve"><value>Disinstalla BthPS3</value></data>
+  <data name="BthPS3Uninstall_Message" xml:space="preserve"><value>Questa operazione rimuove BthPS3 da questo PC: i driver, il filtro che aggiunge a Bluetooth e il driver WinUSB che PadForge ha assegnato ai controller PlayStation 3 per l'associazione. PadForge arresta prima il proprio motore e il Bluetooth si disattiva per un momento mentre i driver vengono scaricati. I controller PlayStation 3, Move e Navigation funzioneranno quindi solo via USB. Associarne uno installa di nuovo BthPS3.</value></data>
+  <data name="BthPS3Uninstall_Reading" xml:space="preserve"><value>Lettura di ciò che BthPS3 ha lasciato su questo PC…</value></data>
+  <data name="BthPS3Uninstall_Nothing" xml:space="preserve"><value>BthPS3 non ha lasciato nulla da rimuovere su questo PC.</value></data>
+  <data name="BthPS3Uninstall_DsHidMini" xml:space="preserve"><value>DsHidMini usa questi driver, quindi restano finché è installato.</value></data>
+  <data name="BthPS3Uninstall_Connected" xml:space="preserve"><value>Un controller PlayStation è connesso tramite Bluetooth. Spegnilo, poi riprova. Scaricare i driver mentre un controller è connesso può causare un arresto anomalo di Windows.</value></data>
+  <data name="BthPS3Uninstall_NotChecked" xml:space="preserve"><value>PadForge non è riuscito a verificare la presenza di controller PlayStation connessi tramite Bluetooth. Riprova tra un momento.</value></data>
+  <data name="BthPS3Uninstall_KindSetup" xml:space="preserve"><value>Programma, rimosso dal proprio programma di disinstallazione</value></data>
+  <data name="BthPS3Uninstall_KindFilter" xml:space="preserve"><value>Registrazione del filtro Bluetooth</value></data>
+  <data name="BthPS3Uninstall_KindService" xml:space="preserve"><value>Servizio del driver</value></data>
+  <data name="BthPS3Uninstall_KindFile" xml:space="preserve"><value>File del driver</value></data>
+  <data name="BthPS3Uninstall_KindPackage" xml:space="preserve"><value>Pacchetto del driver</value></data>
+  <data name="BthPS3Uninstall_KindWinUsb" xml:space="preserve"><value>Pacchetto del driver WinUSB di PadForge</value></data>
+  <data name="BthPS3Uninstall_KindCertificate" xml:space="preserve"><value>Certificato di firma dei driver di PadForge</value></data>
+  <data name="BthPS3Uninstall_KindRadio" xml:space="preserve"><value>Bluetooth</value></data>
+  <data name="BthPS3Uninstall_CertificateKept" xml:space="preserve"><value>Gli altri driver WinUSB di PadForge sono firmati con questo certificato.</value></data>
+  <data name="BthPS3Uninstall_StillThere" xml:space="preserve"><value>È ancora presente su questo PC.</value></data>
+  <data name="BthPS3Uninstall_RadioOff" xml:space="preserve"><value>Il Bluetooth non è stato riattivato. Attivalo nelle Impostazioni di Windows.</value></data>
   <data name="Settings_MidiServices" xml:space="preserve"><value>Windows MIDI Services</value></data>
-  <data name="Settings_MidiDesc" xml:space="preserve"><value>Runtime SDK per output dispositivi MIDI virtuali. Scaricato da GitHub (~210 MB).</value></data>
+  <data name="Settings_MidiDesc" xml:space="preserve"><value>Porte MIDI virtuali e input MIDI. Windows 11 25H2 include l'API dall'aggiornamento di fine novembre 2026. Gli altri PC usano il runtime di Windows MIDI Services, che PadForge può installare, oppure l'API MIDI legacy.</value></data>
+  <data name="Settings_MidiStatusInBox" xml:space="preserve"><value>Integrato in Windows</value></data>
+  <data name="Settings_MidiStatusRuntime" xml:space="preserve"><value>Runtime App SDK</value></data>
+  <data name="Settings_MidiStatusUnavailable" xml:space="preserve"><value>Non disponibile</value></data>
+  <data name="Settings_MidiOlderRuntime_Format" xml:space="preserve"><value>Anche il runtime precedente {0} è installato e non è più necessario</value></data>
+  <data name="Settings_MidiStatusNotRunning" xml:space="preserve"><value>Non avviato</value></data>
+  <data name="Settings_MidiNotRunning" xml:space="preserve"><value>Il servizio MIDI di Windows non ha risposto. PadForge riavvia il servizio e controlla di nuovo.</value></data>
+  <data name="Settings_MidiNotRunningDriver" xml:space="preserve"><value>Un driver MIDI non ha risposto. PadForge controlla di nuovo appena risponde.</value></data>
+  <data name="Settings_MidiUninstallRunning" xml:space="preserve"><value>Il programma di disinstallazione del runtime è ancora in esecuzione. MIDI riparte appena termina.</value></data>
+  <data name="Settings_MidiInstallAfterUninstaller" xml:space="preserve"><value>Il programma di disinstallazione del runtime è ancora in esecuzione. L'installazione sarà disponibile appena termina.</value></data>
+  <data name="Settings_MidiInBoxFailed_Format" xml:space="preserve"><value>L'API MIDI integrata in Windows non si è avviata (errore 0x{0}), quindi PadForge usa l'API MIDI legacy. Ogni slot MIDI invia a una porta scelta nella pagina dello slot. L'input MIDI apre solo i dispositivi assegnati a uno slot.</value></data>
+  <data name="Settings_MidiStatusLegacy" xml:space="preserve"><value>API MIDI legacy</value></data>
+  <data name="Settings_MidiLegacy" xml:space="preserve"><value>Ogni slot MIDI invia a una porta scelta nella pagina dello slot. L'input MIDI apre solo i dispositivi assegnati a uno slot.</value></data>
+  <data name="Settings_MidiInstallTooltip" xml:space="preserve"><value>Scarica e installa il runtime di Windows MIDI Services, che dà a ogni slot MIDI una porta propria. Se il runtime di Visual C++ di questo PC è precedente alla 14.51, prima viene installato il Visual C++ Redistributable di Microsoft.</value></data>
+  <data name="Settings_MidiUninstallBundle_Title" xml:space="preserve"><value>Disinstalla Windows MIDI Services Runtime and Tools</value></data>
+  <data name="Settings_MidiUninstallBundleConfirm_Message" xml:space="preserve"><value>Questa operazione rimuove Windows MIDI Services Runtime and Tools di Microsoft, insieme all'app MIDI Settings, alla console MIDI e al modulo PowerShell. Microsoft non li offre più per il download, quindi non potranno essere reinstallati.</value></data>
   <data name="Settings_SteamVR" xml:space="preserve"><value>SteamVR</value></data>
   <data name="Settings_SteamVRDesc" xml:space="preserve"><value>Runtime VR per i controller VR virtuali. Si installa dai server di Valve senza account Steam né client Steam (diversi GB).</value></data>
   <data name="Settings_SteamVRInstallDir" xml:space="preserve"><value>Percorso di installazione</value></data>
   <data name="Settings_SteamVRUninstall_Title" xml:space="preserve"><value>Disinstalla SteamVR</value></data>
   <data name="Settings_SteamVRUninstallConfirm_Message" xml:space="preserve"><value>Rimuove l'installazione di SteamVR senza Steam in {0} e libera diversi GB. I controller virtuali VR non funzioneranno finché SteamVR non viene reinstallato.</value></data>
-  <data name="Settings_MidiOsRequired" xml:space="preserve"><value>Richiede Windows 11 24H2 (build 26100) o successivo</value></data>
   <data name="Settings_SettingsFile" xml:space="preserve"><value>File impostazioni</value></data>
   <data name="Settings_SettingsFileDesc" xml:space="preserve"><value>Salva, ricarica o ripristina la configurazione.</value></data>
   <data name="Settings_Reload" xml:space="preserve"><value>Ricarica</value></data>
@@ -409,11 +470,11 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="About_HelixToolkit" xml:space="preserve"><value>HelixToolkit</value></data>
   <data name="About_HelixToolkitDesc" xml:space="preserve"><value>Visualizzazione 3D del controller. MIT.</value></data>
   <data name="About_ModernWpf" xml:space="preserve"><value>WPF UI</value></data>
-  <data name="About_ModernWpfDesc" xml:space="preserve"><value>Sistema di design Fluent 2 per WPF. MIT.</value></data>
+  <data name="About_ModernWpfDesc" xml:space="preserve"><value>Sistema di design Fluent 2 per WPF. Wpf.Ui.dll contiene VirtualizingWrapPanel, i font di fluentui-system-icons e codice di WPF e microsoft-ui-xaml. MIT.</value></data>
   <data name="About_MvvmToolkit" xml:space="preserve"><value>MVVM Toolkit</value></data>
   <data name="About_MvvmToolkitDesc" xml:space="preserve"><value>CommunityToolkit.Mvvm per il data binding. MIT.</value></data>
   <data name="About_License" xml:space="preserve"><value>Licenza</value></data>
-  <data name="About_LicenseText" xml:space="preserve"><value>Questo software è concesso in licenza sotto CC BY-NC-SA 4.0 (Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International). Gamepad-Asset-Pack di AL2009man (MIT) fornisce le risorse 2D dei controller. GestureSign di TransposonY (GPL-2.0) è servito solo come documentazione per AngularMarginRecognizer e nessuna parte del suo codice è inclusa. Handheld Companion (CC BY-NC-SA 4.0) fornisce i modelli 3D di Xbox 360 e Steam Deck che PadForge adatta. HelixToolkit, HidHide, HIDMaestro, Windows MIDI Services e WPF UI sono concessi in licenza sotto la MIT License. OpenXInput include solo un disclaimer di marchio dal progetto upstream ed è ridistribuito così com'è agli stessi termini. $Q Recognizer di Magrofuoco, Vatavu, Anthony e Wobbrock (BSD 3-Clause) è il riferimento per lo ShapeRecognizer del touchpad, una riderivazione in C#. SDL3 è concesso in licenza sotto la zlib License. x360ce (LGPL-3.0) è il codice originale da cui PadForge è nato come fork. Zergatul.Obs.InputOverlay di Igor Budzhak (MIT) fornisce la grafica del mouse.</value></data>
+  <data name="About_LicenseText" xml:space="preserve"><value>Questo software è concesso in licenza sotto CC BY-NC-SA 4.0 (Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International). Gamepad-Asset-Pack di AL2009man (MIT) fornisce le risorse 2D dei controller. GestureSign di TransposonY (GPL-2.0) è servito solo come documentazione per AngularMarginRecognizer e nessuna parte del suo codice è inclusa. Handheld Companion (CC BY-NC-SA 4.0) fornisce i modelli 3D di Xbox 360 e Steam Deck che PadForge adatta. HelixToolkit, HidHide, HIDMaestro, Windows MIDI Services e WPF UI sono concessi in licenza sotto la MIT License. OpenXInput include solo un disclaimer di marchio dal progetto upstream ed è ridistribuito così com'è agli stessi termini. $Q Recognizer di Magrofuoco, Vatavu, Anthony e Wobbrock (BSD 3-Clause) è il riferimento per lo ShapeRecognizer del touchpad, una riderivazione in C#. SDL3 è concesso in licenza sotto la zlib License. x360ce (LGPL-3.0-or-later) è il codice originale da cui PadForge è nato come fork. Zergatul.Obs.InputOverlay di Igor Budzhak (MIT) fornisce la grafica del mouse.</value></data>
 
   <!-- ═══ Device Types ═══ -->
   <data name="DeviceType_Gamepad" xml:space="preserve"><value>Gamepad</value></data>
@@ -435,16 +496,19 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Devices_DriverBind_Xbox360Receiver" xml:space="preserve"><value>Leggi chatpad e tavolette uDraw</value></data>
   <data name="Devices_DriverBind_IntelBaseStation" xml:space="preserve"><value>Leggi i gamepad</value></data>
   <data name="Devices_DriverBind_Prodikeys" xml:space="preserve"><value>Leggi i tasti musicali</value></data>
+  <data name="Devices_DriverBind_TouchSenseMouse" xml:space="preserve"><value>Riproduci la vibrazione su questo mouse</value></data>
   <data name="Devices_DriverRestore" xml:space="preserve"><value>Ripristina il driver di Windows</value></data>
   <data name="Devices_DriverConfirmTitle" xml:space="preserve"><value>Passa al driver di PadForge</value></data>
   <data name="Devices_DriverConfirm_Xbox360Pad" xml:space="preserve"><value>PadForge sposta questo controller sul driver WinUSB di Windows per leggere il chatpad. Il controller funziona poi solo mentre PadForge è in esecuzione, e i giochi lo vedono tramite il controller virtuale di PadForge. Tutti i controller collegati di questo modello si spostano con lui, e ognuno va riassegnato al proprio slot. Puoi ripristinare il driver di Windows da questa pagina in qualsiasi momento.</value></data>
   <data name="Devices_DriverConfirm_Xbox360Receiver" xml:space="preserve"><value>PadForge sposta questo ricevitore sul driver WinUSB di Windows per leggere chatpad e tavolette uDraw. Ogni controller e ogni cuffia sul ricevitore si sposta con lui, funziona solo mentre PadForge è in esecuzione e va riassegnato al proprio slot. Puoi ripristinare il driver di Windows da questa pagina in qualsiasi momento.</value></data>
   <data name="Devices_DriverConfirm_IntelBaseStation" xml:space="preserve"><value>PadForge sposta la base sul driver WinUSB di Windows per leggere i gamepad. La tastiera wireless Intel collegata smette allora di scrivere in Windows. Puoi ripristinare il driver di Windows da questa pagina in qualsiasi momento.</value></data>
   <data name="Devices_DriverConfirm_Prodikeys" xml:space="preserve"><value>PadForge sposta i tasti musicali sul driver WinUSB di Windows per leggerli. I tasti multimediali e di sospensione della tastiera smettono allora di funzionare in Windows, mentre i tasti di scrittura continuano a funzionare. Puoi ripristinare il driver di Windows da questa pagina in qualsiasi momento.</value></data>
+  <data name="Devices_DriverConfirm_TouchSenseMouse" xml:space="preserve"><value>PadForge sposta questo mouse sul driver WinUSB di Windows per riprodurvi la vibrazione. Windows smette allora di usare questo mouse come puntatore finché il suo driver non viene ripristinato. PadForge muove il puntatore con questo mouse solo mentre PadForge è in esecuzione e il mouse è assegnato a un controller virtuale Tastiera + Mouse. Puoi ripristinare il driver di Windows da questa pagina in qualsiasi momento.</value></data>
   <data name="Devices_DriverSwitch" xml:space="preserve"><value>Cambia driver</value></data>
   <data name="Status_DriverSwitching_Format" xml:space="preserve"><value>Cambio del driver di {0} in corso…</value></data>
   <data name="Status_DriverBound_Format" xml:space="preserve"><value>{0} ora usa il driver di PadForge.</value></data>
   <data name="Status_DriverBindFailed_Format" xml:space="preserve"><value>{0} non è riuscito a passare al driver di PadForge.</value></data>
+  <data name="Status_DriverBindOthersPluggedIn" xml:space="preserve"><value>Scollega prima gli altri mouse di questo modello. Windows sposta insieme sul driver di PadForge tutti quelli collegati e smette di usare ciascuno come puntatore.</value></data>
   <data name="Status_DriverRestored_Format" xml:space="preserve"><value>{0} usa di nuovo il driver di Windows.</value></data>
   <data name="Status_DriverRestoreFailed_Format" xml:space="preserve"><value>Impossibile ripristinare il driver di Windows per {0}.</value></data>
   <data name="Status_DriverMovedBack_Format" xml:space="preserve"><value>Windows ha riportato {0} sul proprio driver. Selezionalo nella pagina Dispositivi per cambiarlo di nuovo.</value></data>
@@ -464,7 +528,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Devices_ForceRawTooltip" xml:space="preserve"><value>Legge gli indici HID grezzi invece della mappatura gamepad di SDL. Usare quando SDL identifica erroneamente il layout di pulsanti/assi.</value></data>
   <data name="Devices_InputHiding" xml:space="preserve"><value>Nascondimento input</value></data>
   <data name="Devices_HideFromGames" xml:space="preserve"><value>Nascondi ai giochi (HidHide)</value></data>
-  <data name="Devices_HideTooltip" xml:space="preserve"><value>Nasconde completamente questo dispositivo alle altre applicazioni tramite il driver HidHide. Ricollega il controller dopo l’attivazione: tutto ciò che lo aveva già aperto, Windows compreso, lo mantiene finché non ricompare.</value></data>
+  <data name="Devices_HideTooltip" xml:space="preserve"><value>Nasconde completamente questo dispositivo alle altre applicazioni tramite il driver HidHide. Quando PadForge nasconde un controller USB già collegato, lo ricollega in Windows, così tutto ciò che lo aveva aperto lo perde. Un controller Bluetooth, o uno che condivide un ricevitore con un altro controller, resta a ciò che lo aveva aperto prima che venisse nascosto fino alla sua prossima connessione.</value></data>
   <data name="Devices_HideTooltipInstall" xml:space="preserve"><value>Installa il driver HidHide per abilitare questa opzione</value></data>
   <data name="Devices_ConsumeMapped" xml:space="preserve"><value>Consuma input mappati (hook)</value></data>
   <data name="Devices_ConsumeTooltip" xml:space="preserve"><value>Sopprime solo i tasti/pulsanti specifici che sono mappati, lasciando passare gli input non mappati</value></data>
@@ -527,6 +591,9 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="ManageProfiles_ImportFromFileTitle" xml:space="preserve"><value>Importa JSON profilo</value></data>
   <data name="ManageProfiles_StatusImportFileSucceeded_Format" xml:space="preserve"><value>Importato da {0}.</value></data>
   <data name="ManageProfiles_StatusImportFileFailed_Format" xml:space="preserve"><value>Lettura fallita: {0}</value></data>
+  <data name="ManageProfiles_ProblemRefused_Format" xml:space="preserve"><value>HIDMaestro ha rifiutato questo profilo in {1}: {0}</value></data>
+  <data name="ManageProfiles_ProblemNoDescriptor" xml:space="preserve"><value>Questo profilo non ha un descrittore HID, quindi non è possibile creare alcun controller a partire da esso.</value></data>
+  <data name="ManageProfiles_StatusImportRefused_Format" xml:space="preserve"><value>Non è stato importato nulla. {0}</value></data>
   <data name="ImportFromDevice_Refresh" xml:space="preserve"><value>Aggiorna</value></data>
   <data name="ImportFromDevice_Import" xml:space="preserve"><value>Importa</value></data>
   <data name="ImportFromDevice_UnnamedDevice" xml:space="preserve"><value>(dispositivo HID senza nome)</value></data>
@@ -545,7 +612,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_ExtendedPid" xml:space="preserve"><value>PID</value></data>
   <data name="Pad_ExtendedForceFeedback" xml:space="preserve"><value>Force Feedback</value></data>
   <data name="About_Testimony" xml:space="preserve"><value>Un invito</value></data>
-  <data name="About_TestimonyScripture" xml:space="preserve"><value>«E parliamo di Cristo, gioiamo in Cristo, predichiamo Cristo, profetizziamo di Cristo, e scriviamo secondo le nostre profezie, affinché i nostri figli sappiano a quale fonte possano guardare per la remissione dei loro peccati.»</value></data>
+  <data name="About_TestimonyScripture" xml:space="preserve"><value>«E noi parliamo di Cristo, gioiamo in Cristo, predichiamo il Cristo, profetizziamo di Cristo e scriviamo secondo le nostre profezie affinché i nostri figlioli possano sapere a quale fonte possono rivolgersi per la remissione dei loro peccati.»</value></data>
   <data name="About_TestimonyRef" xml:space="preserve"><value>2 Nefi 25:26</value></data>
   <data name="About_TestimonyDoxology" xml:space="preserve"><value>Gloria, onore e lode al Signore Gesù Cristo, fonte di ogni verità e salvezza, nei secoli dei secoli.</value></data>
   <data name="About_TestimonyInvite" xml:space="preserve"><value>Siete cordialmente invitati a visitare ComeUntoChrist.org per saperne di più su di Lui e sulla Chiesa di Gesù Cristo dei Santi degli Ultimi Giorni.</value></data>
@@ -560,7 +627,10 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_MidiStartNote" xml:space="preserve"><value>Nota iniziale</value></data>
   <data name="Pad_MidiStartNoteTooltip" xml:space="preserve"><value>Primo numero nota MIDI (0-127, 60 = Do centrale). Valori più alti riducono il conteggio note massimo.</value></data>
   <data name="Pad_MidiVelocity" xml:space="preserve"><value>Velocità</value></data>
-  <data name="Pad_MidiVelocityTooltip" xml:space="preserve"><value>Velocità note-on (0-127). Intensità con cui vengono premuti i tasti virtuali.</value></data>
+  <data name="Pad_MidiVelocityTooltip" xml:space="preserve"><value>Velocità note-on (1-127). Intensità con cui vengono premuti i tasti virtuali.</value></data>
+  <data name="Pad_MidiOutputPort" xml:space="preserve"><value>Porta di uscita</value></data>
+  <data name="Pad_MidiOutputPortTooltip" xml:space="preserve"><value>La porta MIDI a cui invia questo slot. L'API MIDI legacy non può creare una porta per lo slot.</value></data>
+  <data name="Pad_MidiOutputPortNone" xml:space="preserve"><value>Nessuna</value></data>
   <data name="Pad_SwitchTo2D" xml:space="preserve"><value>Passa alla vista 2D</value></data>
   <data name="Pad_SwitchTo3D" xml:space="preserve"><value>Passa alla vista 3D</value></data>
   <data name="Pad_TestLeftMotor" xml:space="preserve"><value>Clicca per provare il motore sinistro</value></data>
@@ -599,7 +669,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Mapping_Down_IconTooltip" xml:space="preserve"><value>Pulsante che decrementa l'accumulatore verso il basso mentre è tenuto premuto</value></data>
   <data name="Pad_Mapping_Down_PickerTooltip" xml:space="preserve"><value>Giù: pulsante che decrementa l'accumulatore verso il basso mentre è tenuto premuto.</value></data>
   <data name="Pad_Mapping_Rate" xml:space="preserve"><value>Velocità</value></data>
-  <data name="Pad_Mapping_Rate_Tooltip" xml:space="preserve"><value>Velocità di scorrimento in unità al secondo. 0,5 = intervallo completo in 2 s; 2 = intervallo completo in 0,5 s.</value></data>
+  <data name="Pad_Mapping_Rate_Tooltip" xml:space="preserve"><value>Velocità di scorrimento in unità al secondo. 0.5 = intervallo completo in 2 s; 2 = intervallo completo in 0.5 s.</value></data>
   <data name="Pad_Mapping_Sticky" xml:space="preserve"><value>Fisso</value></data>
   <data name="Pad_Mapping_Sticky_Tooltip" xml:space="preserve"><value>Se attivato, l'accumulatore mantiene il suo valore dopo il rilascio (controllo di crociera). Se disattivato, torna al minimo al rilascio.</value></data>
   <data name="Pad_Mapping_Min" xml:space="preserve"><value>Min</value></data>
@@ -660,7 +730,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Formula_Chip_NegateA" xml:space="preserve"><value>Negare la prima sorgente</value></data>
   <data name="Pad_Formula_Chip_OpenGroup" xml:space="preserve"><value>Apri gruppo</value></data>
   <data name="Pad_Formula_Chip_CloseGroup" xml:space="preserve"><value>Chiudi gruppo</value></data>
-  <data name="Pad_Formula_Chip_Half" xml:space="preserve"><value>0,5: metà</value></data>
+  <data name="Pad_Formula_Chip_Half" xml:space="preserve"><value>0.5: metà</value></data>
   <data name="Pad_Formula_Chip_LessThan" xml:space="preserve"><value>Minore di</value></data>
   <data name="Pad_Formula_Chip_GreaterThan" xml:space="preserve"><value>Maggiore di</value></data>
   <data name="Pad_Formula_Chip_LessOrEqual" xml:space="preserve"><value>Minore o uguale a</value></data>
@@ -736,6 +806,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Curve_SCurve" xml:space="preserve"><value>Curva a S</value></data>
   <data name="Curve_Delay" xml:space="preserve"><value>Ritardo</value></data>
   <data name="Curve_Custom" xml:space="preserve"><value>Personalizzato</value></data>
+  <data name="CurveEditor_PointFormat" xml:space="preserve"><value>Punto {0} di {1}, input {2}%, output {3}%</value></data>
   <data name="Pad_CalibrateCenter" xml:space="preserve"><value>Calibra centro</value></data>
   <data name="Pad_Sticks_Section_CenterPoint" xml:space="preserve"><value>Punto centrale</value></data>
   <data name="Pad_Sticks_Section_DeadZone" xml:space="preserve"><value>Zona morta</value></data>
@@ -754,6 +825,8 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_MouseMovement" xml:space="preserve"><value>Movimento mouse</value></data>
   <data name="Pad_ScrollUp" xml:space="preserve"><value>Su</value></data>
   <data name="Pad_ScrollDown" xml:space="preserve"><value>Giù</value></data>
+  <data name="Pad_ScrollLeft" xml:space="preserve"><value>Sinistra</value></data>
+  <data name="Pad_ScrollRight" xml:space="preserve"><value>Destra</value></data>
 
   <!-- ═══ Macros ═══ -->
   <data name="Macro_Name" xml:space="preserve"><value>Nome</value></data>
@@ -1259,6 +1332,11 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Key_Sleep" xml:space="preserve"><value>Sospensione</value></data>
   <!-- Numpad -->
   <data name="Key_Numpad" xml:space="preserve"><value>Tastierino numerico {0}</value></data>
+  <data name="Key_NonUsBackslash" xml:space="preserve"><value>Non US \ |</value></data>
+  <data name="Key_HankakuZenkaku" xml:space="preserve"><value>Hankaku/Zenkaku</value></data>
+  <data name="Key_NonConvert" xml:space="preserve"><value>No Convert</value></data>
+  <data name="Key_Convert" xml:space="preserve"><value>Convert</value></data>
+  <data name="Key_Kana" xml:space="preserve"><value>Kana</value></data>
   <data name="AnalogKey_IntlHash" xml:space="preserve"><value>Intl #</value></data>
   <data name="AnalogKey_IntlBackslash" xml:space="preserve"><value>Intl \</value></data>
   <data name="AnalogKey_Extra_Format" xml:space="preserve"><value>Tasto aggiuntivo {0}</value></data>
@@ -1447,16 +1525,16 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Mapping_CapSenseLeftGripTouch" xml:space="preserve"><value>Tocco impugnatura sinistra</value></data>
   <data name="Mapping_CapSenseRightGripTouch" xml:space="preserve"><value>Tocco impugnatura destra</value></data>
   <data name="Settings_GyroCalibrate_Button" xml:space="preserve"><value>Calibra giroscopio</value></data>
-  <data name="Settings_GyroCalibrate_Tooltip" xml:space="preserve"><value>Appoggia il controller su una superficie piana e fai clic su Calibra giroscopio per campionare la lettura a riposo per ~1,5 secondi. Sottratto dalle letture grezze affinché i mapping giroscopio non facciano andare alla deriva il mouse / stick quando il controller è fermo.</value></data>
+  <data name="Settings_GyroCalibrate_Tooltip" xml:space="preserve"><value>Appoggia il controller su una superficie piana e fai clic su Calibra giroscopio per campionare la lettura a riposo per ~1.5 secondi. Sottratto dalle letture grezze affinché i mapping giroscopio non facciano andare alla deriva il mouse / stick quando il controller è fermo.</value></data>
   <data name="Settings_GyroLastCalibrated_Format" xml:space="preserve"><value>Ultima calibrazione: {0:yyyy-MM-dd HH:mm}</value></data>
   <data name="Settings_GyroNeverCalibrated" xml:space="preserve"><value>Mai calibrato</value></data>
   <data name="Settings_GyroCalibrating" xml:space="preserve"><value>Calibrazione… tieni fermo</value></data>
   <data name="Settings_GyroResetCalibration_Button" xml:space="preserve"><value>Reimposta calibrazione</value></data>
-  <data name="Settings_GyroResetCalibration_Tooltip" xml:space="preserve"><value>Cancella il bias del giroscopio a riposo e il timestamp dell'ultima calibrazione. Il prossimo ciclo di polling riesegue l'autocalibrazione di 1,5 secondi su questo dispositivo.</value></data>
+  <data name="Settings_GyroResetCalibration_Tooltip" xml:space="preserve"><value>Cancella il bias del giroscopio a riposo e il timestamp dell'ultima calibrazione. Il prossimo ciclo di polling riesegue l'autocalibrazione di 1.5 secondi su questo dispositivo.</value></data>
   <data name="Settings_GyroLiveRate_Label" xml:space="preserve"><value>Giroscopio attuale</value></data>
   <data name="Settings_GyroLiveAccel_Label" xml:space="preserve"><value>Accelerometro attuale</value></data>
   <data name="Settings_GyroSensitivityH" xml:space="preserve"><value>Sensibilità orizzontale</value></data>
-  <data name="Settings_GyroSensitivityH_Tooltip" xml:space="preserve"><value>Scala il contributo orizzontale (Yaw + Roll) del giroscopio. 1,0 lascia la frequenza invariata. Valori maggiori amplificano, minori attenuano. Si applica all'intero dispositivo.</value></data>
+  <data name="Settings_GyroSensitivityH_Tooltip" xml:space="preserve"><value>Scala il contributo orizzontale (Yaw + Roll) del giroscopio. 1.0 lascia la frequenza invariata. Valori maggiori amplificano, minori attenuano. Si applica all'intero dispositivo.</value></data>
   <data name="Settings_GyroSensitivityV" xml:space="preserve"><value>Sensibilità verticale</value></data>
   <data name="Settings_GyroSensitivityV_Tooltip" xml:space="preserve"><value>Scala il contributo verticale (Pitch) del giroscopio. Separato da orizzontale per regolare gli assi X e Y in modo indipendente.</value></data>
   <data name="Settings_GyroDeadZone" xml:space="preserve"><value>Zona morta</value></data>
@@ -1504,7 +1582,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Gyro_MagCalibrate" xml:space="preserve"><value>Calibra magnetometro</value></data>
   <data name="Pad_Gyro_MagCalibrate_Stop" xml:space="preserve"><value>Termina calibrazione</value></data>
   <data name="Settings_GyroRealWorldCalibration" xml:space="preserve"><value>Calibrazione reale</value></data>
-  <data name="Settings_GyroRealWorldCalibration_Tooltip" xml:space="preserve"><value>Gradi in gioco per grado fisico di rotazione del controller. 0 = disattivato. 1 = 1:1 (ruoti il pad di 90°, la vista ruota di 90°). Calibra una volta per gioco ruotando il pad di 360° e regolando finché la vista in gioco ruota anch'essa di 360°.</value></data>
+  <data name="Settings_GyroRealWorldCalibration_Tooltip" xml:space="preserve"><value>Gradi in gioco per grado fisico di rotazione del controller. 0 = disattivato. 1.0 = 1:1 (ruoti il pad di 90°, la vista ruota di 90°). Calibra una volta per gioco ruotando il pad di 360° e regolando finché la vista in gioco ruota anch'essa di 360°.</value></data>
   <data name="Settings_GyroTightening" xml:space="preserve"><value>Stringimento</value></data>
   <data name="Settings_GyroTightening_Tooltip" xml:space="preserve"><value>Sotto questa velocità l'input è completamente sostituito dalla media del buffer di smussatura. Elimina tremori della mano e micro-deriva. Predefinito 3°/s.</value></data>
   <data name="Settings_GyroSmoothingThreshold" xml:space="preserve"><value>Soglia di smussatura</value></data>
@@ -1578,7 +1656,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Gyro_ApplyToPassthrough_Tooltip" xml:space="preserve"><value>Applica la regolazione facoltativa del giroscopio di questa scheda (zona morta, sensibilità, smussatura, curva di risposta, inversione) al movimento che il controller virtuale invia al gioco o all'emulatore. Disattivala per inviare solo la lettura calibrata e lasciare che il gioco applichi la propria sensibilità e smussatura. La correzione della deriva da calibrazione si applica comunque in entrambi i casi.</value></data>
   <data name="Pad_ResetGyroApplyToPassthrough" xml:space="preserve"><value>Ripristina regolazione trasmissione</value></data>
   <data name="Mapping_GyroSensitivity" xml:space="preserve"><value>Sensibilità</value></data>
-  <data name="Mapping_GyroSensitivity_Tooltip" xml:space="preserve"><value>Moltiplicatore di sensibilità del giroscopio per sorgente. 1,0 = predefinito del motore (500°/s → deflessione completa). Valori superiori a 1,0 sono più sensibili. Valori inferiori sono meno sensibili.</value></data>
+  <data name="Mapping_GyroSensitivity_Tooltip" xml:space="preserve"><value>Moltiplicatore di sensibilità del giroscopio per sorgente. 1.0 = predefinito del motore (500°/s → deflessione completa). Valori superiori a 1.0 sono più sensibili. Valori inferiori sono meno sensibili.</value></data>
   <data name="Mapping_LeanSensitivity_Tooltip" xml:space="preserve"><value>Moltiplicatore di sensibilità dell'inclinazione per sorgente. 1.0 = 90° di inclinazione per la deflessione completa. Valori sopra 1.0 raggiungono la deflessione completa con meno inclinazione.</value></data>
   <data name="Mapping_GyroTiltX" xml:space="preserve"><value>Inclinazione giroscopio regolabile X</value></data>
   <data name="Mapping_GyroTiltY" xml:space="preserve"><value>Inclinazione giroscopio regolabile Y</value></data>
@@ -1672,6 +1750,15 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Triggers_Subtitle" xml:space="preserve"><value>Per ogni grilletto: zone morte, anti-zone morte, scala dell'intervallo massimo e curve di sensibilità. Ogni sezione sotto si applica a un asse del grilletto dell'uscita attiva. I profili estesi possono esporre fino a otto assi condivisi con la scheda Levette.</value></data>
   <data name="Pad_ForceFeedback_Header" xml:space="preserve"><value>Force Feedback</value></data>
   <data name="Pad_ForceFeedback_Subtitle" xml:space="preserve"><value>Regola come PadForge scala gli eventi di force feedback dal gioco e come li instrada ai motori di vibrazione o agli attuatori aptici del controller fisico. La vibrazione audio aggiunge un livello pilotato dall'audio di sistema.</value></data>
+  <data name="Pad_ForceFeedback_RouteHidpp" xml:space="preserve"><value>La vibrazione viene riprodotta su {0} come impulsi aptici inviati direttamente al dispositivo. Una vibrazione più forte sceglie un impulso più forte e lo ripete più rapidamente.</value></data>
+  <data name="Pad_ForceFeedback_RouteHidppFeedbackOff" xml:space="preserve"><value>Il feedback aptico di {0} è disattivato in Logi Options+, quindi non riproduce nulla finché non lo riattivi lì.</value></data>
+  <data name="Pad_ForceFeedback_RouteHidppAsleep" xml:space="preserve"><value>Questo dispositivo non ha ancora risposto. La sua vibrazione partirà appena si riattiva.</value></data>
+  <data name="Pad_ForceFeedback_RouteTouchSense" xml:space="preserve"><value>La vibrazione viene riprodotta su {0} come un ronzio inviato direttamente al dispositivo.</value></data>
+  <data name="Pad_ForceFeedback_RouteGameSense" xml:space="preserve"><value>La vibrazione passa per il gestore tattile di SteelSeries GG.</value></data>
+  <data name="Pad_ForceFeedback_RouteGameSenseShared" xml:space="preserve"><value>SteelSeries GG pilota tutti i Rival tattili insieme, quindi quello sul controller virtuale {0} decide la loro vibrazione.</value></data>
+  <data name="Pad_ForceFeedback_RouteGameSenseWaiting" xml:space="preserve"><value>In attesa di SteelSeries GG. La vibrazione partirà quando GG sarà in esecuzione.</value></data>
+  <data name="Pad_ForceFeedback_RouteSensa" xml:space="preserve"><value>La vibrazione viene riprodotta sui tuoi dispositivi Razer Sensa HD tramite Razer Synapse.</value></data>
+  <data name="Pad_ForceFeedback_RouteSensaWaiting" xml:space="preserve"><value>In attesa di Sensa HD Haptics in Razer Synapse 4. In Synapse imposta la sorgente aptica del dispositivo su Sensa HD Games.</value></data>
   <data name="Pad_LeftTrigger" xml:space="preserve"><value>Grilletto sinistro</value></data>
   <data name="Pad_RightTrigger" xml:space="preserve"><value>Grilletto destro</value></data>
   <data name="Pad_TriggerMode" xml:space="preserve"><value>Modalità</value></data>
@@ -1696,6 +1783,36 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Lighting_Header" xml:space="preserve"><value>Illuminazione</value></data>
   <data name="Pad_Lighting_Subtitle" xml:space="preserve"><value>Imposta il colore base della barra luminosa e il comportamento audio sul controller fisico assegnato. Le scritture del gioco hanno sempre la precedenza. Le impostazioni utente si attivano quando nessun gioco pilota la barra.</value></data>
   <data name="Pad_Lighting_PlayerIdle_Hint" xml:space="preserve"><value>Finché è selezionato Numero giocatore, il pad a riposo mostra l'identità giocatore del suo controller virtuale: il colore giocatore Sony sulla lightbar (1 blu, 2 rosso, 3 verde, 4 rosa) e, su un DualSense, i LED giocatore corrispondenti. Tutti i dispositivi dello stesso controller virtuale mostrano lo stesso numero. I giochi prendono il controllo quando scrivono l'illuminazione, ciò che imposti qui vince sempre, e le opzioni di spegnimento lasciano quella luce completamente spenta.</value></data>
+  <data name="Pad_Lighting_PeripheralSubtitle" xml:space="preserve"><value>Questo controller virtuale illumina il dispositivo con le stesse modalità della barra luminosa di un DualSense, impostate qui solo per questo controller. Su un controller virtuale PlayStation, un gioco che scrive la barra luminosa prende il controllo come su un DualSense.</value></data>
+  <data name="Pad_Lighting_ControlDevice" xml:space="preserve"><value>Controlla l’illuminazione di questo dispositivo</value></data>
+  <data name="Pad_Lighting_ControlDevice_Tooltip" xml:space="preserve"><value>Disattivato impedisce a questo controller virtuale di illuminare il dispositivo. Una riga del produttore, o un altro dispositivo dello stesso tipo illuminato tramite lo stesso software, può ancora impostarne il colore. Una macro «Imposta colore Chroma» su questo controller virtuale colora comunque un dispositivo Razer.</value></data>
+  <data name="Pad_Lighting_ClaimLevel" xml:space="preserve"><value>Presa sull’illuminazione</value></data>
+  <data name="Pad_Lighting_ClaimLevel_Colors" xml:space="preserve"><value>Solo colori</value></data>
+  <data name="Pad_Lighting_ClaimLevel_Power" xml:space="preserve"><value>Colori e alimentazione delle luci</value></data>
+  <data name="Pad_Lighting_ClaimLevel_HostMode" xml:space="preserve"><value>Colori, alimentazione delle luci e modalità memoria integrata disattivata</value></data>
+  <data name="Pad_Lighting_ClaimLevel_Tooltip" xml:space="preserve"><value>«Solo colori» non tocca il risparmio energetico del dispositivo né il suo profilo salvato. Scegli «Colori e alimentazione delle luci» quando l’effetto di inattività del dispositivo cancella il colore. Il dispositivo smette allora di attenuare le luci da sé. Scegli l’ultima opzione quando il dispositivo mostra l’illuminazione del proprio profilo sopra il colore. La sua modalità memoria integrata si disattiva allora finché è illuminato e si riattiva quando smette di esserlo, e finché è disattivata il profilo salvato sul dispositivo (pulsanti, DPI e frequenza di polling) non si applica.</value></data>
+  <data name="Pad_Lighting_ClaimLevel_TooltipNoHostMode" xml:space="preserve"><value>«Solo colori» non tocca il risparmio energetico del dispositivo né il suo profilo salvato. Scegli «Colori e alimentazione delle luci» quando l’effetto di inattività del dispositivo cancella il colore. Il dispositivo smette allora di attenuare le luci da sé.</value></data>
+  <data name="Pad_Lighting_RouteDirect" xml:space="preserve"><value>I colori arrivano direttamente a {0}.</value></data>
+  <data name="Pad_Lighting_RouteDirectPower" xml:space="preserve"><value>I colori arrivano direttamente a {0}. Finché è illuminato, non attenua le luci da sé.</value></data>
+  <data name="Pad_Lighting_RouteDirectHostMode" xml:space="preserve"><value>I colori arrivano direttamente a {0}. Finché è illuminato, la sua modalità memoria integrata è disattivata.</value></data>
+  <data name="Pad_Lighting_RouteAsleep" xml:space="preserve"><value>Questo dispositivo non ha ancora risposto. I suoi colori compariranno appena si riattiva.</value></data>
+  <data name="Pad_Lighting_RouteThrough" xml:space="preserve"><value>I colori passano da {0}.</value></data>
+  <data name="Pad_Lighting_RouteThroughOrDirect" xml:space="preserve"><value>I colori passano da {0}, che illumina insieme tutti i dispositivi di questo tipo. Finché {0} non è in esecuzione, PadForge illumina questo dispositivo da sé.</value></data>
+  <data name="Pad_Lighting_RouteShared" xml:space="preserve"><value>{0} illumina insieme tutti i dispositivi di questo tipo, quindi quello sul controller virtuale {1} decide il loro colore.</value></data>
+  <data name="Pad_Lighting_RouteSharedVendorRow" xml:space="preserve"><value>{0} illumina insieme tutti i dispositivi di questo tipo, quindi la riga {1} sul controller virtuale {2} decide il loro colore.</value></data>
+  <data name="Pad_Lighting_RouteOtherController" xml:space="preserve"><value>Anche il controller virtuale {0} illumina questo dispositivo, e si vede il suo colore.</value></data>
+  <data name="Pad_Lighting_RouteOtherControllerOnly" xml:space="preserve"><value>Il controller virtuale {0} illumina questo dispositivo.</value></data>
+  <data name="Pad_Lighting_RouteOtherRow" xml:space="preserve"><value>Un’altra riga di questo dispositivo su questo controller virtuale ne decide il colore.</value></data>
+  <data name="Pad_Lighting_RouteOtherRowOnly" xml:space="preserve"><value>Un’altra riga di questo dispositivo su questo controller virtuale lo illumina.</value></data>
+  <data name="Pad_Lighting_RouteWaiting" xml:space="preserve"><value>In attesa di {0}. I colori compariranno appena è in esecuzione.</value></data>
+  <data name="Pad_Lighting_RouteWindowsLighting" xml:space="preserve"><value>L’Illuminazione dinamica di Windows illumina questo dispositivo. Disattivala per questo dispositivo nelle Impostazioni di Windows e PadForge lo illuminerà.</value></data>
+  <data name="Pad_Lighting_RouteWindowsLightingBuiltIn" xml:space="preserve"><value>L’Illuminazione dinamica di Windows illumina questa tastiera. Disattivala per questa tastiera nelle Impostazioni di Windows e PadForge la illuminerà. Su alcuni portatili la tastiera resta allora spenta finché PadForge non la illumina.</value></data>
+  <data name="Pad_Lighting_RouteCannotLight" xml:space="preserve"><value>Il motore LED di Logitech su questo PC non può illuminare questo tipo di dispositivo.</value></data>
+  <data name="Pad_Lighting_RouteVendorRow" xml:space="preserve"><value>Illumina i dispositivi raggiunti da {0} che nessun dispositivo assegnato illumina da sé, come {1}.</value></data>
+  <data name="Pad_Lighting_RouteVendorRowWaiting" xml:space="preserve"><value>In attesa di {0}. Appena è in esecuzione, questa riga illumina i dispositivi che raggiunge e che nessun dispositivo assegnato illumina da sé, come {1}.</value></data>
+  <data name="Pad_Lighting_VendorRowExamples_Chroma" xml:space="preserve"><value>cuffie, tappetini e strisce Chroma Link</value></data>
+  <data name="Pad_Lighting_VendorRowExamples_LedSdk" xml:space="preserve"><value>cuffie, tappetini e altoparlanti</value></data>
+  <data name="Pad_Lighting_VendorRowExamples_GameSense" xml:space="preserve"><value>cuffie</value></data>
   <data name="Pad_Lighting_BaseColor" xml:space="preserve"><value>Barra luminosa</value></data>
   <data name="Pad_Lighting_Hex" xml:space="preserve"><value>HEX</value></data>
   <data name="Pad_Lighting_HexTooltip" xml:space="preserve"><value>Inserisci un colore esadecimale a sei cifre (RRGGBB o #RRGGBB) e premi Invio o fai clic altrove per applicarlo.</value></data>
@@ -2126,6 +2243,8 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Recorder_Error_NoEngine" xml:space="preserve"><value>Motore non in esecuzione. Avvia il motore prima di registrare.</value></data>
   <data name="Recorder_Error_BadSample" xml:space="preserve"><value>Nessun campione valido acquisito. Prova a disegnare di nuovo il gesto.</value></data>
   <data name="Pad_Wheel_RotationRange" xml:space="preserve"><value>Intervallo di rotazione</value></data>
+  <data name="Pad_Wheel_SetRotationRange" xml:space="preserve"><value>Imposta intervallo di rotazione</value></data>
+  <data name="Pad_Wheel_SetRotationRangeTooltip" xml:space="preserve"><value>Deseleziona per lasciare l’intervallo al volante e al suo software. PadForge non invierà quindi alcun intervallo al volante.</value></data>
   <data name="Pad_Wheel_Autocenter" xml:space="preserve"><value>Autocentratura</value></data>
   <data name="Pad_Wheel_RpmLeds" xml:space="preserve"><value>LED di regime</value></data>
   <data name="Pad_Steering_Header" xml:space="preserve"><value>Sterzo</value></data>
@@ -2278,6 +2397,8 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Audio_NoSpeaker" xml:space="preserve"><value>Il dispositivo selezionato non ha un altoparlante integrato. I suoni macro di questo pad escono sull’uscita predefinita.</value></data>
   <data name="About_QDollar" xml:space="preserve"><value>$Q Recognizer</value></data>
   <data name="About_QDollarDesc" xml:space="preserve"><value>Riconoscitore di sagome per il touchpad (cerchio / quadrato / triangolo / Z / spunta e gesti registrati personalizzati). Rielaborazione in C# del riferimento JavaScript di Magrofuoco, Vatavu, Anthony e Wobbrock. BSD 3-Clause.</value></data>
+  <data name="About_Qmk" xml:space="preserve"><value>QMK Firmware</value></data>
+  <data name="About_QmkDesc" xml:space="preserve"><value>Posizioni dei tasti e tasti del livello base delle tastiere che l'anteprima Tastiera + Mouse disegna, generati dai dati di layout di QMK e dal fork QMK di Keychron. GPL-2.0-or-later.</value></data>
   <data name="About_GestureSign" xml:space="preserve"><value>GestureSign</value></data>
   <data name="About_GestureSignDesc" xml:space="preserve"><value>Punteggio a margine angolare che affianca il riconoscitore a nuvola di punti sulle forme a un dito. Implementa in C# originale l'idea di punteggio del PointPatternAnalyzer di GestureSign. GPL-2.0, solo documentazione.</value></data>
   <data name="Pad_Audio_Reset_All" xml:space="preserve"><value>Reimposta Uscita audio</value></data>
@@ -2350,6 +2471,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="RemoteLink_PasswordTitle" xml:space="preserve">
     <value>Password di Remote Link</value>
   </data>
+  <data name="RemoteLink_PasswordConfirm" xml:space="preserve"><value>Conferma password</value></data>
   <data name="Dashboard_TouchpadOverlayWindowTitle" xml:space="preserve">
     <value>Touchpad PadForge</value>
   </data>
@@ -2508,7 +2630,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   </data>
   <data name="PickSound_Title" xml:space="preserve"><value>Scegli un suono</value></data>
   <data name="About_NAudio" xml:space="preserve"><value>NAudio</value></data>
-  <data name="About_NAudioDesc" xml:space="preserve"><value>Acquisizione loopback WASAPI per il mirroring audio del controller e la vibrazione dei grilletti dai bassi. Di Mark Heath. MIT.</value></data>
+  <data name="About_NAudioDesc" xml:space="preserve"><value>Acquisizione loopback WASAPI per il mirroring audio del controller e la vibrazione dei grilletti dai bassi. NAudio.Midi, che PadForge non distribuisce, è anche il riferimento per le dichiarazioni WinMM e le sequenze delle porte dell’API MIDI legacy, per la regola secondo cui un note-on con velocità 0 è un note-off, e per i controller on/off come il sustain. Di Mark Heath. MIT.</value></data>
   <data name="About_Vosk" xml:space="preserve"><value>Vosk</value></data>
   <data name="About_VoskDesc" xml:space="preserve"><value>Riconoscimento vocale offline per le frasi delle macro vocali. Di Alpha Cephei. Il modello è incluso in PadForge. Apache-2.0.</value></data>
   <data name="About_BouncyCastle" xml:space="preserve"><value>Bouncy Castle</value></data>
@@ -2544,6 +2666,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="WiiPair_Failed" xml:space="preserve"><value>Impossibile completare l'associazione Wii. Riprova.</value></data>
   <data name="WiiPair_Done" xml:space="preserve"><value>Fatto</value></data>
   <data name="Common_Close" xml:space="preserve"><value>Chiudi</value></data>
+  <data name="Common_ResizePanes" xml:space="preserve"><value>Ridimensiona riquadri</value></data>
   <data name="Nfc_Title" xml:space="preserve"><value>Tag NFC</value></data>
   <data name="Nfc_RegisterHeader" xml:space="preserve"><value>Registra un tag</value></data>
   <data name="Nfc_TapPrompt" xml:space="preserve"><value>Avvicina un tag al lettore per acquisirne l'UID.</value></data>
@@ -2563,6 +2686,8 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="DeviceType_LogitechGKeys" xml:space="preserve"><value>Tasti G Logitech</value></data>
   <data name="DeviceType_AnalogKeyboard" xml:space="preserve"><value>Tastiera analogica</value></data>
   <data name="DeviceType_WebMenus" xml:space="preserve"><value>Menu Web</value></data>
+  <data name="DeviceType_PeripheralHaptics" xml:space="preserve"><value>Aptica</value></data>
+  <data name="DeviceType_PeripheralLighting" xml:space="preserve"><value>Illuminazione</value></data>
   <data name="HeadTracker_Yaw" xml:space="preserve"><value>Imbardata della testa</value></data>
   <data name="HeadTracker_Pitch" xml:space="preserve"><value>Beccheggio della testa</value></data>
   <data name="HeadTracker_Roll" xml:space="preserve"><value>Rollio della testa</value></data>
@@ -2811,7 +2936,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="About_DsHidMini" xml:space="preserve"><value>DsHidMini</value></data>
   <data name="About_DsHidMiniDesc" xml:space="preserve"><value>Riferimento del protocollo DualShock 3 di Benjamin Höglinger-Stelzer: feature report sixpair, modello di output-report Bluetooth, sequenza di abilitazione, mappa della batteria. L'implementazione di PadForge è in C# originale. Il controller DualShock 3 (SIXAXIS): Full di HIDMaestro usa il descrittore dei report della modalità SXS di DsHidMini. BSD 3-Clause.</value></data>
   <data name="About_NefariusDevMgmt" xml:space="preserve"><value>Nefarius.Utilities.DeviceManagement</value></data>
-  <data name="About_NefariusDevMgmtDesc" xml:space="preserve"><value>Installazione nel driver store, registrazione del filtro di classe Bluetooth e ciclo della porta USB per la configurazione di BthPS3 nell'app, di nefarius. MIT.</value></data>
+  <data name="About_NefariusDevMgmtDesc" xml:space="preserve"><value>Installazione nel driver store, registrazione del filtro di classe Bluetooth e ciclo della porta USB per la configurazione di BthPS3 nell'app e per liberare un controller USB nascosto, di nefarius. MIT.</value></data>
   <data name="About_Libusb" xml:space="preserve"><value>libusb</value></data>
   <data name="About_LibusbDesc" xml:space="preserve"><value>Accesso USB per il driver cablato dello Switch 2 Pro e i controller che PadForge associa a WinUSB, distribuito come libusb-1.0.dll. LGPL-2.1-or-later.</value></data>
   <data name="About_Nipplejs" xml:space="preserve"><value>nipplejs</value></data>
@@ -2831,11 +2956,11 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="About_Hitboxer" xml:space="preserve"><value>hitboxer</value></data>
   <data name="About_HitboxerDesc" xml:space="preserve"><value>Semantica di pulizia SOCD per le modalità Snap Tap, di valignatev. MIT.</value></data>
   <data name="About_Dolphin" xml:space="preserve"><value>Dolphin</value></data>
-  <data name="About_DolphinDesc" xml:space="preserve"><value>Documentazione della cerimonia di abbinamento Wii, dell'ADPCM dell'altoparlante, dell'orientamento laterale e verticale del Wii Remote, del modello del gate della levetta con il suo formato di salvataggio, e della convenzione degli assi del giroscopio. GPL-2.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_DolphinDesc" xml:space="preserve"><value>Documentazione della cerimonia di abbinamento Wii, dell'ADPCM dell'altoparlante, dell'orientamento laterale e verticale del Wii Remote, del modello del gate della levetta con il suo formato di salvataggio, e della convenzione degli assi del giroscopio. GPL-2.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_Ds4Windows" xml:space="preserve"><value>DS4Windows</value></data>
-  <data name="About_Ds4WindowsDesc" xml:space="preserve"><value>Documentazione del comportamento del DualShock: disconnessione per inattività, limiti del touchpad, decodifica della batteria, l'IOCTL di disconnessione Bluetooth, i bit della modalità di vibrazione del DualSense, la curva di jitter del giroscopio, la scala della levetta come mouse e il seme CRC dei report di uscita Bluetooth. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_Ds4WindowsDesc" xml:space="preserve"><value>Documentazione del comportamento del DualShock: disconnessione per inattività, limiti del touchpad, decodifica della batteria, l'IOCTL di disconnessione Bluetooth, i bit della modalità di vibrazione del DualSense, la curva di jitter del giroscopio, la scala della levetta come mouse e il seme CRC dei report di uscita Bluetooth. La tabella dei tasti della sua tastiera virtuale ha guidato quella di PadForge. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_XoneXow" xml:space="preserve"><value>xone / xow</value></data>
-  <data name="About_XoneXowDesc" xml:space="preserve"><value>Documentazione dei comandi LED GIP che conferma xbledctl. GPL, solo documentazione.</value></data>
+  <data name="About_XoneXowDesc" xml:space="preserve"><value>Documentazione dei comandi LED GIP che conferma xbledctl. GPL-2.0-or-later, solo documentazione.</value></data>
   <data name="About_WiimoteLib" xml:space="preserve"><value>WiimoteLib</value></data>
   <data name="About_WiimoteLibDesc" xml:space="preserve"><value>Documentazione del comportamento della fotocamera IR della Wii e della Balance Board, di Brian Peek. MIT.</value></data>
   <data name="About_JoyconSinger" xml:space="preserve"><value>joycon-singer</value></data>
@@ -2882,6 +3007,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Vr_Status_Running" xml:space="preserve"><value>In esecuzione</value></data>
   <data name="Vr_Status_DriverConnected" xml:space="preserve"><value>In esecuzione, driver connesso</value></data>
   <data name="Vr_Status_ControllersLive" xml:space="preserve"><value>In esecuzione, controller attivi</value></data>
+  <data name="Vr_DriverNameConflict_Format" xml:space="preserve"><value>Un altro driver OpenVR usa lo stesso nome driver di HIDMaestro, quindi SteamVR può caricarlo al posto di quello di PadForge e i controller VR virtuali non compariranno. Rimuovi quel driver per risolvere: {0}</value></data>
   <data name="MovePair_Family" xml:space="preserve"><value>PlayStation Move / Navigation</value></data>
   <data name="SerialPair_Family" xml:space="preserve"><value>Controller seriale (porta COM)</value></data>
   <data name="SerialPair_Instructions" xml:space="preserve"><value>Windows non può sapere quale controller si trova su una porta COM. Scegli la porta e il controller, poi aggiungilo. Da quel momento PadForge apre quella porta.</value></data>
@@ -2957,8 +3083,8 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Macro_GuideLedBrightnessName" xml:space="preserve"><value>Luminosità del LED Guide</value></data>
   <data name="MacroAction_Type_SwitchLayer" xml:space="preserve"><value>Cambia livello</value></data>
   <data name="MacroAction_Type_SetChromaColor" xml:space="preserve"><value>Imposta colore Chroma</value></data>
-  <data name="MacroAction_SetChromaColor_Tooltip" xml:space="preserve"><value>Colora tutti i dispositivi Razer Chroma di un solo colore mentre l’azione è in esecuzione.</value></data>
-  <data name="MacroAction_SetChromaColor_Hint" xml:space="preserve"><value>Colora tutti i dispositivi Razer Chroma di questo colore per la durata indicata sopra, poi restituisce l’illuminazione a Razer Synapse, o al colore rispecchiato della barra luminosa quando «Rispecchia la barra luminosa su Razer Chroma» è attivo e un gioco ne ha impostato uno. Per mantenere il colore finché l’attivatore resta premuto, usa «Mentre tenuto» con «Fino al rilascio». Quando due macro colorano insieme, vince quella più in basso nell’elenco, quindi metti la macro della pressione completa sotto quella della pressione leggera. Richiede Razer Synapse in esecuzione.</value></data>
+  <data name="MacroAction_SetChromaColor_Tooltip" xml:space="preserve"><value>Colora di un solo colore i dispositivi Razer assegnati a questo controller virtuale, e tutti gli altri dispositivi Razer dei loro tipi, mentre l’azione è in esecuzione.</value></data>
+  <data name="MacroAction_SetChromaColor_Hint" xml:space="preserve"><value>Per la durata indicata sopra, colora di questo colore i dispositivi Razer assegnati a questo controller virtuale e tutti gli altri dispositivi Razer dei loro tipi, o tutti i dispositivi Razer quando è assegnata la riga Razer Chroma. Questo colore prevale sulla scheda Illuminazione di qualsiasi controller virtuale, poi l’illuminazione viene restituita. Per mantenere il colore finché l’attivatore resta premuto, usa «Mentre tenuto» con «Fino al rilascio». Quando due macro colorano insieme, vince quella più in basso nell’elenco, quindi metti la macro della pressione completa sotto quella della pressione leggera. Quando macro su due controller virtuali colorano lo stesso tipo di dispositivo Razer, vince il numero di giocatore più basso. Richiede Razer Synapse in esecuzione.</value></data>
   <data name="MacroAction_Type_ShowDreamcastScreen" xml:space="preserve"><value>Mostra schermo Dreamcast</value></data>
   <data name="MacroAction_ShowDreamcastScreen_Tooltip" xml:space="preserve"><value>Mostra immagini sulla VMU di ogni controller Dreamcast in una porta Bliss-Box che alimenta questo slot, poi riporta ogni porta alla propria impostazione dello schermo.</value></data>
   <data name="MacroAction_ShowDreamcastScreen_Format" xml:space="preserve"><value>Mostra immagini Dreamcast: {0} × {1} ms, ripetizioni {2}</value></data>
@@ -3226,7 +3352,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Workshop_UpdatesBody" xml:space="preserve"><value>Questi profili importati hanno versioni più recenti su Steam Workshop. Reimportali da Sfoglia configurazioni della community per recepire le modifiche.</value></data>
   <data name="Workshop_UpdateRow_Format" xml:space="preserve"><value>{0} · {1}</value></data>
   <data name="About_SteamKit2" xml:space="preserve"><value>SteamKit2</value></data>
-  <data name="About_SteamKit2Desc" xml:space="preserve"><value>Client di rete Steam che recupera le configurazioni controller di Steam Workshop tramite una sessione anonima, di Ryan Stecker e del SteamRE Team. LGPL-2.1-only.</value></data>
+  <data name="About_SteamKit2Desc" xml:space="preserve"><value>Client di rete Steam che recupera le configurazioni controller di Steam Workshop tramite una sessione anonima, di Ryan Stecker e del SteamRE Team. LGPL-2.1-or-later (license.txt), LGPL-2.1-only (NuGet).</value></data>
   <data name="About_ProtobufNet" xml:space="preserve"><value>protobuf-net</value></data>
   <data name="About_ProtobufNetDesc" xml:space="preserve"><value>Serializzatore Protocol Buffers che SteamKit2 usa per il protocollo di rete di Steam, di Marc Gravell. Apache-2.0.</value></data>
   <data name="About_ZstdSharp" xml:space="preserve"><value>ZstdSharp</value></data>
@@ -3252,7 +3378,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Mapping_TouchpadWindow_West" xml:space="preserve"><value>Quadrante ovest</value></data>
   <data name="Mapping_TouchpadWindow_Center" xml:space="preserve"><value>Centro</value></data>
   <data name="Pad_Touchpad_TapMaxMotion" xml:space="preserve"><value>Percorso max. del tocco</value></data>
-  <data name="Pad_Touchpad_TapMaxMotion_Tooltip" xml:space="preserve"><value>Quanto può muoversi un dito restando un tocco, in larghezze del pad. 0,04 è il 4% del pad.</value></data>
+  <data name="Pad_Touchpad_TapMaxMotion_Tooltip" xml:space="preserve"><value>Quanto può muoversi un dito restando un tocco, in larghezze del pad. 0.04 è il 4% del pad.</value></data>
   <data name="Pad_ResetTouchpadTapMaxMotion" xml:space="preserve"><value>Reimposta percorso max. del tocco</value></data>
   <data name="Pad_Touchpad_LongPressMaxMotion" xml:space="preserve"><value>Percorso max. pressione lunga</value></data>
   <data name="Pad_Touchpad_LongPressMaxMotion_Tooltip" xml:space="preserve"><value>Quanto può spostarsi un dito durante una pressione prolungata restando tale invece di uno scorrimento.</value></data>
@@ -3267,15 +3393,15 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_Touchpad_RotateThreshold_Tooltip" xml:space="preserve"><value>Di quanto devono ruotare due dita prima che scatti una rotazione.</value></data>
   <data name="Pad_ResetTouchpadRotateThresholdDegrees" xml:space="preserve"><value>Reimposta soglia di rotazione</value></data>
   <data name="Pad_Touchpad_Pointer_Header" xml:space="preserve"><value>Puntatore assoluto</value></data>
-  <data name="Pad_Touchpad_Pointer_Subtitle" xml:space="preserve"><value>Regola le sorgenti Puntatore X/Y del touchpad, che portano il cursore alla posizione del dito sul pad (mappale su mouse X/Y di un controller virtuale tastiera / mouse). Dimensione 1,00 con centro 0,50 mappa il pad sull'intero schermo. Riduci la dimensione per confinare il cursore a una parte e sposta il centro per collocarla.</value></data>
+  <data name="Pad_Touchpad_Pointer_Subtitle" xml:space="preserve"><value>Regola le sorgenti Puntatore X/Y del touchpad, che portano il cursore alla posizione del dito sul pad (mappale su mouse X/Y di un controller virtuale tastiera / mouse). Dimensione 1.00 con centro 0.50 mappa il pad sull'intero schermo. Riduci la dimensione per confinare il cursore a una parte e sposta il centro per collocarla.</value></data>
   <data name="Pad_Touchpad_PointerRegionSizeX" xml:space="preserve"><value>Larghezza Area</value></data>
-  <data name="Pad_Touchpad_PointerRegionSizeX_Tooltip" xml:space="preserve"><value>Larghezza dell'area dello schermo su cui si mappa questo pad, come frazione della larghezza schermo. 1,00 copre tutta la larghezza; 0,50 confina il cursore a metà.</value></data>
+  <data name="Pad_Touchpad_PointerRegionSizeX_Tooltip" xml:space="preserve"><value>Larghezza dell'area dello schermo su cui si mappa questo pad, come frazione della larghezza schermo. 1.00 copre tutta la larghezza; 0.50 confina il cursore a metà.</value></data>
   <data name="Pad_Touchpad_PointerRegionSizeY" xml:space="preserve"><value>Altezza Area</value></data>
   <data name="Pad_Touchpad_PointerRegionSizeY_Tooltip" xml:space="preserve"><value>Altezza dell'area dello schermo, come frazione dell'altezza schermo.</value></data>
   <data name="Pad_Touchpad_PointerRegionCenterX" xml:space="preserve"><value>Centro Area X</value></data>
-  <data name="Pad_Touchpad_PointerRegionCenterX_Tooltip" xml:space="preserve"><value>Posizione orizzontale dell'area. 0,00 è il bordo sinistro, 0,50 il centro, 1,00 il bordo destro.</value></data>
+  <data name="Pad_Touchpad_PointerRegionCenterX_Tooltip" xml:space="preserve"><value>Posizione orizzontale dell'area. 0.00 è il bordo sinistro, 0.50 il centro, 1.00 il bordo destro.</value></data>
   <data name="Pad_Touchpad_PointerRegionCenterY" xml:space="preserve"><value>Centro Area Y</value></data>
-  <data name="Pad_Touchpad_PointerRegionCenterY_Tooltip" xml:space="preserve"><value>Posizione verticale. 0,00 è il bordo superiore, 0,50 il centro, 1,00 il bordo inferiore.</value></data>
+  <data name="Pad_Touchpad_PointerRegionCenterY_Tooltip" xml:space="preserve"><value>Posizione verticale. 0.00 è il bordo superiore, 0.50 il centro, 1.00 il bordo inferiore.</value></data>
   <data name="Pad_Touchpad_SwipeHaptics_Header" xml:space="preserve"><value>Feedback aptico di scorrimento</value></data>
   <data name="Pad_Touchpad_SwipeHaptics_Subtitle" xml:space="preserve"><value>Fa pulsare il feedback aptico del controller mentre il dito percorre questo touchpad, come i tick del trackpad di Steam Input. Gli Steam Controller e lo Steam Deck fanno scattare l'attuatore sotto il pad; DualSense e DualShock 4 pulsano i motori di vibrazione.</value></data>
   <data name="Pad_Touchpad_SwipeHapticsEnabled" xml:space="preserve"><value>Abilita feedback aptico di scorrimento</value></data>
@@ -3543,7 +3669,7 @@ Una copia della versione precedente si trova in questa cartella: {1}</value></da
   <data name="Pad_RumbleAudio_Frequency_Tooltip" xml:space="preserve"><value>Frequenza del tono di questo canale, da 20 a 120 Hz. Usa la scansione di frequenza per trovare dove il tuo shaker risponde di più.</value></data>
   <data name="Pad_RumbleAudio_Gain_Tooltip" xml:space="preserve"><value>Volume di questo canale prima del guadagno generale.</value></data>
   <data name="Pad_RumbleAudio_Test" xml:space="preserve"><value>Prova</value></data>
-  <data name="Pad_RumbleAudio_Test_Tooltip" xml:space="preserve"><value>Riproduce il tono di questo canale per 1,5 secondi al guadagno impostato.</value></data>
+  <data name="Pad_RumbleAudio_Test_Tooltip" xml:space="preserve"><value>Riproduce il tono di questo canale per 1.5 secondi al guadagno impostato.</value></data>
   <data name="Pad_RumbleAudio_ResetVoiceLow" xml:space="preserve"><value>Reimposta motore a bassa frequenza</value></data>
   <data name="Pad_RumbleAudio_ResetVoiceHigh" xml:space="preserve"><value>Reimposta motore ad alta frequenza</value></data>
   <data name="Pad_RumbleAudio_ResetVoiceTriggerLeft" xml:space="preserve"><value>Reimposta grilletto sinistro</value></data>
@@ -3585,7 +3711,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
     <value>Curva di accelerazione del puntatore del trackpad per l'output da touchpad a mouse. Porting in C# del profilo di accelerazione touchpad di libinput. MIT.</value>
   </data>
   <data name="About_HandheldCompanionDesc" xml:space="preserve">
-    <value>Modelli 3D dei controller (Xbox 360, Steam Deck) e il codice di modello e animazione della vista 3D, di CasperH2O, Lesueur Benjamin, trippyone. Anche il riferimento per la decodifica dei report e dell'aptica dello Steam Deck, il report di spegnimento dello Steam Controller (2015), l'elenco dei servizi dei PC portatili monitorati e la cadenza del controllo degli aggiornamenti. CC BY-NC-SA 4.0.</value>
+    <value>Modelli 3D dei controller (Xbox 360, Steam Deck) e il codice di modello e animazione della vista 3D, di CasperH2O, Lesueur Benjamin, trippyone. Anche il riferimento per la decodifica dei report e dell'aptica dello Steam Deck, il report di spegnimento dello Steam Controller (2015), l'elenco dei servizi dei PC portatili monitorati, la cadenza del controllo degli aggiornamenti e il riavvio della porta dell'hub, a 500 ms l'uno dall'altro, che ricollega un controller USB nascosto così che chi lo aveva aperto prima lo perda. CC BY-NC-SA 4.0.</value>
   </data>
   <data name="About_GamepadAssetPackDesc" xml:space="preserve">
     <value>Schemi 2D dei controller (Xbox 360, Xbox One S, Xbox Series, DualShock 4, DualSense), di AL2009man. MIT.</value>
@@ -3668,8 +3794,8 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="Pad_Audio_EqType_Peaking" xml:space="preserve"><value>Picco</value></data>
   <data name="Pad_Audio_EqType_LowShelf" xml:space="preserve"><value>Shelf Bassi</value></data>
   <data name="Pad_Audio_EqType_HighShelf" xml:space="preserve"><value>Shelf Alti</value></data>
-  <data name="Pad_Audio_EqType_HighPass" xml:space="preserve"><value>Passa-Alto</value></data>
-  <data name="Pad_Audio_EqType_LowPass" xml:space="preserve"><value>Passa-Basso</value></data>
+  <data name="Pad_Audio_EqType_HighPass" xml:space="preserve"><value>HPF</value></data>
+  <data name="Pad_Audio_EqType_LowPass" xml:space="preserve"><value>LPF</value></data>
   <data name="Pad_Audio_EqType_Notch" xml:space="preserve"><value>Notch</value></data>
   <data name="Pad_Audio_EqCol_Freq" xml:space="preserve"><value>Freq. (Hz)</value></data>
   <data name="Pad_Audio_EqCol_Gain" xml:space="preserve"><value>Guadagno (dB)</value></data>
@@ -3787,9 +3913,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_Interhaptics" xml:space="preserve">
     <value>Interhaptics (Wyvrn)</value>
   </data>
-  <data name="About_InterhapticsDesc" xml:space="preserve">
-    <value>Motore aptico e provider Razer dietro il mirror aptico Razer Sensa HD. HAR.dll e Interhaptics.RazerProvider.dll sono inclusi in PadForge, invariati rispetto al Core SDK pubblico. Di Wyvrn. EULA Wyvrn.</value>
-  </data>
+  <data name="About_InterhapticsDesc" xml:space="preserve"><value>Motore aptico e provider Razer dietro la vibrazione della riga Razer Sensa. HAR.dll e Interhaptics.RazerProvider.dll sono inclusi in PadForge, invariati rispetto al Core SDK pubblico. Di Wyvrn. EULA Wyvrn.</value></data>
   <data name="About_ValveCad" xml:space="preserve">
     <value>Valve Steam Controller CAD</value>
   </data>
@@ -3800,7 +3924,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
     <value>MinGW-w64 runtime</value>
   </data>
   <data name="About_MingwRuntimeDesc" xml:space="preserve">
-    <value>libgcc_s_seh-1.dll, libstdc++-6.dll e libwinpthread-1.dll, il runtime nativo richiesto dal riconoscitore Vosk, incluso nella versione x64. GPL-3.0 con la GCC Runtime Library Exception e la licenza winpthreads di mingw-w64. Nella versione ARM64, libvosk.dll contiene il proprio runtime: mingw-w64 e winpthreads, più libc++, libunwind e compiler-rt di LLVM con licenza Apache-2.0 con LLVM Exceptions.</value>
+    <value>libgcc_s_seh-1.dll, libstdc++-6.dll e libwinpthread-1.dll, il runtime nativo richiesto dal riconoscitore Vosk, incluso nella versione x64. GPL-3.0-or-later con la GCC Runtime Library Exception e, per winpthreads, MIT, con BSD 3-Clause per le parti derivate dalla libreria Posix Threads di Lockless Inc. Nella versione ARM64, libvosk.dll contiene il proprio runtime: mingw-w64 e winpthreads, più libc++, libunwind e compiler-rt di LLVM con licenza Apache-2.0 con LLVM Exceptions.</value>
   </data>
   <data name="About_TritonLib" xml:space="preserve">
     <value>TritonLib and Steam Controller haptics research</value>
@@ -3811,15 +3935,11 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_Colore" xml:space="preserve">
     <value>Colore</value>
   </data>
-  <data name="About_ColoreDesc" xml:space="preserve">
-    <value>Conferma del formato dell'API REST Razer Chroma per il mirror della barra luminosa, di Adam Hellberg e Brandon Scott. MIT. Solo documentazione, nessun codice distribuito.</value>
-  </data>
+  <data name="About_ColoreDesc" xml:space="preserve"><value>Conferma del formato dell'API REST Razer Chroma per l'illuminazione Razer, di Adam Hellberg e Brandon Scott. MIT. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_LogitechLedRefs" xml:space="preserve">
     <value>Logitech LED SDK references</value>
   </data>
-  <data name="About_LogitechLedRefsDesc" xml:space="preserve">
-    <value>Punti di ingresso del motore e convenzione di chiamata dietro il mirror della barra luminosa LIGHTSYNC, letti da Artemis.Plugins (PolyForm Noncommercial), Aurora (MIT), LogiLed2Corsair (MIT), Logitech-LED (GPL-2.0), logitech-led-sdk-rs (MIT OR Apache-2.0) e RGB.NET (LGPL-2.1). PadForge carica il motore di G HUB stesso e non distribuisce codice Logitech.</value>
-  </data>
+  <data name="About_LogitechLedRefsDesc" xml:space="preserve"><value>Punti di ingresso del motore, convenzione di chiamata e disposizione delle zone dietro l'illuminazione Logitech tramite G HUB, letti da Artemis.Plugins (PolyForm Noncommercial), Aurora (MIT), LogiLed2Corsair (MIT), Logitech-LED (GPL-2.0), logitech-led-sdk-rs (MIT OR Apache-2.0) e RGB.NET (LGPL-2.1). PadForge carica il motore di G HUB stesso e non distribuisce codice Logitech.</value></data>
   <data name="About_Opentrack" xml:space="preserve">
     <value>opentrack</value>
   </data>
@@ -3836,7 +3956,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
     <value>InputPlumber</value>
   </data>
   <data name="About_InputPlumberDesc" xml:space="preserve">
-    <value>Stringhe di identità dei PC portatili e note sui report del produttore, verificate per l'apprendimento dei pulsanti nascosti. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value>
+    <value>Stringhe di identità dei PC portatili e note sui report del produttore, verificate per l'apprendimento dei pulsanti nascosti. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value>
   </data>
   <data name="About_Linuxmotehook" xml:space="preserve">
     <value>linuxmotehook and WiimoteHook</value>
@@ -3846,14 +3966,18 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   </data>
   <data name="About_OpenXrRefs" xml:space="preserve"><value>Riferimenti OpenXR</value></data>
   <data name="About_OpenXrRefsDesc" xml:space="preserve"><value>L’interfaccia di runtime, la disposizione delle strutture e le chiavi di registro dietro l’input del visore e dei controller di movimento, lette dalle intestazioni dell’SDK OpenXR di Khronos (Apache-2.0) e verificate con VirtualDesktop-OpenXR (MIT). PadForge parla con il runtime installato sul tuo sistema e non distribuisce codice Khronos.</value></data>
+  <data name="About_PeripheralOutputRefs" xml:space="preserve"><value>Riferimenti per le uscite delle periferiche</value></data>
+  <data name="About_PeripheralOutputRefsDesc" xml:space="preserve"><value>I frame HID++ Logitech di aptica, illuminazione, abbinamento e batteria, letti da Solaar (GPL-2.0-or-later), libratbag (MIT), LiveHaptics, OpenLogi (0BSD e MIT OR Apache-2.0), dalla documentazione OpenLogi, keyleds (GPL-3.0-or-later), g810-led e g810-led-resources (GPL-3.0), rigdeck (GPL-3.0-or-later), OpenGHub (MIT) e g915x-heatmap (MIT), con note da OpenRGB-Fixed (GPL-2.0-or-later) e HaloDaemon-plugins. Gli ID prodotto e i report di illuminazione Razer, letti da OpenRazer (GPL-2.0-or-later) e OpenRGB (GPL-2.0-or-later) e confrontati con uncoil (GPL-3.0-or-later), OpenSynapse (MIT), openrazer-win (GPL-2.0-or-later), sanshoku (MIT), razer_test (GPL-3.0-or-later) e razer-life (GPL-2.0-or-later), con il blocco che questi strumenti condividono, da Aurora (MIT) e LibreHardwareMonitor (MPL-2.0). Gli ID prodotto e i report di illuminazione SteelSeries, letti da OpenRGB e rivalcfg (WTFPL) e confrontati con i plugin di SignalRGB, Aerox_5 (MIT), apex-3-tkl (MIT), ApexCtl (LGPL-3.0), SteelSeriesControl (GPL-3.0), rival310-re (LGPL-3.0), Cricetus-Imperator (MIT) e Wine (LGPL-2.1-or-later). I report HID LampArray, letti dalle HID Usage Tables dell'USB-IF, dalla documentazione Microsoft sull'illuminazione dinamica e dai suoi esempi ArduinoHidForWindows e RP2040MacropadHidSample (MIT), e confrontati con lampctl (MIT OR Apache-2.0), hid-rgb-ctl, keybackcon, mistel-lights, CaYaLight, hp-omen-35l-rgb, mac-dynamic-lighting, aura-loq e Apex3TklDynamicLighting (tutti MIT), acer-predator-helios-rgb (GPL-2.0-only) e crosrgbkblight. Il report di vibrazione iFeel, letto da iFeel, dal driver iFeel per Linux (GPL-2.0-or-later) e da Logitech-iFeel-Vibration-POC, con una regola sui descrittori dal kernel Linux (GPL-2.0-or-later) e la scala di intensità dal driver MouseWare 9.80 di Logitech. I gestori tattili e del colore dal GameSense SDK. Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_PortMidiRtMidi" xml:space="preserve"><value>PortMidi / RtMidi</value></data>
+  <data name="About_PortMidiRtMidiDesc" xml:space="preserve"><value>Le sequenze di chiamate WinMM alla base dell’API MIDI legacy: aprire una porta, inviarle messaggi e chiuderla. Lette da PortMidi (MIT, di Ross Bencina, Phil Burk e Roger B. Dannenberg) e RtMidi (licenza RtMidi in stile MIT, di Gary P. Scavone). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_LogitechGKeyRefs" xml:space="preserve"><value>Riferimenti all’SDK G-key di Logitech</value></data>
   <data name="About_LogitechGKeyRefsDesc" xml:space="preserve"><value>La disposizione della parola di evento dietro l’input dei tasti G proviene da LogitechGkeyLib.h nell’SDK. L’ordine di ricerca e la chiusura della libreria seguono GKey.cpp di Mumble (BSD 3-Clause). PadForge carica la libreria presente sulla macchina e non distribuisce codice Logitech.</value></data>
   <data name="About_AnalogKeyboardRefs" xml:space="preserve"><value>HallJoy, Soup e AnalogSense</value></data>
-  <data name="About_AnalogKeyboardRefsDesc" xml:space="preserve"><value>L’input delle tastiere analogiche porta in C# le route delle tastiere, le tabelle dei tasti e i cataloghi dei modelli di HallJoy (AGPL-3.0, PashOK7) e segue Soup e l’AnalogSense JavaScript SDK (MIT, Calamity, Inc.), verificati con il Wooting Analog SDK (MPL-2.0). Altre tastiere seguono AnalogKeys (MIT, Nisayera), KeyAxis (MIT, RigZeeel), HallEffectAnalogMapper (MIT, Ricards Mironovs), libhmk e hmkconf (GPL-3.0, peppapighs) e i fork di Soup di DenkiSuki, LeiterConsulting e paysdelest (MIT). Formati dei report e tabelle dei tasti provengono anche dai configuratori Synapse Web di Razer e NuPhyIO di NuPhy, da OpenRazer (GPL-2.0), da razer-analog-keyboard di Abbytech, da TinyUSB (MIT) e dalle note di acquisizione di Sainan.</value></data>
+  <data name="About_AnalogKeyboardRefsDesc" xml:space="preserve"><value>L’input delle tastiere analogiche porta in C# le route delle tastiere, le tabelle dei tasti e i cataloghi dei modelli di HallJoy (AGPL-3.0, PashOK7) e segue Soup e l’AnalogSense JavaScript SDK (MIT, Calamity, Inc.), verificati con il Wooting Analog SDK (MPL-2.0). Altre tastiere seguono AnalogKeys (MIT, Nisayera), KeyAxis (MIT, RigZeeel), HallEffectAnalogMapper (MIT, Ricards Mironovs), libhmk e hmkconf (GPL-3.0-or-later, peppapighs) e i fork di Soup di DenkiSuki, LeiterConsulting e paysdelest (MIT). Formati dei report e tabelle dei tasti provengono anche dai configuratori Synapse Web di Razer e NuPhyIO di NuPhy, da OpenRazer (GPL-2.0-or-later), da razer-analog-keyboard di Abbytech, da TinyUSB (MIT) e dalle note di acquisizione di Sainan.</value></data>
   <data name="About_BlissBoxRefs" xml:space="preserve"><value>Riferimenti Bliss-Box</value></data>
   <data name="About_BlissBoxRefsDesc" xml:space="preserve"><value>L’API Bliss-Box alla base di Leggi gli adattatori Bliss-Box, letta dall’API Tool di Bliss-Box LLC (tipo BSD, ridistribuzione gratuita) e da DeviceBuddy (sorgente consultabile, Bliss-Box LLC), con i nomi dei pulsanti dai file Bliss-Box del fork di retroarch-joypad-autoconfig di SteveFox1620, i checksum del Controller Pak verificati con libdragon (Unlicense) e la risposta del controller PlayStation da psx-spx e dal driver Linux psxpad-spi (GPL-2.0-or-later). Anche i nomi dei controller e le note sul supporto provengono dall’elenco di compatibilità di Bliss-Box LLC, e il comportamento degli adattatori è stato verificato sul loro firmware. Solo documentazione, nessun codice incluso.</value></data>
   <data name="About_UsbipWin2" xml:space="preserve"><value>usbip-win2</value></data>
-  <data name="About_UsbipWin2Desc" xml:space="preserve"><value>Trasporto USB di Vadym Hrynchyshyn per i controller USB compositi di HIDMaestro. Il programma di installazione firmato è incluso in HIDMaestro e viene eseguito la prima volta che si crea un controller composito. BSD 2-Clause.</value></data>
+  <data name="About_UsbipWin2Desc" xml:space="preserve"><value>Trasporto USB di Vadym Hrynchyshyn per i controller USB compositi di HIDMaestro. HIDMaestro include il relativo driver del controller host firmato e lo installa la prima volta che si crea un controller composito. BSD 2-Clause.</value></data>
   <data name="Pad_Kbm_Surfaces_Tooltip" xml:space="preserve">
     <value>Scegli quali metà di questo slot sono attive. Disattivando una metà se ne nascondono le righe e si interrompe l'invio, ma le assegnazioni restano e tornano riattivandola.</value>
   </data>
@@ -3866,6 +3990,19 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="Pad_Kbm_Surfaces_KeyboardOnly_Name" xml:space="preserve">
     <value>Solo tastiera</value>
   </data>
+  <data name="Pad_Kbm_Preview_Approximate" xml:space="preserve"><value>Disegnata con il layout standard più vicino</value></data>
+  <data name="Pad_Kbm_Device_WindowsInput" xml:space="preserve"><value>Input di Windows</value></data>
+  <data name="Pad_Kbm_Device_SameAsKeyboard" xml:space="preserve"><value>Stesso dispositivo della tastiera</value></data>
+  <data name="Pad_Kbm_Device_SameAsMouse" xml:space="preserve"><value>Stesso dispositivo del mouse</value></data>
+  <data name="Pad_Kbm_Device_Keyboard_Tooltip" xml:space="preserve"><value>L'input di Windows digita ogni tasto tramite Windows e i programmi possono riconoscere che proviene da software. Un modello di tastiera lo digita su una tastiera virtuale che i programmi vedono come quell'hardware. La tabella delle mappature nasconde i tasti che il modello non può inviare.</value></data>
+  <data name="Pad_Kbm_Device_Mouse_Tooltip" xml:space="preserve"><value>L'input di Windows sposta il puntatore tramite Windows e i programmi possono riconoscere che proviene da software. Un modello di mouse lo sposta con un mouse virtuale che i programmi vedono come quell'hardware. La tabella delle mappature nasconde i pulsanti e le rotelle che il modello non ha.</value></data>
+  <data name="Pad_Kbm_Caps_KeysAtOnce_Format" xml:space="preserve"><value>Tasti simultanei: {0}</value></data>
+  <data name="Pad_Kbm_Caps_KeysAtOnceAny" xml:space="preserve"><value>Tasti simultanei: qualsiasi</value></data>
+  <data name="Pad_Kbm_Caps_MediaKeys" xml:space="preserve"><value>Tasti multimediali</value></data>
+  <data name="Pad_Kbm_Caps_LockLights" xml:space="preserve"><value>Spie di blocco</value></data>
+  <data name="Pad_Kbm_Caps_Buttons_Format" xml:space="preserve"><value>Pulsanti: {0}</value></data>
+  <data name="Pad_Kbm_Caps_Wheel" xml:space="preserve"><value>Rotella</value></data>
+  <data name="Pad_Kbm_Caps_TiltWheel" xml:space="preserve"><value>Rotella inclinabile</value></data>
   <data name="Pad_Mapping_Scope_All" xml:space="preserve">
     <value>Tutto</value>
   </data>
@@ -3984,19 +4121,35 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="Devices_AllConsumerControlsMerged" xml:space="preserve"><value>Tutti i controlli multimediali (uniti)</value></data>
   <data name="Status_InstallerExitCode_Format" xml:space="preserve"><value>Il programma di installazione è terminato con il codice {0}.</value></data>
   <data name="Status_InstallerTimedOut" xml:space="preserve"><value>Il programma di installazione era ancora in esecuzione dopo tre minuti.</value></data>
+  <data name="Status_InstallerNotTracked" xml:space="preserve"><value>Windows ha avviato il programma di installazione senza permettere a PadForge di seguirlo. La scheda mostra il risultato appena l'installazione termina.</value></data>
+  <data name="Status_VcRedistUnsigned" xml:space="preserve"><value>Il Visual C++ Redistributable scaricato non è firmato da Microsoft.</value></data>
+  <data name="Status_MidiRuntimeHashMismatch" xml:space="preserve"><value>Il runtime MIDI scaricato non corrisponde al suo SHA-256 pubblicato.</value></data>
+  <data name="Status_NoMidiRuntimeToRemove" xml:space="preserve"><value>Nessun runtime di Windows MIDI Services è installato.</value></data>
+  <data name="Status_VcRuntimeHeld" xml:space="preserve"><value>Un programma tiene aperto il vecchio runtime di Visual C++, quindi Windows non ha potuto sostituirlo. Chiudi gli altri programmi e seleziona di nuovo Installa.</value></data>
+  <data name="Status_VcRuntimeStillOld_Format" xml:space="preserve"><value>Il runtime di Visual C++ è ancora precedente alla {0} dopo l'esecuzione del suo programma di installazione.</value></data>
+  <data name="Status_VcRedistStillRunning" xml:space="preserve"><value>Il programma di installazione del Visual C++ Redistributable è ancora in esecuzione. Seleziona di nuovo Installa al termine.</value></data>
+  <data name="Status_NoOwnedSteamVRToRemove" xml:space="preserve"><value>PadForge non ha un'installazione di SteamVR propria da rimuovere.</value></data>
+  <data name="Status_SteamVRFolderIsDriveRoot_Format" xml:space="preserve"><value>La cartella di SteamVR registrata, {0}, è la radice di un'unità, quindi PadForge non la eliminerà.</value></data>
+  <data name="Status_SteamVRNotRemoved_Format" xml:space="preserve"><value>SteamVR non è stato rimosso del tutto: {0} esiste ancora. Chiudi tutto ciò che usa SteamVR e riprova.</value></data>
+  <data name="Status_SteamVRLocationNotFull" xml:space="preserve"><value>Il percorso di installazione di SteamVR deve essere completo, ad esempio C:\SteamVR.</value></data>
+  <data name="Status_SteamVRLocationIsDriveRoot" xml:space="preserve"><value>Il percorso di installazione di SteamVR non può essere la radice di un'unità. Scegli una cartella, ad esempio C:\SteamVR.</value></data>
+  <data name="Status_SteamCmdTimedOut" xml:space="preserve"><value>steamcmd non ha finito entro 60 minuti.</value></data>
+  <data name="Status_SteamVRDidNotLand_Format" xml:space="preserve"><value>steamcmd è stato eseguito, ma SteamVR non è stato installato in {0}. steamcmd ha detto: ...{1}</value></data>
+  <data name="Status_HidHideDriverDidNotStart" xml:space="preserve"><value>HidHide è stato installato, ma il suo dispositivo di controllo non si è aperto, quindi non è stato aggiunto alcun filtro di classe.</value></data>
+  <data name="Status_HidHideFilterStillListed" xml:space="preserve"><value>HidHide risulta ancora come filtro di classe, quindi il driver è stato lasciato al suo posto.</value></data>
   <data name="Status_RemovingLegacyDrivers" xml:space="preserve"><value>Rimozione dei driver legacy in corso…</value></data>
   <data name="About_Nefcon" xml:space="preserve"><value>nefcon</value></data>
-  <data name="About_NefconDesc" xml:space="preserve"><value>Strumento di installazione di HidHide, di Nefarius. La versione ARM64 installa il driver HidHide su Windows su ARM. MIT.</value></data>
+  <data name="About_NefconDesc" xml:space="preserve"><value>Strumento di installazione di HidHide, di Nefarius. La versione ARM64 installa il driver HidHide su Windows su ARM. Collega Argh!, colorwin, easyloggingpp, Microsoft Detours, scope_guard, le Windows Implementation Libraries e neflib. MIT.</value></data>
   <data name="About_Kaldi" xml:space="preserve"><value>Kaldi, OpenFst, OpenBLAS and CLAPACK</value></data>
-  <data name="About_KaldiDesc" xml:space="preserve"><value>Il decodificatore vocale, la libreria di trasduttori e l'algebra lineare contenuti in libvosk.dll. Kaldi e OpenFst: Apache-2.0. OpenBLAS e CLAPACK: BSD 3-Clause, con l'avviso proprio del runtime f2c.</value></data>
+  <data name="About_KaldiDesc" xml:space="preserve"><value>Il decodificatore vocale, la libreria di trasduttori e l'algebra lineare contenuti in libvosk.dll. Kaldi e OpenFst: Apache-2.0. OpenBLAS e CLAPACK: BSD 3-Clause, con avvisi propri per GotoBLAS2, incluso in OpenBLAS, e per il runtime f2c.</value></data>
   <data name="About_AntiMicroX" xml:space="preserve"><value>AntiMicroX</value></data>
-  <data name="About_AntiMicroXDesc" xml:space="preserve"><value>Layout dei profili iniziali per strategia e desktop, e il comportamento del turbo che il turbo in base alla pressione evita. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_AntiMicroXDesc" xml:space="preserve"><value>Layout dei profili iniziali per strategia e desktop, e il comportamento del turbo che il turbo in base alla pressione evita. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_AudioEndPointLibrary" xml:space="preserve"><value>AudioEndPointLibrary</value></data>
   <data name="About_AudioEndPointLibraryDesc" xml:space="preserve"><value>Riferimento di Antoine Aflalo per la disposizione dell'interfaccia non documentata IPolicyConfig di Windows, con cui PadForge riattiva l'endpoint audio di un controller. MIT. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_AutoEq" xml:space="preserve"><value>AutoEq</value></data>
   <data name="About_AutoEqDesc" xml:space="preserve"><value>Il formato dei profili di equalizzatore parametrico che la scheda Audio importa, di Jaakko Pasanen. MIT. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_AutoHotkey" xml:space="preserve"><value>AutoHotkey</value></data>
-  <data name="About_AutoHotkeyDesc" xml:space="preserve"><value>Tecniche SendInput alla base delle macro Blocco di testo e dell'hook degli accordi da tastiera: digitazione Unicode, limiti dei lotti, il tasto di mascheramento per il tasto Windows e l'input iniettato contrassegnato. GPL-2.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_AutoHotkeyDesc" xml:space="preserve"><value>Tecniche SendInput alla base delle macro Blocco di testo e dell'hook degli accordi da tastiera: digitazione Unicode, limiti dei lotti, il tasto di mascheramento per il tasto Windows e l'input iniettato contrassegnato. GPL-2.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_CemuhookProtocol" xml:space="preserve"><value>cemuhook-protocol</value></data>
   <data name="About_CemuhookProtocolDesc" xml:space="preserve"><value>Riferimento del protocollo DSU alla base del server di movimento, di v1993. Unlicense.</value></data>
   <data name="About_Ds4Drv" xml:space="preserve"><value>ds4drv</value></data>
@@ -4010,7 +4163,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_DualSenseSupport" xml:space="preserve"><value>DualSenseSupport</value></data>
   <data name="About_DualSenseSupportDesc" xml:space="preserve"><value>Valori del preset GameCube per i grilletti adattivi, di Mxater. Letto solo per i dati.</value></data>
   <data name="About_Eden" xml:space="preserve"><value>Eden</value></data>
-  <data name="About_EdenDesc" xml:space="preserve"><value>Segni degli assi di movimento DSU, verificati con il suo decodificatore UDP. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_EdenDesc" xml:space="preserve"><value>Segni degli assi di movimento DSU, verificati con il suo decodificatore UDP. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_EdRefCard2" xml:space="preserve"><value>EDRefCard2</value></data>
   <data name="About_EdRefCard2Desc" xml:space="preserve"><value>Preset predefiniti di Elite Dangerous alla base del profilo iniziale Simulazione spaziale, di Richard Buckle. MIT.</value></data>
   <data name="About_FFmpeg" xml:space="preserve"><value>FFmpeg</value></data>
@@ -4032,7 +4185,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_Jc2Mouse" xml:space="preserve"><value>jc2mouse / joycon2cpp / joycon2mouse</value></data>
   <data name="About_Jc2MouseDesc" xml:space="preserve"><value>Contatori del mouse ottico del Joy-Con 2 e delta con riavvolgimento alla base di Movimento del mouse X e Y, di coffincolors, Frano e moutella. MIT. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_LinuxKernel" xml:space="preserve"><value>Driver del kernel Linux</value></data>
-  <data name="About_LinuxKernelDesc" xml:space="preserve"><value>Dettagli di protocollo di DualShock 3, Move, DualSense, Steam Deck e force feedback PID, e il layout dei blocchi ACPI WMI. GPL-2.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_LinuxKernelDesc" xml:space="preserve"><value>Dettagli di protocollo di DualShock 3, Move, DualSense, Steam Deck e force feedback PID, e il layout dei blocchi ACPI WMI. PadForge legge i descrittori di tastiere e mouse secondo le regole di hid-core. GPL-2.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_GameInput" xml:space="preserve"><value>Microsoft GameInput</value></data>
   <data name="About_GameInputDesc" xml:space="preserve"><value>Input dei controller di Windows, incluse le palette dell'Xbox Elite. Il loader dell'SDK è collegato in SDL. MIT (loader dell'SDK).</value></data>
   <data name="About_VcRuntime" xml:space="preserve"><value>Microsoft Visual C++ Runtime</value></data>
@@ -4040,7 +4193,7 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_SwitchResearch" xml:space="preserve"><value>Nintendo_Switch_Reverse_Engineering</value></data>
   <data name="About_SwitchResearchDesc" xml:space="preserve"><value>Note su HID, vibrazione HD e LED Home dei Joy-Con e del Pro Controller, di dekuNukem, con switch2_controller_research di ndeadly per la Switch 2. Lette solo per i dettagli del protocollo.</value></data>
   <data name="About_OpenRgb" xml:space="preserve"><value>OpenRGB</value></data>
-  <data name="About_OpenRgbDesc" xml:space="preserve"><value>Uso dei byte dei report di uscita della barra luminosa di DualSense e DualShock 4. GPL-2.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_OpenRgbDesc" xml:space="preserve"><value>Uso dei byte dei report di uscita della barra luminosa di DualSense e DualShock 4, e i frame di illuminazione HID++ 0x8070 di Logitech con la disposizione delle collection. GPL-2.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_OpenTabletDriver" xml:space="preserve"><value>OpenTabletDriver</value></data>
   <data name="About_OpenTabletDriverDesc" xml:space="preserve"><value>Lo schema del verbo di aggiornamento con privilegi elevati alla base dell'helper dell'aggiornamento integrato. LGPL-3.0, letto solo come documentazione, nessun codice LGPL distribuito.</value></data>
   <data name="About_PcscSharp" xml:space="preserve"><value>pcsc-sharp</value></data>
@@ -4054,13 +4207,13 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_SipSorcery" xml:space="preserve"><value>SIPSorcery</value></data>
   <data name="About_SipSorceryDesc" xml:space="preserve"><value>Il layout dei messaggi STUN e la decodifica di XOR-MAPPED-ADDRESS alla base dell'attraversamento NAT di Remote Link, incorporati dal suo sorgente C#, di Aaron Clauson. BSD 3-Clause, con la restrizione d'uso della sezione 2 della sua licenza.</value></data>
   <data name="About_SpaceMouseRefs" xml:space="preserve"><value>Riferimenti SpaceMouse</value></data>
-  <data name="About_SpaceMouseRefsDesc" xml:space="preserve"><value>Layout dei report, tabella dei dispositivi e scala degli assi di 3Dconnexion, letti da hid.spacemouse (MIT), PySpaceMouse (MIT), spacemouse di AndunHH (CC BY-NC-SA 4.0) e spacenavd (GPL-3.0). Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_SpaceMouseRefsDesc" xml:space="preserve"><value>Layout dei report, tabella dei dispositivi e scala degli assi di 3Dconnexion, letti da hid.spacemouse (MIT), PySpaceMouse (MIT), spacemouse di AndunHH (CC BY-NC-SA 4.0) e spacenavd (GPL-3.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_SpecialK" xml:space="preserve"><value>Special K</value></data>
-  <data name="About_SpecialKDesc" xml:space="preserve"><value>La disconnessione Bluetooth tramite IOCTL dell'host, gli ordinali XInput nascosti di spegnimento e capacità, e i valori predefiniti della vibrazione dei grilletti del DualSense. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_SpecialKDesc" xml:space="preserve"><value>La disconnessione Bluetooth tramite IOCTL dell'host, gli ordinali XInput nascosti di spegnimento e capacità, e i valori predefiniti della vibrazione dei grilletti del DualSense. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_SteamControllerRefs" xml:space="preserve"><value>Riferimenti al protocollo dello Steam Controller</value></data>
   <data name="About_SteamControllerRefsDesc" xml:space="preserve"><value>Impulsi del feedback aptico di scorrimento, bit dei pulsanti del report 0x42, il comando di spegnimento e il relay del dongle, letti da OpenPuck (AGPL-3.0), sc2-research (MIT), steam_controller_tools (GPL-2.0) e SteamlessController (MIT). Solo documentazione, nessun codice GPL o AGPL distribuito.</value></data>
   <data name="About_ThumbstickDeadzones" xml:space="preserve"><value>Thumbstick Deadzones</value></data>
-  <data name="About_ThumbstickDeadzonesDesc" xml:space="preserve"><value>Le sei forme di zona morta, di Minimuino. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_ThumbstickDeadzonesDesc" xml:space="preserve"><value>Le sei forme di zona morta, di Minimuino. GFDL-1.3-or-later e GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_Touchmote" xml:space="preserve"><value>Touchmote</value></data>
   <data name="About_TouchmoteDesc" xml:space="preserve"><value>Comportamento del puntatore IR del Wii Remote: punto medio della coppia di punti, margini, offset della barra sensori, smussamento e la curva Mouse FPS, con i fork di Ryochan7, Suegrini e Trihy. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_TriggerEffectGenerator" xml:space="preserve"><value>TriggerEffectGenerator</value></data>
@@ -4068,17 +4221,17 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_ViGEmClient" xml:space="preserve"><value>ViGEmClient</value></data>
   <data name="About_ViGEmClientDesc" xml:space="preserve"><value>Il layout DS4_REPORT_EX alla base del report di input del DualShock 4 virtuale, di Benjamin Höglinger-Stelzer. MIT.</value></data>
   <data name="About_ViiperHbashton" xml:space="preserve"><value>VIIPER (fork di hbashton)</value></data>
-  <data name="About_ViiperHbashtonDesc" xml:space="preserve"><value>L'intervallo di attenuazione di 48 dB del microfono del DualSense virtuale. GPL-3.0, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_ViiperHbashtonDesc" xml:space="preserve"><value>L'intervallo di attenuazione di 48 dB del microfono del DualSense virtuale. GPL-3.0-or-later, letto solo come documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_WheelRefs" xml:space="preserve"><value>Riferimenti ai protocolli dei volanti</value></data>
-  <data name="About_WheelRefsDesc" xml:space="preserve"><value>Report nativi di force feedback e dei LED di regime per i volanti Fanatec, Thrustmaster e Logitech, letti da hid-fanatecff (GPL-2.0), hid-tmff2 (GPL-2.0-or-later), new-lg4ff (GPL-2.0), oversteer (GPL-3.0) e thrustmaster-led-linux (GPL-3.0), e verificati con il plugin LED per SimHub di prodigal.knight (MIT) e tm-bt-led (MIT). Solo documentazione, nessun codice GPL distribuito.</value></data>
+  <data name="About_WheelRefsDesc" xml:space="preserve"><value>Report nativi di force feedback e dei LED di regime per i volanti Fanatec, Thrustmaster e Logitech, letti da hid-fanatecff (GPL-2.0), hid-tmff2 (GPL-2.0-or-later), new-lg4ff (GPL-2.0-or-later), oversteer (GPL-3.0) e thrustmaster-led-linux (GPL-3.0), e verificati con il plugin LED per SimHub di prodigal.knight (MIT) e tm-bt-led (MIT). Solo documentazione, nessun codice GPL distribuito.</value></data>
   <data name="About_ArcadeIoRefs" xml:space="preserve"><value>Riferimenti I/O arcade</value></data>
   <data name="About_ArcadeIoRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per le schede I/O arcade Namco e Konami e le schede JVS, letti da arcade-docs (WTFPL), bemanitools (Unlicense), Dolphin (GPL-2.0-or-later), ITAIKO-firmware (MIT), JoypadOS (Apache-2.0), jvsio (BSD-3-Clause), MAME (BSD-3-Clause), OpenITG (StepMania license), p4io-mdxfdrv (GPL-3.0), RPCS3 (GPL-2.0) e TaikoZucchini (MIT). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_BleControllerRefs" xml:space="preserve"><value>Riferimenti controller Bluetooth LE</value></data>
   <data name="About_BleControllerRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver Bluetooth LE del fork di SDL per i controller Poke Ball Plus, Daydream, Gear VR, Oculus Go, Guitar Hero Live iOS, Zwift e Myo, letti da Access-GearVR-Controller-from-PC (Apache-2.0), daydream-catcher, daydream-controller.js (MIT), daydream2hid (Apache-2.0), dl-myo (GPL-3.0), find-a-cig (MIT), gear_vr_controller (MIT), gearVRC (MIT), gearvr-controller (MIT), gearvr-controller-webbluetooth (GPL-3.0), GHLtarUtility (GPL-3.0), ghlioscon (MIT), hardfault.life, jsyang.ca, makinolo.com, myo-bluetooth (Apache-2.0), myo-raw (MIT), OculusGo-Air-Mouse-4-macOS (MIT), PlasticBand (CC BY-SA 4.0), pokeball-plus-4-windows, pokeball-plus-mouse (Apache-2.0), PokeBall-Plus-Controller-Driver-App-Mac, PokeballPlus-4-PC (MIT), pyomyo (MIT), qdomyos-zwift (GPL-3.0), Santroller (GPL-3.0), SwiftControl (noncommercial), Zephyr (Apache-2.0) e zwiftplay. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_RfcommIcadeRefs" xml:space="preserve"><value>Riferimenti Bluetooth RFCOMM e iCade</value></data>
-  <data name="About_RfcommIcadeRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per i controller MOGA, Zeemote, BGP100 e Phonejoy e l'ION iCade, letti da android-bluez-ime (LGPL-2.1), flatlib.jp, iCade-iOS (MIT), Linux (GPL-2.0), MogaSerial (MIT), moga-uinput (MIT), ZeeClient (MIT), zeemoted (GPL-3.0) e zeemouse. Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_RfcommIcadeRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per i controller MOGA, Zeemote, BGP100 e Phonejoy e l'ION iCade, letti da android-bluez-ime (LGPL-2.1-or-later), flatlib.jp, iCade-iOS (MIT), Linux (GPL-2.0-or-later), MogaSerial (MIT), moga-uinput (MIT), ZeeClient (MIT), zeemoted (GPL-3.0-or-later) e zeemouse. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_DjiRemoteRefs" xml:space="preserve"><value>Riferimenti radiocomandi DJI</value></data>
-  <data name="About_DjiRemoteRefsDesc" xml:space="preserve"><value>I messaggi DUML dietro i driver del fork di SDL per i radiocomandi dei droni DJI, letti da dji-firmware-tools (GPL-3.0), dji-rc-joystick di gregszero (GPL-3.0), dji-rc-joystick di voluminor (LGPL-2.1), dji-rc-linux (MIT), dji-rc-windows, DJI_RC-N1_SIMULATOR_FLY_DCL (Apache-2.0), DJI_RC_Motion_Bridge (MIT), DJI_RCN1_for_drone_simulators, DJI_RCNx_for_drone_simulators, DJI-RC-Emulator (MIT), DjiMini2RCasJoystick (Apache-2.0), mDjiController di Matsemann (Apache-2.0), mDjiController di mishavoloshchuk (Apache-2.0), mDjiController di slaterbbx (Apache-2.0) e miniDjiController (Apache-2.0). Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_DjiRemoteRefsDesc" xml:space="preserve"><value>I messaggi DUML dietro i driver del fork di SDL per i radiocomandi dei droni DJI, letti da dji-firmware-tools (GPL-3.0-or-later), dji-rc-joystick di gregszero (GPL-3.0), dji-rc-joystick di voluminor (LGPL-2.1), dji-rc-linux (MIT), dji-rc-windows, DJI_RC-N1_SIMULATOR_FLY_DCL (Apache-2.0), DJI_RC_Motion_Bridge (MIT), DJI_RCN1_for_drone_simulators, DJI_RCNx_for_drone_simulators, DJI-RC-Emulator (MIT), DjiMini2RCasJoystick (Apache-2.0), mDjiController di Matsemann (Apache-2.0), mDjiController di mishavoloshchuk (Apache-2.0), mDjiController di slaterbbx (Apache-2.0) e miniDjiController (Apache-2.0). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_GunConRefs" xml:space="preserve"><value>Riferimenti GunCon</value></data>
   <data name="About_GunConRefsDesc" xml:space="preserve"><value>I report della GunCon 2 dietro il driver del fork di SDL e il ridimensionamento allo schermo di PadForge, letti da guncon2 di beardypig (GPL-2.0), guncon2 di psakhis, GunconUSB (GPL-2.0), IR-Light-Gun (LGPL-2.1-or-later), PCSX2 (GPL-3.0-or-later) e topgun-linux-driver (GPL-3.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_HidDeviceRefs" xml:space="preserve"><value>Riferimenti dispositivi HID</value></data>
@@ -4086,17 +4239,17 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_IForceRefs" xml:space="preserve"><value>Riferimenti I-Force</value></data>
   <data name="About_IForceRefsDesc" xml:space="preserve"><value>I comandi e i report I-Force dietro il driver del fork di SDL per volanti e joystick I-Force USB e seriali, letti da forcers, iforce-binary-driver, iforce-feedback-wheel-driver-port (MIT/GPL-2.0-or-later), JUa9Win11Driver, linuxconsole (GPL-2.0-or-later) e Linux (GPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_InstrumentRefs" xml:space="preserve"><value>Riferimenti strumenti ed estensioni Wii</value></data>
-  <data name="About_InstrumentRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per le estensioni strumento e tavoletta del Wii Remote, i dongle Guitar Hero Live, gli strumenti Rock Band 3 Pro e le periferiche PS3, letti da AutoCalibrationRB, brandonw.net, Dolphin (GPL-2.0-or-later), GHLtarUtility (GPL-3.0), GHLtarUtility di Sera486 (GPL-3.0), hid-ghlive-dkms (GPL-3.0), JoypadOS (Apache-2.0), Linux (GPL-2.0), NintendoExtensionCtrl (LGPL-3.0), PlasticBand (CC BY-SA 4.0), raphnet.net, rb3_keytar (MIT), RB4InstrumentMapper (MIT), RPCS3 (GPL-2.0), Santroller (GPL-3.0), uDrawTablet, WiiBrew, WiitarThing (MIT) e xpad di paroj (GPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_InstrumentRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per le estensioni strumento e tavoletta del Wii Remote, i dongle Guitar Hero Live, gli strumenti Rock Band 3 Pro e le periferiche PS3, letti da AutoCalibrationRB, brandonw.net, Dolphin (GPL-2.0-or-later), GHLtarUtility (GPL-3.0), GHLtarUtility di Sera486 (GPL-3.0), hid-ghlive-dkms (GPL-3.0), JoypadOS (Apache-2.0), Linux (GPL-2.0), NintendoExtensionCtrl (LGPL-3.0-or-later), PlasticBand (CC BY-SA 4.0), raphnet.net, rb3_keytar (MIT), RB4InstrumentMapper (MIT), RPCS3 (GPL-2.0), Santroller (GPL-3.0), uDrawTablet, WiiBrew, WiitarThing (MIT) e xpad di paroj (GPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_RingConRefs" xml:space="preserve"><value>Riferimenti Ring-Con</value></data>
   <data name="About_RingConRefsDesc" xml:space="preserve"><value>Le sequenze di avvio e arresto del Ring-Con dietro il driver Switch del fork di SDL e la scala di flessione letta da PadForge, lette da demo-of-ring-con-with-web-hid, Eden (GPL-3.0-or-later), joy di Yamakaky (MIT), joy-con-webhid (Apache-2.0), Nintendo_Switch_Reverse_Engineering, osc-ringcon (MIT), Ringcon-Driver (MIT) e RingconProtocolDebug (Apache-2.0). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_SerialControllerRefs" xml:space="preserve"><value>Riferimenti controller seriali</value></data>
   <data name="About_SerialControllerRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver seriali del fork di SDL per controller a sei assi, gamepad, joystick di volo, trasmittenti RC, pannelli di volo ed ergometri, letti da Async.fi, hidsporb, JoypadOS (Apache-2.0), KettlerBLE (MIT), kettlerUSB2BLE (MIT), libsball di John E. Stone (BSD-style), linuxconsole (GPL-2.0-or-later), Linux (GPL-2.0), spacenavd (GPL-3.0-or-later), vJoySerialFeeder (GPL-3.0), VRInsight-Xplane-Interface (MIT), vrinsight-cdu-ii-msfs-driver (MIT), VRPN (BSL-1.0), xf86-input-magellan (MIT/X11), xf86-input-spaceorb (MIT/X11) e XPComboTest (MIT). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_SpecialtyUsbRefs" xml:space="preserve"><value>Riferimenti dispositivi USB speciali</value></data>
-  <data name="About_SpecialtyUsbRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per la base Intel Wireless Series, il ricevitore Big Button per Xbox 360, il CH Products Multi-Function Panel, l'Ergodex DX1, i TrackIR 2 e 3 e le unità di comando dei rulli Tacx, letti da antifier (MIT), chmfp (GPL-3.0), dx1-studio (GPL-3.0), ergodex-dx1-linux (GPL-3.0), FortiusANT (GPL-3.0), intel-wings (GPL-2.0), JoypadOS (Apache-2.0), Linux (GPL-2.0), linuxtrack (MIT), t19xx_usb (GPL-3.0) e xbox360bb (GPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_SpecialtyUsbRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per la base Intel Wireless Series, il ricevitore Big Button per Xbox 360, il CH Products Multi-Function Panel, l'Ergodex DX1, i TrackIR 2 e 3 e le unità di comando dei rulli Tacx, letti da antifier (MIT), chmfp (GPL-3.0-or-later), dx1-studio (GPL-3.0), ergodex-dx1-linux (GPL-3.0), fortius_1942 (GPL-2.0-or-later), FortiusANT (GPL-3.0), intel-wings (GPL-2.0), JoypadOS (Apache-2.0), linuxtrack (MIT), t19xx_usb (GPL-3.0), ttyT1941 (GPL-3.0) e xbox360bb (GPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_TrainControllerRefs" xml:space="preserve"><value>Riferimenti controller ferroviari</value></data>
   <data name="About_TrainControllerRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per i controller ferroviari Densha de GO!, Multi Train, Train Mascon e Master Controller, letti da amy.hi-ho.ne.jp di Takatani, bvets.net di Mackoy, ConToJREts, ddgo-pnp-controller (GPL-3.0), OpenBVE (BSD-2-Clause), PCSX2 (GPL-3.0-or-later), Qiita di kazuhidet, RPCS3 (GPL-2.0), Scrapbox di p4ken e Train Controller Database. Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_XboxControllerRefs" xml:space="preserve"><value>Riferimenti controller Xbox</value></data>
-  <data name="About_XboxControllerRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per la Xbox originale, Steel Battalion, il chatpad Xbox 360 e la uDraw Xbox 360, e i ricevitori Xbox 360 che PadForge associa al driver di Windows, letti da brandonw.net, Chatpad Super Driver (MIT), Cxbx-Reloaded (GPL-2.0-or-later), euc.jp di ITO Takayuki, JoypadOS (Apache-2.0), libSteelBattalion, libsteelbat, Linux (GPL-2.0), ogx360 (GPL-3.0-or-later), s-config.com, SBC (MIT), Spivey's Corner, steel-battalion-net (LGPL-3.0), SteelBattalionController (Apache-2.0), SteelBattalionDriver (GPL-3.0), SteelBattalionMapper (GPL-3.0-or-later), tusb_xinput (MIT), uDrawTablet, Xb2XInput (GPL-3.0), xb360ChatpadToKM (GPL-3.0), xbox360wirelesschatpad, xboxdevwiki, xboxdrv (GPL-3.0-or-later) e xemu (LGPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
+  <data name="About_XboxControllerRefsDesc" xml:space="preserve"><value>I protocolli dietro i driver del fork di SDL per la Xbox originale, Steel Battalion, il chatpad Xbox 360 e la uDraw Xbox 360, e i ricevitori Xbox 360 che PadForge associa al driver di Windows, letti da brandonw.net, Chatpad Super Driver (MIT), Cxbx-Reloaded (GPL-2.0-or-later), euc.jp di ITO Takayuki, JoypadOS (Apache-2.0), libSteelBattalion, libsteelbat, Linux (GPL-2.0-or-later), ogx360 (GPL-3.0-or-later), s-config.com, SBC (MIT), Spivey's Corner, steel-battalion-net (LGPL-3.0), SteelBattalionController (Apache-2.0), SteelBattalionDriver (GPL-3.0), SteelBattalionMapper (GPL-3.0-or-later), tusb_xinput (MIT), uDrawTablet, Xb2XInput (GPL-3.0), xb360ChatpadToKM (GPL-3.0), xbox360wirelesschatpad, xboxdevwiki, xboxdrv (GPL-3.0-or-later) e xemu (LGPL-2.0-or-later). Solo documentazione, nessun codice distribuito.</value></data>
   <data name="About_Libwdi" xml:space="preserve"><value>libwdi</value></data>
   <data name="About_LibwdiDesc" xml:space="preserve"><value>Il pacchetto con un INF per dispositivo e l'elenco dei dispositivi dietro l'associazione automatica a WinUSB, di Pete Batard. Solo documentazione, nessun codice distribuito. LGPL-3.0-or-later.</value></data>
   <data name="About_Bluepad32" xml:space="preserve"><value>Bluepad32</value></data>
@@ -4109,4 +4262,6 @@ Vuoi che PadForge li disinstalli ora? L'operazione richiede privilegi elevati e 
   <data name="About_WiiBrewDesc" xml:space="preserve"><value>Documentazione del protocollo dell'altoparlante e della calibrazione IR del Wii Remote. Letta solo per i dettagli del protocollo.</value></data>
   <data name="About_X1nput" xml:space="preserve"><value>X1nput</value></data>
   <data name="About_X1nputDesc" xml:space="preserve"><value>Il report da 9 byte dei grilletti Impulse Xbox e il relativo percorso di scrittura, di araghon007. MIT.</value></data>
+  <data name="About_ChiakiNg" xml:space="preserve"><value>chiaki-ng</value></data>
+  <data name="About_ChiakiNgDesc" xml:space="preserve"><value>Il formato PCM aptico della PS5, 16 bit con segno a 3 kHz, che ha chiarito la codifica aptica a 8 bit con segno via Bluetooth. AGPL-3.0, letto solo come documentazione, nessun codice AGPL distribuito.</value></data>
 </root>

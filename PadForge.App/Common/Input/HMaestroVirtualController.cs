@@ -50,6 +50,11 @@ namespace PadForge.Common.Input
         // rumble-to-audio path read it without feedback loops.
         private long _inboundRumblePack;
 
+        /// <summary>The lightbar color a game writes to this Sony virtual,
+        /// for the slot's mice and keyboards (#494). Owned here so it moves
+        /// with the controller through a reorder, like the rumble pack.</summary>
+        private readonly Peripherals.GameLightbar _gameLightbar = new();
+
         /// <summary>Last logged XUSB SET_STATE shape (length + leading
         /// bytes), so the FFBXIN evidence line fires per dialect change
         /// rather than per packet.</summary>
@@ -70,7 +75,8 @@ namespace PadForge.Common.Input
         private const ushort DualSensePid = 0x0CE6;
         private const ushort DualSenseEdgePid = 0x0DF2;
         // Nintendo family: the virtual Switch Pro (HM v1.3.18, HM#33)
-        // decodes its rumble outputs onto OutputDecoded like Sony.
+        // decodes its rumble outputs onto OutputDecoded like Sony, and
+        // so does the Switch 2 Pro composite (HM v1.11.0, HM#66).
         private const ushort NintendoVid = 0x057E;
 
         private bool IsDualSenseVirtual =>
@@ -156,6 +162,21 @@ namespace PadForge.Common.Input
         public static bool DecodesFeedbackWithoutPidBlock(string profileId) =>
             string.Equals(profileId, "steam-deck-composite", StringComparison.OrdinalIgnoreCase);
 
+        /// <summary>True for a persona whose device side builds every input
+        /// report from a state block, HIDMaestro's own
+        /// <see cref="HMProfile.BuildsItsOwnReports"/> (2.0.0): switch-pro,
+        /// switch-pro-usb, dualshock-3-full and the Switch 2 Pro composite.
+        /// It takes state and no finished frame. A raw submit on it is its
+        /// state block, and HMController.SubmitRawReport throws
+        /// ArgumentException for any other length. PadForge once kept a test
+        /// of its own here, a USB/IP controller on 057E:2069, which named the
+        /// Switch 2 Pro composite alone.</summary>
+        internal static bool DeviceBuildsReports(HMProfile profile) =>
+            profile != null && profile.BuildsItsOwnReports;
+
+        /// <summary>See <see cref="DeviceBuildsReports"/>.</summary>
+        internal bool BuildsItsOwnReports { get; }
+
         /// <summary>The identity key handed to HIDMaestro for a virtual
         /// controller (HIDMaestro 1.8.0, HM#60). Every device path, the
         /// container id and, for USB/IP personas, the USB serial derive from
@@ -211,6 +232,10 @@ namespace PadForge.Common.Input
 
         private readonly string _identityKey;
 
+        /// <summary>The Switch 2 Pro family's row map, null on every other
+        /// profile. See <see cref="Switch2ProStateMap"/>.</summary>
+        private readonly Switch2ProStateMap _switch2Map;
+
         public HMaestroVirtualController(HMContext ctx, HMProfile profile, VirtualControllerType type,
             string identityKey = null)
         {
@@ -218,6 +243,8 @@ namespace PadForge.Common.Input
             _profile = profile ?? throw new ArgumentNullException(nameof(profile));
             _type = type;
             _identityKey = string.IsNullOrWhiteSpace(identityKey) ? null : identityKey;
+            BuildsItsOwnReports = DeviceBuildsReports(_profile);
+            _switch2Map = Switch2ProStateMap.ForProfile(_profile.Id);
 
             // Resolve the 6-slot canonical axis keys via the profile's
             // AxisMap, which maps wire HMAxis → semantic role string
@@ -313,12 +340,135 @@ namespace PadForge.Common.Input
             }
         }
 
+        /// <summary>Set by the test assembly for the life of its process
+        /// (PadForge.Tests VirtualControllerOffLimits), never by the app.
+        /// HIDMaestro makes device nodes, installs its driver and, for a
+        /// composite persona, attaches a USB device through usbip-win2, and
+        /// its sweep removes the controllers ended programs left on the PC
+        /// (every controller on the PC through 1.x, a running PadForge's
+        /// included), and its removal takes it off the PC. A test hands
+        /// <see cref="Connect"/> a seam in HIDMaestro's place. While this is
+        /// set, a Connect with no seam throws as a create that failed does,
+        /// the engine sets up no HIDMaestro context and installs no driver,
+        /// and no sweep or removal runs. False in production, where every
+        /// path is as it was.</summary>
+        internal static bool OffLimitsForTest;
+
+        /// <summary>HIDMaestro's sweep of the virtual controllers that
+        /// programs which have ended left on the PC, a crashed PadForge's
+        /// among them, its install kept. Since 2.0.0 it leaves every running
+        /// program's controllers alone, this one's included
+        /// (HMContext.RemoveAllVirtualControllers). The one way the app runs
+        /// it. The test host runs none: it made none of them, and the sweep
+        /// changes the PC.</summary>
+        internal static void SweepVirtualControllers()
+        {
+            if (OffLimitsForTest) return;
+            HMContext.RemoveAllVirtualControllers(preserveInstall: true);
+        }
+
+        /// <summary>HIDMaestro's removal of itself from the PC
+        /// (HMUninstall.Run, 2.0.1): every virtual controller, the driver,
+        /// its certificate, its registry keys and its files. The one way the
+        /// app runs it (Services.HIDMaestroRemoval). The test host runs none
+        /// and gets null.</summary>
+        internal static HMUninstallReport RemoveHIDMaestro(HMUninstallOptions options)
+        {
+            if (OffLimitsForTest) return null;
+            return HMUninstall.Run(options);
+        }
+
+        /// <summary>Test seam for the HIDMaestro call that makes the
+        /// controller, null in production. The real call creates a device,
+        /// and for a composite persona deploys the USB/IP transport and
+        /// attaches through it, so a test replaces it to run
+        /// <see cref="Connect"/> and <see cref="Disconnect"/> and see what
+        /// they record around it.</summary>
+        internal Func<HMProfile, string, HMController> CreateControllerSeam;
+
+        /// <summary>Test seam run once HIDMaestro has made the controller and
+        /// before the rest of <see cref="Connect"/>, null in production. A
+        /// test throws from it to fail Connect at the point where the device
+        /// already exists.</summary>
+        internal Action ControllerMadeSeam;
+
+        /// <summary>Test seam for the dispose a failed <see cref="Connect"/>
+        /// makes of the controller HIDMaestro handed it, null in production.
+        /// A test has no SDK controller to watch
+        /// (<see cref="CreateControllerSeam"/> hands back none), so it counts
+        /// the disposes here.</summary>
+        internal Action<HMController> DisposeControllerSeam;
+
         public void Connect()
         {
             if (IsConnected) return;
+            // A composite persona rides the real USB stack under its model's
+            // own ids. Step 1 knows one by HIDMaestro's serial on its USB
+            // device, and one with a captured serial from its ids alone,
+            // only while this process makes one
+            // (InputManager.ChecksUsbipAncestry). Recorded before the device
+            // exists, and retired if it never does.
+            bool persona = _profile.RequiresUsbipBackend;
+            if (persona) InputManager.NotePersonaLive(this, _profile.VendorId, _profile.ProductId);
             // The key makes the pad's paths durable across lives (HM#60);
             // a null key falls back to HIDMaestro's controller index.
-            _controller = _ctx.CreateController(_profile, _identityKey);
+            try
+            {
+                var seam = CreateControllerSeam;
+                if (seam == null && OffLimitsForTest)
+                    throw new InvalidOperationException("The test host creates no virtual controller device.");
+                _controller = seam != null
+                    ? seam(_profile, _identityKey)
+                    : _ctx.CreateController(_profile, _identityKey);
+            }
+            catch
+            {
+                if (persona) InputManager.NotePersonaRetired(this);
+                throw;
+            }
+
+            // HIDMaestro has made the controller, and its device with it. A
+            // throw from here on takes both down again on the way out. The
+            // caller's Dispose cannot: it calls Disconnect, which returns at
+            // once for a controller that never connected, so the SDK
+            // controller was never disposed and its device stayed.
+            try { FinishConnect(); }
+            catch
+            {
+                ReleaseFailedConnect(persona);
+                throw;
+            }
+
+            IsConnected = true;
+        }
+
+        /// <summary>Takes down what a <see cref="Connect"/> that threw after
+        /// HIDMaestro made the controller left behind: the SDK controller,
+        /// whose device stays for as long as it lives, the decoder built on
+        /// it, and the persona's place in Step 1's scope, retired after the
+        /// dispose as <see cref="Disconnect"/> retires it. A failure of the
+        /// dispose itself is dropped, so the caller sees the throw that
+        /// failed the Connect.</summary>
+        private void ReleaseFailedConnect(bool persona)
+        {
+            var controller = _controller;
+            _controller = null;
+            _ffbDecoder = null;
+            try
+            {
+                var seam = DisposeControllerSeam;
+                if (seam != null) seam(controller);
+                else controller?.Dispose();
+            }
+            catch { /* the Connect's own failure is the one to report */ }
+            if (persona) InputManager.NotePersonaRetired(this);
+        }
+
+        /// <summary>The rest of <see cref="Connect"/>, once HIDMaestro has
+        /// made the controller.</summary>
+        private void FinishConnect()
+        {
+            ControllerMadeSeam?.Invoke();
 
             // Fresh HMController = fresh shared section. Reset the idle-dedup
             // memory so the first frame always submits instead of waiting out
@@ -330,14 +480,14 @@ namespace PadForge.Common.Input
             // GetFeature(PidPool) up-front to discover capabilities, so the
             // shared section must be populated by the time the device shows
             // up to host enumeration. Lazy init on first OutputReceived was
-            // too late — the first GetFeature can land before the first
+            // too late. The first GetFeature can land before the first
             // SetFeature/Output packet ever does.
             //
             // Gate on the descriptor carrying the PID FFB block, not on VID.
             // The synthetic Custom profile (0xBEEF) ships with FFB built in,
             // but Extended slots that customize a non-Custom catalog profile
             // also rebuild the descriptor with AddPidFfbBlock when the user
-            // ticks the FFB checkbox — those keep the catalog VID/PID (so
+            // ticks the FFB checkbox. Those keep the catalog VID/PID (so
             // games still recognize the original device's signature) but
             // need the same decoder + PID-state publish path. Inspecting
             // the descriptor catches both cases without coupling to VID.
@@ -347,8 +497,6 @@ namespace PadForge.Common.Input
                 _ffbDecoder = new HMaestroFfbDecoder(_controller, descriptorHex);
                 _ffbDecoder.PublishInitialState();
             }
-
-            IsConnected = true;
         }
 
         /// <summary>Set under <c>_dispatcherLock</c> the moment teardown
@@ -412,14 +560,26 @@ namespace PadForge.Common.Input
                 }
             }
 
+            // The slot no longer shows this controller's game color (#494),
+            // whichever pad it last fed: a teardown can run after the
+            // feedback detach parked the index.
+            Peripherals.GameLightbarCapture.WithdrawEverywhere(_gameLightbar);
+
             _controller?.Dispose();
             _controller = null;
             IsConnected = false;
+            // The persona's device leaves the tree from here on.
+            if (_profile.RequiresUsbipBackend) InputManager.NotePersonaRetired(this);
         }
 
         /// <summary>Registers a new controller's effects without starting output.</summary>
         internal UserEffectsDispatcher PrepareDeviceEffectsForPublication(PadForge.ViewModels.DeviceSlotConfig config)
         {
+            // The slot's game color comes from the controller that won it
+            // (#494), never from a spare that loses and is torn down. Only a
+            // Sony profile decodes a lightbar.
+            if (_profile.VendorId == SonyVid && FeedbackPadIndex >= 0)
+                Peripherals.GameLightbarCapture.Publish(FeedbackPadIndex, _gameLightbar);
             if (config == null) return null;
             lock (_dispatcherLock)
             {
@@ -493,7 +653,15 @@ namespace PadForge.Common.Input
         /// entry.</para></summary>
         internal void RetargetToPad(int newPadIndex, PadForge.ViewModels.DeviceSlotConfig config)
         {
+            int oldPadIndex = FeedbackPadIndex;
             FeedbackPadIndex = newPadIndex;
+            // The game color moves with the controller. In a two-pad swap the
+            // second move finds its old pad already taken and leaves it.
+            if (_profile.VendorId == SonyVid)
+            {
+                Peripherals.GameLightbarCapture.Withdraw(oldPadIndex, _gameLightbar);
+                Peripherals.GameLightbarCapture.Publish(newPadIndex, _gameLightbar);
+            }
 
             // DS5 pass-through: rebuild against the new pad. Recreated here
             // rather than deferred, because RegisterFeedbackCallback (its only
@@ -1003,6 +1171,14 @@ namespace PadForge.Common.Input
                 StoreRawFrame(in raw, hadMotion: false, nowRawTick);
             }
 
+            _controller.SubmitState(BuildRawHidState(raw, sticks, triggers, in motion));
+        }
+
+        /// <summary>The state one raw-surface frame submits. It needs no
+        /// device, so a test can hand it to HIDMaestro's own encoders.</summary>
+        internal HMGamepadState BuildRawHidState(RawHidState raw, int sticks, int triggers,
+            in PadForge.Services.MotionSnapshot motion)
+        {
             short Ax(int i) => (raw.Axes != null && i >= 0 && i < raw.Axes.Length) ? raw.Axes[i] : (short)0;
 
             // Convert raw signed short (-32768..+32767) to HM v1.3.9's
@@ -1071,6 +1247,17 @@ namespace PadForge.Common.Input
                 }
             }
 
+            // A Switch 2 Pro profile reads neither of those. HIDMaestro
+            // takes its buttons by name, its D-pad from the hat and ZL /
+            // ZR from the trigger axes, so the rows go through the family's
+            // map and replace the mask and the hat built above.
+            bool zl = false, zr = false;
+            if (_switch2Map != null)
+            {
+                _switch2Map.Read(in raw, out buttons, out ushort dpad, out zl, out zr);
+                hat = MapHat(dpad);
+            }
+
             // HM v1.3.9: address every analog axis the profile exposes
             // by HMAxis key. Drive _profile.Sticks / _profile.Triggers
             // directly — those are the SDK's authoritative per-row
@@ -1107,6 +1294,15 @@ namespace PadForge.Common.Input
                     _axesScratch[axis] = ToHmRange(Ax(ti));
             }
 
+            if (_switch2Map != null)
+            {
+                // Written every frame, held or not. A trigger axis the
+                // state lacks is HIDMaestro's to guess, and 1.10.1 read
+                // the right stick's Y for it: a resting slot held ZR.
+                if (_axLeftTrigger != HMAxis.None) _axesScratch[_axLeftTrigger] = zl ? 1f : 0f;
+                if (_axRightTrigger != HMAxis.None) _axesScratch[_axRightTrigger] = zr ? 1f : 0f;
+            }
+
             var state = new HMGamepadState
             {
                 Axes = _axesScratch,
@@ -1130,7 +1326,7 @@ namespace PadForge.Common.Input
                 state.GyroDpsZ = motion.GyroRoll;
             }
 
-            _controller.SubmitState(state);
+            return state;
         }
 
         /// <summary>The usage the descriptor gave trigger <paramref name="t"/>,
@@ -1212,8 +1408,10 @@ namespace PadForge.Common.Input
         /// repopulating a slot this VC no longer owns.</summary>
         public void UnregisterFeedback()
         {
+            int pad = FeedbackPadIndex;
             FeedbackPadIndex = -1;
             _fbVibrationStates = null;
+            Peripherals.GameLightbarCapture.Withdraw(pad, _gameLightbar);
         }
 
         public void RegisterFeedbackCallback(int padIndex, Vibration[] vibrationStates)
@@ -1275,36 +1473,41 @@ namespace PadForge.Common.Input
                 int idx = FeedbackPadIndex;
                 if (idx < 0 || idx >= vibrationStates.Length) return;
 
-                // Chroma lightbar mirror (#373): every Sony profile's codec
-                // decodes a 'lightbar' rgb24 field (byte[3] R,G,B) with the
-                // per-transport offsets handled by the profile declaration,
-                // so no parser lives here. The family's validity bit says
-                // whether THIS write carries the lightbar: DualSense/Edge
-                // assert validFlag1 bit 2 (the NotifyExternalSubsystems
-                // gate), DualShock 4 asserts validFlag0 bit 1 (SDL
-                // k_EPS4EffectLED = 1 << 1). Publish is one volatile write,
-                // so an idle mirror costs nothing on this callback.
-                if (e.Fields.TryGetValue("lightbar", out var lbObj)
-                    && lbObj is byte[] lbRgb && lbRgb.Length >= 3)
-                {
-                    bool lbValid;
-                    if (IsDualSenseVirtual)
-                        lbValid = e.Fields.TryGetValue("validFlag1", out var vf1Obj)
-                            && vf1Obj is byte lbVf1 && (lbVf1 & 0x04) != 0;
-                    else
-                        lbValid = e.Fields.TryGetValue("validFlag0", out var vf0Obj)
-                            && vf0Obj is byte lbVf0 && (lbVf0 & 0x02) != 0;
-                    if (lbValid)
-                    {
-                        PadForge.Services.ChromaLightbarService.Publish(lbRgb[0], lbRgb[1], lbRgb[2]);
-                        // Lightsync lightbar mirror (#382): the Logitech
-                        // sibling rides the exact same decoded field and
-                        // validity gate, one more volatile write.
-                        PadForge.Services.LightsyncLightbarService.Publish(lbRgb[0], lbRgb[1], lbRgb[2]);
-                    }
-                }
-
                 int declaredSize = _profile.ExtendedOutputReport?.Size ?? -1;
+
+                // The game's lightbar for the slot's mice and keyboards (#494).
+                // Every Sony profile's codec decodes a 'lightbar' rgb24 field
+                // (byte[3] R,G,B) with the per-transport offsets handled by
+                // the profile declaration, so no parser lives here. The
+                // family's validity bit says whether THIS write carries the
+                // lightbar: DualSense/Edge assert validFlag1 bit 2 (the
+                // NotifyExternalSubsystems gate), DualShock 4 asserts
+                // validFlag0 bit 1 (SDL k_EPS4EffectLED = 1 << 1). Only a
+                // frame the trust gate accepts counts, the declared length and
+                // a valid checksum (SonyFrameValid): the Chroma and LIGHTSYNC
+                // mirrors this replaced read the field before that gate, so a
+                // corrupt Bluetooth frame could paint a keyboard. Any trusted
+                // frame also says the game is still there, which keeps the
+                // color it set earlier.
+                if (_profile.VendorId == SonyVid
+                    && SonyFrameValid(e.RawBytes.Length, declaredSize, e.CrcValid))
+                {
+                    long lbNow = Environment.TickCount64;
+                    bool lbValid = false;
+                    if (e.Fields.TryGetValue("lightbar", out var lbObj)
+                        && lbObj is byte[] lbRgb && lbRgb.Length >= 3)
+                    {
+                        if (IsDualSenseVirtual)
+                            lbValid = e.Fields.TryGetValue("validFlag1", out var vf1Obj)
+                                && vf1Obj is byte lbVf1 && (lbVf1 & 0x04) != 0;
+                        else
+                            lbValid = e.Fields.TryGetValue("validFlag0", out var vf0Obj)
+                                && vf0Obj is byte lbVf0 && (lbVf0 & 0x02) != 0;
+                        if (lbValid && _gameLightbar.Capture(lbRgb[0], lbRgb[1], lbRgb[2], lbNow))
+                            Peripherals.GameLightbarCapture.NotifyChanged(idx);
+                    }
+                    if (!lbValid) _gameLightbar.NoteFrame(lbNow);
+                }
 
                 // Order (#434): the pass-through forward and the
                 // per-subsystem mirror run BEFORE the motor gate below
@@ -1425,7 +1628,10 @@ namespace PadForge.Common.Input
                         // the motor fields for genuine rumble frames, and
                         // this wire has no validFlag/CRC to gate on. Same
                         // provenance as the motors above: game-authored
-                        // only, so the #236 pack rides directly.
+                        // only, so the #236 pack rides directly. The
+                        // Switch 2 Pro composite (HM v1.11.0) rides here
+                        // too: the SDK decodes its output report 0x02
+                        // into the same pair, and a stop arrives as 0, 0.
                         System.Threading.Volatile.Write(ref _inboundRumblePack,
                             Engine.Common.LfeOutputState.Pack(
                                 (ushort)(left * 257), (ushort)(right * 257), 0, 0));

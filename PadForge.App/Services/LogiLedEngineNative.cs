@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -7,7 +8,8 @@ using Microsoft.Win32;
 namespace PadForge.Services
 {
     /// <summary>
-    /// Production native layer for <see cref="LightsyncLightbarService"/>:
+    /// Production native layer for the LED SDK worker
+    /// (<see cref="PadForge.Common.Input.Peripherals.LedSdkBackend"/>, #494):
     /// replicates the LogitechLedEnginesWrapper.dll shim (#382). The shim's
     /// entire loader, proven by its PE imports and string table, is a
     /// registry read of the CLSID ServerBinary default value, a version
@@ -21,14 +23,15 @@ namespace PadForge.Services
     /// 4-byte BOOL width mismatch the C# reference wrappers silently
     /// carry. LogiLedInitWithName takes an ANSI char*, per the mangling
     /// (QEBD) and the Rust binding's CString call site. Optional exports
-    /// (InitWithName, SetTargetDevice, Save, Restore) degrade per export:
-    /// old engines carry only 13 exports (proven by PE parse), and a
-    /// missing optional must not kill the feature.
+    /// (InitWithName, SetTargetDevice, Save, Restore,
+    /// SetLightingForTargetZone) degrade per export: old engines carry only
+    /// 13 exports (proven by PE parse), and a missing optional must not kill
+    /// the feature.
     ///
     /// Single-caller contract: the service worker owns every call here,
     /// the serialization discipline all references keep.
     /// </summary>
-    internal sealed class LogiLedEngineNative : LightsyncLightbarService.ILogiLedNative
+    internal sealed class LogiLedEngineNative : PadForge.Common.Input.Peripherals.ILogiLedNative
     {
         // The key the wrapper shim reads (its only embedded wide string,
         // identical across both wrapper generations), and the same key
@@ -39,8 +42,6 @@ namespace PadForge.Services
         // Aurora validates the registered engine by FileDescription
         // before trusting it (LgsInstallationUtils.cs:48-64).
         internal const string EngineFileDescription = "Logitech Gaming LED SDK";
-
-        private const int LogiDeviceTypeAll = 7; // MONOCHROME 1 | RGB 2 | PERKEY_RGB 4
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
@@ -63,6 +64,8 @@ namespace PadForge.Services
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate byte SetLightingFn(int redPct, int greenPct, int bluePct);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate byte SetZoneFn(int deviceType, int zone, int redPct, int greenPct, int bluePct);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void VoidFn();
 
         private IntPtr _module;
@@ -72,24 +75,38 @@ namespace PadForge.Services
         private BoolFn _save;
         private BoolFn _restore;
         private SetLightingFn _setLighting;
+        private SetZoneFn _setZone;
         private VoidFn _shutdown;
 
-        public bool SoftwarePresent()
+        /// <summary>The process names every reference gates on: G HUB's
+        /// agent, then both LGS-era hosts.</summary>
+        internal static readonly string[] HostProcesses = { "lghub_agent", "lgs", "LCore" };
+
+        /// <summary>The first of <see cref="HostProcesses"/> running, or
+        /// null, from one walk of the process list. It took a walk per name,
+        /// three while G HUB is closed, at 230 to 290 ms each on a PC with
+        /// about 480 processes.</summary>
+        internal static string RunningHost()
+            => FirstRunning(PadForge.Common.Input.ProcessPresence.RunningAmong(HostProcesses));
+
+        /// <summary>The first of <see cref="HostProcesses"/>, in their order,
+        /// that <paramref name="running"/> holds, or null.</summary>
+        internal static string FirstRunning(ICollection<string> running)
         {
-            // The process names every reference gates on: G HUB's agent,
-            // and both LGS-era hosts.
-            foreach (string name in new[] { "lghub_agent", "lgs", "LCore" })
-            {
-                var procs = Process.GetProcessesByName(name);
-                bool any = procs.Length > 0;
-                foreach (var p in procs) p.Dispose();
-                if (any) return true;
-            }
-            return false;
+            foreach (string name in HostProcesses)
+                if (running.Contains(name)) return name;
+            return null;
         }
+
+        public bool SoftwarePresent() => RunningHost() != null;
 
         public bool TryLoad(out string detail)
         {
+            if (PadForge.Engine.Common.VendorProgramGate.Refuses)
+            {
+                detail = "the test host loads no vendor engine";
+                return false;
+            }
             if (_module != IntPtr.Zero) { detail = "already loaded"; return true; }
 
             string path = null;
@@ -144,6 +161,9 @@ namespace PadForge.Services
             _setTarget = Resolve<SetTargetFn>("LogiLedSetTargetDevice");
             _save = Resolve<BoolFn>("LogiLedSaveCurrentLighting");
             _restore = Resolve<BoolFn>("LogiLedRestoreLighting");
+            // The 9.00 header's zone call (logitech-led-sdk-rs
+            // bindings-x86_64.rs:354, RGB.NET _LogitechGSDK.cs:146).
+            _setZone = Resolve<SetZoneFn>("LogiLedSetLightingForTargetZone");
             detail = $"loaded {path}";
             return true;
         }
@@ -163,9 +183,27 @@ namespace PadForge.Services
             catch { return false; }
         }
 
-        public bool SetTargetAll()
+        public bool SetTarget(int deviceTypeMask)
         {
-            try { return _setTarget == null || _setTarget(LogiDeviceTypeAll) != 0; }
+            try { return _setTarget == null || _setTarget(deviceTypeMask) != 0; }
+            catch { return false; }
+        }
+
+        public bool Restore()
+        {
+            try { return _restore == null || _restore() != 0; }
+            catch { return false; }
+        }
+
+        public bool ZoneCallsAvailable => _setZone != null;
+
+        public bool TargetCallsAvailable => _setTarget != null;
+
+        public bool SetLightingForTargetZone(int deviceType, int zone, int rPct, int gPct, int bPct)
+        {
+            var fn = _setZone;
+            if (fn == null) return false;
+            try { return fn(deviceType, zone, rPct, gPct, bPct) != 0; }
             catch { return false; }
         }
 
@@ -203,6 +241,7 @@ namespace PadForge.Services
             _save = null;
             _restore = null;
             _setLighting = null;
+            _setZone = null;
             _shutdown = null;
             if (_module != IntPtr.Zero)
             {

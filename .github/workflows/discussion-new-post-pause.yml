@@ -1,0 +1,185 @@
+# Pause new discussions from people without write access, while replies
+# to existing discussions stay open.
+#
+# GitHub can limit issue creation to collaborators (Settings > Features >
+# Issues), but it has no matching control for discussions short of
+# switching every category to the Announcement format, which relabels
+# every existing thread in it. This workflow does the rest: a new
+# discussion from anyone outside the project gets a short explanation, is
+# locked at once, and is deleted an hour later.
+#
+# Keep a post: unlock it within the hour. The delete step and the sweep
+# both skip a discussion that is no longer locked, and take the marker off
+# its notice, so a lock put on it later, as when it is answered and
+# closed, does not mark it for deletion again.
+#
+# Lift the pause: disable this workflow in the Actions tab.
+#
+# Auth: ISSUE_BOT_TOKEN, the owner's token. Deleting a discussion needs
+# admin rights, which GITHUB_TOKEN does not carry.
+#
+# The sweep runs every 15 minutes and deletes any paused discussion whose
+# notice is over an hour old, so a cancelled or failed run cannot leave
+# one behind. It deletes a discussion only when all three hold: it is
+# locked, its author is outside the project, and the owner's account
+# posted the notice. Anyone can type the marker into a comment, so the
+# marker alone would let a commenter mark any thread for deletion. A
+# paused discussion it finds unlocked after the hour is kept, and its
+# notice loses the marker.
+
+name: Pause new discussions
+
+on:
+  discussion:
+    types: [created]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      discussion_number:
+        description: 'Pause this discussion number whoever posted it (for testing). Leave empty to run the sweep.'
+        required: false
+        default: ''
+      delay_seconds:
+        description: 'Seconds to wait before deleting, on a test run'
+        required: false
+        default: '3600'
+
+permissions:
+  contents: read
+
+env:
+  MARKER: '<!-- padforge-new-discussion-pause -->'
+  # What the marker becomes on a notice whose discussion was kept. It does
+  # not contain MARKER, so nothing reads it as a pause.
+  KEPT: '<!-- padforge-new-discussion-kept -->'
+
+jobs:
+  pause:
+    if: >-
+      (github.event_name == 'discussion'
+        && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.discussion.author_association))
+      || (github.event_name == 'workflow_dispatch' && inputs.discussion_number != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GH_TOKEN: ${{ secrets.ISSUE_BOT_TOKEN }}
+      NUMBER: ${{ github.event.discussion.number || inputs.discussion_number }}
+      DELAY: ${{ github.event_name == 'workflow_dispatch' && inputs.delay_seconds || '3600' }}
+    steps:
+      - name: Explain and lock
+        run: |
+          set -euo pipefail
+          o="${GITHUB_REPOSITORY%/*}"; n="${GITHUB_REPOSITORY#*/}"
+          id=$(gh api graphql \
+            -f query='query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){discussion(number:$num){id}}}' \
+            -f o="$o" -f n="$n" -F num="$NUMBER" --jq .data.repository.discussion.id)
+          echo "DISCUSSION_ID=$id" >> "$GITHUB_ENV"
+          body=$(cat <<'NOTICE'
+          Thanks for posting. New discussions are paused for now while work on the next release is underway, so this one is locked and will be removed in about an hour. Replies to existing discussions are still open. Please post it again once the pause lifts.
+
+          <!-- padforge-new-discussion-pause -->
+          NOTICE
+          )
+          gh api graphql \
+            -f query='mutation($d:ID!,$b:String!){addDiscussionComment(input:{discussionId:$d,body:$b}){comment{id}}}' \
+            -f d="$id" -f b="$body" > /dev/null
+          gh api graphql \
+            -f query='mutation($d:ID!){lockLockable(input:{lockableId:$d}){lockedRecord{locked}}}' \
+            -f d="$id" > /dev/null
+          echo "Discussion #$NUMBER locked with the notice."
+
+      - name: Wait
+        run: sleep "$DELAY"
+
+      - name: Delete unless unlocked
+        run: |
+          set -euo pipefail
+          # "true", "false", or "null" for a discussion that is gone. The
+          # // operator would turn false into its fallback too.
+          locked=$(gh api graphql \
+            -f query='query($d:ID!){node(id:$d){... on Discussion{locked}}}' \
+            -f d="$DISCUSSION_ID" --jq '.data.node.locked | tostring' 2>/dev/null || echo error)
+          if [ "$locked" = "false" ]; then
+            # Kept. The owner's notice loses its marker, so the sweep never
+            # takes this discussion for a paused one.
+            gh api graphql \
+              -f query='query($d:ID!){node(id:$d){... on Discussion{comments(first:10){nodes{id body author{login}}}}}}' \
+              -f d="$DISCUSSION_ID" \
+            | jq -c --arg m "$MARKER" --arg k "$KEPT" --arg owner "${GITHUB_REPOSITORY%/*}" '
+                .data.node.comments.nodes[]
+                | select(.author.login == $owner and (.body | contains($m)))
+                | {id, body: (.body | split($m) | join($k))}' \
+            | while read -r row; do
+                gh api graphql \
+                  -f query='mutation($c:ID!,$b:String!){updateDiscussionComment(input:{commentId:$c,body:$b}){comment{id}}}' \
+                  -f c="$(jq -r .id <<<"$row")" -f b="$(jq -r .body <<<"$row")" > /dev/null
+              done
+            echo "Discussion #$NUMBER was unlocked, so it stays."
+            exit 0
+          fi
+          if [ "$locked" != "true" ]; then
+            echo "Discussion #$NUMBER is gone or could not be read ($locked). Leaving it."
+            exit 0
+          fi
+          gh api graphql \
+            -f query='mutation($d:ID!){deleteDiscussion(input:{id:$d}){discussion{number}}}' \
+            -f d="$DISCUSSION_ID" > /dev/null
+          echo "Discussion #$NUMBER deleted."
+
+  sweep:
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && inputs.discussion_number == '')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ISSUE_BOT_TOKEN }}
+    steps:
+      - name: Delete paused discussions older than an hour
+        run: |
+          set -euo pipefail
+          o="${GITHUB_REPOSITORY%/*}"; n="${GITHUB_REPOSITORY#*/}"
+          now=$(date -u +%s)
+          data=$(gh api graphql \
+            -f query='query($o:String!,$n:String!){repository(owner:$o,name:$n){discussions(first:50,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number locked authorAssociation comments(first:10){nodes{id body createdAt author{login}}}}}}}' \
+            -f o="$o" -f n="$n")
+          # Kept: a paused discussion that is unlocked once its hour is up.
+          # Its notice loses the marker, as the delete step does it, for a
+          # pause whose run ended before that step.
+          jq -c --arg m "$MARKER" --arg k "$KEPT" --arg owner "$o" --argjson now "$now" '
+              .data.repository.discussions.nodes[]
+              | select(.locked | not)
+              | select(.authorAssociation as $a | ["OWNER","MEMBER","COLLABORATOR"] | index($a) | not)
+              | .number as $num
+              | .comments.nodes[]
+              | select(.author.login == $owner and (.body | contains($m))
+                       and ((.createdAt | fromdateiso8601) <= ($now - 3600)))
+              | {id, num: $num, body: (.body | split($m) | join($k))}' <<<"$data" \
+          | while read -r row; do
+              num=$(jq -r .num <<<"$row")
+              if gh api graphql \
+                   -f query='mutation($c:ID!,$b:String!){updateDiscussionComment(input:{commentId:$c,body:$b}){comment{id}}}' \
+                   -f c="$(jq -r .id <<<"$row")" -f b="$(jq -r .body <<<"$row")" > /dev/null; then
+                echo "Kept #$num: its notice no longer marks it."
+              else
+                echo "Could not take the marker off the notice on #$num."
+              fi
+            done
+          jq -r --arg m "$MARKER" --arg owner "$o" --argjson now "$now" '
+              .data.repository.discussions.nodes[]
+              | select(.locked)
+              | select(.authorAssociation as $a | ["OWNER","MEMBER","COLLABORATOR"] | index($a) | not)
+              | select([.comments.nodes[]
+                        | select(.author.login == $owner and (.body | contains($m)))
+                        | (.createdAt | fromdateiso8601)]
+                       | length > 0 and min <= ($now - 3600))
+              | "\(.id) \(.number)"' <<<"$data" \
+          | while read -r id num; do
+              if gh api graphql \
+                   -f query='mutation($d:ID!){deleteDiscussion(input:{id:$d}){discussion{number}}}' \
+                   -f d="$id" > /dev/null; then
+                echo "Deleted paused discussion #$num."
+              else
+                echo "Could not delete #$num, it may already be gone."
+              fi
+            done

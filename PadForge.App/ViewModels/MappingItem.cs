@@ -205,9 +205,15 @@ namespace PadForge.ViewModels
             if (!ReferenceEquals(msi, _primaryKindSource)) msi.EnforceRapidTriggerGate();
             msi.SyncSelectedInputFromState(AvailableInputs);
             // ParamUp/Down/Modifier picker bridges resolve their
-            // InputChoice against this row's AvailableInputs — re-fire
-            // the picker getters whenever the input list is rebuilt.
+            // InputChoice against this row's AvailableInputs, so the
+            // picker getters re-fire whenever the input list is rebuilt.
             msi.RefreshParamPickerChoices();
+            // With the list in, a key saved before keys carried a controller
+            // takes the one its picker shows. Not while a load fills the row
+            // (BeginLoadRow): the slot's list is rebuilt after the rows load,
+            // and the one in hand can still be the previous controllers'.
+            // The rebuild's RefreshAllExtraSourceInputs decides then.
+            if (!_suppressPrimaryKindGate) msi.AdoptLegacyKeyDevices();
         }
 
         /// <summary>True when the row's target is a discrete
@@ -361,16 +367,14 @@ namespace PadForge.ViewModels
             }
         }
 
-        /// <summary>Keeps the primary off an option the gate no longer offers. When
-        /// the last contributing secondary goes away while the primary is InvertOnHold,
-        /// the primary would be inert, so revert it to Direct. Re-fires the options so
-        /// the dropdown updates.</summary>
         /// <summary>Set while a reload is repopulating this row. The gate
         /// below reads ExtraSources, and a reload empties that collection
         /// before refilling it, so every firing point saw "no contributing
         /// secondary" mid-load and reverted a perfectly valid stored
         /// InvertOnHold primary to Direct. The loader brackets the row and
-        /// runs the gate once at the end, against the finished state.</summary>
+        /// runs the gate once at the end, against the finished state. A key
+        /// saved before keys carried a controller takes none inside the
+        /// bracket either (<see cref="RefreshExtraSourceInputs"/>).</summary>
         private bool _suppressPrimaryKindGate;
 
         internal void BeginLoadRow() => _suppressPrimaryKindGate = true;
@@ -385,6 +389,10 @@ namespace PadForge.ViewModels
             if (IsMultiSource) EnsureCombineModeDefault();
         }
 
+        /// <summary>Keeps the primary off an option the gate no longer offers. When
+        /// the last contributing secondary goes away while the primary is InvertOnHold,
+        /// the primary would be inert, so revert it to Direct. Re-fires the options so
+        /// the dropdown updates.</summary>
         private void EnforcePrimaryKindGate()
         {
             if (_suppressPrimaryKindGate) return;
@@ -464,23 +472,43 @@ namespace PadForge.ViewModels
                 p.ParamUp = "";
                 p.ParamDown = "";
                 p.ParamModifier = "";
+                p.ParamUpDeviceGuid = null;
+                p.ParamDownDeviceGuid = null;
+                p.ParamModifierDeviceGuid = null;
                 p.Kind = src?.Kind is "Toggle" or "RapidTrigger" ? src.Kind : "Direct";
+                // The holder names no controller either. The one a key
+                // source loaded before had left here was saved as the
+                // primary's own once its kind read keys again, and a source
+                // on a controller the slot does not have is dropped by the
+                // next device merge.
+                p.DeviceGuid = "";
+                p.DeviceLabel = "";
                 return;
             }
-            p.DeviceGuid = src.DeviceGuid ?? "";
-            p.Invert = src.Invert;
-            p.ParamUp = src.ParamUp ?? "";
-            p.ParamDown = src.ParamDown ?? "";
-            p.ParamRate = src.ParamRate;
-            p.ParamSticky = src.ParamSticky;
-            p.ParamMin = src.ParamMin;
-            p.ParamMax = src.ParamMax;
-            p.ParamModifier = src.ParamModifier ?? "";
-            p.ParamAttackTime = src.ParamAttackTime;
-            p.ParamReleaseTime = src.ParamReleaseTime;
-            p.ParamAutocenter = src.ParamAutocenter;
-            p.ParamReverseMultiplier = src.ParamReverseMultiplier >= 1 ? src.ParamReverseMultiplier : 4.0;
-            p.Kind = src.Kind; // set Kind last so card visibility settles after params load
+            // The device lands before the keys, so no key takes a controller
+            // until the whole source is in (MappingSourceItem.LoadingKeys).
+            p.LoadingKeys = true;
+            try
+            {
+                p.DeviceGuid = src.DeviceGuid ?? "";
+                p.Invert = src.Invert;
+                p.ParamUp = src.ParamUp ?? "";
+                p.ParamDown = src.ParamDown ?? "";
+                p.ParamUpDeviceGuid = src.ParamUpDeviceGuid;
+                p.ParamDownDeviceGuid = src.ParamDownDeviceGuid;
+                p.ParamRate = src.ParamRate;
+                p.ParamSticky = src.ParamSticky;
+                p.ParamMin = src.ParamMin;
+                p.ParamMax = src.ParamMax;
+                p.ParamModifier = src.ParamModifier ?? "";
+                p.ParamModifierDeviceGuid = src.ParamModifierDeviceGuid;
+                p.ParamAttackTime = src.ParamAttackTime;
+                p.ParamReleaseTime = src.ParamReleaseTime;
+                p.ParamAutocenter = src.ParamAutocenter;
+                p.ParamReverseMultiplier = src.ParamReverseMultiplier >= 1 ? src.ParamReverseMultiplier : 4.0;
+                p.Kind = src.Kind; // set Kind last so card visibility settles after params load
+            }
+            finally { p.LoadingKeys = false; }
             RefreshExtraSourceInputs(p);
         }
 
@@ -795,8 +823,9 @@ namespace PadForge.ViewModels
         internal void BeginSharedListRebuild() => _suppressSelectionSync = true;
 
         private ObservableCollection<InputChoice> _paramInputs;
-        /// <summary>The slot's full list, for the modifier and Up and Down
-        /// pickers and their lookups. It differs from
+        /// <summary>The slot's full list, for the modifier picker and for
+        /// the lookups of the modifier and the Up and Down keys. The Up and
+        /// Down pickers offer <see cref="KeyInputs"/>, a part of it. It differs from
         /// <see cref="AvailableInputs"/> only on the Motion rows (#475),
         /// whose source pickers offer the bundled motion sources alone while
         /// an InvertOnHold modifier still needs a button.</summary>
@@ -824,8 +853,8 @@ namespace PadForge.ViewModels
             }
         }
 
-        /// <summary>Points the modifier and Up and Down pickers at the slot's
-        /// full list. Call after <see cref="UseSharedAvailableInputs"/>: the
+        /// <summary>Points the modifier picker and the parameter lookups at
+        /// the slot's full list. Call after <see cref="UseSharedAvailableInputs"/>: the
         /// same list as the row's own collapses back to it.</summary>
         internal void UseSharedParamInputs(ObservableCollection<InputChoice> full)
         {
@@ -835,6 +864,48 @@ namespace PadForge.ViewModels
             _paramInputsView = null;
             OnPropertyChanged(nameof(ParamInputs));
             OnPropertyChanged(nameof(ParamInputsView));
+        }
+
+        private ObservableCollection<InputChoice> _keyInputs = new();
+        /// <summary>What the Up and Down pickers of an Incremental or Ramp
+        /// source offer: the slot's inputs that read as a key
+        /// (<c>PadViewModel.SlotKeyInputs</c>). A key saved from the full
+        /// list before the pickers were narrowed, a stick or a trigger, is
+        /// not in it, so its picker shows no selection. The saved value
+        /// stays until the user picks a key or resets the field.</summary>
+        public ObservableCollection<InputChoice> KeyInputs => _keyInputs;
+
+        private ICollectionView _keyInputsView;
+        /// <summary>The grouped view of <see cref="KeyInputs"/>. One
+        /// default view per collection, so every row of the slot shares it
+        /// and the grouping is set once.</summary>
+        public ICollectionView KeyInputsView
+        {
+            get
+            {
+                if (_keyInputsView == null)
+                {
+                    _keyInputsView = CollectionViewSource.GetDefaultView(_keyInputs);
+                    if (_keyInputsView != null
+                        && _keyInputsView.GroupDescriptions != null
+                        && _keyInputsView.GroupDescriptions.Count == 0)
+                    {
+                        _keyInputsView.GroupDescriptions.Add(
+                            new PropertyGroupDescription(nameof(InputChoice.DeviceLabel)));
+                    }
+                }
+                return _keyInputsView;
+            }
+        }
+
+        /// <summary>Points the Up and Down pickers at the slot's key list.</summary>
+        internal void UseSharedKeyInputs(ObservableCollection<InputChoice> shared)
+        {
+            if (shared == null || ReferenceEquals(_keyInputs, shared)) return;
+            _keyInputs = shared;
+            _keyInputsView = null;
+            OnPropertyChanged(nameof(KeyInputs));
+            OnPropertyChanged(nameof(KeyInputsView));
         }
 
         internal void EndSharedListRebuild()
@@ -909,13 +980,6 @@ namespace PadForge.ViewModels
             }
         }
 
-        /// <summary>
-        /// Synchronizes SelectedInput to match the current SourceDescriptor
-        /// + <see cref="PrimarySourceDeviceGuid"/> without triggering a
-        /// descriptor update. Match is on (DeviceGuid, Descriptor) so a
-        /// "Button 0" on the DualSense and a "Button 0" on a keyboard
-        /// (which auto-mapping might have stamped) don't get confused.
-        /// </summary>
         /// <summary>Replaces the picker's item list and re-resolves the
         /// selection, with the SelectedInput setter suppressed across BOTH
         /// steps.
@@ -932,10 +996,11 @@ namespace PadForge.ViewModels
         /// shape suppressed only SyncSelectedInputFromDescriptor, so the two
         /// list mutations ran wide open. No test caught it because the
         /// provocation needs a real ComboBox: with no visual tree nothing
-        /// ever writes back.</para></summary>
-        /// <summary>Test seam: runs <paramref name="duringRebuild"/> at the
+        /// ever writes back.</para>
+        ///
+        /// <para>Test seam: runs <paramref name="duringRebuild"/> at the
         /// exact point a live ComboBox would write its SelectedItem back,
-        /// so the suppression can be asserted without a visual tree.</summary>
+        /// so the suppression can be asserted without a visual tree.</para></summary>
         internal void ReplaceAvailableInputsForTest(
             System.Collections.Generic.IEnumerable<InputChoice> choices,
             System.Action duringRebuild)
@@ -952,6 +1017,13 @@ namespace PadForge.ViewModels
             SyncSelectedInputFromDescriptor();
         }
 
+        /// <summary>
+        /// Synchronizes SelectedInput to match the current SourceDescriptor
+        /// + <see cref="PrimarySourceDeviceGuid"/> without triggering a
+        /// descriptor update. Match is on (DeviceGuid, Descriptor) so a
+        /// "Button 0" on the DualSense and a "Button 0" on a keyboard
+        /// (which auto-mapping might have stamped) don't get confused.
+        /// </summary>
         public void SyncSelectedInputFromDescriptor()
         {
             _suppressSelectionSync = true;
@@ -1747,8 +1819,15 @@ namespace PadForge.ViewModels
                     p.ParamUp = "";
                     p.ParamDown = "";
                     p.ParamModifier = "";
+                    p.ParamUpDeviceGuid = null;
+                    p.ParamDownDeviceGuid = null;
+                    p.ParamModifierDeviceGuid = null;
                     p.ParamRapidTriggerDistance = Engine.Data.MappingSource.DefaultRapidTriggerDistance;
                     p.Kind = "Direct";
+                    // And the controller its keys had put it on
+                    // (LoadPrimaryKind does the same for a load).
+                    p.DeviceGuid = "";
+                    p.DeviceLabel = "";
                 }
                 SyncSelectedInputFromDescriptor();
                 Cleared?.Invoke(this, EventArgs.Empty);
@@ -2082,9 +2161,13 @@ namespace PadForge.ViewModels
         // Without the cache, hovering / clicking inside the Mappings tab
         // burned visible CPU because virtualization + per-row binding
         // re-evaluation kept refetching this list.
+        // The stamp is the culture's name, not its LCID. Windows gives a
+        // language it has no number for LCID 4096, so Bislama, Bikol,
+        // Chuukese, Haitian Creole and the rest share one, and a switch
+        // between two of them kept the first one's text (#505).
         private static CombineModeOption[] _availableCombineModesCache;
         private static CombineModeOption[] _availableCombineModesNoTrimCache;
-        private static int _availableCombineModesCacheCulture;
+        private static string _availableCombineModesCacheCulture;
 
         /// <summary>Motion rows use axis combine modes. StickTrim is available on trigger rows.</summary>
         public System.Collections.Generic.IReadOnlyList<CombineModeOption> AvailableCombineModes
@@ -2125,7 +2208,7 @@ namespace PadForge.ViewModels
 
         private static CombineModeOption[] GetAvailableCombineModes()
         {
-            int currentCulture = System.Globalization.CultureInfo.CurrentUICulture.LCID;
+            string currentCulture = System.Globalization.CultureInfo.CurrentUICulture.Name;
             var cached = _availableCombineModesCache;
             if (cached != null && _availableCombineModesCacheCulture == currentCulture)
                 return cached;

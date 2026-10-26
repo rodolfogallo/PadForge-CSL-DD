@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using PadForge.Common;
 using PadForge.Common.Input;
 using PadForge.Resources.Strings;
 
@@ -54,24 +55,15 @@ namespace PadForge.ViewModels
         //  Language
         // ─────────────────────────────────────────────
 
-        public ObservableCollection<CultureInfo> AvailableLanguages { get; } = new()
-        {
-            new CultureInfo("en"),
-            new CultureInfo("de"),
-            new CultureInfo("fr"),
-            new CultureInfo("ja"),
-            new CultureInfo("ko"),
-            new CultureInfo("zh-Hans"),
-            new CultureInfo("pt-BR"),
-            new CultureInfo("es"),
-            new CultureInfo("it"),
-            new CultureInfo("nl"),
-        };
+        /// <summary>The languages the picker lists, each under its own name
+        /// with its English name beside it. The list is LanguageCatalog's:
+        /// one row for each translation in the tree (#505).</summary>
+        public IReadOnlyList<LanguageInfo> AvailableLanguages => LanguageCatalog.All;
 
         private CultureInfo _selectedLanguage;
 
         /// <summary>
-        /// Currently selected UI language. Persisted as the culture name (e.g. "en", "ja").
+        /// Currently selected UI language. Persisted as the culture name (e.g. "en-US", "ja").
         /// Changing this applies the new language immediately (live switching).
         /// </summary>
         public CultureInfo SelectedLanguage
@@ -79,20 +71,12 @@ namespace PadForge.ViewModels
             get
             {
                 if (_selectedLanguage != null) return _selectedLanguage;
-                // Walk the parent chain before giving up. An exact-name match
-                // alone sent de-DE, zh-Hans-CN and every other specific culture
-                // to AvailableLanguages[0], which is English, even when the
-                // neutral parent (de, zh-Hans) is right there in the list. A
-                // German user with a German Windows saw the picker say English.
-                for (var c = CultureInfo.CurrentUICulture;
-                     c != null && !string.IsNullOrEmpty(c.Name);
-                     c = c.Parent)
-                {
-                    var hit = AvailableLanguages.FirstOrDefault(a => a.Name == c.Name);
-                    if (hit != null) return hit;
-                    if (ReferenceEquals(c, c.Parent)) break;   // InvariantCulture is its own parent
-                }
-                return AvailableLanguages[0];
+                // The catalog walks the parent chain before giving up. An
+                // exact-name match alone sent de-DE, zh-Hans-CN and every
+                // other specific culture to English, even when the neutral
+                // parent (de, zh-Hans) is right there in the list. A German
+                // user with a German Windows saw the picker say English.
+                return (LanguageCatalog.Resolve(CultureInfo.CurrentUICulture) ?? LanguageCatalog.English).Culture;
             }
             set
             {
@@ -105,7 +89,11 @@ namespace PadForge.ViewModels
         {
             Title = Strings.Instance.Settings_Title;
             OnPropertyChanged(nameof(HidHideStatusText));
+            OnPropertyChanged(nameof(HIDMaestroStatusText));
+            OnPropertyChanged(nameof(BthPS3StatusText));
             OnPropertyChanged(nameof(MidiServicesStatusText));
+            OnPropertyChanged(nameof(MidiServicesDetailText));
+            OnPropertyChanged(nameof(MidiInstallTooltip));
             OnPropertyChanged(nameof(SteamVrStatusText));
             // Both build their text from Strings.Instance, so they are exactly
             // as culture-dependent as the two above and were the pair this
@@ -145,8 +133,9 @@ namespace PadForge.ViewModels
         {
             _selectedLanguage = null;
             // The culture the process started under, before the saved
-            // override: the OS display language a fresh install shows.
-            Strings.ChangeCulture(App.StartupUICulture ?? CultureInfo.InstalledUICulture);
+            // override: the OS display language a fresh install shows, read
+            // through its row of the language table as startup reads it.
+            Strings.ChangeCulture(LanguageCatalog.InterfaceCulture(App.StartupUICulture ?? CultureInfo.InstalledUICulture));
             OnPropertyChanged(nameof(SelectedLanguage));
         }
 
@@ -155,7 +144,7 @@ namespace PadForge.ViewModels
         {
             if (!string.IsNullOrEmpty(code))
             {
-                var match = AvailableLanguages.FirstOrDefault(c => c.Name == code);
+                CultureInfo match = LanguageCatalog.Find(code)?.Culture;
                 if (match != null)
                 {
                     _selectedLanguage = match;
@@ -237,6 +226,83 @@ namespace PadForge.ViewModels
             }
             catch { return string.Empty; }
         }
+
+        private bool _isHIDMaestroInstalled;
+
+        /// <summary>Whether HIDMaestro's driver is in the driver store
+        /// (Services.HIDMaestroRemoval.IsDriverInstalled). PadForge installs it
+        /// with its first virtual controller, and Uninstall removes it.</summary>
+        public bool IsHIDMaestroInstalled
+        {
+            get => _isHIDMaestroInstalled;
+            set
+            {
+                if (SetProperty(ref _isHIDMaestroInstalled, value))
+                    OnPropertyChanged(nameof(HIDMaestroStatusText));
+            }
+        }
+
+        /// <summary>HIDMaestro status display text.</summary>
+        public string HIDMaestroStatusText =>
+            _isHIDMaestroInstalled ? Strings.Instance.Common_Installed : Strings.Instance.Common_NotInstalled;
+
+        private RelayCommand _uninstallHIDMaestroCommand;
+
+        /// <summary>Opens the removal of HIDMaestro from the PC (#518). Always
+        /// available: with the driver gone, the dialog still lists whatever
+        /// else HIDMaestro left, or says nothing is left.</summary>
+        public RelayCommand UninstallHIDMaestroCommand =>
+            _uninstallHIDMaestroCommand ??= new RelayCommand(
+                () => UninstallHIDMaestroRequested?.Invoke(this, EventArgs.Empty));
+
+        /// <summary>Raised when the user asks to remove HIDMaestro.</summary>
+        public event EventHandler UninstallHIDMaestroRequested;
+
+        /// <summary>The BthPS3 version PadForge carries and installs, from
+        /// the DriverVer of its embedded BthPS3.inf.</summary>
+        public string BthPS3Version { get; } = GetBundledBthPs3Version();
+
+        private static string GetBundledBthPs3Version()
+        {
+            try
+            {
+                var v = Services.Ds3DriverInstaller.BundledBthPs3Version();
+                return v != null ? $"v{v.Major}.{v.Minor}.{v.Build}" : string.Empty;
+            }
+            catch { return string.Empty; }
+        }
+
+        private bool _isBthPS3Installed;
+
+        /// <summary>Whether either BthPS3 driver is installed as a service
+        /// (Services.Ds3DriverInstaller.IsAnyBthPs3DriverInstalled). PadForge installs
+        /// BthPS3 the first time a PlayStation 3, Move or Navigation
+        /// controller is paired, and Uninstall removes it.</summary>
+        public bool IsBthPS3Installed
+        {
+            get => _isBthPS3Installed;
+            set
+            {
+                if (SetProperty(ref _isBthPS3Installed, value))
+                    OnPropertyChanged(nameof(BthPS3StatusText));
+            }
+        }
+
+        /// <summary>BthPS3 status display text.</summary>
+        public string BthPS3StatusText =>
+            _isBthPS3Installed ? Strings.Instance.Common_Installed : Strings.Instance.Common_NotInstalled;
+
+        private RelayCommand _uninstallBthPS3Command;
+
+        /// <summary>Opens the removal of BthPS3 from the PC. Always available:
+        /// with the drivers gone, the dialog still lists the WinUSB package
+        /// and certificate PadForge left, or says nothing is left.</summary>
+        public RelayCommand UninstallBthPS3Command =>
+            _uninstallBthPS3Command ??= new RelayCommand(
+                () => UninstallBthPS3Requested?.Invoke(this, EventArgs.Empty));
+
+        /// <summary>Raised when the user asks to remove BthPS3.</summary>
+        public event EventHandler UninstallBthPS3Requested;
 
         private RelayCommand _installHidHideCommand;
 
@@ -481,66 +547,230 @@ namespace PadForge.ViewModels
         //  Windows MIDI Services
         // ─────────────────────────────────────────────
 
-        private bool _isMidiServicesInstalled;
+        // Microsoft deleted the Windows MIDI Services runtime installers on
+        // 2026-10-01. The card says which API PadForge drives, offers
+        // PadForge's build of the runtime where it would give MIDI slots
+        // their own ports (MidiApiSelection.CanOfferRuntimeInstall), and
+        // offers to uninstall an installed runtime, Microsoft's or
+        // PadForge's.
 
-        /// <summary>Whether Windows MIDI Services is available.</summary>
-        public bool IsMidiServicesInstalled
+        private Common.Input.MidiApiKind _activeMidiApi;
+
+        /// <summary>The API PadForge drives on this PC
+        /// (<see cref="Common.Input.MidiApiSelection"/>).</summary>
+        internal Common.Input.MidiApiKind ActiveMidiApi
         {
-            get => _isMidiServicesInstalled;
+            get => _activeMidiApi;
             set
             {
-                if (SetProperty(ref _isMidiServicesInstalled, value))
-                {
-                    OnPropertyChanged(nameof(MidiServicesStatusText));
-                    _installMidiServicesCommand?.NotifyCanExecuteChanged();
-                    _uninstallMidiServicesCommand?.NotifyCanExecuteChanged();
-                }
+                if (_activeMidiApi == value) return;
+                _activeMidiApi = value;
+                OnPropertyChanged(nameof(IsMidiAvailable));
+                OnMidiCardChanged();
             }
         }
 
-        /// <summary>MIDI Services status display text.</summary>
-        public string MidiServicesStatusText => _isMidiServicesInstalled ? Strings.Instance.Common_Installed : Strings.Instance.Common_NotInstalled;
+        private bool _canInstallMidiRuntime;
 
-        private string _midiServicesVersion = string.Empty;
-
-        /// <summary>MIDI Services version string.</summary>
-        public string MidiServicesVersion
+        /// <summary>Whether the card offers to install the App SDK
+        /// runtime.</summary>
+        public bool CanInstallMidiRuntime
         {
-            get => _midiServicesVersion;
-            set => SetProperty(ref _midiServicesVersion, value);
+            get => _canInstallMidiRuntime;
+            set
+            {
+                if (SetProperty(ref _canInstallMidiRuntime, value))
+                    _installMidiRuntimeCommand?.NotifyCanExecuteChanged();
+            }
         }
 
-        private RelayCommand _installMidiServicesCommand;
+        private RelayCommand _installMidiRuntimeCommand;
 
-        /// <summary>True if the OS meets the minimum version for Windows MIDI Services (Win11 24H2, build 26100).</summary>
-        public static bool IsMidiOsSupported => Environment.OSVersion.Version.Build >= 26100;
+        /// <summary>Installs PadForge's build of the App SDK runtime.
+        /// Unavailable while a runtime uninstaller PadForge started still
+        /// runs, as Uninstall is: Windows Installer runs one installation at
+        /// a time and refuses a second with 1618, and the card offers
+        /// Install as soon as the registry stops listing the runtime, which
+        /// can be before its uninstaller exits.</summary>
+        public RelayCommand InstallMidiRuntimeCommand =>
+            _installMidiRuntimeCommand ??= new RelayCommand(
+                () => InstallMidiRuntimeRequested?.Invoke(this, EventArgs.Empty),
+                () => _canInstallMidiRuntime && !_midiUninstallerRunning);
 
-        /// <summary>Instance forwarder for XAML. A Binding path resolves
-        /// against the DataContext INSTANCE and cannot reach a static member,
-        /// so SettingsPage's `{Binding IsMidiOsSupported}` DataTrigger never
-        /// evaluated and the Win11-24H2-required tooltip was never set. Bind
-        /// this instead. Never raises PropertyChanged because the OS build
-        /// cannot change while the app runs.</summary>
-        public bool MidiOsSupported => IsMidiOsSupported;
+        /// <summary>The Install button's tooltip: what it installs, or while
+        /// an uninstaller still runs, that Install waits for it. Under the
+        /// legacy API MIDI keeps running through the uninstall, so the card's
+        /// own line for a running uninstaller, which says MIDI starts again,
+        /// does not fit here.</summary>
+        public string MidiInstallTooltip => _midiUninstallerRunning
+            ? Strings.Instance.Settings_MidiInstallAfterUninstaller
+            : Strings.Instance.Settings_MidiInstallTooltip;
 
-        /// <summary>Command to download and install Windows MIDI Services.</summary>
-        public RelayCommand InstallMidiServicesCommand =>
-            _installMidiServicesCommand ??= new RelayCommand(
-                () => InstallMidiServicesRequested?.Invoke(this, EventArgs.Empty),
-                () => !_isMidiServicesInstalled && IsMidiOsSupported);
+        /// <summary>Raised when the user requests installing the runtime.</summary>
+        public event EventHandler InstallMidiRuntimeRequested;
+
+        private bool _isMidiRuntimeInstalled;
+
+        /// <summary>Whether the App SDK runtime is installed, Microsoft's or
+        /// PadForge's. It can be, beside the in-box API, after the November
+        /// update.</summary>
+        public bool IsMidiRuntimeInstalled
+        {
+            get => _isMidiRuntimeInstalled;
+            set
+            {
+                if (SetProperty(ref _isMidiRuntimeInstalled, value))
+                    OnMidiCardChanged();
+            }
+        }
+
+        private string _midiRuntimeVersion = string.Empty;
+
+        /// <summary>The runtime's version, from its DLL.</summary>
+        public string MidiRuntimeVersion
+        {
+            get => _midiRuntimeVersion;
+            set
+            {
+                if (SetProperty(ref _midiRuntimeVersion, value ?? string.Empty))
+                    OnPropertyChanged(nameof(MidiServicesDetailText));
+            }
+        }
+
+        private bool _midiApiNotStarted;
+
+        /// <summary>True when the probe found no API it could start, the
+        /// legacy one included, or timed out on a stuck service
+        /// (<see cref="Common.Input.MidiApiSelection.ForCard"/>).</summary>
+        public bool MidiApiNotStarted
+        {
+            get => _midiApiNotStarted;
+            set
+            {
+                if (SetProperty(ref _midiApiNotStarted, value))
+                    OnMidiCardChanged();
+            }
+        }
+
+        private Common.Input.MidiNotRunningReason _midiNotRunningReason;
+
+        /// <summary>Why MIDI is not running, for the detail line while
+        /// <see cref="MidiApiNotStarted"/> holds: a service that did not
+        /// respond, which PadForge restarts, a classic MIDI driver that did
+        /// not respond, which no service restart reaches, or the runtime's
+        /// uninstaller still running.</summary>
+        internal Common.Input.MidiNotRunningReason MidiNotRunningReason
+        {
+            get => _midiNotRunningReason;
+            set
+            {
+                if (_midiNotRunningReason == value) return;
+                _midiNotRunningReason = value;
+                OnMidiCardChanged();
+            }
+        }
+
+        private int _midiInBoxFailure;
+
+        /// <summary>The HRESULT of an in-box API that Windows registers but
+        /// that failed to activate, or 0. The legacy API runs in its place,
+        /// and the detail line names the failure.</summary>
+        internal int MidiInBoxFailure
+        {
+            get => _midiInBoxFailure;
+            set
+            {
+                if (_midiInBoxFailure == value) return;
+                _midiInBoxFailure = value;
+                OnMidiCardChanged();
+            }
+        }
+
+        /// <summary>Whether any MIDI API can run MIDI slots and MIDI input.</summary>
+        public bool IsMidiAvailable => _activeMidiApi != Common.Input.MidiApiKind.None;
+
+        /// <summary>The card's status line: which API, or that none
+        /// started.</summary>
+        public string MidiServicesStatusText => _activeMidiApi switch
+        {
+            Common.Input.MidiApiKind.InBox => Strings.Instance.Settings_MidiStatusInBox,
+            Common.Input.MidiApiKind.AppSdk => Strings.Instance.Settings_MidiStatusRuntime,
+            Common.Input.MidiApiKind.Legacy => Strings.Instance.Settings_MidiStatusLegacy,
+            _ => _midiApiNotStarted
+                ? Strings.Instance.Settings_MidiStatusNotRunning
+                : Strings.Instance.Settings_MidiStatusUnavailable,
+        };
+
+        /// <summary>The line under the status: the runtime's version while
+        /// PadForge uses it, a note that a leftover runtime is no longer
+        /// needed once Windows has the API, how the legacy API sends and
+        /// listens (naming the in-box API's failure when that is why the
+        /// legacy API runs), or why nothing runs.</summary>
+        public string MidiServicesDetailText => _activeMidiApi switch
+        {
+            Common.Input.MidiApiKind.InBox => _isMidiRuntimeInstalled
+                ? string.Format(Strings.Instance.Settings_MidiOlderRuntime_Format, _midiRuntimeVersion)
+                : string.Empty,
+            Common.Input.MidiApiKind.AppSdk => _midiRuntimeVersion,
+            Common.Input.MidiApiKind.Legacy => _midiInBoxFailure != 0
+                ? string.Format(Strings.Instance.Settings_MidiInBoxFailed_Format, _midiInBoxFailure.ToString("X8"))
+                : Strings.Instance.Settings_MidiLegacy,
+            _ => !_midiApiNotStarted ? string.Empty
+                : _midiNotRunningReason switch
+                {
+                    Common.Input.MidiNotRunningReason.Uninstalling => Strings.Instance.Settings_MidiUninstallRunning,
+                    Common.Input.MidiNotRunningReason.DriverDidNotRespond => Strings.Instance.Settings_MidiNotRunningDriver,
+                    _ => Strings.Instance.Settings_MidiNotRunning,
+                },
+        };
+
+        /// <summary>True when the detail line is the older runtime's
+        /// version, which the card sets in the telemetry face.</summary>
+        public bool MidiDetailIsVersion => _activeMidiApi == Common.Input.MidiApiKind.AppSdk;
+
+        private void OnMidiCardChanged()
+        {
+            OnPropertyChanged(nameof(MidiServicesStatusText));
+            OnPropertyChanged(nameof(MidiServicesDetailText));
+            OnPropertyChanged(nameof(MidiDetailIsVersion));
+            _uninstallMidiServicesCommand?.NotifyCanExecuteChanged();
+        }
+
+        private bool _midiUninstallerRunning;
+
+        /// <summary>True while a runtime uninstaller PadForge started has not
+        /// exited (<see cref="Common.Input.MidiRuntimeSwitch.UninstallerRunning"/>).
+        /// One that outlives its five-minute wait leaves the card usable
+        /// again, and Uninstall and Install stay unavailable until it exits:
+        /// Windows Installer runs one installation at a time, so a second
+        /// one only fails.</summary>
+        internal bool MidiUninstallerRunning
+        {
+            get => _midiUninstallerRunning;
+            set
+            {
+                if (_midiUninstallerRunning == value) return;
+                _midiUninstallerRunning = value;
+                _uninstallMidiServicesCommand?.NotifyCanExecuteChanged();
+                _installMidiRuntimeCommand?.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(MidiInstallTooltip));
+            }
+        }
 
         private RelayCommand _uninstallMidiServicesCommand;
 
-        /// <summary>Command to uninstall Windows MIDI Services.</summary>
+        /// <summary>Uninstalls the runtime. A MIDI slot running on it keeps
+        /// it installed. When Windows has the API, or the legacy API runs
+        /// the slots, the runtime can go while they run. Unavailable while
+        /// an uninstaller already runs.</summary>
         public RelayCommand UninstallMidiServicesCommand =>
             _uninstallMidiServicesCommand ??= new RelayCommand(
                 () => UninstallMidiServicesRequested?.Invoke(this, EventArgs.Empty),
-                () => _isMidiServicesInstalled && !HasAnyMidiSlots());
+                () => _isMidiRuntimeInstalled
+                      && !_midiUninstallerRunning
+                      && !(_activeMidiApi == Common.Input.MidiApiKind.AppSdk && HasAnyMidiSlots()));
 
-        /// <summary>Raised when the user requests MIDI Services installation.</summary>
-        public event EventHandler InstallMidiServicesRequested;
-
-        /// <summary>Raised when the user requests MIDI Services uninstallation.</summary>
+        /// <summary>Raised when the user requests uninstalling the runtime.</summary>
         public event EventHandler UninstallMidiServicesRequested;
 
         // ─────────────────────────────────────────────
@@ -587,7 +817,68 @@ namespace PadForge.ViewModels
 
         /// <summary>Raises the SteamVR row's change notification. MainWindow's
         /// periodic status refresh calls it.</summary>
-        public void RefreshSteamVrStatus() => OnPropertyChanged(nameof(SteamVrStatusText));
+        public void RefreshSteamVrStatus()
+        {
+            OnPropertyChanged(nameof(SteamVrStatusText));
+            RefreshSteamVrDriverConflict();
+        }
+
+        private string _steamVrDriverConflictText = string.Empty;
+
+        /// <summary>The warning the SteamVR row shows when another OpenVR
+        /// driver is registered under HIDMaestro's driver name, naming its
+        /// folders. Empty when there is none. OpenVR requires driver names to
+        /// be unique, so SteamVR may load that driver in place of
+        /// HIDMaestro's and the VR slot's controllers never appear
+        /// (HMVR.FindDriverNameConflicts, HIDMaestro 1.12.0).</summary>
+        public string SteamVrDriverConflictText
+        {
+            get => _steamVrDriverConflictText;
+            private set
+            {
+                if (SetProperty(ref _steamVrDriverConflictText, value ?? string.Empty))
+                    OnPropertyChanged(nameof(HasSteamVrDriverConflict));
+            }
+        }
+
+        public bool HasSteamVrDriverConflict => _steamVrDriverConflictText.Length > 0;
+
+        private long _steamVrConflictCheckedTick;
+        private bool _steamVrConflictChecked;
+        private const long SteamVrConflictTtlMs = 10_000;
+
+        /// <summary>Test seam for the conflict probe, the SDK's own call in
+        /// production. It reads the user's openvrpaths.vrpath and SteamVR's
+        /// drivers folder and changes nothing.</summary>
+        internal static Func<IReadOnlyList<string>> SteamVrConflictProbe = () => HIDMaestro.HMVR.FindDriverNameConflicts();
+
+        /// <summary>Re-reads the conflict list at most every ten seconds:
+        /// the probe reads files, and the periodic refresh runs far more often
+        /// than a user installs an OpenVR driver.</summary>
+        private void RefreshSteamVrDriverConflict()
+        {
+            if (!_isSteamVrInstalled)
+            {
+                SteamVrDriverConflictText = string.Empty;
+                return;
+            }
+            long now = Environment.TickCount64;
+            if (_steamVrConflictChecked && now - _steamVrConflictCheckedTick < SteamVrConflictTtlMs) return;
+            _steamVrConflictChecked = true;
+            _steamVrConflictCheckedTick = now;
+            IReadOnlyList<string> folders;
+            try { folders = SteamVrConflictProbe(); }
+            catch { folders = null; }
+            SteamVrDriverConflictText = SteamVrDriverConflictLine(folders);
+        }
+
+        /// <summary>The warning for a conflict list: empty for none, else the
+        /// format with the folders joined one per line.</summary>
+        internal static string SteamVrDriverConflictLine(IReadOnlyList<string> folders)
+            => folders == null || folders.Count == 0
+                ? string.Empty
+                : string.Format(Strings.Instance.Vr_DriverNameConflict_Format,
+                    string.Join(Environment.NewLine, folders));
 
         private string _steamVrInstallDir = PadForge.Common.DriverInstaller.SteamVrInstallDir;
 
@@ -1605,6 +1896,11 @@ namespace PadForge.ViewModels
             get => _name;
             set => SetProperty(ref _name, value);
         }
+
+        /// <summary>The entry's screen-reader name, the profile's name:
+        /// ListBoxItem and ItemAutomationPeer read an item that is not text
+        /// through its ToString().</summary>
+        public override string ToString() => Name ?? string.Empty;
 
         private string _executables;
         public string Executables

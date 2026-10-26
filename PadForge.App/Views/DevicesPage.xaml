@@ -162,20 +162,20 @@
 
         <!-- Header -->
         <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
-            <TextBlock Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+            <reset:GlyphText Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                        VerticalAlignment="Center" Margin="0,0,10,0"/>
-            <TextBlock Text="{Binding Devices_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
+            <TextBlock AutomationProperties.HeadingLevel="Level1" Text="{Binding Devices_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
             <ui:Button Style="{StaticResource EmberIconButton}" Margin="16,0,0,0"
                        VerticalAlignment="Center"
                        Command="{Binding RefreshCommand}"
                        ToolTip="{Binding Common_Refresh, Source={x:Static strings:Strings.Instance}}">
-                <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                <reset:GlyphText Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
             </ui:Button>
             <ui:Button Style="{StaticResource EmberIconButton}" Margin="8,0,0,0"
                        VerticalAlignment="Center"
                        Command="{Binding PairCommand}"
                        ToolTip="{Binding Devices_Pair, Source={x:Static strings:Strings.Instance}}">
-                <TextBlock Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                <reset:GlyphText Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
             </ui:Button>
             <!-- Telemetry counter (#175 typography): counts mono cold,
                  labels mono tertiary, same treatment as the status bar
@@ -214,7 +214,7 @@
                      hair-space letterspaced literals; counts come from the
                      VM on the same cadence as the header counter. -->
                 <WrapPanel Margin="6,0,0,4">
-                    <Border Tag="ALL" MouseLeftButtonUp="FacetChip_Click">
+                    <reset:ClickBorder Tag="ALL" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=ALL}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -230,8 +230,8 @@
                             <TextBlock Text="A&#8202;L&#8202;L" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding TotalCount, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="GAMEPAD" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="GAMEPAD" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=GAMEPAD}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -247,8 +247,8 @@
                             <TextBlock Text="G&#8202;A&#8202;M&#8202;E&#8202;P&#8202;A&#8202;D" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountGamepad, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="JOYSTICK" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="JOYSTICK" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=JOYSTICK}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -264,8 +264,8 @@
                             <TextBlock Text="J&#8202;O&#8202;Y&#8202;S&#8202;T&#8202;I&#8202;C&#8202;K" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountJoystick, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="WHEEL" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="WHEEL" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=WHEEL}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -281,8 +281,8 @@
                             <TextBlock Text="W&#8202;H&#8202;E&#8202;E&#8202;L" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountWheel, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="KEYBOARD" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="KEYBOARD" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=KEYBOARD}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -298,8 +298,8 @@
                             <TextBlock Text="K&#8202;E&#8202;Y&#8202;B&#8202;O&#8202;A&#8202;R&#8202;D" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountKeyboard, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="MOUSE" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="MOUSE" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=MOUSE}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -315,8 +315,8 @@
                             <TextBlock Text="M&#8202;O&#8202;U&#8202;S&#8202;E" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountMouse, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
-                    <Border Tag="OTHER" MouseLeftButtonUp="FacetChip_Click">
+                    </reset:ClickBorder>
+                    <reset:ClickBorder Tag="OTHER" Click="FacetChip_Click" IsSelected="{Binding SelectedFacet, Mode=OneWay, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=OTHER}">
                         <Border.Style>
                             <Style TargetType="Border" BasedOn="{StaticResource FacetChipBase}">
                                 <Style.Triggers>
@@ -332,7 +332,7 @@
                             <TextBlock Text="O&#8202;T&#8202;H&#8202;E&#8202;R" Style="{StaticResource FacetToken}"/>
                             <TextBlock Text="{Binding FacetCountOther, Mode=OneWay}" Style="{StaticResource FacetCount}"/>
                         </StackPanel>
-                    </Border>
+                    </reset:ClickBorder>
                 </WrapPanel>
 
             <ListBox Grid.Row="1"
@@ -368,7 +368,7 @@
                                         <ColumnDefinition Width="Auto"/>
                                         <ColumnDefinition Width="*"/>
                                     </Grid.ColumnDefinitions>
-                                    <Path Margin="0,0,8,0" VerticalAlignment="Center">
+                                    <Path FlowDirection="LeftToRight" Margin="0,0,8,0" VerticalAlignment="Center">
                                         <Path.Style>
                                             <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
                                                 <Style.Triggers>
@@ -409,6 +409,19 @@
                                 <StackPanel Grid.Column="1" Grid.RowSpan="2"
                                             VerticalAlignment="Center" Margin="8,0,0,0">
                                     <ItemsControl ItemsSource="{Binding SlotBadges}">
+                                        <!-- Out of the screen-reader tree while empty: an empty list draws
+                                             nothing and has no size and no margin, so collapsing it changes
+                                             nothing on screen. -->
+                                        <ItemsControl.Style>
+                                            <Style TargetType="ItemsControl" BasedOn="{StaticResource {x:Type ItemsControl}}">
+                                                <Setter Property="Focusable" Value="False"/>
+                                                <Style.Triggers>
+                                                    <Trigger Property="HasItems" Value="False">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                    </Trigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </ItemsControl.Style>
                                         <ItemsControl.ItemsPanel>
                                             <ItemsPanelTemplate>
                                                 <WrapPanel MaxWidth="118" HorizontalAlignment="Right"/>
@@ -439,9 +452,9 @@
                                                              app and keep their MDL2 glyphs, mirroring
                                                              the nav rail's type pill. -->
                                                         <Grid VerticalAlignment="Center">
-                                                            <Path Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
+                                                            <Path FlowDirection="LeftToRight" Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
                                                                   Stretch="Uniform" Fill="#FFFFF3E8"/>
-                                                            <TextBlock Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
+                                                            <reset:GlyphText Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
                                                                        FontSize="10" Foreground="#FFFFF3E8"
                                                                        HorizontalAlignment="Center" VerticalAlignment="Center"
                                                                        Visibility="{Binding TypeGlyph, Converter={StaticResource StringToVisibility}}"/>
@@ -484,7 +497,7 @@
                                             </Style.Triggers>
                                         </Style>
                                     </ui:Button.Style>
-                                    <TextBlock Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                    <reset:GlyphText Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
                                 </ui:Button>
 
                                 <!-- Row 1: Type | VID:PID | Capabilities. A WrapPanel
@@ -512,7 +525,7 @@
                                     <StackPanel Orientation="Horizontal"
                                                 Visibility="{Binding HasBattery, Converter={StaticResource BoolToVisibilityConverter}}">
                                         <TextBlock Text=" &#x2022; " Style="{StaticResource DeviceMetaText}"/>
-                                        <TextBlock Text="{Binding BatteryGlyph}" Style="{StaticResource DeviceMetaText}" FontFamily="Segoe MDL2 Assets"
+                                        <reset:GlyphText Text="{Binding BatteryGlyph}" Style="{StaticResource DeviceMetaText}" FontFamily="Segoe MDL2 Assets"
                                                    VerticalAlignment="Center"/>
                                         <TextBlock Text="{Binding BatteryText}" Style="{StaticResource DeviceMetaText}"
                                                    Margin="4,0,0,0" VerticalAlignment="Center"/>
@@ -621,7 +634,7 @@
                             </Style.Triggers>
                         </Style>
                     </StackPanel.Style>
-                    <TextBlock Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="34"
+                    <reset:GlyphText Text="&#xE772;" FontFamily="Segoe MDL2 Assets" FontSize="34"
                                Foreground="{DynamicResource SteelLineBrush}"
                                HorizontalAlignment="Center"/>
                     <TextBlock Text="{Binding Devices_EmptyHint, Source={x:Static strings:Strings.Instance}}"
@@ -663,7 +676,7 @@
                             <ui:Button Style="{StaticResource EmberIconButton}" HorizontalAlignment="Right"
                                        Click="CopyDossier_Click"
                                        ToolTip="{Binding Common_Copy, Source={x:Static strings:Strings.Instance}}">
-                                <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                <reset:GlyphText Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
                             </ui:Button>
                         </Grid>
                         <Border Background="{DynamicResource SteelGroundBrush}" BorderBrush="{DynamicResource SteelLineBrush}"
@@ -773,7 +786,7 @@
                                 <StackPanel Orientation="Horizontal" Margin="0,0,0,2"
                                             Visibility="{Binding SelectedDevice.IsBluetoothLink, Converter={StaticResource BoolToVisibilityConverter}}">
                                     <TextBlock Text="LINK" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
-                                    <TextBlock Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                                    <reset:GlyphText Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
                                     <TextBlock Text="BT" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center"/>
                                 </StackPanel>
                                 <!-- Serial as SDL reports it (BT MAC on most
@@ -788,7 +801,7 @@
                                 <StackPanel Orientation="Horizontal" Margin="0,0,0,2"
                                             Visibility="{Binding SelectedDevice.HasBattery, Converter={StaticResource BoolToVisibilityConverter}}">
                                     <TextBlock Text="BATT" Width="64" FontSize="10" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center"/>
-                                    <TextBlock Text="{Binding SelectedDevice.BatteryGlyph}" FontFamily="Segoe MDL2 Assets" FontSize="11" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                                    <reset:GlyphText Text="{Binding SelectedDevice.BatteryGlyph}" FontFamily="Segoe MDL2 Assets" FontSize="11" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center" Margin="0,0,4,0"/>
                                     <TextBlock Text="{Binding SelectedDevice.BatteryText}" FontSize="11" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource ColdBrush}" VerticalAlignment="Center"/>
                                 </StackPanel>
                                 <!-- Capability row: the established capability
@@ -807,25 +820,24 @@
                                              direction 2026-08-12). Clicking it vibrates
                                              the selected device; the tooltip carries
                                              both facts. -->
-                                        <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
+                                        <reset:ClickBorder Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
                                                 CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
                                                 Cursor="Hand"
                                                 ToolTip="{Binding Devices_IdentifyTooltip, Source={x:Static strings:Strings.Instance}}"
-                                                Visibility="{Binding SelectedDevice.HasRumble, Converter={StaticResource BoolToVisibilityConverter}}"
-                                                MouseLeftButtonUp="IdentifyChip_Click">
-                                            <TextBlock Text="&#xE877;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
-                                        </Border>
+                                                Visibility="{Binding SelectedDevice.HasRumble, Converter={StaticResource BoolToVisibilityConverter}}" Click="IdentifyChip_Click">
+                                            <reset:GlyphText Text="&#xE877;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                        </reset:ClickBorder>
                                         <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
                                                 CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
                                                 ToolTip="{Binding Devices_Gyro, Source={x:Static strings:Strings.Instance}}"
                                                 Visibility="{Binding SelectedDevice.HasGyro, Converter={StaticResource BoolToVisibilityConverter}}">
-                                            <TextBlock Text="&#xE7AD;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                            <reset:GlyphText Text="&#xE7AD;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
                                         </Border>
                                         <Border Background="{DynamicResource EmberTintBrush}" BorderBrush="#66FF6B2C" BorderThickness="1"
                                                 CornerRadius="4" Padding="6,3" Margin="0,0,4,0"
                                                 ToolTip="{Binding Btn_Touchpad, Source={x:Static strings:Strings.Instance}}"
                                                 Visibility="{Binding SelectedDevice.ShowTouchpadCapability, Converter={StaticResource BoolToVisibilityConverter}}">
-                                            <TextBlock Text="&#xEFA5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
+                                            <reset:GlyphText Text="&#xEFA5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource EmberBrush}"/>
                                         </Border>
                                     </WrapPanel>
                                 </StackPanel>
@@ -1012,7 +1024,7 @@
                              HeadTracker without a local device to ask, so the
                              status is empty there and an empty line would still
                              hold its margin open. -->
-                        <TextBlock Text="{Binding HeadTrackerStatus}" TextWrapping="Wrap"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding HeadTrackerStatus}" TextWrapping="Wrap"
                                    FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,8"
                                    Visibility="{Binding HeadTrackerStatus, Converter={StaticResource StringToVisibility}}"/>
 
@@ -1072,10 +1084,10 @@
                                                      the checked ember swap recolors it with the
                                                      glyph and number. -->
                                                 <Grid VerticalAlignment="Center">
-                                                    <Path Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
+                                                    <Path FlowDirection="LeftToRight" Data="{Binding TypeGeometry, Mode=OneWay}" Width="10" Height="10"
                                                           Stretch="Uniform"
                                                           Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}"/>
-                                                    <TextBlock Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
+                                                    <reset:GlyphText Text="{Binding TypeGlyph, Mode=OneWay}" FontFamily="Segoe MDL2 Assets"
                                                                FontSize="10" HorizontalAlignment="Center" VerticalAlignment="Center"
                                                                Visibility="{Binding TypeGlyph, Converter={StaticResource StringToVisibility}}"/>
                                                 </Grid>
@@ -1112,7 +1124,9 @@
                         <Separator Margin="0,2,0,8"
                                    Visibility="{Binding SelectedDevice.ShowInputModeOrHidingSection, Converter={StaticResource BoolToVisibilityConverter}}"/>
 
-                        <!-- ─── Input Mode (real gamepads only — virtual web/overlay sources skip) ─── -->
+                        <!-- ─── Input Mode: a gamepad row that is no source of PadForge's own (a web pad, a
+                             Remote Link copy), and any row whose Force Raw Joystick Mode is on, so the
+                             checkbox can turn it off (ShowInputModeSection) ─── -->
                         <StackPanel Visibility="{Binding SelectedDevice.ShowInputModeSection, Converter={StaticResource BoolToVisibilityConverter}}">
                             <TextBlock Text="{Binding Devices_InputMode, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}"
                                        Style="{StaticResource SectionEyebrow}" Margin="0,0,0,6"/>
@@ -1346,6 +1360,7 @@
                         <ItemsControl ItemsSource="{Binding RawAxes}" Margin="0,0,0,8">
                             <ItemsControl.Style>
                                 <Style TargetType="ItemsControl">
+                                    <Setter Property="Focusable" Value="False"/>
                                     <Style.Triggers>
                                         <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
                                             <Setter Property="Visibility" Value="Collapsed"/>
@@ -1459,6 +1474,7 @@
                         <ItemsControl ItemsSource="{Binding RawButtons}" Margin="0,0,0,8">
                             <ItemsControl.Style>
                                 <Style TargetType="ItemsControl">
+                                    <Setter Property="Focusable" Value="False"/>
                                     <Style.Triggers>
                                         <DataTrigger Binding="{Binding IsKeyboardDevice}" Value="True">
                                             <Setter Property="Visibility" Value="Collapsed"/>
@@ -1708,7 +1724,7 @@
                             <ItemsControl ItemsSource="{Binding KeyboardKeys}">
                                 <ItemsControl.ItemsPanel>
                                     <ItemsPanelTemplate>
-                                        <Canvas Width="556" Height="136"/>
+                                        <Canvas FlowDirection="LeftToRight" Width="556" Height="136"/>
                                     </ItemsPanelTemplate>
                                 </ItemsControl.ItemsPanel>
                                 <ItemsControl.ItemContainerStyle>
@@ -1803,15 +1819,18 @@
                             </TextBlock.Style>
                         </TextBlock>
                         <ItemsControl ItemsSource="{Binding RawPovs}" Margin="0,0,0,8">
+                            <!-- Wraps. Measured with tools/rowmeasure, four hats
+                                 need 321 against the 298 the pane leaves for
+                                 them, so a fourth hat ran past the edge. -->
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
-                                    <StackPanel Orientation="Horizontal"/>
+                                    <WrapPanel Orientation="Horizontal"/>
                                 </ItemsPanelTemplate>
                             </ItemsControl.ItemsPanel>
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
                                     <StackPanel Orientation="Horizontal" Margin="0,0,12,0">
-                                        <Canvas Width="36" Height="36">
+                                        <Canvas FlowDirection="LeftToRight" Width="36" Height="36">
                                             <!-- Background circle -->
                                             <Ellipse Width="36" Height="36"
                                                      Fill="{DynamicResource SteelGroundBrush}" Stroke="{DynamicResource SteelLineBrush}"
@@ -1982,7 +2001,7 @@
                                 BorderThickness="1"
                                 CornerRadius="6" Margin="0,0,0,8"
                                 Height="100" ClipToBounds="True">
-                            <Canvas>
+                            <Canvas FlowDirection="LeftToRight">
                                 <!-- Up to 5 simultaneous touchpad contacts.
                                      SDL gamepad pads typically expose 1-2;
                                      Windows PTP can deliver up to 5. Each
@@ -2019,7 +2038,7 @@
                                 BorderThickness="1"
                                 CornerRadius="6" Margin="0,0,0,8"
                                 Height="100" ClipToBounds="True">
-                            <Canvas>
+                            <Canvas FlowDirection="LeftToRight">
                                 <Ellipse x:Name="Pad2Dot0" Width="14" Height="14" Fill="#CCFF6600"
                                          Effect="{StaticResource ColdDotGlow}"
                                          Visibility="{Binding Pad2Down0, Converter={StaticResource BoolToVisibilityConverter}}"/>

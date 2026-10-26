@@ -386,25 +386,11 @@ namespace PadForge.Common.Input
         }
 
         /// <summary>True while Razer Synapse runs, the process check Soup's
-        /// areRazerAnalogueReportsEnabled makes.</summary>
+        /// areRazerAnalogueReportsEnabled makes, from one walk of the process
+        /// list for both names. Worker threads only:
+        /// <see cref="AnalogKeyboardDevice.SynapseCheck"/> runs it.</summary>
         internal static bool IsSynapseRunning()
-        {
-            foreach (string name in AnalogKeyboardCatalog.SynapseProcessNames)
-            {
-                System.Diagnostics.Process[] found = null;
-                try
-                {
-                    found = System.Diagnostics.Process.GetProcessesByName(name);
-                    if (found.Length > 0) return true;
-                }
-                catch { }
-                finally
-                {
-                    if (found != null) foreach (var p in found) p.Dispose();
-                }
-            }
-            return false;
-        }
+            => ProcessPresence.RunningAmong(AnalogKeyboardCatalog.SynapseProcessNames).Count > 0;
 
         internal const int HidP_Input = 0;
         internal const int HidP_Output = 1;
@@ -459,6 +445,7 @@ namespace PadForge.Common.Input
     {
         private const int DefaultWriteTimeoutMs = 1000;
         private const int DefaultIoctlTimeoutMs = 500;
+        private const int ErrorFileNotFound = 2;
         private const int ErrorAccessDenied = 5;
         private const int ErrorSharingViolation = 32;
 
@@ -619,6 +606,13 @@ namespace PadForge.Common.Input
         /// failed open in <see cref="LastOpenError"/>.</summary>
         private static SafeFileHandle CreateOverlapped(string path, uint access, uint share)
         {
+            // The test host opens no device (DirectDeviceAccess): the answer
+            // of a device that is not there.
+            if (DirectDeviceAccess.Refuses(path))
+            {
+                LastOpenError = ErrorFileNotFound;
+                return new SafeFileHandle(new IntPtr(-1), true);
+            }
             var handle = SonyHeadsetHid.CreateFile(path, access, share,
                 IntPtr.Zero, SonyHeadsetHid.OPEN_EXISTING, SonyHeadsetHid.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
             if (handle.IsInvalid) LastOpenError = Marshal.GetLastWin32Error();

@@ -82,6 +82,25 @@
     </EmbeddedResource>
   </ItemGroup>
 
+  <!-- Every translation builds into a satellite resource, whatever its tag (#505).
+       MSBuild names the culture of Strings.<tag>.resx itself only for a tag it
+       knows. Strings.chk.resx, Strings.tzo.resx and the like it would embed in
+       the main assembly under a name no culture looks up, and those languages
+       would show English. So the culture and the resource name are taken from
+       the file name here for all of them, and RespectAlreadyAssignedItemCulture
+       tells the build to keep what this rule assigned. Languages.tsv is the
+       table LanguageCatalog reads: one row for each of these files. -->
+  <PropertyGroup>
+    <RespectAlreadyAssignedItemCulture>true</RespectAlreadyAssignedItemCulture>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Update="Resources\Strings\Strings.*.resx">
+      <Culture>$([System.String]::Copy('%(Filename)').Substring(8))</Culture>
+      <LogicalName>PadForge.Resources.Strings.%(Filename).resources</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Strings\Languages.tsv" LogicalName="PadForge.Languages.tsv" />
+  </ItemGroup>
+
   <ItemGroup>
     <Resource Include="Resources\PadForge.ico" />
     <Resource Include="Resources\PadForge-logo.png" />
@@ -202,13 +221,21 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Management" Version="10.0.11" />
+    <PackageReference Include="System.Management" Version="10.0.13" />
     <PackageReference Include="WPF-UI" Version="4.3.0" />
     <PackageReference Include="HelixToolkit.Core.Wpf" Version="2.27.3" />
-    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="Microsoft.Windows.Devices.Midi2" Version="1.0.16-rc.3.7" />
+    <!-- C#/WinRT generates the projection for the in-box Windows MIDI
+         Services API (Windows.Devices.Midi2) from the metadata in
+         Resources\WinMD, the way Microsoft's own C# samples build it. The
+         Windows SDK projection and the rc.3.7 projection reference
+         WinRT.Runtime 2.2.0.0. This version ships WinRT.Runtime 2.3.1.0, and
+         .NET binds both references to it, since a newer assembly version
+         satisfies an older reference. -->
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.3.1" />
     <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
-    <PackageReference Include="System.Speech" Version="10.0.0" />
+    <PackageReference Include="System.Speech" Version="10.0.13" />
     <!-- Vosk (Apache-2.0, Alpha Cephei): modern offline recognizer for voice
          macros. Phrase-list grammar with an [unk] bucket, so non-phrase audio
          decodes as unknown instead of force-matching the nearest phrase. -->
@@ -217,8 +244,44 @@
     <PackageReference Include="Concentus" Version="2.2.2" />
     <!-- Driver-store install, class filters, and USB CyclePort for the BthPS3
          DualShock 3 Bluetooth stack (nefarius, same lib BthPS3's own installer uses) -->
-    <PackageReference Include="Nefarius.Utilities.DeviceManagement" Version="5.2.0" />
+    <PackageReference Include="Nefarius.Utilities.DeviceManagement" Version="6.1.0" />
   </ItemGroup>
+
+  <!-- The in-box Windows MIDI Services API ships in Windows 11 25H2 (build
+       26200) from the late-November 2026 update, and the Windows SDK does not
+       carry its metadata yet. Resources\WinMD\Windows.Devices.Midi2.winmd is
+       the metadata from Microsoft's Windows.Devices.Midi2 0.99.88-preview.10
+       package (microsoft/MIDI release inbox-preview-10, MIT): package SHA-256
+       6daf121a3f76a4a1e0d46521c5072ac576477448c9332048383bb58960a4ce69, this
+       file SHA-256 497d9e7c2fb219388f748c585d7aad537d3a6a576de854bd16bfe1bc73f8d9a9.
+       Only the metadata is taken. The package's own implementation DLLs are
+       never referenced: at run time PadForge uses the copy Windows installs
+       in System32, or none. Replace this with the Windows SDK's metadata once
+       an SDK carries it. -->
+  <PropertyGroup>
+    <CsWinRTIncludes>Windows.Devices.Midi2</CsWinRTIncludes>
+  </PropertyGroup>
+  <ItemGroup>
+    <CsWinRTInputs Include="Resources\WinMD\Windows.Devices.Midi2.winmd" />
+  </ItemGroup>
+
+  <!-- cswinrt.exe 2.2.0 is not long-path aware (its manifest declares only
+       its execution level), so a generated file whose full path passes
+       Windows' 259-character limit is dropped without a word, and further
+       out the tool dies with 0xC0000409 (MSB3073, exit code -1073740791)
+       and no hint about the path. The longest file it generates from this
+       WinMD is Windows.Devices.Midi2.Transports.BasicLoopback.cs, 49
+       characters, so the generated folder, trailing backslash included, may
+       be at most 210 characters. The folder sits about 85 characters below
+       the clone's root, so this refuses a clone in a folder longer than about
+       125 characters, with the remedy, instead of the crash. A WinMD with a
+       longer namespace needs the 210 revisited. Design-time builds skip it,
+       so Visual Studio does not flag a deep clone in the editor. -->
+  <Target Name="RefuseCsWinRTPathPastLimit" AfterTargets="CsWinRTPrepareProjection" BeforeTargets="CsWinRTGenerateProjection"
+          Condition="'$(DesignTimeBuild)' != 'true'">
+    <Error Condition="$(CsWinRTGeneratedFilesDir.Length) &gt; 210"
+           Text="Build refused: cswinrt.exe cannot write past Windows' 259-character path limit, and its output folder '$(CsWinRTGeneratedFilesDir)' is $(CsWinRTGeneratedFilesDir.Length) characters, past the 210 its longest generated file allows. Clone PadForge into a shorter folder, such as C:\src\PadForge." />
+  </Target>
 
   <!-- Microsoft-signed BthPS3 + BthPS3PSM drivers (nefarius release) and the DS3
        WinUSB INF, embedded so the single-file app can drop them to a temp dir and
@@ -245,7 +308,60 @@
          unstable in-progress work from the HIDMaestro repo. Update by
          copying the Release build of HIDMaestro.Core.dll from the
          HIDMaestro repo into Resources\HIDMaestro\ after tagging a
-         release there. Current: v1.9.2, which moves the USB/IP
+         release there. Current: v2.0.3, whose removal also takes
+         usbip-win2's USB root hub filter when usbip-win2 is included and
+         no other program uses it. Taking the filter off restarts every
+         USB 3 root hub, and the filter's service goes at the next start.
+         v2.0.2 before it gives the Valve personas
+         a report clock of their own (4 ms on the Deck and the 2026
+         controller, 9 ms on the 2015 controller), calibrated motion, a
+         unit serial per identity and the firmware's trigger click
+         thresholds, which PadForge's packers now match.
+         v2.0.1 before it removes HIDMaestro from the PC through
+         HMUninstall, which the Settings card runs (#518), and installs
+         usbip-win2's host controller without usbip-win2's installer.
+         v2.0.0 before that loads profiles strictly and lists each file
+         it refuses (HMContext.ProfileLoadIssues), sweeps only the
+         controllers of programs that have ended, stages its tools for
+         an elevated process only, builds the Switch Pro, DualShock 3
+         Full and Switch 2 Pro composite reports from state
+         (HMProfile.BuildsItsOwnReports), and adds switch-pro-usb and a
+         descriptor for the Wii U GameCube adapter, which PadForge
+         withholds.
+         v1.12.0 before it added keyboards and mice
+         (HM#67): 51 keyboard and 52 mouse profiles, each the report
+         descriptor of a real device, driven through SubmitKeyboard,
+         SubmitMouse and SubmitConsumer. Every report a keyboard or mouse
+         gets is delivered in order, one per millisecond at most, and the
+         driver lets go of held keys if the consuming process dies. The
+         Keyboard + Mouse slot sends through them when a keyboard or mouse
+         is picked instead of Windows input. The same release renames the
+         Valve personas' bits the way SDL numbers them and names the
+         capacitive stick and grip sensors, writes a GameInput mapping for
+         no catalog profile, records the registry keys a virtual shares
+         with real devices in a ledger that restores them, and waits in
+         Dispose until Windows reports the device gone.
+         v1.11.0 before it added the Nintendo Switch
+         2 Pro Controller: Full persona (HM#66): the pad as it appears
+         over USB, with HID on interface 0 and a vendor bulk pair on
+         interface 1, where SDL's Switch 2 driver and Steam start the
+         pad and read its motion. The USB/IP backend serves bulk
+         transfers for it and answers Microsoft OS 1.0 descriptor
+         requests, so Windows binds WinUSB to interface 1 with no driver
+         install. The same release reads a profile's trigger axes from
+         its axisMap alone, which stops a Switch 2 Pro's right stick
+         from pulling ZR.
+         v1.10.1 before it decodes the native DualShock 3 preset's
+         rumble and LED report (HM#65), so a game's rumble on that
+         preset reaches OutputDecoded, which PadForge's motor handler
+         reads.
+         v1.10.0 before that added DualShock 3 (SIXAXIS): Full, the form
+         PCSX2 and RPCS3 read button pressure from, gave the DualSense
+         and DualShock 4 profiles an identity motion calibration in the
+         pads' own units, made a Valve persona fed raw frames repeat its
+         consumer's last frame when it goes quiet, and kept SDL reading
+         the Bluetooth DualShock 4 preset after a host arms it (HM#64).
+         v1.9.2 before it moved the USB/IP
          transport to usbip-win2 0.9.8.1, the first release with the fix
          for the attach work item that blocked driver unload. The x64
          installer is the release asset, and the ARM64 one is the same
@@ -756,6 +872,21 @@
           Condition="!Exists('Resources\SDL3\$(NativeArch)\SDL3.dll') Or !Exists('Resources\SDL3\$(NativeArch)\libusb-1.0.dll') Or !Exists('Resources\OpenXInput\$(NativeArch)\xinput1_4.dll')">
     <Message Importance="high"
              Text="$(NativeArch): SDL3.dll, libusb-1.0.dll and/or xinput1_4.dll are not in Resources\...\$(NativeArch) yet. This build compiles, and a publish will be refused until all three are there." />
+  </Target>
+
+  <!-- PadForge ships none of Microsoft's in-box Windows MIDI Services
+       binaries. Windows installs that API in System32, and this project takes
+       only its metadata (Resources\WinMD). Nothing here brings the binaries
+       in, so this refuses a publish that would carry one anyway: for example
+       after a PackageReference to Microsoft's Windows.Devices.Midi2 preview
+       package, whose runtimes\win-*\native DLL and .pri NuGet copies by
+       itself. -->
+  <Target Name="RefuseInBoxMidiBinaries" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <_InBoxMidiBinary Include="@(ResolvedFileToPublish)" Condition="'%(Filename)' == 'Windows.Devices.Midi2'" />
+    </ItemGroup>
+    <Error Condition="'@(_InBoxMidiBinary)' != ''"
+           Text="Publish refused: @(_InBoxMidiBinary->'%(Filename)%(Extension)') would ship. PadForge uses the Windows MIDI Services implementation Windows installs in System32 and ships none of its own." />
   </Target>
 
   <!-- Build identity for in-app updates (#457). Every build between two

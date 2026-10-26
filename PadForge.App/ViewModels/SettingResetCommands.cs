@@ -238,9 +238,6 @@ namespace PadForge.ViewModels
             nameof(EnableRemoteLink) or
             nameof(AutoReconnect) or
             nameof(EnableTouchpadOverlay) or
-            nameof(EnableChromaLightbar) or
-            nameof(EnableLightsyncLightbar) or
-            nameof(EnableSensaHaptics) or
             nameof(EnableMenuOverlay) or
             nameof(EnableShiftLayerFlyout) or
             nameof(EnableProfileOverlay);
@@ -282,21 +279,6 @@ namespace PadForge.ViewModels
                 case nameof(EnableTouchpadOverlay):
                 {
                     EnableTouchpadOverlay = false;
-                    break;
-                }
-                case nameof(EnableChromaLightbar):
-                {
-                    EnableChromaLightbar = false;
-                    break;
-                }
-                case nameof(EnableLightsyncLightbar):
-                {
-                    EnableLightsyncLightbar = false;
-                    break;
-                }
-                case nameof(EnableSensaHaptics):
-                {
-                    EnableSensaHaptics = false;
                     break;
                 }
                 case nameof(EnableMenuOverlay):
@@ -391,10 +373,13 @@ namespace PadForge.ViewModels
         internal static bool CanResetSetting(string name) => name is
             nameof(ProfileId) or
             nameof(KbmSurfaces) or
+            nameof(KbmKeyboardDevice) or
+            nameof(KbmMouseDevice) or
             nameof(SteeringLockLightbarColorSource) or
             nameof(SteeringLockLightbarColor) or
             nameof(TriggerRumbleFold) or
             nameof(SwapMotors) or
+            nameof(WheelRotationRangeEnabled) or
             nameof(ConstantForceEnabled) or
             nameof(AudioRumbleEnabled) or
             nameof(ImpulseSwapTriggers) or
@@ -416,6 +401,16 @@ namespace PadForge.ViewModels
                     KbmSurfaces = KbmSlotConfig.DefaultSurfaces;
                     break;
                 }
+                case nameof(KbmKeyboardDevice):
+                {
+                    KbmKeyboardDevice = KbmSlotConfig.WindowsInput;
+                    break;
+                }
+                case nameof(KbmMouseDevice):
+                {
+                    KbmMouseDevice = KbmSlotConfig.WindowsInput;
+                    break;
+                }
                 case nameof(SteeringLockLightbarColorSource):
                 {
                     SteeringLockLightbarColorSource = MacroLightbarColorSource.Fixed;
@@ -434,6 +429,11 @@ namespace PadForge.ViewModels
                 case nameof(SwapMotors):
                 {
                     SwapMotors = false;
+                    break;
+                }
+                case nameof(WheelRotationRangeEnabled):
+                {
+                    WheelRotationRangeEnabled = true;
                     break;
                 }
                 case nameof(ConstantForceEnabled):
@@ -709,17 +709,17 @@ namespace PadForge.ViewModels
                 }
                 case nameof(ParamUpInputChoice):
                 {
-                    ParamUp = "";
+                    SetParamKey(ParamRecordTarget.Up, "", null);
                     break;
                 }
                 case nameof(ParamDownInputChoice):
                 {
-                    ParamDown = "";
+                    SetParamKey(ParamRecordTarget.Down, "", null);
                     break;
                 }
                 case nameof(ParamModifierInputChoice):
                 {
-                    ParamModifier = "";
+                    SetParamKey(ParamRecordTarget.Modifier, "", null);
                     break;
                 }
                 default: return;

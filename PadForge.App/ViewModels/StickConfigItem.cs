@@ -21,19 +21,20 @@ namespace PadForge.ViewModels
         public static string[] CurvePresetNames { get; private set; } =
             Common.CurveLut.BuildPresetDisplayNames();
 
-        // LCID-stamped rebuild, no handler-order dependence: the previous
+        // Culture-stamped rebuild, no handler-order dependence: the previous
         // static-ctor lambda landed in CultureChanged's weak list (compiler
         // instance target) and could run AFTER the instance re-raises, so
         // the preset combo re-read the OLD-language list against the NEW
         // localized PresetName and the selection went blank (audit
-        // 2026-07-16).
-        private static int s_presetLcid = System.Globalization.CultureInfo.CurrentUICulture.LCID;
+        // 2026-07-16). The stamp is the culture's name: every language
+        // Windows has no number for shares LCID 4096 (#505).
+        private static string s_presetCulture = System.Globalization.CultureInfo.CurrentUICulture.Name;
 
         internal static void EnsurePresetsCultureCurrent()
         {
-            int lcid = System.Globalization.CultureInfo.CurrentUICulture.LCID;
-            if (lcid == s_presetLcid) return;
-            s_presetLcid = lcid;
+            string culture = System.Globalization.CultureInfo.CurrentUICulture.Name;
+            if (culture == s_presetCulture) return;
+            s_presetCulture = culture;
             CurvePresetNames = Common.CurveLut.BuildPresetDisplayNames();
         }
 
@@ -43,6 +44,11 @@ namespace PadForge.ViewModels
         public string Title { get; }
         public int Index { get; }
         public string IconLabel { get; }
+
+        /// <summary>The card's screen-reader name, its title: the card is a
+        /// list item, and ItemAutomationPeer.GetNameCore falls back to the
+        /// item's ToString().</summary>
+        public override string ToString() => Title ?? string.Empty;
 
         /// <summary>Per-card "Reset {Title}" tooltip — composes the localized
         /// section reset format with the stick's own localized name so the
@@ -115,12 +121,6 @@ namespace PadForge.ViewModels
         }
 
         private double _sensitivity = 1.0;
-        /// <summary>Output sensitivity multiplier for this stick. Applied
-        /// after the deadzone / range / curve stage, so it scales what the
-        /// mapping table already produced. Lives here rather than in the
-        /// mapping grid: per-row it made the grid's raw and out readouts
-        /// agree (the scale was folded in before the readout) and its slider
-        /// sat in a column too narrow to show it.</summary>
         /// <summary>Speed multiplier for the KEYBOARD AND MOUSE lane's two
         /// pointer sticks (mouse movement, scroll wheel), where the output is
         /// a rate and a multiplier is the natural control. Surfaced only when
@@ -134,7 +134,13 @@ namespace PadForge.ViewModels
         /// the same tab do that job properly. See the 2026-07-27 ruling.</para>
         ///
         /// <para>Per-source Sensitivity on the mapping rows is a different
-        /// field, live for mouse, gyro, IR pointer, and touchpad.</para></summary>
+        /// field, live for mouse, gyro, IR pointer, and touchpad.</para>
+        ///
+        /// <para>Applied after the deadzone / range / curve stage, so it
+        /// scales what the mapping table already produced. Lives here rather
+        /// than in the mapping grid: per-row it made the grid's raw and out
+        /// readouts agree (the scale was folded in before the readout) and
+        /// its slider sat in a column too narrow to show it.</para></summary>
         public double Sensitivity
         {
             get => _sensitivity;

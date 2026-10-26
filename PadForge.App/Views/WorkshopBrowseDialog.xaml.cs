@@ -96,7 +96,8 @@ namespace PadForge.Views
         /// slim fetch, cached under the art budget.</summary>
         private static readonly Lazy<HttpClient> AvatarHttp = new Lazy<HttpClient>(() =>
         {
-            var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            var http = PadForge.Engine.Common.OutboundNetworkGate.NewHttpClient();
+            http.Timeout = TimeSpan.FromSeconds(15);
             var version = typeof(WorkshopBrowseDialog).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
             http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("PadForge", version));
             return http;
@@ -466,7 +467,7 @@ namespace PadForge.Views
             return false;
         }
 
-        private void BackToSearch_Click(object sender, MouseButtonEventArgs e)
+        private void BackToSearch_Click(object sender, RoutedEventArgs e)
         {
             // Search state survives untouched behind the game room
             // (design: back returns without losing state).
@@ -767,10 +768,6 @@ namespace PadForge.Views
             }
         }
 
-        /// <summary>Refetches the game room under the current query. A
-        /// refetch rather than a local filter: the point is to reach the
-        /// configs that were never paged in, which is the whole problem on a
-        /// game carrying thousands of them.</summary>
         /// <summary>Clears the query and the box without triggering a
         /// refetch: the caller is already about to fetch.</summary>
         private void ResetConfigQuery()
@@ -781,6 +778,10 @@ namespace PadForge.Views
                 ConfigSearchBox.Clear();
         }
 
+        /// <summary>Refetches the game room under the current query. A
+        /// refetch rather than a local filter: the point is to reach the
+        /// configs that were never paged in, which is the whole problem on a
+        /// game carrying thousands of them.</summary>
         private void ApplyConfigQuery()
         {
             string next = ConfigSearchBox.Text?.Trim();
@@ -815,7 +816,7 @@ namespace PadForge.Views
         /// <summary>Cycles the sort order and refetches. Refetch rather than
         /// re-sort, because the order decides WHICH configs come back, not
         /// just how the loaded ones line up.</summary>
-        private void SortChip_Click(object sender, MouseButtonEventArgs e)
+        private void SortChip_Click(object sender, RoutedEventArgs e)
         {
             _sortIndex = (_sortIndex + 1) % SortOrders.Length;
             UpdateSortChips();
@@ -831,7 +832,7 @@ namespace PadForge.Views
         /// keeps working, and each new page is folded in and the whole list
         /// re-reversed, so the order stays consistent as it grows.</para>
         /// </summary>
-        private void SortDir_Click(object sender, MouseButtonEventArgs e)
+        private void SortDir_Click(object sender, RoutedEventArgs e)
         {
             _sortAscending = !_sortAscending;
             UpdateSortChips();
@@ -1055,7 +1056,7 @@ namespace PadForge.Views
             }
         }
 
-        private void TagChip_Click(object sender, MouseButtonEventArgs e)
+        private void TagChip_Click(object sender, RoutedEventArgs e)
         {
             if ((sender as FrameworkElement)?.DataContext is not WorkshopTagChipItem chip) return;
             if (string.Equals(chip.Tag, _activeTag, StringComparison.Ordinal)) return;
@@ -1204,7 +1205,7 @@ namespace PadForge.Views
                       _selectedConfig.FileId.ToString(CultureInfo.InvariantCulture);
             try
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
+                PadForge.Common.ShellLaunch.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
             }
             catch (Exception)
             {
@@ -1426,24 +1427,64 @@ namespace PadForge.Views
             return fallback;
         }
 
+        /// <summary>Steam's names for the config-localization languages, by
+        /// the interface language they match: the "API language code" column
+        /// of Steamworks' Supported Languages page, for every language there
+        /// the interface is translated into. Steam keeps two varieties of
+        /// Chinese, Portuguese and Spanish, and a config that has only the
+        /// other one is read in it before English (#505). English is the
+        /// last choice for every language, so it has no row.</summary>
+        internal static readonly IReadOnlyDictionary<string, string[]> SteamLanguageNames = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ar"] = new[] { "arabic" },
+            ["bg"] = new[] { "bulgarian" },
+            ["cs"] = new[] { "czech" },
+            ["da"] = new[] { "danish" },
+            ["de"] = new[] { "german" },
+            ["el"] = new[] { "greek" },
+            ["es"] = new[] { "spanish", "latam" },
+            ["fi"] = new[] { "finnish" },
+            ["fr"] = new[] { "french" },
+            ["hu"] = new[] { "hungarian" },
+            ["id"] = new[] { "indonesian" },
+            ["it"] = new[] { "italian" },
+            ["ja"] = new[] { "japanese" },
+            ["ko"] = new[] { "koreana" },
+            ["ms"] = new[] { "malay" },
+            ["nl"] = new[] { "dutch" },
+            ["no"] = new[] { "norwegian" },
+            ["pl"] = new[] { "polish" },
+            ["pt-BR"] = new[] { "brazilian", "portuguese" },
+            ["pt-PT"] = new[] { "portuguese", "brazilian" },
+            ["ro"] = new[] { "romanian" },
+            ["ru"] = new[] { "russian" },
+            ["sv"] = new[] { "swedish" },
+            ["th"] = new[] { "thai" },
+            ["tr"] = new[] { "turkish" },
+            ["uk"] = new[] { "ukrainian" },
+            ["vi"] = new[] { "vietnamese" },
+            ["zh-Hans"] = new[] { "schinese", "tchinese" },
+            ["zh-Hant"] = new[] { "tchinese", "schinese" },
+        };
+
         /// <summary>Config-localization language keys to try, best first.
         /// Steam names them in English ("english", "german"), not as culture
-        /// codes, so the running culture maps through its English name.</summary>
-        private static IEnumerable<string> PreferredConfigLanguages()
+        /// codes, so the interface culture maps through its own name or its
+        /// nearest parent's: zh-HK reads zh-Hant's. The map named only the
+        /// first ten interface languages, and read Traditional Chinese as
+        /// Simplified and Portugal's Portuguese as Brazil's.</summary>
+        internal static IEnumerable<string> PreferredConfigLanguages()
         {
-            var culture = CultureInfo.CurrentUICulture;
-            string steamName = culture.TwoLetterISOLanguageName switch
+            for (var culture = CultureInfo.CurrentUICulture; culture != null && culture.Name.Length > 0; culture = culture.Parent)
             {
-                "de" => "german",   "es" => "spanish",  "fr" => "french",
-                "it" => "italian",  "ja" => "japanese", "ko" => "koreana",
-                "nl" => "dutch",    "pt" => "brazilian", "zh" => "schinese",
-                _ => "english",
-            };
-            yield return steamName;
-            if (steamName != "english") yield return "english";
+                if (!SteamLanguageNames.TryGetValue(culture.Name, out string[] names)) continue;
+                foreach (string name in names) yield return name;
+                break;
+            }
+            yield return "english";
         }
 
-        private void PresetChip_Click(object sender, MouseButtonEventArgs e)
+        private void PresetChip_Click(object sender, RoutedEventArgs e)
         {
             if ((sender as FrameworkElement)?.DataContext is not WorkshopPresetChipItem chip) return;
             chip.IsIncluded = !chip.IsIncluded;
@@ -1668,11 +1709,6 @@ namespace PadForge.Views
             return rows;
         }
 
-        /// <summary>Group header from the entry path
-        /// (<c>Preset/slot_token/group N (mode)/input/Activator</c>): the
-        /// physical cluster, preset-prefixed when several presets are in
-        /// play. Aggregate entries (preset-only paths) group under the
-        /// preset name, or the neutral fallback.</summary>
         /// <summary>The action layer a row belongs to: the leading segment of
         /// the entry path, which the translator fills with the preset's
         /// DISPLAY name (its action-set title, resolved through the config's
@@ -1686,6 +1722,11 @@ namespace PadForge.Views
             return head.Length == 0 ? Strings.Instance.Workshop_GroupOther : head;
         }
 
+        /// <summary>Group header from the entry path
+        /// (<c>Preset/slot_token/group N (mode)/input/Activator</c>): the
+        /// physical cluster, preset-prefixed when several presets are in
+        /// play. Aggregate entries (preset-only paths) group under the
+        /// preset name, or the neutral fallback.</summary>
         private static string GroupLabel(string sourcePath, bool multiPreset)
         {
             var segments = (sourcePath ?? string.Empty).Split('/');
@@ -2280,16 +2321,6 @@ namespace PadForge.Views
             return sb.ToString();
         }
 
-        /// <summary>Folds a translator SOURCE onto the art element that
-        /// draws it.
-        ///
-        /// <para>The preview renders the controller the config was authored
-        /// on (the body is picked from the config's own controller tag), so
-        /// a binding belongs on the control the author physically pressed,
-        /// labeled with what it produces. Anchoring on the target instead
-        /// drew the virtual pad's geometry on the source device's body: a
-        /// Steam Deck touchpad bound to the d-pad lit the DECK'S d-pad and
-        /// called it "Touchpad 0", which is backwards on every layout.</para></summary>
         /// <summary>Splits a manifest source into the bare engine identifier
         /// and its human decoration.
         ///
@@ -2323,6 +2354,16 @@ namespace PadForge.Views
             return (bare.TrimEnd(), decoration);
         }
 
+        /// <summary>Folds a translator SOURCE onto the art element that
+        /// draws it.
+        ///
+        /// <para>The preview renders the controller the config was authored
+        /// on (the body is picked from the config's own controller tag), so
+        /// a binding belongs on the control the author physically pressed,
+        /// labeled with what it produces. Anchoring on the target instead
+        /// drew the virtual pad's geometry on the source device's body: a
+        /// Steam Deck touchpad bound to the d-pad lit the DECK'S d-pad and
+        /// called it "Touchpad 0", which is backwards on every layout.</para></summary>
         internal static string ArtAnchorFor(string source)
         {
             if (string.IsNullOrWhiteSpace(source)) return null;
@@ -2535,10 +2576,6 @@ namespace PadForge.Views
         public string Source { get; init; }
         public string Target { get; init; }
 
-        /// <summary>The RAW target, kept for the controller preview's art
-        /// join. Target itself is humanized for display, and the 2DModels
-        /// layout keys on the engine identifier, so the two must not be the
-        /// same string.</summary>
         /// <summary>The art element this row is DRAWN ON: the physical
         /// control the config binds, not the virtual output it produces.
         /// The preview shows the pad the config was authored for, so the

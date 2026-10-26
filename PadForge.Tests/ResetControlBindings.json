@@ -55,24 +55,6 @@
   },
   {
     "File": "PadForge.App/Views/DashboardPage.xaml",
-    "Id": "Reset_DashboardViewModel_EnableChromaLightbar_1964",
-    "Owner": "PadForge.ViewModels.DashboardViewModel",
-    "Property": "EnableChromaLightbar"
-  },
-  {
-    "File": "PadForge.App/Views/DashboardPage.xaml",
-    "Id": "Reset_DashboardViewModel_EnableLightsyncLightbar_1979",
-    "Owner": "PadForge.ViewModels.DashboardViewModel",
-    "Property": "EnableLightsyncLightbar"
-  },
-  {
-    "File": "PadForge.App/Views/DashboardPage.xaml",
-    "Id": "Reset_DashboardViewModel_EnableSensaHaptics_2000",
-    "Owner": "PadForge.ViewModels.DashboardViewModel",
-    "Property": "EnableSensaHaptics"
-  },
-  {
-    "File": "PadForge.App/Views/DashboardPage.xaml",
     "Id": "Reset_DashboardViewModel_EnableMenuOverlay_2023",
     "Owner": "PadForge.ViewModels.DashboardViewModel",
     "Property": "EnableMenuOverlay"
@@ -106,6 +88,18 @@
     "Id": "Reset_PadViewModel_KbmSurfaces_531",
     "Owner": "PadForge.ViewModels.PadViewModel",
     "Property": "KbmSurfaces"
+  },
+  {
+    "File": "PadForge.App/Views/PadPage.xaml",
+    "Id": "Reset_PadViewModel_KbmKeyboardDevice",
+    "Owner": "PadForge.ViewModels.PadViewModel",
+    "Property": "KbmKeyboardDevice"
+  },
+  {
+    "File": "PadForge.App/Views/PadPage.xaml",
+    "Id": "Reset_PadViewModel_KbmMouseDevice",
+    "Owner": "PadForge.ViewModels.PadViewModel",
+    "Property": "KbmMouseDevice"
   },
   {
     "File": "PadForge.App/Views/PadPage.xaml",
@@ -898,6 +892,12 @@
     "Id": "Reset_PadViewModel_SwapMotors_7252",
     "Owner": "PadForge.ViewModels.PadViewModel",
     "Property": "SwapMotors"
+  },
+  {
+    "File": "PadForge.App/Views/PadPage.xaml",
+    "Id": "Reset_PadViewModel_WheelRotationRangeEnabled_12112",
+    "Owner": "PadForge.ViewModels.PadViewModel",
+    "Property": "WheelRotationRangeEnabled"
   },
   {
     "File": "PadForge.App/Views/PadPage.xaml",

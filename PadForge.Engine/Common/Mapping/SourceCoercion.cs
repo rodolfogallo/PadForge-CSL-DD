@@ -551,6 +551,23 @@ namespace PadForge.Engine.Common.Mapping
         /// against the per-device InputState bool reader.</summary>
         public static Func<string, string, int, bool> ButtonHeldProvider { get; set; }
 
+        /// <summary>Reads an Up or Down key of an Incremental or Ramp source
+        /// on the controller the key names (SourceKindRuntime.ReadKey), given
+        /// the key's device guid, its descriptor and the slot. An empty guid
+        /// reads any controller on the slot. The app wires it. An engine-only
+        /// caller without it reads every key on the state in hand.</summary>
+        public static Func<string, string, int, bool> KeyHeldProvider { get; set; }
+
+        /// <summary>True while the input an Up or Down key reads on a device
+        /// is held back from the mapping rows, given the slot, the device
+        /// whose state the key is read on and the key's descriptor. The app
+        /// wires it to the test its row loops put to a Direct source and to
+        /// an Invert on Hold modifier: an input an activator reads, held
+        /// while "Also Fire Activator's Own Mapping" is off, and the trigger
+        /// a consuming macro eats. A key held back reads released
+        /// (SourceKindRuntime.ReadKeyOn). Unwired, no key is held back.</summary>
+        public static Func<int, string, string, bool> KeyHeldBackProvider { get; set; }
+
         /// <summary>— resolved Aim-Engage state for the slot. App
         /// runs the per-tick Hold/Toggle logic in
         /// <c>InputManager.UpdateGyroEngageStates</c> against the
@@ -1198,13 +1215,14 @@ namespace PadForge.Engine.Common.Mapping
         /// Touchpad tab's Momentum card, which the mouse lane reads
         /// (ReadTouchpadMouseCounts); the decay here was a second
         /// implementation of the same idea, on a different physical model,
-        /// reachable only when a pad drove a non-mouse target.</para></summary>
-        /// <summary>Per-pad cursor feel. <paramref name="settingsAccel"/> is
+        /// reachable only when a pad drove a non-mouse target.</para>
+        ///
+        /// <para>Per-pad cursor feel. <paramref name="settingsAccel"/> is
         /// the pad's own MouseAcceleration card; the per-source ParamAccel is
         /// the pre-handover driver for an import whose value has not yet been
         /// folded into that card, exactly as the pointer region resolves.
         /// Applied through the SAME curve either way, so which one supplies
-        /// the number cannot change the feel.
+        /// the number cannot change the feel.</para>
         ///
         /// <para>fingerDown and deviceGuid used to be parameters here and went
         /// unused when the EMA smoothing and trackball integrators were
@@ -1238,6 +1256,27 @@ namespace PadForge.Engine.Common.Mapping
         /// move is to reuse the reference's own stated assumption and expose
         /// the threshold for calibration.</para></summary>
         internal const float TrackpadAssumedPadWidthMm = 69f;
+
+        /// <summary><para>Smallest non-zero finger speed a pad of the given
+        /// physical width can report, in mm/s, at one coordinate unit per
+        /// report. Below this the pad reads as stationary, so any part of the
+        /// gain curve under it is unreachable.</para>
+        ///
+        /// <para>Exists because that is not hypothetical. At libinput's assumed
+        /// 69 mm a DS4 pad (1920 units, ~250 Hz) has a quantum of 8.98 mm/s,
+        /// which is ABOVE the 7 mm/s deceleration knee: the entire precision
+        /// half of the curve would be dead, and the profile would only ever
+        /// accelerate, which is the exact failure it was added to fix. The knee
+        /// comes into range below about 54 mm. So the width is a real setting,
+        /// not a constant, and this helper is what the test asserts
+        /// against.</para></summary>
+        internal static float TrackpadSpeedQuantumMmPerSec(
+            float padWidthMm, int unitsAcrossPad, float reportIntervalSec)
+        {
+            if (unitsAcrossPad <= 0 || reportIntervalSec <= 0f) return 0f;
+            float padWidthsPerSec = 1f / unitsAcrossPad / reportIntervalSec;
+            return padWidthsPerSec * padWidthMm;
+        }
 
         /// <summary><para>Cursor gain for a finger speed, ported from
         /// libinput's <c>touchpad_accel_profile_linear</c>
@@ -1274,27 +1313,6 @@ namespace PadForge.Engine.Common.Mapping
         /// out at exactly 1.0 and unchanged, while the shape either side of it
         /// (0.333x at rest, up to 5.333x at the cap) is libinput's
         /// exactly.</para></summary>
-        /// <summary><para>Smallest non-zero finger speed a pad of the given
-        /// physical width can report, in mm/s, at one coordinate unit per
-        /// report. Below this the pad reads as stationary, so any part of the
-        /// gain curve under it is unreachable.</para>
-        ///
-        /// <para>Exists because that is not hypothetical. At libinput's assumed
-        /// 69 mm a DS4 pad (1920 units, ~250 Hz) has a quantum of 8.98 mm/s,
-        /// which is ABOVE the 7 mm/s deceleration knee: the entire precision
-        /// half of the curve would be dead, and the profile would only ever
-        /// accelerate, which is the exact failure it was added to fix. The knee
-        /// comes into range below about 54 mm. So the width is a real setting,
-        /// not a constant, and this helper is what the test asserts
-        /// against.</para></summary>
-        internal static float TrackpadSpeedQuantumMmPerSec(
-            float padWidthMm, int unitsAcrossPad, float reportIntervalSec)
-        {
-            if (unitsAcrossPad <= 0 || reportIntervalSec <= 0f) return 0f;
-            float padWidthsPerSec = 1f / unitsAcrossPad / reportIntervalSec;
-            return padWidthsPerSec * padWidthMm;
-        }
-
         internal static float TrackpadPointerGain(
             float padWidthsPerSec, float thresholdMmPerSec, float padWidthMm)
         {
@@ -1501,6 +1519,12 @@ namespace PadForge.Engine.Common.Mapping
         /// name written the usual way resolves without building a string.</summary>
         private static readonly Dictionary<string, string> _gamepadAliasByName = BuildGamepadAliasByName();
 
+        /// <summary><see cref="_gamepadAliasLookup"/> searched by a span of a
+        /// name, so the search builds no string. After the table it searches:
+        /// static fields start in the order they are written.</summary>
+        private static readonly Dictionary<string, string>.AlternateLookup<ReadOnlySpan<char>> _gamepadAliasMembers =
+            _gamepadAliasLookup.GetAlternateLookup<ReadOnlySpan<char>>();
+
         private static Dictionary<string, string> BuildGamepadAliasByName()
         {
             var d = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1612,13 +1636,17 @@ namespace PadForge.Engine.Common.Mapping
         }
 
         /// <summary>The SDL-layout descriptor of the alias <paramref name="trimmed"/>
-        /// names, from the table alone.</summary>
+        /// names, from the table alone. A name the table does not hold by its
+        /// full spelling is searched by the member part, which stays a span of
+        /// <paramref name="trimmed"/>: a stick ring or a touch sensor
+        /// ("Gamepad LeftStickRing") is no member, and its Substring cost a
+        /// string on every read.</summary>
         private static bool TryGetAliasCanonical(string trimmed, out string canonical)
         {
             if (_gamepadAliasByName.TryGetValue(trimmed, out canonical)) return true;
             canonical = null;
             return trimmed.StartsWith("Gamepad ", StringComparison.Ordinal)
-                   && _gamepadAliasLookup.TryGetValue(trimmed.Substring("Gamepad ".Length).Trim(), out canonical);
+                   && _gamepadAliasMembers.TryGetValue(trimmed.AsSpan("Gamepad ".Length).Trim(), out canonical);
         }
 
         /// <summary>True for a member of <see cref="GamepadAliasTable"/>.</summary>
@@ -1715,9 +1743,6 @@ namespace PadForge.Engine.Common.Mapping
         private static float PerSourceSensitivity(MappingSource src)
             => (float)(src.Sensitivity > 0 ? src.Sensitivity : 1.0);
 
-        /// <summary>True for any MIDI-input descriptor
-        /// (<c>"Midi Note N"</c> / <c>"Midi CC N"</c> /
-        /// <c>"Midi Pitch Bend"</c>).</summary>
         /// <summary>True when the descriptor belongs to an engine-evaluated
         /// family whose name legitimately begins with 'I' ("IR Pointer X/Y",
         /// "IR Brightness"), so the legacy I/H invert/half prefix grammar must
@@ -1758,6 +1783,9 @@ namespace PadForge.Engine.Common.Mapping
             return clean;
         }
 
+        /// <summary>True for any MIDI-input descriptor
+        /// (<c>"Midi Note N"</c> / <c>"Midi CC N"</c> /
+        /// <c>"Midi Pitch Bend"</c>).</summary>
         public static bool IsMidiDescriptor(string descriptor)
             => !string.IsNullOrEmpty(descriptor)
             && descriptor.StartsWith("Midi ", StringComparison.Ordinal);
@@ -1921,9 +1949,22 @@ namespace PadForge.Engine.Common.Mapping
         /// descriptor ("Mouse Gesture Left" becomes "Left"). Empty when the
         /// descriptor is not of the family.</summary>
         public static string ParseMouseGestureName(string descriptor)
-            => IsMouseGestureDescriptor(descriptor)
-                ? descriptor.Substring("Mouse Gesture ".Length).Trim()
-                : "";
+        {
+            if (!IsMouseGestureDescriptor(descriptor)) return "";
+            // Remembered by the descriptor string, as the type-index parse
+            // is: a gesture read runs at the poll rate, and the Substring
+            // cost a string on every read.
+            if (!s_mouseGestureNameCache.TryGetValue(descriptor, out string name))
+            {
+                name = descriptor.Substring("Mouse Gesture ".Length).Trim();
+                if (s_mouseGestureNameCache.Count < TypeIndexCacheCap)
+                    s_mouseGestureNameCache[descriptor] = name;
+            }
+            return name;
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+            s_mouseGestureNameCache = new(StringComparer.Ordinal);
 
         /// <summary>Parses a touchpad-gesture descriptor into its pad
         /// index + gesture name. Returns true on success;
@@ -1947,9 +1988,28 @@ namespace PadForge.Engine.Common.Mapping
             if (parts[2].Equals("Pointer", StringComparison.Ordinal)) return false; // #9 B-15 absolute pointer
             gestureName = parts.Length == 3
                 ? parts[2]
-                : string.Join(" ", parts, 2, parts.Length - 2);
+                : JoinedGestureName(descriptor, parts);
             return true;
         }
+
+        /// <summary>The name of a touchpad gesture of more than one word
+        /// ("SwipeUp Left"), its tokens from the third on joined by single
+        /// spaces, remembered by the descriptor string as the token split
+        /// is: a gesture read runs at the poll rate, and the join cost a
+        /// string on every read.</summary>
+        private static string JoinedGestureName(string descriptor, string[] parts)
+        {
+            if (!s_gestureNameCache.TryGetValue(descriptor, out string name))
+            {
+                name = string.Join(" ", parts, 2, parts.Length - 2);
+                if (s_gestureNameCache.Count < TypeIndexCacheCap)
+                    s_gestureNameCache[descriptor] = name;
+            }
+            return name;
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+            s_gestureNameCache = new(StringComparer.Ordinal);
 
         /// <summary>Returns true if the named gesture fired on the
         /// given <c>(slotIndex, deviceGuid, padIdx)</c> on the current
@@ -2035,7 +2095,10 @@ namespace PadForge.Engine.Common.Mapping
         {
             string s = (descriptor ?? "").Trim();
             if (!s.StartsWith("Gyro ", StringComparison.Ordinal)) return -1;
-            string axis = s.Substring(5).Trim();
+            // The axis name is a span of the descriptor, compared where it
+            // stands: the Substrings cost one or two strings on every gyro
+            // read.
+            ReadOnlySpan<char> axis = s.AsSpan(5).Trim();
             // Aux family (#252): "Gyro L Pitch" carries the same axis
             // indices; only the sensor differs, and the reader picks that
             // from IsGyroAuxDescriptor. The strip is gated on the SAME
@@ -2044,9 +2107,9 @@ namespace PadForge.Engine.Common.Mapping
             // classifier rejects, so the row parsed an axis while aux
             // resolved false and silently read the PRIMARY sensor.
             if (IsGyroAuxDescriptor(s))
-                axis = axis.Substring(2).Trim();
+                axis = axis.Slice(2).Trim();
             else if (IsGyroRDescriptor(s))
-                axis = axis.Substring(2).Trim();
+                axis = axis.Slice(2).Trim();
             if (axis.Equals("Pitch",      StringComparison.OrdinalIgnoreCase)) return 0;
             if (axis.Equals("Yaw",        StringComparison.OrdinalIgnoreCase)) return 1;
             if (axis.Equals("Roll",       StringComparison.OrdinalIgnoreCase)) return 2;
@@ -2063,16 +2126,17 @@ namespace PadForge.Engine.Common.Mapping
         {
             string s = (descriptor ?? "").Trim();
             if (!s.StartsWith("Gyro ", StringComparison.Ordinal)) return false;
-            string axis = s.Substring(5).Trim();
+            // A span of the descriptor, as in ParseGyroAxisIndex.
+            ReadOnlySpan<char> axis = s.AsSpan(5).Trim();
             // Aux family (#268): "Gyro L Horizontal" blends the LEFT
             // sensor. The strip is gated on the SAME classifier predicate
             // as ParseGyroAxisIndex's (the C45 discipline): a lenient bare
             // "L " strip would accept spellings the classifier rejects,
             // and those must keep failing closed here too.
             if (IsGyroAuxDescriptor(s))
-                axis = axis.Substring(2).Trim();
+                axis = axis.Slice(2).Trim();
             else if (IsGyroRDescriptor(s))
-                axis = axis.Substring(2).Trim();
+                axis = axis.Slice(2).Trim();
             return axis.Equals("Horizontal", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -2655,6 +2719,16 @@ namespace PadForge.Engine.Common.Mapping
             return xAxis != null && yAxis != null;
         }
 
+        /// <summary>Constant-true source (translator v25): Steam's
+        /// always_on_action switch member, "Always On Command"
+        /// (ControllerBinding_SwitchesActionSetAlwaysOn in the shipped
+        /// strings; Valve's own controller_neptune_webbrowser template
+        /// authors one). The read is unconditionally on; scoping to the
+        /// hosting action set rides the row's LayerMask (or the macro
+        /// layer gate), so an always-on binding asserts exactly while its
+        /// set is active.</summary>
+        public const string AlwaysOnDescriptor = "Always On";
+
         /// <summary>Stick deflection-ring descriptors (translator v17,
         /// Steam's joystick Outer Ring Binding). The value is the stick
         /// pair's deflection magnitude, sqrt(x*x + y*y) clamped to [0..1],
@@ -2666,16 +2740,6 @@ namespace PadForge.Engine.Common.Mapping
         /// Invert selects the INNER ring ("the command will be sent when
         /// inside the radius instead of outside", Steam's shipped
         /// EdgeBindingInvert string) instead of the default outer ring.</summary>
-        /// <summary>Constant-true source (translator v25): Steam's
-        /// always_on_action switch member, "Always On Command"
-        /// (ControllerBinding_SwitchesActionSetAlwaysOn in the shipped
-        /// strings; Valve's own controller_neptune_webbrowser template
-        /// authors one). The read is unconditionally on; scoping to the
-        /// hosting action set rides the row's LayerMask (or the macro
-        /// layer gate), so an always-on binding asserts exactly while its
-        /// set is active.</summary>
-        public const string AlwaysOnDescriptor = "Always On";
-
         public const string LeftStickRingDescriptor = "Gamepad LeftStickRing";
         public const string RightStickRingDescriptor = "Gamepad RightStickRing";
 
@@ -3234,7 +3298,7 @@ namespace PadForge.Engine.Common.Mapping
             // The latch carries the hold it was captured under (#392): a
             // grip change drops it and the next real sample re-latches in
             // the new frame.
-            string gid = aux ? LeanNeutralKey(deviceGuid, slotIndex) + "|L" : LeanNeutralKey(deviceGuid, slotIndex);
+            string gid = LeanNeutralKey(deviceGuid, slotIndex, aux);
             string grip = LatchGrip(deviceGuid, slotIndex, aux);
             bool haveNeutral = TryGetLeanNeutral(_motionLeanNeutralStatic, gid, grip, out var n);
             if (!haveNeutral && gLen > 4.0)
@@ -3278,10 +3342,6 @@ namespace PadForge.Engine.Common.Mapping
             return (float)(sign * remapped);
         }
 
-        /// <summary>Canonical dictionary key for a device guid string:
-        /// parseable guids collapse to lowercase "d" format, anything else
-        /// passes through. The latch, the lookup, and the per-device reset
-        /// all agree through this.</summary>
         /// <summary>The latch key. It carries the SLOT as well as the device
         /// because the grip it is tagged with is per-(device, slot): a device
         /// on two slots can be held two ways. Keyed by device alone, the two
@@ -3289,10 +3349,27 @@ namespace PadForge.Engine.Common.Mapping
         /// dropped the latch and re-latched from the current sample, and
         /// RealignToDown then mapped that sample exactly onto down. Gyro Lean,
         /// Gyro Tilt and the static Motion Lean read a constant zero on both
-        /// slots for as long as the assignment stood.</summary>
-        private static string LeanNeutralKey(string deviceGuid, int slotIndex)
-            => (Guid.TryParse(deviceGuid, out var g) ? g.ToString() : (deviceGuid ?? ""))
-               + "#" + slotIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        /// slots for as long as the assignment stood.
+        ///
+        /// <para>The device half is the canonical key for a device guid
+        /// string: parseable guids collapse to lowercase "d" format, anything
+        /// else passes through. The latch, the lookup, and the per-device
+        /// reset all agree through this.</para></summary>
+        private static string LeanNeutralKey(string deviceGuid, int slotIndex, bool aux = false)
+        {
+            // One composed key per device text, slot and sensor. Composed on
+            // every read, it cost the Guid's text and a joined string each
+            // time: a lean read on a button or trigger row allocated about
+            // 200 bytes a poll.
+            var composed = (deviceGuid ?? "", slotIndex, aux);
+            if (s_leanNeutralKeys.TryGetValue(composed, out string key)) return key;
+            key = (Guid.TryParse(deviceGuid, out var g) ? g.ToString() : (deviceGuid ?? ""))
+                  + "#" + slotIndex.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                  + (aux ? "|L" : "");
+            return s_leanNeutralKeys.GetOrAdd(composed, key);
+        }
+
+        private static readonly ConcurrentDictionary<(string Device, int Slot, bool Aux), string> s_leanNeutralKeys = new();
 
         /// <summary>The device half of a latch key, without the slot. Used to
         /// retire every slot's latch for one device.</summary>
@@ -3572,17 +3649,28 @@ namespace PadForge.Engine.Common.Mapping
         }
 
         /// <summary>Descriptor-only read for the plain hardware-bool
-        /// families (capsense touch, NFC tag, touchpad contact): the
-        /// param/gate reader's fallback (#248 audit). These carry no
+        /// families (capsense touch, NFC tag, voice phrase, MIDI, touchpad
+        /// contact): the param/gate reader's fallback (#248 audit). These carry no
         /// threshold or direction, so a bare descriptor fully determines
-        /// the read; families that need a MappingSource (axes, rings,
-        /// mouse motion) stay out and read false here.</summary>
+        /// the read. The analog-derived on/off families (IR Brightness, the
+        /// Ring-Con, analog keys, the stick and touchpad rings) read at a
+        /// fixed half, since a key has no threshold of its own. Families that
+        /// need a MappingSource (axes, mouse motion) stay out and read false
+        /// here.</summary>
         public static bool ReadHardwareBoolDescriptor(CustomInputState state, string canonical)
         {
             if (state == null || string.IsNullOrEmpty(canonical)) return false;
             if (IsCapSenseDescriptor(canonical)) return ReadCapSenseBool(state, canonical);
             if (IsNfcTagDescriptor(canonical)) return ReadNfcTagBool(state, canonical);
             if (IsVoicePhraseDescriptor(canonical)) return ReadVoicePhraseBool(state, canonical);
+            // A stick ring or a touchpad finger ring at the Button row's
+            // default radius, half of full deflection: the outer ring, held
+            // at or past it. A key carries no Invert, so the inner ring
+            // stays a Button row's.
+            if (IsStickRingDescriptor(canonical))
+                return ReadStickRingMagnitude(state, canonical) >= KeyRingRadius;
+            if (TryParseTouchpadRing(canonical, out int ringPad, out int ringFinger, out int ringHalf))
+                return ReadTouchpadRingMagnitude(state, ringPad, ringFinger, ringHalf) >= KeyRingRadius;
             // IR cover-as-button at the fixed 50 percent midpoint: the
             // param/gate surfaces carry no per-source threshold, and the
             // main rows keep their tunable read (#248 audit round 3).
@@ -3598,8 +3686,81 @@ namespace PadForge.Engine.Common.Mapping
             // An analog key (#468) at the same fixed half press.
             if (canonical.StartsWith(AnalogKeyPrefix, StringComparison.Ordinal))
                 return AnalogKeyPressed(ReadAnalogKey(state, canonical), 50);
+            // MIDI: a note held, an encoder detent's pulse (MidiInputDevice
+            // holds each one for 24 ms), or a CC at 64 or more. Pedals and
+            // control-surface buttons send a CC, and 64 is where MIDI's own
+            // on/off controllers turn on (the MIDI Association's control
+            // change table: Damper Pedal, CC 64, reads "<=63 off, >=64 on").
+            // The Button row's default threshold lands on the same value.
+            // Pitch bend is a wheel with no off position and reads false.
+            if (canonical.StartsWith("Midi ", StringComparison.Ordinal))
+                return ReadMidiBool(state, canonical);
             return ReadTouchpadBool(state, canonical);
         }
+
+        /// <summary>The CC value at which a MIDI CC reads as held. MIDI's
+        /// on/off controllers are off at 63 and below and on from 64, and
+        /// the Button row's default threshold (more than half of 127)
+        /// lands on the same value.</summary>
+        internal const int MidiCcOnValue = 64;
+
+        /// <summary>The radius at which a stick ring or a touchpad finger
+        /// ring reads as held when it is a key: the Button row's default,
+        /// DeadZone 50 (<see cref="ReadStickRingBool"/>,
+        /// <see cref="ReadTouchpadRingBool"/>).</summary>
+        internal const float KeyRingRadius = 0.5f;
+
+        /// <summary>A MIDI descriptor read as on or off: a note held, an
+        /// encoder detent's pulse, or a CC at <see cref="MidiCcOnValue"/>
+        /// or more. Pitch bend and anything unparsed read false.</summary>
+        private static bool ReadMidiBool(CustomInputState state, string canonical)
+        {
+            if (state.Midi == null || !TryParseMidi(canonical, out char kind, out int index)) return false;
+            return kind switch
+            {
+                'N' => state.Midi.Notes[index],
+                'C' => state.Midi.Cc[index] >= MidiCcOnValue,
+                'U' => state.Midi.CcUp[index],
+                'D' => state.Midi.CcDown[index],
+                _ => false,
+            };
+        }
+
+        /// <summary>True for the descriptors
+        /// <see cref="ReadHardwareBoolDescriptor"/> can read as held: its
+        /// families, one for one. It reads no state, so it wakes no Joy-Con
+        /// MCU and marks no analog key as mapped. A family added to the read
+        /// is added here (UpDownKeyPickerTests runs the two against each
+        /// other).</summary>
+        public static bool IsHardwareBoolDescriptor(string canonical)
+        {
+            if (string.IsNullOrEmpty(canonical)) return false;
+            return IsCapSenseDescriptor(canonical)
+                || IsNfcTagDescriptor(canonical)
+                || IsVoicePhraseDescriptor(canonical)
+                || IsStickRingDescriptor(canonical)
+                || TryParseTouchpadRing(canonical, out _, out _, out _)
+                || canonical.Equals("IR Brightness", StringComparison.Ordinal)
+                || IsRingConDescriptor(canonical)
+                || IsAnalogKeyDescriptor(canonical)
+                || IsMidiKeyDescriptor(canonical)
+                || IsTouchpadBoolDescriptor(canonical);
+        }
+
+        /// <summary>True for the MIDI descriptors that read as on or off: a
+        /// note, a CC, or an encoder detent. Pitch bend is a wheel with no
+        /// off position and stays out.</summary>
+        public static bool IsMidiKeyDescriptor(string canonical)
+            => TryParseMidi(canonical, out char kind, out _) && kind != 'P';
+
+        /// <summary>True for "IR Offscreen" (#203): a Wii Remote or a GunCon 2
+        /// aimed off the screen. Its read keeps a debounce per device, so a
+        /// descriptor alone cannot read it, and the Up and Down keys of an
+        /// Incremental or Ramped source and an Invert on Hold modifier read
+        /// it through <see cref="ReadSlotEventBool"/>, as a Button row
+        /// reads it.</summary>
+        public static bool IsIrOffscreenDescriptor(string canonical)
+            => string.Equals(canonical, "IR Offscreen", StringComparison.Ordinal);
 
         /// <summary>True for the input families a descriptor alone cannot
         /// read, because each answers for one slot and one device: touchpad
@@ -3617,13 +3778,14 @@ namespace PadForge.Engine.Common.Mapping
         /// parses again when the descriptor changes.</summary>
         [ThreadStatic] private static MappingSource t_slotEventScratch;
 
-        /// <summary>A slot event family read as a key: the read a Button row
-        /// on <paramref name="slotIndex"/> takes from the device behind
-        /// <paramref name="deviceGuid"/>, at the fixed half the param surfaces
-        /// use. A tap or swipe holds the key for as long as its gesture stays
-        /// fired, the gesture cooldown. A long press, a touch spot or a radial
-        /// zone holds it while the finger stays, and a gesture axis past
-        /// half.</summary>
+        /// <summary>A slot event family, or IR Offscreen, read as a key: the
+        /// read a Button row on <paramref name="slotIndex"/> takes from the
+        /// device behind <paramref name="deviceGuid"/>, at the fixed half the
+        /// param surfaces use. A tap or swipe holds the key for as long as
+        /// its gesture stays fired, the gesture cooldown. A long press, a
+        /// touch spot or a radial zone holds it while the finger stays, and
+        /// a gesture axis past half. IR Offscreen holds it from 150 ms after
+        /// the remote loses the screen until it finds it again.</summary>
         public static bool ReadSlotEventBool(CustomInputState state, string canonical, int slotIndex,
             string deviceGuid)
         {
@@ -4174,19 +4336,6 @@ namespace PadForge.Engine.Common.Mapping
             return 0f;
         }
 
-        /// <summary>Reads <c>state.Gyro[gyroAxis]</c> minus the
-        /// (device, slot) at-rest bias (looked up via
-        /// <see cref="GyroBiasProvider"/>). Returns 0 when the
-        /// (device, slot) has no calibration entry — caller gets the
-        /// raw reading minus zero, which is the right default for
-        /// "uncalibrated yet, just connected." Defensive against null
-        /// state.Gyro[].</summary>
-        /// <summary>Bool-aux compatibility entry (the passthrough and
-        /// pre-#271 callers): aux picks the left sensor, otherwise the
-        /// primary RAW. Deliberately never Fused: the motion passthrough
-        /// must stay a real single-sensor stream (native-frame contract),
-        /// so fusion is selected only by the mapping path's descriptor
-        /// classification.</summary>
         // ─── Grip: the hold's body-to-game rotation (#392) ──────────────
 
         public const string GripPointing = "Pointing";
@@ -4300,9 +4449,22 @@ namespace PadForge.Engine.Common.Mapping
             return RotateForGrip(GetGrip(deviceGuid, slotIndex), grav.gx, grav.gy, grav.gz);
         }
 
+        /// <summary>Bool-aux compatibility entry (the passthrough and
+        /// pre-#271 callers): aux picks the left sensor, otherwise the
+        /// primary RAW. Deliberately never Fused: the motion passthrough
+        /// must stay a real single-sensor stream (native-frame contract),
+        /// so fusion is selected only by the mapping path's descriptor
+        /// classification.</summary>
         private static float ReadCalibratedGyroRate(CustomInputState state, int gyroAxis, string deviceGuid, int slotIndex, bool aux = false)
             => ReadCalibratedGyroRate(state, gyroAxis, deviceGuid, slotIndex, aux ? GyroSide.Left : GyroSide.Right);
 
+        /// <summary>Reads <c>state.Gyro[gyroAxis]</c> minus the
+        /// (device, slot) at-rest bias (looked up via
+        /// <see cref="GyroBiasProvider"/>). Returns 0 when the
+        /// (device, slot) has no calibration entry — caller gets the
+        /// raw reading minus zero, which is the right default for
+        /// "uncalibrated yet, just connected." Defensive against null
+        /// state.Gyro[].</summary>
         private static float ReadCalibratedGyroRate(CustomInputState state, int gyroAxis, string deviceGuid, int slotIndex, GyroSide side,
             bool gripAux = false)
         {
@@ -4376,10 +4538,6 @@ namespace PadForge.Engine.Common.Mapping
 
         // ─── Per-target-type evaluators ────────────────────────────────
 
-        /// <summary>Evaluates a source for a button-class target. Returns
-        /// the post-Invert pressed state. Axis and slider sources cross a
-        /// threshold (per-source DeadZone overrides the global threshold
-        /// when set).</summary>
         /// <summary>Effective per-source threshold percent: an authored
         /// row DeadZone wins, but 0 (unset) AND 50 (the MappingSource
         /// model's untouched default, the same sentinel the mapping
@@ -4391,6 +4549,10 @@ namespace PadForge.Engine.Common.Mapping
         internal static int EffectiveThresholdPercent(MappingSource src, int globalThresholdPercent)
             => (src.DeadZone > 0 && src.DeadZone != 50) ? src.DeadZone : globalThresholdPercent;
 
+        /// <summary>Evaluates a source for a button-class target. Returns
+        /// the post-Invert pressed state. Axis and slider sources cross a
+        /// threshold (per-source DeadZone overrides the global threshold
+        /// when set).</summary>
         public static bool EvaluateForButtonTarget(
             CustomInputState state, MappingSource src, int globalThresholdPercent, int slotIndex = -1,
             string evaluatedDeviceGuid = null)
@@ -6631,6 +6793,34 @@ namespace PadForge.Engine.Common.Mapping
             return false;
         }
 
+        /// <summary>True for the descriptors <see cref="ReadTouchpadBool"/>
+        /// can read as held: a click, a windowed click, or a finger's
+        /// contact with or without a window. These are the read's own token
+        /// tests on the read's own split, taken without a state.</summary>
+        public static bool IsTouchpadBoolDescriptor(string descriptor)
+        {
+            if (string.IsNullOrEmpty(descriptor)) return false;
+            string[] parts = SplitTokensCached(descriptor);
+            if (parts.Length < 3) return false;
+            if (!int.TryParse(parts[1], out int padIdx) || padIdx < 0) return false;
+
+            if (parts[2].Equals("Click", StringComparison.Ordinal))
+                return parts.Length == 3
+                    || (parts.Length == 4 && ParseTouchpadHalf(parts[3]) != TouchpadHalfNone);
+
+            if ((parts.Length == 5 || parts.Length == 6 || parts.Length == 7)
+                && parts[2].Equals("Finger", StringComparison.Ordinal)
+                && parts[4].Equals("Down", StringComparison.Ordinal))
+            {
+                if (parts.Length == 6 && ParseTouchpadHalf(parts[5]) == TouchpadHalfNone) return false;
+                if (parts.Length == 7
+                    && ComposeTouchpadWindow(ParseTouchpadHalf(parts[5]), ParseTouchpadHalf(parts[6])) == TouchpadHalfNone)
+                    return false;
+                return int.TryParse(parts[3], out int fingerIdx) && fingerIdx >= 0;
+            }
+            return false;
+        }
+
         /// <summary>Returns the <see cref="TouchpadInputState"/> for the
         /// requested pad index, or <c>null</c> when the device has no
         /// touchpad or the requested pad index is out of range. Centralizes
@@ -6662,10 +6852,12 @@ namespace PadForge.Engine.Common.Mapping
         /// (current - previous), and seeds itself on every fresh touch-down
         /// so a re-touch doesn't generate a jump. Lifted finger collapses
         /// the entry back to "needs seeding."</summary>
-        private struct TouchpadAxisDelta
+        // One object per tracked axis, updated in place under its own lock.
+        // As a struct it was put back in the table on every poll while a
+        // finger moved, and the table made a new node for it each time.
+        private sealed class TouchpadAxisDelta
         {
             public float PrevValue;
-            public bool Seeded;
             // Poll-frame gate: the delta is (current - previous) with
             // previous updated on compute, so the first reader consumed the
             // movement and a second row on the same (slot, finger, axis)
@@ -6805,32 +6997,34 @@ namespace PadForge.Engine.Common.Mapping
             }
 
             // X / Y → delta from previous poll. Seed on first contact.
-            var prev = _touchpadDeltas.GetOrAdd(key, _ => new TouchpadAxisDelta { PrevValue = raw, Seeded = false });
-            if (!prev.Seeded)
+            // Looked up with no factory: one that captured the sample was
+            // built on every read, whether or not it added anything.
+            if (!_touchpadDeltas.TryGetValue(key, out var prev))
             {
-                _touchpadDeltas[key] = new TouchpadAxisDelta { PrevValue = raw, Seeded = true, FrameSeq = _pollFrameSeq };
+                _touchpadDeltas[key] = new TouchpadAxisDelta { PrevValue = raw, FrameSeq = _pollFrameSeq };
                 // Seed frame reads 0; the touch also kills any trackball
                 // momentum (catching the ball stops it).
                 bipolar = ApplyTouchpadFeel(src, 0f, padAccel);
                 return true;
             }
             float delta;
-            if (prev.FrameSeq == _pollFrameSeq)
+            // A preview on the UI thread reads the same tracker as the
+            // polling thread, so the three fields change together.
+            lock (prev)
             {
-                // Second row on this (slot, finger, axis) in the same poll:
-                // re-serve the delta instead of consuming it to ~0.
-                delta = prev.FrameDelta;
-            }
-            else
-            {
-                delta = raw - prev.PrevValue;
-                _touchpadDeltas[key] = new TouchpadAxisDelta
+                if (prev.FrameSeq == _pollFrameSeq)
                 {
-                    PrevValue = raw,
-                    Seeded = true,
-                    FrameSeq = _pollFrameSeq,
-                    FrameDelta = delta,
-                };
+                    // Second row on this (slot, finger, axis) in the same poll:
+                    // re-serve the delta instead of consuming it to ~0.
+                    delta = prev.FrameDelta;
+                }
+                else
+                {
+                    delta = raw - prev.PrevValue;
+                    prev.PrevValue = raw;
+                    prev.FrameSeq = _pollFrameSeq;
+                    prev.FrameDelta = delta;
+                }
             }
 
             // Y sign: return the RAW delta in SDL convention (raw_y=0 at top,

@@ -84,6 +84,26 @@ namespace PadForge.Engine.RemoteLink
         /// <summary>The peer device's input-device-type constant (see InputDeviceType).</summary>
         public int InputDeviceType { get; set; } = PadForge.Engine.InputDeviceType.Gamepad;
 
+        /// <summary>Whether the owner reads the device in SDL's gamepad
+        /// layout, the layout the "(Any Device)" Gamepad names read
+        /// (InputManager.InSdlGamepadLayout on the owner's PC). The type does
+        /// not say: SDL opens some wheels, flight sticks, arcade sticks and
+        /// instrument pads through its gamepad API and types each for what it
+        /// is, and a device typed a gamepad can be read outside the layout.
+        /// Null leaves the answer to the type, a gamepad's or not, as every
+        /// copy answered before this was carried: the wire holds one bit, set
+        /// where the layout is not what the type says (caps2 bit 7 in the v3
+        /// tail), so an owner from before the bit sends none and a peer from
+        /// before it reads none. Kept in one field a thread reads whole: the
+        /// link's receive thread refreshes it and the poll thread reads
+        /// it.</summary>
+        public bool? GamepadLayout
+        {
+            get => _gamepadLayout switch { 1 => true, 2 => false, _ => null };
+            set => _gamepadLayout = value == null ? 0 : value.Value ? 1 : 2;
+        }
+        private volatile int _gamepadLayout;
+
         /// <summary>Whether the device is currently active on the owner (#138 live device
         /// sync). Carried in the DeviceList message so the consumer shows active/inactive.</summary>
         public bool Online { get; set; } = true;
@@ -140,6 +160,15 @@ namespace PadForge.Engine.RemoteLink
         /// device and from a peer that predates the v11 tail, where the row's
         /// 0.15 rad/s rule stands.</summary>
         public string Ds3Identity { get; set; }
+
+        /// <summary>The capacitive sensors the owner's pad has, as a bitmask
+        /// over the SDL_GAMEPAD_CAPSENSE_* indices (the owner's
+        /// UserDevice.CapSenseChannelMask): the stick tops of the Steam Deck
+        /// and the 2026 Steam Controller, and the 2026 pad's grips. A pad's own
+        /// picker group and the Valve automap list a sensor only where the mask
+        /// has it. 0 for a pad with none and from a peer that predates the v12
+        /// tail, where the sensors are offered under (Any Device) alone.</summary>
+        public int CapSenseChannelMask { get; set; }
 
         internal RemotePeerDeviceInfo CloneForSlot(byte slot)
         {
@@ -319,6 +348,11 @@ namespace PadForge.Engine.RemoteLink
         public bool HasTouchpad => Info.HasTouchpad;
         public int NumTouchpads => Info.HasTouchpad ? Math.Max(1, Info.NumTouchpads) : 0;
         public int[] TouchpadFingerCounts => Info.TouchpadFingerCounts ?? Array.Empty<int>();
+        /// <summary>The owner's answer, carried by the device list's v12 tail.
+        /// The interface's default of 0 left a shared Steam Deck or 2026
+        /// Steam Controller with no sensor in its own picker group and none
+        /// for the Valve automap to bind.</summary>
+        public int CapSenseChannelMask => Info.CapSenseChannelMask;
         public bool? TouchpadPressureSupported => Info.TouchpadPressureSupported;
         public bool? TouchpadClickSupported => Info.TouchpadClickSupported;
         public HapticEffectStrategy HapticStrategy => HapticEffectStrategy.None;

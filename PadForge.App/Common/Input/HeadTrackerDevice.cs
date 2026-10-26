@@ -199,6 +199,12 @@ namespace PadForge.Common.Input
         public int UdpPort => _port;
         public bool UdpEnabled => _udpEnabled;
         internal int BoundUdpPort => (_socket?.LocalEndPoint as IPEndPoint)?.Port ?? 0;
+        internal IPAddress BoundUdpAddress => (_socket?.LocalEndPoint as IPEndPoint)?.Address;
+
+        /// <summary>The local address the UDP socket binds. Every address in
+        /// the app, which takes a tracker on another PC. The tests pass
+        /// loopback, so the test host opens nothing the network can reach.</summary>
+        internal IPAddress UdpBindAddress { get; init; } = IPAddress.Any;
         public bool UdpBindFailed => _udpBindFailed;
         public bool FreeTrackEnabled => _freeTrackEnabled;
 
@@ -235,6 +241,8 @@ namespace PadForge.Common.Input
             {
                 try
                 {
+                    // The test host binds loopback alone (NetworkListenerGate).
+                    PadForge.Engine.Common.NetworkListenerGate.Enter(UdpBindAddress);
                     var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                     _socket = s;
                     // Suppress ICMP port-unreachable surfacing as a SocketException
@@ -244,7 +252,7 @@ namespace PadForge.Common.Input
                     // on the same port) must surface as a conflict, not steal
                     // half the datagrams.
                     s.ExclusiveAddressUse = true;
-                    s.Bind(new IPEndPoint(IPAddress.Any, _port));
+                    s.Bind(new IPEndPoint(UdpBindAddress, _port));
                     _running = true;
                     _thread = new Thread(ReceiveLoop)
                     {
@@ -486,9 +494,10 @@ namespace PadForge.Common.Input
             try { _freeTrack?.Dispose(); } catch { }
             _freeTrack = null;
             // The OpenXR source owns native handles, so its stop is a real
-            // wait rather than a courtesy. It is bounded: every native call
-            // in its loop is a locate or an event poll, and neither blocks on
-            // a compositor.
+            // wait rather than a courtesy. It is bounded at two seconds
+            // (OpenXrHeadPoseSource.Stop): the loop's locates and event polls
+            // do not block on a compositor, and its waits for a headset or a
+            // returning runtime sleep in short slices.
             try { _openXr?.Dispose(); } catch { }
             _openXr = null;
             try { LeftHand?.Dispose(); } catch { }
@@ -538,8 +547,23 @@ namespace PadForge.Common.Input
             _mutexName = mutexName;
         }
 
+        /// <summary>Set by the test assembly for the life of its process
+        /// (PadForge.Tests FreeTrackOffLimits), never by the app. FT_SharedMem
+        /// and FT_Mutext are the names every FreeTrack tracker and game on
+        /// the PC shares, and opening the mapping creates it where no
+        /// tracker has. While this is set, a reader on those two names
+        /// opens nothing and answers as a mapping that failed does. A reader
+        /// on names of a test's own still opens. False in production, where
+        /// every path is as it was.</summary>
+        internal static bool OffLimitsForTest;
+
         public bool Open()
         {
+            if (OffLimitsForTest && (_heapName == HeapName || _mutexName == MutexName))
+            {
+                SdlDiagLog.WriteLine("Head tracker: FreeTrack mapping failed: the test host opens no shared FreeTrack memory");
+                return false;
+            }
             try
             {
                 _mmf = MemoryMappedFile.CreateOrOpen(_heapName, HeadPose.FreeTrackHeapBytes, MemoryMappedFileAccess.ReadWrite);

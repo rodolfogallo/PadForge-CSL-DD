@@ -1349,13 +1349,13 @@ public class GyroSimulationTests
     }
 
     [Theory]
-    [InlineData("00265C507543", "00265c507543")]
-    [InlineData("00:26:5c:50:75:43", "00265c507543")]
-    [InlineData("00-26-5C-50-75-43", "00265c507543")]
-    [InlineData("02265C507543", null)]
+    [InlineData("00005E005343", "00005e005343")]
+    [InlineData("00:00:5e:00:53:43", "00005e005343")]
+    [InlineData("00-00-5E-00-53-43", "00005e005343")]
+    [InlineData("02005E005343", null)]
     [InlineData("000000000000", null)]
-    [InlineData("00265C50754", null)]
-    [InlineData("00265C50754G", null)]
+    [InlineData("00005E00534", null)]
+    [InlineData("00005E00534G", null)]
     [InlineData("", null)]
     [InlineData(null, null)]
     public void OnlyAnAddressThatNamesOnePadCounts(string raw, string expected)
@@ -1495,7 +1495,7 @@ public class GyroSimulationTests
         string des = RepoText("PadForge.App", "Resources", "Strings", "Strings.Designer.cs");
         foreach (var k in keys)
             Assert.Contains($"public string {k} => Get(\"{k}\");", des);
-        foreach (var loc in new[] { "", ".de", ".es", ".fr", ".it", ".ja", ".ko", ".nl", ".pt-BR", ".zh-Hans" })
+        foreach (var loc in PadForge.Tests.LocaleFiles.CompleteSuffixes)
         {
             string resx = RepoText("PadForge.App", "Resources", "Strings", "Strings" + loc + ".resx");
             foreach (var k in keys)

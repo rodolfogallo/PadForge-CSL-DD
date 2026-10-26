@@ -189,24 +189,42 @@ namespace PadForge.Engine
         public bool HasJoyCon2Mouse { get; private set; }
 
         /// <summary>Cycles the motion sensors off and back on. The SDL
-        /// fork decides the right Joy-Con NIR camera's fate only at this
-        /// enable edge (SDL_hidapi_switch.c SetSensorsEnabled: hint set ->
-        /// EnableIRSensor, hint clear while active -> DisableIRSensor via
-        /// the disable leg), so a RUNTIME flip of the IR hint needs one
-        /// bounce to take effect without a reconnect (#248 audit round 2).
+        /// fork starts a Wii Remote's IR camera on the enable edge
+        /// (SDL_hidapi_wii.c SetJoystickSensorsEnabled, EnableIR), so a
+        /// bounce is one more start, and the toggle sets the driver's own
+        /// retry delays back to the first (hifihedgehog/SDL#39). Since SDL
+        /// 77cf0379f5 neither edge waits on the remote (hifihedgehog/SDL#40),
+        /// see <see cref="StepIrCameraCheck"/>. A right Joy-Con's NIR camera
+        /// needs no bounce: the fork follows its hint on every update
+        /// (SDL_hidapi_switch.c UpdateIR).
+        /// Both open paths enable the sensors, so both are cycled.
         /// Gyro/accel streams resume immediately; one bounce costs a few
         /// sensor frames.</summary>
         public void BounceMotionSensors()
         {
-            if (GameController == IntPtr.Zero) return;
-            if (HasGyro) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_GYRO, false);
-            if (HasAccel) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_ACCEL, false);
-            if (HasGyroAux) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_GYRO_L, false);
-            if (HasAccelAux) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_ACCEL_L, false);
-            if (HasGyro) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_GYRO, true);
-            if (HasAccel) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_ACCEL, true);
-            if (HasGyroAux) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_GYRO_L, true);
-            if (HasAccelAux) SDL_SetGamepadSensorEnabled(GameController, SDL_SENSOR_ACCEL_L, true);
+            IntPtr gamepad = GameController;
+            if (gamepad != IntPtr.Zero)
+            {
+                if (HasGyro) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO, false);
+                if (HasAccel) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL, false);
+                if (HasGyroAux) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO_L, false);
+                if (HasAccelAux) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL_L, false);
+                if (HasGyro) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO, true);
+                if (HasAccel) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL, true);
+                if (HasGyroAux) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO_L, true);
+                if (HasAccelAux) SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL_L, true);
+                return;
+            }
+            IntPtr joystick = Joystick;
+            if (joystick == IntPtr.Zero) return;
+            if (HasGyro) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_GYRO, false);
+            if (HasAccel) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_ACCEL, false);
+            if (HasGyroAux) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_GYRO_L, false);
+            if (HasAccelAux) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_ACCEL_L, false);
+            if (HasGyro) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_GYRO, true);
+            if (HasAccel) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_ACCEL, true);
+            if (HasGyroAux) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_GYRO_L, true);
+            if (HasAccelAux) SDL_SetJoystickSensorEnabled(joystick, SDL_SENSOR_ACCEL_L, true);
         }
 
         /// <summary>Whether this device has an NFC reader the SDL fork can
@@ -277,6 +295,24 @@ namespace PadForge.Engine
         /// per-frame fill and the CustomInputState allocation stay free for
         /// the overwhelmingly common capsense-less device.</summary>
         private bool[] _capSenseChannels;
+
+        /// <summary>The capsense channels this pad has, as a bitmask over the
+        /// SDL_GAMEPAD_CAPSENSE_* indices (bit 0 left stick, 1 right stick, 2
+        /// left grip, 3 right grip). Persisted onto UserDevice like the
+        /// touchpad finger counts, so the pad's own picker group and the
+        /// automap offer only the sensors it has, even offline.</summary>
+        public int CapSenseChannelMask
+        {
+            get
+            {
+                var channels = _capSenseChannels;
+                if (channels == null) return 0;
+                int mask = 0;
+                for (int c = 0; c < channels.Length && c < 31; c++)
+                    if (channels[c]) mask |= 1 << c;
+                return mask;
+            }
+        }
 
         /// <summary>Human-readable device name.</summary>
         public string Name { get; private set; } = string.Empty;
@@ -757,6 +793,14 @@ namespace PadForge.Engine
             // wrapper instead.
             _nfcPrevUid = null;
             if (_nfcPulseUntil != null) Array.Clear(_nfcPulseUntil, 0, _nfcPulseUntil.Length);
+
+            // The IR camera check and the accelerometer seed it reads belong
+            // to the connection: a reopened remote's camera starts again.
+            _irCheckStarted = false;
+            _irReportSeen = false;
+            _irCheckGaveUp = false;
+            _irBounces = 0;
+            _irAccelSeeded = false;
 
             // Same reason, wider scope: every capability flag and probe
             // result below is stamped by Open from the handle it just got.
@@ -1336,15 +1380,19 @@ namespace PadForge.Engine
             // negated and SDL's Y as the remote's Z
             // (SDL_hidapi_wii.c HandleWiiRemoteAccelData).
             bool accel = state.Accel != null && state.Accel.Length > 1;
+            short d0x = SDL_GetJoystickAxis(Joystick, 6);
+            short d0y = SDL_GetJoystickAxis(Joystick, 7);
+            short d1x = SDL_GetJoystickAxis(Joystick, 8);
+            short d1y = SDL_GetJoystickAxis(Joystick, 9);
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
             var (x, y, detected, calibrated) = StepIrPointer(
-                SDL_GetJoystickAxis(Joystick, 6),
-                SDL_GetJoystickAxis(Joystick, 7),
-                SDL_GetJoystickAxis(Joystick, 8),
-                SDL_GetJoystickAxis(Joystick, 9),
+                d0x, d0y, d1x, d1y,
                 accel ? -state.Accel[0] : 0f,
                 accel ? state.Accel[1] : 0f,
-                System.Diagnostics.Stopwatch.GetTimestamp(),
+                now,
                 trigger);
+            if (StepIrCameraCheck(d0x, d0y, d1x, d1y, _irAccelSeeded, now))
+                ScheduleIrCameraBounce();
 
             // Pointer-tab tuning (sensor-bar offset, smoothing) is applied at
             // the SLOT-scoped read (SourceCoercion.ReadTunedIrPointer), not
@@ -1411,6 +1459,118 @@ namespace PadForge.Engine
                 return (x, y, true, false);
             (x, y) = ApplyWiiPointerCalibration(x, y, calibration);
             return (x, y, true, true);
+        }
+
+        // ── The IR camera's start (#484) ──
+        // The fork starts a Wii Remote's camera from the sensor-enable edge:
+        // reports 0x13 and 0x1a and five register writes, each sent once the
+        // remote acknowledges the one before it (SDL_hidapi_wii.c EnableIR,
+        // SendCameraStep). Before SDL c2eb7a5f2a a write that timed out left
+        // the camera off for the connection, since only the next sensor
+        // toggle or a reopen tried again and Open enables the sensors once:
+        // the aim lost after a remote reconnected while every button worked
+        // (discussion #484). The driver now starts a failed camera again
+        // after 1, 2 and 4 s and then every 8 s, and reads the camera bit in
+        // a status report (hifihedgehog/SDL#39). Since 77cf0379f5 the start
+        // runs on the driver's update loop and waits on nothing
+        // (hifihedgehog/SDL#40). This check stays as a backstop that records
+        // the start in the log. The fork posts every IR report on axes 6-9 as
+        // a dot or -1, and SDL starts them at 0, so four zeros while the
+        // accelerometer reports mean no IR report has come. The check then
+        // bounces the sensors, which starts the camera once more and sets the
+        // driver's delays back. Poll-thread state.
+
+        /// <summary>How long the camera has after the remote's first report
+        /// to send its first IR report. A start is seven writes, each sent
+        /// once the one before it is acknowledged, and a write still without
+        /// its acknowledgment 250 ms after it went out goes again, four sends
+        /// in all (SDL_hidapi_wii.c WII_WRITE_PATIENCE_MS, UpdateWrites). Each
+        /// later bounce waits twice as long as the one before.</summary>
+        internal const int IrCameraFirstCheckMs = 3000;
+
+        /// <summary>Bounces per connection. Each cuts the motion streams for a
+        /// few frames, and the driver keeps retrying on its own, so after
+        /// these the camera is left to the driver's retries.</summary>
+        internal const int IrCameraMaxBounces = 3;
+
+        private bool _irCheckStarted;
+        private bool _irReportSeen;
+        private bool _irCheckGaveUp;
+        private int _irBounces;
+        private long _irCheckStart;
+        private long _irBounceDue;
+        private int _irBouncing;
+
+        /// <summary>Whether this poll should bounce the sensors to start the
+        /// IR camera, from the four dot axes, whether the remote's
+        /// accelerometer has reported and the poll's Stopwatch time. The
+        /// clock starts at the remote's first report, so a remote that sends
+        /// nothing, which a bounce cannot help, is never bounced. An IR report
+        /// on any axis ends the check for the connection. Split from
+        /// <see cref="ReadIrPointer"/> so it runs without SDL.</summary>
+        internal bool StepIrCameraCheck(short d0x, short d0y, short d1x, short d1y, bool reporting, long now)
+        {
+            if (_irReportSeen)
+                return false;
+            if (d0x != 0 || d0y != 0 || d1x != 0 || d1y != 0)
+            {
+                _irReportSeen = true;
+                if (_irBounces > 0)
+                    SdlDiagLog.WriteLine($"WIIIR {Name} SDL#{SdlInstanceId} camera started after {_irBounces} bounce(s), {IrCameraSeconds(now):F1} s after the remote's first report");
+                return false;
+            }
+            if (!reporting)
+                return false;
+            if (!_irCheckStarted)
+            {
+                _irCheckStarted = true;
+                _irCheckStart = now;
+                _irBounceDue = now + IrCameraTicks(IrCameraFirstCheckMs);
+                return false;
+            }
+            if (_irCheckGaveUp || now < _irBounceDue)
+                return false;
+            if (_irBounces >= IrCameraMaxBounces)
+            {
+                _irCheckGaveUp = true;
+                SdlDiagLog.WriteLine($"WIIIR {Name} SDL#{SdlInstanceId} no IR report {IrCameraSeconds(now):F1} s after the remote's first report and {_irBounces} bounces, so the camera is left to the driver's retries");
+                return false;
+            }
+            _irBounces++;
+            _irBounceDue = now + IrCameraTicks(IrCameraFirstCheckMs << _irBounces);
+            SdlDiagLog.WriteLine($"WIIIR {Name} SDL#{SdlInstanceId} no IR report {IrCameraSeconds(now):F1} s after the remote's first report, bouncing the sensors ({_irBounces} of {IrCameraMaxBounces})");
+            return true;
+        }
+
+        private static long IrCameraTicks(int ms) => ms * System.Diagnostics.Stopwatch.Frequency / 1000;
+
+        private double IrCameraSeconds(long now) => (now - _irCheckStart) / (double)System.Diagnostics.Stopwatch.Frequency;
+
+        /// <summary>Bounces the sensors on a worker, one bounce at a time.
+        /// Before SDL 77cf0379f5 the driver's camera start waited on
+        /// acknowledged writes under SDL's joystick lock. It waits on nothing
+        /// now (hifihedgehog/SDL#40), and the worker only keeps the sensor
+        /// calls off the poll thread.</summary>
+        private void ScheduleIrCameraBounce()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _irBouncing, 1) != 0)
+                return;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    if (!_disposed)
+                        BounceMotionSensors();
+                }
+                catch
+                {
+                    // A remote closing under the bounce: its next arrival checks again.
+                }
+                finally
+                {
+                    System.Threading.Volatile.Write(ref _irBouncing, 0);
+                }
+            });
         }
 
         // ── Twist compensation (#485) ──
@@ -2831,27 +2991,6 @@ namespace PadForge.Engine
         private static string GetGamepadButtonName(int buttonIndex)
             => GamepadObjectNames.Button(buttonIndex);
 
-        /// <summary>
-        /// Maps a PadForge button position (0-21) to the SDL gamepad button
-        /// enum it reads from. Used by <see cref="GetDeviceObjects"/> to skip
-        /// positions whose backing button isn't physically present on the
-        /// device (so an Xbox 360 doesn't show "Misc 1" / "Right Paddle 1"
-        /// in the dropdown). Positions 11-21 follow SDL's
-        /// <c>SDL_GamepadButton</c> enum order (Misc1, paddles R1/L1/R2/L2,
-        /// Touchpad, Misc2-Misc6), skipping the four DPad slots that
-        /// PadForge synthesizes into POV[0].
-        /// </summary>
-        /// <summary>
-        /// Builds the sparse list of button positions this device exposes,
-        /// used to populate <see cref="SupportedButtonIndices"/>. For SDL3
-        /// gamepads, positions 11-21 are gated on <c>SDL_GamepadHasButton</c>
-        /// so an Xbox 360 (no paddles, no Misc, no touchpad) reports just
-        /// 0-10, while a DualSense Edge reports 0-10 plus its actual
-        /// paddle / Mute / touchpad slots. Raw passthrough indices ≥22 are
-        /// included only when not already consumed by the gamepad mapping
-        /// (matches <see cref="GetGamepadState"/>'s passthrough loop).
-        /// Non-gamepad devices get a dense 0..NumButtons-1 list.
-        /// </summary>
         /// <summary>Open-time presence of extended positions 11-21 (from
         /// the SDL_GamepadHasButton probe); null before the probe runs.</summary>
         private bool[] _extButtonPresent;
@@ -2972,6 +3111,17 @@ namespace PadForge.Engine
             return true;
         }
 
+        /// <summary>
+        /// Builds the sparse list of button positions this device exposes,
+        /// used to populate <see cref="SupportedButtonIndices"/>. For SDL3
+        /// gamepads, positions 11-21 are gated on <c>SDL_GamepadHasButton</c>
+        /// so an Xbox 360 (no paddles, no Misc, no touchpad) reports just
+        /// 0-10, while a DualSense Edge reports 0-10 plus its actual
+        /// paddle / Mute / touchpad slots. Raw passthrough indices ≥22 are
+        /// included only when not already consumed by the gamepad mapping
+        /// (matches <see cref="GetGamepadState"/>'s passthrough loop).
+        /// Non-gamepad devices get a dense 0..NumButtons-1 list.
+        /// </summary>
         private int[] ComputeSupportedButtonIndices()
         {
             int max = Math.Min(NumButtons, CustomInputState.MaxButtons);
@@ -3043,6 +3193,16 @@ namespace PadForge.Engine
             };
         }
 
+        /// <summary>
+        /// Maps a PadForge button position (0-21) to the SDL gamepad button
+        /// enum it reads from. Used by <see cref="GetDeviceObjects"/> to skip
+        /// positions whose backing button isn't physically present on the
+        /// device (so an Xbox 360 doesn't show "Misc 1" / "Right Paddle 1"
+        /// in the dropdown). Positions 11-21 follow SDL's
+        /// <c>SDL_GamepadButton</c> enum order (Misc1, paddles R1/L1/R2/L2,
+        /// Touchpad, Misc2-Misc6), skipping the four DPad slots that
+        /// PadForge synthesizes into POV[0].
+        /// </summary>
         private static int GamepadButtonForPosition(int position)
         {
             return position switch

@@ -151,6 +151,7 @@ namespace PadForge.Common.Input
         /// </summary>
         internal static bool TrySetSessionVolume(IntPtr pSession, float volume)
         {
+            if (AudioEndpointAccess.Refuses) return false;
             var iidVol = IID_SimpleAudioVolume;
             // Marshal.QueryInterface declares the IID as `in Guid` — passing
             // it bare lets the compiler insert the in-pass; an explicit `ref`
@@ -196,9 +197,11 @@ namespace PadForge.Common.Input
                         if (!TryGetSessionProcessId(pSession, out uint pid) || pid == 0)
                             continue;
 
-                        using var proc = System.Diagnostics.Process.GetProcessById((int)pid);
-                        if (seen.Add(proc.ProcessName))
-                            names.Add(proc.ProcessName);
+                        // One limited query of this process. ProcessName on a
+                        // process it cannot open walks every process.
+                        string name = PadForge.Common.Input.ProcessImage.NameOf(pid);
+                        if (name != null && seen.Add(name))
+                            names.Add(name);
                     }
                     catch { }
                     finally
@@ -657,7 +660,9 @@ namespace PadForge.Common.Input
                 // stop on disengage. Applied before the WasTriggerActive
                 // latch so re-engaging the layer is a fresh rising edge.
                 bool layerOpen = MacroLayerGateOpen(macro);
-                if (!layerOpen) triggerActive = false;
+                // DC20: a menu commit made by leaving a layer is gated by
+                // that layer, for that commit's trigger alone.
+                if (!layerOpen) triggerActive = triggerActive && LayerExitCommitOpensMacro(macro, menuCellHeld);
 
                 // Toggle mode (#238): a trigger-level latch. Each raw
                 // rising edge flips it, and downstream sees the LATCH as
@@ -920,6 +925,7 @@ namespace PadForge.Common.Input
             if (_macroPassConsumedButtons != 0)
                 gp.Buttons = (ushort)((gp.Buttons & (ushort)~_macroPassConsumedButtons)
                                       | _macroPassOutputButtons);
+            FlushChromaColors();
         }
 
         /// <summary>Shift-layer gate for layer-scoped macros (translator
@@ -1002,6 +1008,62 @@ namespace PadForge.Common.Input
             return false;
         }
 
+        /// <summary>DC20. With the macro's layer gate closed on the layer
+        /// engaged now, true when what fired the macro is a live menu commit
+        /// that a layer's ending made, and the gate opens on that layer. Two
+        /// shapes carry one: a macro cell's stamp, which records the layer,
+        /// and an imported cell binding, whose macro triggers on the cell's
+        /// own descriptor. A trigger with any other part (a button, a POV, a
+        /// gesture, an axis, another descriptor, Always or a custom
+        /// expression) keeps the gate closed: those parts are the departed
+        /// layer's other sources, inactive after the exit.</summary>
+        private static bool LayerExitCommitOpensMacro(MacroItem macro, bool menuCellHeld)
+        {
+            if (menuCellHeld && macro.MenuTriggerExitLayer != null
+                && MacroLayerGateOpenOn(macro, macro.MenuTriggerExitLayer))
+                return true;
+
+            if (macro.TriggerMode == MacroTriggerMode.Always
+                || macro.TriggerMode == MacroTriggerMode.CustomExpression
+                || macro.UsesRawTrigger || macro.TriggerButtons != 0
+                || macro.UsesPovTrigger || macro.UsesGestureTrigger || macro.UsesAxisTrigger)
+                return false;
+            var entries = macro.GetTriggerInputEntries();
+            long nowMs = PadForge.Engine.Menus.MenuClock.NowMs;
+            bool any = false;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var e = entries[i];
+                if (e.AxisTarget != MacroAxisTarget.None || e.RawButton >= 0
+                    || !string.IsNullOrEmpty(e.Pov) || !string.IsNullOrEmpty(e.GestureDescriptor))
+                    return false;
+                if (string.IsNullOrEmpty(e.SourceDescriptor)) continue;
+                if (!PadForge.Engine.Common.Mapping.SourceCoercion.TryParseMenuItem(
+                        e.SourceDescriptor, out int menuId, out int itemIndex))
+                    return false;
+                string layer = LayerExitCommitLayer(macro.PadIndex, menuId, itemIndex, nowMs);
+                if (layer == null || !MacroLayerGateOpenOn(macro, layer)) return false;
+                any = true;
+            }
+            return any;
+        }
+
+        /// <summary>The layer gate as it reads with <paramref name="engaged"/>
+        /// engaged on the macro's own slot, the departed layer of a commit
+        /// its ending made (DC20). Base follows the Base-row contract the
+        /// live gate uses: open under a layer that inherits unmapped targets.</summary>
+        private static bool MacroLayerGateOpenOn(MacroItem macro, string engaged)
+        {
+            string mask = macro.LayerMask;
+            if (string.IsNullOrEmpty(mask)) return true;
+            if (string.Equals(mask, engaged, StringComparison.Ordinal)) return true;
+            if (!string.Equals(mask, "Base", StringComparison.Ordinal)) return false;
+            var sets = SettingsManager.SlotMappingSets;
+            int slot = macro.PadIndex;
+            var ownSet = sets != null && slot >= 0 && slot < sets.Length ? sets[slot] : null;
+            return ownSet != null && LayerInheritsUnmapped(ownSet, engaged);
+        }
+
         /// <summary>True when any slot's set currently engages the mask
         /// (the pre-#254 walk, kept for the split-config and unset-slot
         /// fallbacks).</summary>
@@ -1017,8 +1079,6 @@ namespace PadForge.Common.Input
             return false;
         }
 
-        /// <summary>True when the set carries a shift activator for the
-        /// mask, i.e. the slot OWNS that layer (#254 A-4).</summary>
         /// <summary>Length of a mask's "Layer_{fileId}_" import-domain
         /// prefix, or -1 when the mask is not import-grammar (round five).
         /// The translator mints set masks as "Layer_{fileId}_{presetId}",
@@ -1077,8 +1137,6 @@ namespace PadForge.Common.Input
             return string.CompareOrdinal(mask, start, foreignMask, 0, flen) == 0;
         }
 
-        /// <summary>Ends a run and re-arms it, the shape every completion
-        /// path uses (round five, X14).</summary>
         /// <summary>True while a macro still owns output or a pending edge,
         /// so retiring it from evaluation would strand that state.
         ///
@@ -1120,6 +1178,8 @@ namespace PadForge.Common.Input
                     || macro.TriggerHoldStartUtc != DateTime.MinValue);
         }
 
+        /// <summary>Ends a run and re-arms it, the shape every completion
+        /// path uses (round five, X14).</summary>
         private void EndMacroRun(MacroItem macro)
         {
             // Any press leg this run left between its down and its duration
@@ -1153,6 +1213,8 @@ namespace PadForge.Common.Input
             return false;
         }
 
+        /// <summary>True when the set carries a shift activator for the
+        /// mask, i.e. the slot OWNS that layer (#254 A-4).</summary>
         private static bool SlotDeclaresMask(MappingSet set, string mask)
         {
             var acts = set?.ShiftActivators;
@@ -1228,13 +1290,6 @@ namespace PadForge.Common.Input
             return false;
         }
 
-        /// <summary>Shared SinglePress trigger evaluation (#238): the
-        /// DEFERRED single. Chains rising edges through the shared press
-        /// window exactly like TriplePress; a chain of exactly ONE press
-        /// fires once when its window expires with no follow-up (held or
-        /// released), and a chain of two or more fires nothing here and
-        /// resets once quiet. Lets one button carry Single + Double +
-        /// Triple macros without the single firing on the chains.</summary>
         /// <summary>How far past the press window a deferred single may
         /// still fire. Live polling detects expiry within milliseconds
         /// (idle mode within ~50 ms); beyond this the arm predates an
@@ -1244,6 +1299,13 @@ namespace PadForge.Common.Input
         /// <summary>Overrides only the SinglePress clock for deterministic tests.</summary>
         internal Func<DateTime> SinglePressUtcNow { get; set; }
 
+        /// <summary>Shared SinglePress trigger evaluation (#238): the
+        /// DEFERRED single. Chains rising edges through the shared press
+        /// window exactly like TriplePress; a chain of exactly ONE press
+        /// fires once when its window expires with no follow-up (held or
+        /// released), and a chain of two or more fires nothing here and
+        /// resets once quiet. Lets one button carry Single + Double +
+        /// Triple macros without the single firing on the chains.</summary>
         private bool EvaluateSinglePressTrigger(MacroItem macro, bool triggerActive, bool wasTriggerActive)
         {
             var now = SinglePressUtcNow?.Invoke() ?? DateTime.UtcNow;
@@ -2413,7 +2475,7 @@ namespace PadForge.Common.Input
                     float vol = useDevice ? ReadAxisFromDevice(action)
                         : ReadAxisAsVolume(in gp, action.AxisTarget);
                     if (action.InvertAxis) vol = 1f - vol;
-                    SetSystemVolume(vol * (action.VolumeLimit / 100f), action.ShowVolumeOsd);
+                    PostSystemVolume(vol * (action.VolumeLimit / 100f), action.ShowVolumeOsd);
                     break;
                 }
                 case MacroActionType.AppVolume:
@@ -2422,7 +2484,7 @@ namespace PadForge.Common.Input
                         float vol = useDevice ? ReadAxisFromDevice(action)
                             : ReadAxisAsVolume(in gp, action.AxisTarget);
                         if (action.InvertAxis) vol = 1f - vol;
-                        SetAppVolume(vol * (action.VolumeLimit / 100f), action.ProcessName);
+                        PostAppVolume(vol * (action.VolumeLimit / 100f), action.ProcessName);
                     }
                     break;
                 case MacroActionType.MouseMove:
@@ -2744,11 +2806,49 @@ namespace PadForge.Common.Input
             return action.RepeatVcPulseOn;
         }
 
-        /// <summary>Where Set Chroma Color sends its color (#468): the Chroma
-        /// service's per-frame assertion. A seam so a test can watch both
-        /// dispatch loops without the service's process-wide state, which
-        /// the Chroma service tests reset from their own collection.</summary>
-        internal static Action<byte, byte, byte> MacroChromaSink = PadForge.Services.ChromaLightbarService.AssertMacroColor;
+        /// <summary>Where Set Chroma Color sends its color (#468): the slot's
+        /// per-frame assertion, which the Chroma worker paints onto the Razer
+        /// devices assigned to the slot (#494). A seam so a test can watch
+        /// both dispatch loops without the process-wide assertion state.</summary>
+        internal static Action<int, byte, byte, byte> MacroChromaSink =
+            PadForge.Common.Input.Peripherals.PeripheralOutputs.AssertChromaMacro;
+
+        /// <summary>Each slot's Set Chroma Color for the frame being
+        /// evaluated, packed 0x00RRGGBB, or -1. Two macros current at once
+        /// leave the last one evaluated here, and the sink hears only that
+        /// color once the slot's macros are done, so the color a reader sees
+        /// never flips between the two within a frame. Poll thread only.</summary>
+        private readonly int[] _frameChroma = CreateFrameChroma();
+        private bool _frameChromaAny;
+
+        private static int[] CreateFrameChroma()
+        {
+            var colors = new int[MaxPads];
+            System.Array.Fill(colors, -1);
+            return colors;
+        }
+
+        private void NoteChromaColor(int slot, byte r, byte g, byte b)
+        {
+            if ((uint)slot >= (uint)_frameChroma.Length) return;
+            _frameChroma[slot] = (r << 16) | (g << 8) | b;
+            _frameChromaAny = true;
+        }
+
+        /// <summary>Hands the frame's Set Chroma Color of each slot to the
+        /// sink, once.</summary>
+        private void FlushChromaColors()
+        {
+            if (!_frameChromaAny) return;
+            _frameChromaAny = false;
+            for (int slot = 0; slot < _frameChroma.Length; slot++)
+            {
+                int rgb = _frameChroma[slot];
+                if (rgb < 0) continue;
+                _frameChroma[slot] = -1;
+                MacroChromaSink(slot, (byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb);
+            }
+        }
 
         /// <summary>Where Show Dreamcast Screen sends its pictures (#469): the
         /// screen service's queue, taking the slot, the pictures, the frame
@@ -2852,9 +2952,10 @@ namespace PadForge.Common.Input
                 case MacroActionType.SetChromaColor:
                     // Chroma color (#468): asserted every frame while
                     // current, the AxisHold duration shape, so the color
-                    // leaves when the action ends. No slot is involved:
-                    // Chroma paints the machine's devices.
-                    MacroChromaSink(action.LightbarR, action.LightbarG, action.LightbarB);
+                    // leaves when the action ends. It paints the Razer
+                    // devices assigned to this macro's controller (#494).
+                    // The frame's last color goes out after the walk.
+                    NoteChromaColor(macro.PadIndex, action.LightbarR, action.LightbarG, action.LightbarB);
                     if (actionElapsed >= action.DurationMs)
                         AdvanceAction(macro);
                     break;
@@ -3620,7 +3721,7 @@ namespace PadForge.Common.Input
                     };
                     if (!string.IsNullOrEmpty(workDir))
                         psi.WorkingDirectory = workDir;
-                    System.Diagnostics.Process.Start(psi);
+                    PadForge.Common.ShellLaunch.Start(psi);
                 }
                 catch { /* bad path or blocked launch: the user owns this; never crash the engine */ }
             });
@@ -4135,12 +4236,10 @@ namespace PadForge.Common.Input
             return moved;
         }
 
-        /// <summary>Extended twin of <see cref="AxisWriteYields"/>: the
-        /// word-array frame is signed short on every index, so one stick
-        /// threshold applies to all six canonical axes.</summary>
-        /// <summary>Raw yield check against the per-tick entry snapshot
-        /// (see _preMacroRawAxes): earlier macros' writes this frame are
-        /// never mistaken for physical input.</summary>
+        /// <summary>Extended twin of <see cref="AxisWriteYields"/>. Raw
+        /// yield check against the per-tick entry snapshot (see
+        /// _preMacroRawAxes): earlier macros' writes this frame are never
+        /// mistaken for physical input.</summary>
         private bool AxisWriteYieldsRawValueAt(int axisIndex, MacroAction action)
         {
             if (axisIndex < 0 || axisIndex >= _preMacroRawAxes.Length) return false;
@@ -4595,7 +4694,9 @@ namespace PadForge.Common.Input
                 // path: applied before the latch so re-engage is a fresh
                 // rising edge.
                 bool layerOpen = MacroLayerGateOpen(macro);
-                if (!layerOpen) triggerActive = false;
+                // DC20: a menu commit made by leaving a layer is gated by
+                // that layer, for that commit's trigger alone.
+                if (!layerOpen) triggerActive = triggerActive && LayerExitCommitOpensMacro(macro, menuCellHeld);
 
                 // Toggle mode (#238): a trigger-level latch. Each raw
                 // rising edge flips it, and downstream sees the LATCH as
@@ -4818,6 +4919,7 @@ namespace PadForge.Common.Input
                     if (_macroPassConsumedWords[w] != 0)
                         raw.Buttons[w] = (raw.Buttons[w] & ~_macroPassConsumedWords[w])
                                          | _macroPassOutputWords[w];
+            FlushChromaColors();
         }
 
         /// <summary>Extended twin of <see cref="ApplyMacroLatches"/> (issue #9
@@ -5010,7 +5112,7 @@ namespace PadForge.Common.Input
                     float vol = useDevice ? ReadAxisFromDevice(action)
                         : ReadAxisAsVolumeRaw(in raw, action.AxisTarget);
                     if (action.InvertAxis) vol = 1f - vol;
-                    SetSystemVolume(vol * (action.VolumeLimit / 100f), action.ShowVolumeOsd);
+                    PostSystemVolume(vol * (action.VolumeLimit / 100f), action.ShowVolumeOsd);
                     break;
                 }
                 case MacroActionType.AppVolume:
@@ -5019,7 +5121,7 @@ namespace PadForge.Common.Input
                         float vol = useDevice ? ReadAxisFromDevice(action)
                             : ReadAxisAsVolumeRaw(in raw, action.AxisTarget);
                         if (action.InvertAxis) vol = 1f - vol;
-                        SetAppVolume(vol * (action.VolumeLimit / 100f), action.ProcessName);
+                        PostAppVolume(vol * (action.VolumeLimit / 100f), action.ProcessName);
                     }
                     break;
                 case MacroActionType.MouseMove:
@@ -5194,7 +5296,7 @@ namespace PadForge.Common.Input
                 case MacroActionType.SetChromaColor:
                     // Extended twin (#468): the Chroma color does not touch
                     // the slot's surface, so it is the gamepad arm verbatim.
-                    MacroChromaSink(action.LightbarR, action.LightbarG, action.LightbarB);
+                    NoteChromaColor(macro.PadIndex, action.LightbarR, action.LightbarG, action.LightbarB);
                     if (actionElapsed >= action.DurationMs)
                         AdvanceAction(macro);
                     break;
@@ -5739,6 +5841,124 @@ namespace PadForge.Common.Input
         }
 
         // ─────────────────────────────────────────────
+        //  Volume macro lane
+        // ─────────────────────────────────────────────
+
+        // The System Volume and App Volume actions run every frame while their
+        // macro is active, and applying them on the poll thread put the audio
+        // service's calls there: an endpoint write per change, four volume
+        // keys and a second write for the OSD, and for App Volume a pass over
+        // every audio session that named each session's process. The poll
+        // thread now posts the newest target, and a worker applies the posted
+        // targets every VolumeWorkerPeriodMs through the same SetSystemVolume
+        // and SetAppVolume, whose change detection, OSD correction window and
+        // retry cooldowns are all measured in time and hold as they were.
+        private readonly object _volumeLock = new();
+        private bool _systemVolumePosted;
+        private float _systemVolumeTarget;
+        private bool _systemVolumeOsd;
+        private readonly Dictionary<string, float> _appVolumePosted = new(StringComparer.OrdinalIgnoreCase);
+        private long _volumePostedMs;
+        private bool _volumeWorkerRunning;
+
+        /// <summary>How often the volume worker applies the posted targets.
+        /// Tests shorten it.</summary>
+        internal int VolumeWorkerPeriodMs = 5;
+
+        /// <summary>How long the volume worker runs on with nothing posted
+        /// before it ends. Tests shorten it.</summary>
+        internal int VolumeWorkerIdleMs = 2_000;
+
+        /// <summary>What the worker runs for a posted target, SetSystemVolume
+        /// and SetAppVolume when null. Tests replace them.</summary>
+        internal Action<float, bool> SystemVolumeApply;
+        internal Action<float, string> AppVolumeApply;
+
+        /// <summary>Posts the System Volume target for the worker. Never
+        /// waits on the audio service. Poll thread.</summary>
+        internal void PostSystemVolume(float volume, bool showOsd)
+        {
+            lock (_volumeLock)
+            {
+                _systemVolumeTarget = volume;
+                _systemVolumeOsd = showOsd;
+                _systemVolumePosted = true;
+                NoteVolumePostLocked();
+            }
+        }
+
+        /// <summary>Posts the App Volume target for one process. Never waits
+        /// on the audio service. Poll thread.</summary>
+        internal void PostAppVolume(float volume, string processName)
+        {
+            lock (_volumeLock)
+            {
+                _appVolumePosted[processName] = volume;
+                NoteVolumePostLocked();
+            }
+        }
+
+        private void NoteVolumePostLocked()
+        {
+            _volumePostedMs = Environment.TickCount64;
+            if (_volumeWorkerRunning) return;
+            _volumeWorkerRunning = true;
+            new Thread(VolumeWorker) { IsBackground = true, Name = "PadForge Volume" }.Start();
+        }
+
+        /// <summary>Applies the targets posted since its last pass, one pass
+        /// every VolumeWorkerPeriodMs, and ends once nothing has been posted
+        /// for VolumeWorkerIdleMs. The only caller of SetSystemVolume and
+        /// SetAppVolume, so their state has one thread.</summary>
+        private void VolumeWorker()
+        {
+            var apps = new List<KeyValuePair<string, float>>();
+            while (true)
+            {
+                bool system;
+                float systemTarget;
+                bool osd;
+                apps.Clear();
+                lock (_volumeLock)
+                {
+                    if (!_systemVolumePosted && _appVolumePosted.Count == 0
+                        && Environment.TickCount64 - _volumePostedMs >= VolumeWorkerIdleMs)
+                    {
+                        _volumeWorkerRunning = false;
+                        return;
+                    }
+                    system = _systemVolumePosted;
+                    systemTarget = _systemVolumeTarget;
+                    osd = _systemVolumeOsd;
+                    _systemVolumePosted = false;
+                    apps.AddRange(_appVolumePosted);
+                    _appVolumePosted.Clear();
+                }
+                if (system)
+                {
+                    try
+                    {
+                        var apply = SystemVolumeApply;
+                        if (apply != null) apply(systemTarget, osd);
+                        else SetSystemVolume(systemTarget, osd);
+                    }
+                    catch { }
+                }
+                foreach (var app in apps)
+                {
+                    try
+                    {
+                        var apply = AppVolumeApply;
+                        if (apply != null) apply(app.Value, app.Key);
+                        else SetAppVolume(app.Value, app.Key);
+                    }
+                    catch { }
+                }
+                Thread.Sleep(VolumeWorkerPeriodMs);
+            }
+        }
+
+        // ─────────────────────────────────────────────
         //  System volume control for SystemVolume macro action
         // ─────────────────────────────────────────────
 
@@ -5771,6 +5991,7 @@ namespace PadForge.Common.Input
         /// </summary>
         private void SetSystemVolume(float volume, bool showOsd = true)
         {
+            if (AudioEndpointAccess.Refuses) return;
             volume = Math.Clamp(volume, 0f, 1f);
 
             // Skip if the volume hasn't changed (within ~0.4% tolerance = 1/256).
@@ -5885,13 +6106,11 @@ namespace PadForge.Common.Input
                         if (!AudioSessionHelper.TryGetSessionProcessId(pSession, out uint pid) || pid == 0)
                             continue;
 
-                        string exeName;
-                        try
-                        {
-                            using var proc = Process.GetProcessById((int)pid);
-                            exeName = proc.ProcessName;
-                        }
-                        catch { continue; }
+                        // One limited query of this process. ProcessName on a
+                        // process it cannot open walks every process, 245 to
+                        // 639 ms on a PC with about 480 processes.
+                        string exeName = ProcessImage.NameOf(pid);
+                        if (exeName == null) continue;
 
                         if (!exeName.Equals(processName, StringComparison.OrdinalIgnoreCase))
                             continue;
@@ -6433,8 +6652,15 @@ namespace PadForge.Common.Input
         private const ushort VK_TAB = 0x09;
         private const ushort VK_RETURN = 0x0D;
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendInput")]
+        private static extern uint SendInputNative(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        /// <summary>The one way a macro injects a key, a button, a wheel
+        /// turn or a move. The test host injects none
+        /// (InputHookManager.DesktopInputOffLimits) and is answered no event
+        /// sent, as when the input is blocked.</summary>
+        private static uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize)
+            => PadForge.Engine.Common.InputHookManager.DesktopInputOffLimits ? 0 : SendInputNative(nInputs, pInputs, cbSize);
 
         [DllImport("user32.dll")]
         private static extern uint MapVirtualKey(uint uCode, uint uMapType);

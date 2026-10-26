@@ -464,6 +464,17 @@ namespace PadForge.Engine.Data
         /// — callers fall back to the legacy two-finger assumption.</summary>
         public int[] CapTouchpadFingerCounts { get; set; }
 
+        /// <summary>The capacitive sensors the pad has, as a bitmask over the
+        /// SDL_GAMEPAD_CAPSENSE_* indices (bit 0 left stick top, 1 right stick
+        /// top, 2 left grip, 3 right grip). Persisted for the reason
+        /// <see cref="CapTouchpadFingerCounts"/> is: the pad's own picker
+        /// group and the automap list a sensor only when the pad has it, and
+        /// they must agree whether or not the pad is on. 0 on configs that
+        /// predate the field and on pads with none.</summary>
+        [XmlElement]
+        public int CapSenseChannelMask { get; set; }
+        public bool ShouldSerializeCapSenseChannelMask() => CapSenseChannelMask != 0;
+
         public bool? CapTouchpadPressure { get; set; }
         public bool? CapTouchpadClick { get; set; }
         public bool ShouldSerializeCapTouchpadPressure() => CapTouchpadPressure.HasValue;
@@ -479,6 +490,34 @@ namespace PadForge.Engine.Data
         /// <c>SDL_PROP_JOYSTICK_CAP_TRIGGER_RUMBLE_BOOLEAN</c>.</summary>
         [XmlElement]
         public bool HasRumbleTriggers { get; set; }
+
+        /// <summary>The haptic (bit 0) and lighting (bit 1) outputs found for
+        /// a mouse, keyboard, vendor row or unit row through its own channel
+        /// (#494), and the lighting holds its device offers above colors
+        /// alone (bits 2 and 3). Persisted so the row's Force Feedback and
+        /// Lighting tabs, and the choices on them, stay up while the device
+        /// sleeps or is unplugged, as a gamepad's tabs do. Zero on configs
+        /// predating it and on every other row.</summary>
+        [XmlElement]
+        public int PeripheralOutputs { get; set; }
+
+        /// <summary>The row has a haptic output (#494).</summary>
+        [XmlIgnore]
+        public bool HasPeripheralHaptics => (PeripheralOutputs & 1) != 0;
+
+        /// <summary>The row has a lighting output (#494).</summary>
+        [XmlIgnore]
+        public bool HasPeripheralLighting => (PeripheralOutputs & 2) != 0;
+
+        /// <summary>The row's device offers the first lighting hold above
+        /// colors alone, its lighting power (#494).</summary>
+        [XmlIgnore]
+        public bool HasPeripheralLightingLevel1 => (PeripheralOutputs & 4) != 0;
+
+        /// <summary>The row's device offers the second lighting hold too,
+        /// its on-board memory mode switched off (#494).</summary>
+        [XmlIgnore]
+        public bool HasPeripheralLightingLevel2 => (PeripheralOutputs & 8) != 0;
 
         // Gyro bias, calibration timestamp, and tuning (H/V sensitivity,
         // deadzone, smoothing, acceleration, output curve, units) all
@@ -890,6 +929,7 @@ namespace PadForge.Engine.Data
             HasTouchpad = wrapper.HasTouchpad;
             CapTouchpadCount = wrapper.NumTouchpads;
             CapTouchpadFingerCounts = wrapper.TouchpadFingerCounts;
+            CapSenseChannelMask = wrapper.CapSenseChannelMask;
             CapTouchpadPressure = wrapper.TouchpadPressureSupported;
             CapTouchpadClick = wrapper.TouchpadClickSupported;
             HasRumbleTriggers = wrapper.HasRumbleTriggers;

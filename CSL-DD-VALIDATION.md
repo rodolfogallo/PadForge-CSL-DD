@@ -1,40 +1,67 @@
-# PadForge 5.0.0.1 — correção CSL DD
+# Fanatec CSL DD FFB fix — validated on PadForge 5.0 and 5.1
 
-Cópia privada independente de [hifihedgehog/PadForge](https://github.com/hifihedgehog/PadForge), baseada na tag `v5.0.0`, commit `9d1cac181e1d21441a084d0eb82bc7846262771d`. A tag local `upstream-v5.0.0` preserva o snapshot importado. O histórico anterior à importação permanece no projeto original. A licença e a atribuição originais foram preservadas.
+Current source: PadForge v5.1.0 plus the local CSL DD fix, file version
+5.1.0.1. The upstream base commit is
+`97182cb60eb3b158f90c9d6eb5e3b392f30db8b8`.
 
-## O que foi corrigido
+This repository began as an independent private snapshot of upstream
+v5.0.0. It has now been updated to the validated 5.1 source and made public
+at the owner's request. Attribution and the upstream license are retained.
+The official fork used for contributions is
+[rodolfogallo/PadForge](https://github.com/rodolfogallo/PadForge).
 
-- Para `VID_0EB7/PID_0020`, a saída é resolvida pelo mesmo pai PnP da entrada, pelos atributos reais e pelas capacidades HID. Coleções de joystick com saída proprietária `FF00/0002`, 7 valores de 8 bits e relatório total de 8 bytes são elegíveis. O Report ID é validado em memória pelo Windows. A coleção primária de ID `01` tem preferência; se houver apenas outra coleção elegível, usa-se seu ID real. Coleções ambíguas e o protocolo `FF/64 bytes` são recusados.
-- A coleção usada para ler entradas pode ser COL02 e a saída ser COL01 do mesmo volante. Outros PIDs Fanatec mantêm a seleção de transporte anterior; os pedais não são redirecionados.
-- O cache de FFB só marca uma assinatura como entregue quando todas as escritas necessárias retornam sucesso. Falhas são tentadas novamente após 250 ms, mesmo com força idêntica. Um novo pedido de parada pode antecipar a tentativa, sem criar repetição ilimitada.
-- Configuração de range e autocentragem precede a força Fanatec; reabertura/falha de saída invalida o estado aplicado. Uma parada limpa os cinco slots de efeito. Ao trocar de tipo de condição, a anterior é desativada.
-- A escrita exige conclusão e quantidade completa de bytes. Os diagnósticos incluem caminho, ID, tamanho, fase, erro Win32, quantidade transferida, duração e motivo de omissão, limitados a uma linha por caminho/fase a cada cinco segundos.
-- O modo `--fanatec-hid-probe` termina antes de iniciar o motor de entrada, o atualizador, HidHide ou HIDMaestro. Abre handles somente para metadados, com acesso zero. Não envia relatórios.
+## Problem and evidence
 
-Sucesso da escrita no Windows não comprova aceitação física do comando pelo firmware. A validação de torque continua pendente do proprietário do volante.
+The CSL DD (`VID_0EB7/PID_0020`) was recognized, but produced no force
+feedback in PadForge or in-game. FFB worked in the Fanatec application.
+Windows capability inspection found these output reports:
 
-## Validar na sua máquina
+| Collection | Report ID | Total bytes |
+|---|---|---|
+| COL01 | 0x01 | 8 |
+| COL02 | 0x02 | 8 |
+| COL03 | 0xFF | 64 |
 
-1. Extraia o pacote em uma pasta nova. Não substitua `D:\GAMES\PadForge` nesta etapa e não copie seu XML antigo para começar. Feche a instância original pela opção Exit/Sair da bandeja antes de abrir esta cópia.
-2. Opcionalmente, execute `Inspecionar-HID.ps1` com PowerShell, ou inicie `PadForge.exe --fanatec-hid-probe "C:\caminho\fanatec-hid-probe.json"`. O executável conserva a solicitação de administrador do projeto original. Este modo só produz o JSON e termina. No CSL DD investigado, espera-se uma saída resolvida com ReportId `1` e ReportLength `8` no caminho COL01.
-3. Para validar FFB, abra normalmente o `PadForge.exe` desta pasta e habilite a gravação de diagnósticos em Settings/Diagnostics. O arquivo `diagnostics.log` ficará ao lado dele.
-4. Crie o controle virtual pretendido e associe **uma** das entradas FANATEC Wheel ao slot — prefira COL01 para começar. Só aparecer na lista de Devices não basta. A versão investigada tinha zero associações Fanatec salvas. A associação normal já pode aplicar range e autocentragem, portanto pertence à etapa de validação física.
-5. Comece com intensidade geral baixa e autocentragem em zero. Teste uma força/efeito por vez; confirme também que o efeito cessa ao encerrar o teste. Não associe simultaneamente COL01 e COL02 do mesmo volante para este primeiro ensaio.
-6. Se não funcionar, preserve `diagnostics.log` e o JSON do probe, informando qual entrada e slot foram usados. Procure linhas `[FanatecHidEndpoint]`, `[RawHidOutput]` e `[WheelFFB]`. Elas distinguem resolução, abertura, escrita, erro e repetição omitida.
+`FanatecRawHidWriter.BuildWheelReport` assumed ID zero, which the Windows
+HID parser rejected for all three collections. For COL01/COL02, the buffer
+length was already correct. `_appliedWheelFfb` also recorded requested
+effects without checking write success, so identical requests could be
+omitted after a failed delivery.
 
-Esta cópia conserva o atualizador do upstream. Mantenha a instalação automática desativada e não instale uma versão oficial sobre esta cópia durante a validação, pois isso substituiria a correção privada. Configurações desta execução são gravadas na pasta nova; não foi incluído XML pessoal no pacote ou no GitHub.
+## Correction
 
-## Compilar e testar
+- Discover the command endpoint independently of the input collection,
+  constrained to the same PnP parent and actual device attributes.
+- Validate the vendor output field and its report ID/length; prefer the
+  primary eight-byte channel. Do not guess between ambiguous endpoints or
+  use COL03's unrelated 64-byte protocol.
+- Cache only complete successful writes, retry failures with bounded
+  backoff, and invalidate applied state after output recovery.
+- Configure Fanatec range/autocentring before the force, preserving v5.1's
+  option to leave rotation range to the wheel.
+- Disable all five effect slots on stop and add rate-limited diagnostics.
+- Provide a metadata-only `--fanatec-hid-probe <output.json>` mode.
 
-Windows x64 com SDK .NET 10:
+## Validation
+
+**The hardware owner confirmed that patched versions 5.0.0.1 and 5.1.0.1
+both restore FFB in the GUI and in-game.**
+
+The 5.1 port passed 58 targeted tests covering endpoint selection, report
+framing, failure/retry caching, stop behavior, pedal/shutdown regressions
+and v5.1 rotation-range behavior. These tests did not send motor commands.
+Compatibility with other Fanatec models has not been established.
+
+## Build and use
+
+Windows x64 with .NET SDK 10:
 
 ```powershell
-dotnet test PadForge.Tests/PadForge.Tests.csproj -c Release --filter 'FullyQualifiedName~FanatecCslDdOutputTests|FullyQualifiedName~WheelFfbWriteCacheTests|FullyQualifiedName~AuditJuly26RoundTwentyThreeTests|FullyQualifiedName~EngineStopRumbleTests'
+dotnet test PadForge.Tests/PadForge.Tests.csproj -c Release --filter 'FullyQualifiedName~FanatecCslDdOutputTests|FullyQualifiedName~WheelFfbWriteCacheTests|FullyQualifiedName~AuditJuly26RoundTwentyThreeTests|FullyQualifiedName~EngineStopRumbleTests|FullyQualifiedName~WheelRange'
 dotnet publish PadForge.App/PadForge.App.csproj -c Release -r win-x64 -o artifacts/csl-dd-win-x64
 ```
 
-Os testes selecionados não acionam motores. Um deles consulta as capacidades do CSL DD, se conectado, sem abrir acesso de escrita. A primeira compilação também compacta os recursos gráficos e pode demorar vários minutos. A saída é portátil e inclui o runtime .NET, sem instalação separada.
-
-## Limites
-
-Não foram alterados firmware, drivers, parâmetros Fanatec ou a instalação original. O aplicativo completo não foi aberto pelo agente, nem o FFB foi testado fisicamente. A validação disponível cobre compilação, regressões de seleção/cache/formato e descoberta de metadados do dispositivo conectado.
+Use a backup or a separate folder for testing. Assign one Fanatec input
+collection to the desired virtual slot; device recognition alone does not
+create an association. Automatic upstream updates can replace the local
+fix. No personal settings XML, machine logs or crash dumps are included.

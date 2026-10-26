@@ -51,6 +51,20 @@ namespace PadForge.Services
         private const int ERROR_NO_SUCH_DEVICE = 433;
         private const string PsmControlPath = @"\\.\BthPS3PSMControl";
 
+        /// <summary>Set by the test assembly for the life of its process
+        /// (PadForge.Tests Ds3DriverOffLimits), never by the app. The work
+        /// of this class is done to the PC: driver packages installed and
+        /// forced onto a device, a class filter registered, the Bluetooth
+        /// radio cycled or toggled, device nodes removed, a profile service
+        /// advertised, BthPS3 and BTHPORT registry keys written, owned and
+        /// deleted, the PSM filter armed and disarmed, a signing certificate
+        /// added to the machine stores, Inf2Cat and signtool run. While this
+        /// is set, none of it happens: each of those members returns or
+        /// throws as a failed call would, and so does the pairing ceremony's
+        /// own open of a controller (Ds3PairingService). Reads are as they
+        /// were. False in production, where every path is as it was.</summary>
+        internal static bool OffLimitsForTest;
+
         private static readonly PsmPatchCoordinator PsmCoordinator = new(
             ReadPsmPatchSnapshot,
             () => SetPsmPatchingCore(false, null, 0),
@@ -86,6 +100,7 @@ namespace PadForge.Services
         /// profile driver and Bluetooth silently never works.</para></summary>
         public static bool EnsureInstalled(Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             try
             {
                 if (IsServiceInstalled("BthPS3"))
@@ -242,6 +257,7 @@ namespace PadForge.Services
         /// Bluetooth device and must never run on a healthy machine.</para></summary>
         private static void RepairPsmFilter(Action<string> log)
         {
+            if (OffLimitsForTest) return;
             log("PSM filter is missing from a half-installed stack; repairing.");
             try
             {
@@ -275,7 +291,9 @@ namespace PadForge.Services
         // GenerateCatalogs). We own our own certificate rather than borrowing
         // HIDMaestro's, because its subject is that SDK's internal detail,
         // and we borrow only its extracted toolchain (Inf2Cat.exe,
-        // signtool.exe), which is stable.
+        // signtool.exe), which is stable. Since HIDMaestro 2.0.0 it stages
+        // that toolchain under %ProgramFiles%\HIDMaestro\Staging, for an
+        // elevated process only, which PadForge always is.
         //
         // Shipping a pre-signed catalog is what broke: the one in the repo
         // was signed by a prototype certificate that existed on exactly one
@@ -309,6 +327,9 @@ namespace PadForge.Services
                     if (c.NotAfter > DateTime.Now.AddDays(30) && c.HasPrivateKey)
                         return c.Thumbprint;
             }
+            // The test host adds no certificate to this PC's stores.
+            if (OffLimitsForTest)
+                throw new InvalidOperationException("The test host adds no certificate to this PC's stores.");
 
             using var rsa = RSA.Create(2048);
             var req = new CertificateRequest(Ds3CertSubject, rsa,
@@ -369,6 +390,11 @@ namespace PadForge.Services
         /// under the one certificate.</summary>
         internal static bool SignDriverPackage(string dir, string catalogName, Action<string> log)
         {
+            if (OffLimitsForTest)
+            {
+                log?.Invoke("Preparing the USB driver failed: the test host signs no driver package.");
+                return false;
+            }
             lock (_signLock)
             try
             {
@@ -433,9 +459,13 @@ namespace PadForge.Services
         /// inf2cat both write warnings to stderr as a matter of course. Same
         /// shape as HIDMaestro's DriverBuilder.Run, which documents the same
         /// trap. A timed-out child is killed rather than orphaned, or it keeps
-        /// a handle on the catalog and fails the NEXT attempt's delete.</summary>
-        private static (int Code, string Output) RunTool(string exe, string args, string workingDir)
+        /// a handle on the catalog and fails the NEXT attempt's delete.
+        /// Two minutes for a build tool, longer for BthPS3's own
+        /// uninstaller.</summary>
+        private static (int Code, string Output) RunTool(string exe, string args, string workingDir, int timeoutMs = 120000)
         {
+            if (OffLimitsForTest)
+                throw new System.ComponentModel.Win32Exception(5, "The test host starts no process: " + exe);
             var psi = new System.Diagnostics.ProcessStartInfo(exe, args)
             {
                 WorkingDirectory = workingDir,
@@ -450,10 +480,10 @@ namespace PadForge.Services
             p.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
-            if (!p.WaitForExit(120000))
+            if (!p.WaitForExit(timeoutMs))
             {
                 try { p.Kill(entireProcessTree: true); } catch { }
-                lock (sb) return (-1, (sb + "\n(timed out after 120 s)").Trim());
+                lock (sb) return (-1, (sb + $"\n(timed out after {timeoutMs / 1000} s)").Trim());
             }
             // The overload with no timeout flushes the async readers, so the
             // buffer is complete before it is read.
@@ -510,6 +540,7 @@ namespace PadForge.Services
         public static bool EnsureWinUsbBound(
             Action<string> log, CancellationToken ct, string pidToken, string padLabel)
         {
+            if (OffLimitsForTest) return false;
             try
             {
                 // The DOCKED PAD decides, never the interface registry. The
@@ -705,25 +736,6 @@ namespace PadForge.Services
             finally { SetupDiDestroyDeviceInfoList(set); }
         }
 
-        /// <summary>Reports what BthPS3 did with the pad's inbound
-        /// connection, for the one failure this arc cannot currently tell
-        /// apart from the log: the ceremony reports full success, the pad
-        /// then flashes forever, and nothing downstream says why.
-        ///
-        /// <para>Three states, three different causes, and they are
-        /// distinguishable only here. NO CHILD at all means the L2CAP
-        /// connection never reached BthPS3, so the PSM patch or the radio
-        /// is the suspect. A child with a PROBLEM CODE means BthPS3 built
-        /// it and PnP could not start it: problem 28 (FAILED_INSTALL) is
-        /// the RawPDO=0 case this file's step-7 comment describes, where
-        /// the child wants a function driver no INF matches, which is
-        /// exactly the "pad flashes forever" signature. A child with NO
-        /// raw interface means it started but published nothing the reader
-        /// can open.</para>
-        ///
-        /// <para>Read-only and best-effort: it never changes state and any
-        /// failure degrades to a log line, because its whole job is to
-        /// make a silent state speak.</para></summary>
         /// <summary>Silent form of <see cref="LogBthPs3ChildState"/> for the
         /// post-ceremony watcher: same read-only enumeration, no logging, so a
         /// poll loop can call it every few seconds without flooding the DIAG
@@ -946,6 +958,7 @@ namespace PadForge.Services
         /// Returns the number removed.</summary>
         internal static int RemoveStaleBthPs3Children(Action<string> log)
         {
+            if (OffLimitsForTest) return 0;
             int removed = 0;
             try
             {
@@ -990,6 +1003,25 @@ namespace PadForge.Services
             return removed;
         }
 
+        /// <summary>Reports what BthPS3 did with the pad's inbound
+        /// connection, for the one failure this arc cannot currently tell
+        /// apart from the log: the ceremony reports full success, the pad
+        /// then flashes forever, and nothing downstream says why.
+        ///
+        /// <para>Three states, three different causes, and they are
+        /// distinguishable only here. NO CHILD at all means the L2CAP
+        /// connection never reached BthPS3, so the PSM patch or the radio
+        /// is the suspect. A child with a PROBLEM CODE means BthPS3 built
+        /// it and PnP could not start it: problem 28 (FAILED_INSTALL) is
+        /// the RawPDO=0 case this file's step-7 comment describes, where
+        /// the child wants a function driver no INF matches, which is
+        /// exactly the "pad flashes forever" signature. A child with NO
+        /// raw interface means it started but published nothing the reader
+        /// can open.</para>
+        ///
+        /// <para>Read-only and best-effort: it never changes state and any
+        /// failure degrades to a log line, because its whole job is to
+        /// make a silent state speak.</para></summary>
         internal static void LogBthPs3ChildState(Action<string> log)
         {
             try
@@ -1137,6 +1169,11 @@ namespace PadForge.Services
         // callback lifetimes.
         private static readonly object _cycleLock = new object();
 
+        /// <summary>The two pads the WinUSB package binds, as the PID token
+        /// the node search matches on.</summary>
+        internal const string Ds3PidToken = "PID_0268";
+        internal const string NavPidToken = "PID_042F";
+
         /// <summary><para>Every setup class a docked DS3 can occupy. A device node's
         /// class comes from the INF that OWNS it, not from the bus it hangs off, so
         /// the pad moves between these as its driver changes. Searching one class
@@ -1154,11 +1191,6 @@ namespace PadForge.Services
         /// SERVICE allowlist below is the gate, and it is unchanged: only an empty
         /// service or HidUsb is ever bound. Widening the search only lets the
         /// allowlist see a device it was always meant to judge.</para></summary>
-        /// <summary>The two pads the WinUSB package binds, as the PID token
-        /// the node search matches on.</summary>
-        internal const string Ds3PidToken = "PID_0268";
-        internal const string NavPidToken = "PID_042F";
-
         internal static readonly Guid[] Ds3HostClasses =
         {
             new Guid("745A17A0-74D3-11D0-B6FE-00A0C90F57DA"), // HIDCLASS: on inbox HidUsb
@@ -1326,6 +1358,7 @@ namespace PadForge.Services
         /// itself (observed on the 2026-08-06 arcade-PC rehearsal).</para></summary>
         public static void CycleBluetoothRadio(Action<string> log)
         {
+            if (OffLimitsForTest) return;
             try
             {
                 lock (_cycleLock)
@@ -1343,7 +1376,7 @@ namespace PadForge.Services
                     }
                     catch (Exception ex)
                     {
-                        log("Radio port cycle refused (" + ex.Message + "); toggling the adapter instead.");
+                        log("Radio port cycle refused (" + ex.Message + "). Toggling the adapter instead.");
                     }
                     radio.Disable();
                     Thread.Sleep(500);
@@ -1444,6 +1477,7 @@ namespace PadForge.Services
         public static bool WriteRememberedDeviceRecord(byte[] radioMacBigEndian, string deviceMacHex,
             string remoteName, int pid, Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             PurgeForeignDeviceRecord(radioMacBigEndian, deviceMacHex, log);
             if (!WriteDeviceNameRecord(deviceMacHex, remoteName, pid, log)) return false;
             if (!SetDeviceRecordOwnerToSystem(deviceMacHex, log)) return false;
@@ -1480,6 +1514,7 @@ namespace PadForge.Services
         /// radio cycle makes the driver reload it.</summary>
         public static bool EnsureMoveFamilySupportEnabled(Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             bool changed = false;
             try
             {
@@ -1521,6 +1556,7 @@ namespace PadForge.Services
         // record from an earlier pairing can still be overwritten by the elevated app.
         private static bool WriteDeviceNameRecord(string deviceMacHex, string remoteName, int pid, Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             EnablePrivilege("SeBackupPrivilege");
             EnablePrivilege("SeRestorePrivilege");
             int rc = RegCreateKeyEx(HKLM, BthPortDevicesKey + deviceMacHex, 0, null,
@@ -1554,6 +1590,7 @@ namespace PadForge.Services
         // the caller; SeTakeOwnership to touch the record's security at all.
         private static bool SetDeviceRecordOwnerToSystem(string deviceMacHex, Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             EnablePrivilege("SeTakeOwnershipPrivilege");
             EnablePrivilege("SeRestorePrivilege");
             if (!ConvertStringSidToSid("S-1-5-18", out IntPtr pSid)) { log("SID convert failed."); return false; }
@@ -1567,15 +1604,13 @@ namespace PadForge.Services
             finally { LocalFree(pSid); }
         }
 
-        /// <summary>Deletes the DS3's remembered-device record + link key for a clean
-        /// unpair. The Devices subkey is SYSTEM-owned, so ownership is taken back to
-        /// Administrators first (SeTakeOwnership/SeRestore) before the delete.</summary>
         /// <summary>Grants BUILTIN\Administrators full control of an HKLM key
         /// whose ownership we have just taken. Ownership alone confers only
         /// WRITE_DAC, so without this step every subsequent operation on a
         /// SYSTEM-owned key still fails with ERROR_ACCESS_DENIED.</summary>
         private static void GrantAdministratorsFullControl(string subKey, Action<string> log)
         {
+            if (OffLimitsForTest) return;
             try
             {
                 using var key = Registry.LocalMachine.OpenSubKey(subKey,
@@ -1595,8 +1630,12 @@ namespace PadForge.Services
             catch (Exception ex) { log?.Invoke("Granting access to the record failed: " + ex.Message); }
         }
 
+        /// <summary>Deletes the DS3's remembered-device record + link key for a clean
+        /// unpair. The Devices subkey is SYSTEM-owned, so ownership is taken back to
+        /// Administrators first (SeTakeOwnership/SeRestore) before the delete.</summary>
         public static void DeleteRememberedDeviceRecord(byte[] radioMacBigEndian, string deviceMacHex, Action<string> log)
         {
+            if (OffLimitsForTest) return;
             try
             {
                 EnablePrivilege("SeTakeOwnershipPrivilege");
@@ -1709,6 +1748,9 @@ namespace PadForge.Services
 
         private static IntPtr OpenKeysBackupRestore(byte[] radioMacBigEndian, Action<string> log)
         {
+            // The open creates the radio's key where there is none, so the
+            // test host makes none: the answer of a refused open.
+            if (OffLimitsForTest) return IntPtr.Zero;
             EnablePrivilege("SeBackupPrivilege");
             EnablePrivilege("SeRestorePrivilege");
             var sb = new System.Text.StringBuilder(radioMacBigEndian.Length * 2);
@@ -1867,6 +1909,7 @@ namespace PadForge.Services
 
         private static void InstallInf(string infPath, Action<string> log)
         {
+            if (OffLimitsForTest) throw new InvalidOperationException("The test host installs no driver.");
             if (!File.Exists(infPath)) throw new FileNotFoundException("Bundled driver missing", infPath);
             Devcon.Install(infPath, out bool reboot);
             if (reboot) log("(a reboot was requested by " + Path.GetFileName(infPath) + ")");
@@ -1887,15 +1930,17 @@ namespace PadForge.Services
         /// writes Parameters itself (RawPDO 0 / ExclusivePDO 1, the defaults
         /// these lines override), so on a healthy install the subkey is
         /// already there, and creating it under a REAL service is safe
-        /// either way. What must never happen is creating the parent.</para></summary>
-        /// <summary>Writes the consumer overrides, returning true when it
+        /// either way. What must never happen is creating the parent.</para>
+        ///
+        /// <para>Writes the consumer overrides, returning true when it
         /// actually CHANGED something. The caller needs that answer: BthPS3
         /// reads RawPDO when it builds the child PDO, so a fresh write has to
         /// be followed by a re-enumeration or the running driver keeps serving
         /// the INF's defaults (RawPDO=0), and a non-raw child is a child that
-        /// needs a function driver no INF here can supply.</summary>
+        /// needs a function driver no INF here can supply.</para></summary>
         private static bool EnsureConsumerParams()
         {
+            if (OffLimitsForTest) return false;
             if (!IsServiceInstalled("BthPS3")) return false;
             using var key = Registry.LocalMachine.CreateSubKey(BthPs3ParamsKey, writable: true);
             if (key == null) return false;
@@ -2023,6 +2068,7 @@ namespace PadForge.Services
         /// SetPsmPatching drives the immediate state.</summary>
         public static void RestoreBthPs3AutoArm()
         {
+            if (OffLimitsForTest) return;
             try
             {
                 using var key = Registry.LocalMachine.OpenSubKey(BthPs3ParamsKey, writable: true);
@@ -2041,6 +2087,7 @@ namespace PadForge.Services
         /// Parameters key.</summary>
         public static void EnsurePadForgeOwnsPsmPatch()
         {
+            if (OffLimitsForTest) return;
             try
             {
                 using var key = Registry.LocalMachine.OpenSubKey(BthPs3ParamsKey, writable: true);
@@ -2090,6 +2137,7 @@ namespace PadForge.Services
 
         private static int SetPsmPatchingCore(bool enable, Action<string> log, int waitForFilterMs)
         {
+            if (OffLimitsForTest) return 0;
             if (waitForFilterMs > 0 && !IsPsmFilterPresent())
                 WaitForPsmControlDevice(waitForFilterMs);
 
@@ -2142,6 +2190,7 @@ namespace PadForge.Services
         /// forever.</summary>
         private static bool EnableBthPs3Service(Action<string> log)
         {
+            if (OffLimitsForTest) return false;
             // Wait for the radio rather than reading its absence as "no radio
             // exists". This ran 0.7 s after a radio cycle and took the early
             // exit, silently skipping the advertisement.
@@ -2206,10 +2255,6 @@ namespace PadForge.Services
 
         // ── service helpers ───────────────────────────────────────────────────────
 
-        /// <summary>True once the driver's service key exists (i.e. the INF installed).
-        /// A registry probe avoids a dependency on System.ServiceProcess and is the
-        /// right "is it installed" question - running state is handled by the profile
-        /// service advertisement + AutoEnableFilter.</summary>
         /// <summary><para>True when a kernel service is REALLY installed, which
         /// means its key carries an ImagePath. The key's mere existence is not
         /// the same question: any write under
@@ -2276,6 +2321,444 @@ namespace PadForge.Services
             using var k = servicesRoot?.OpenSubKey(name);
             return k != null && k.GetValue("ImagePath") == null;
         }
+
+        // ── removal (Settings > BthPS3 Bluetooth Driver > Uninstall) ─────────────
+        //
+        // BthPS3's own setup removes it in this order (BthPS3Installer/
+        // CustomActions.cs UninstallDrivers): the filter's class registration,
+        // the profile service's advertisement, the radio off, a restart of the
+        // radio device, the three driver packages, the radio on. That setup
+        // leaves the two driver services and the binaries their INFs copy to
+        // System32\drivers (DefaultDestDir = 12), which go here too, as does
+        // the WinUSB package PadForge gives PlayStation 3 controllers and the
+        // certificate that signs it. BthPS3Removal runs the steps. Each one
+        // that changes the PC is refused in the test host, like the install.
+
+        /// <summary>The services BthPS3's two drivers run as.</summary>
+        internal static readonly string[] BthPs3Services = { "BthPS3", "BthPS3PSM" };
+
+        /// <summary>The INF names of BthPS3's three driver packages, as its
+        /// own removal matches them in the driver store.</summary>
+        internal static readonly string[] BthPs3Infs = { "bthps3.inf", "bthps3_pdo_null_device.inf", "bthps3psm.inf" };
+
+        /// <summary>The INF name of the WinUSB package PadForge gives the
+        /// PlayStation 3 controller and the Navigation controller.</summary>
+        internal const string Ds3WinUsbInf = "ds3_winusb.inf";
+
+        /// <summary>The signer the driver database records for every package
+        /// PadForge signs (<see cref="EnsureSigningCertificate"/>).</summary>
+        internal const string PadForgeSigner = Ds3CertFriendlyName;
+
+        /// <summary>The display name BthPS3's own setup registers
+        /// (BthPS3Installer/InstallScript.cs ProductName).</summary>
+        internal const string BthPs3SetupName = "Nefarius BthPS3 Bluetooth Drivers";
+
+        /// <summary>True while either BthPS3 driver is installed as a service,
+        /// where <see cref="IsBthPs3Installed"/> asks about the profile
+        /// driver alone. Two registry reads, so the Settings card follows it
+        /// on its five-second timer.</summary>
+        internal static bool IsAnyBthPs3DriverInstalled()
+        {
+            try
+            {
+                using var services = Registry.LocalMachine.OpenSubKey(ServicesRoot);
+                return BthPs3Services.Any(s => IsServiceInstalled(services, s));
+            }
+            catch { return false; }
+        }
+
+        /// <summary>One package the driver database lists
+        /// (SYSTEM\DriverDatabase\DriverPackages, which
+        /// <see cref="IsDsHidMiniInstalled"/> reads too): the driver store
+        /// folder it sits in, which is its key's name, its published oem
+        /// INF, the INF's own name, its provider and its signer.</summary>
+        internal readonly record struct DriverPackage(string Folder, string Published, string InfName, string Provider, string Signer)
+        {
+            /// <summary>The package's INF in the driver store.</summary>
+            internal string RepositoryInf => Path.Combine(Environment.SystemDirectory, "DriverStore", "FileRepository", Folder, InfName);
+        }
+
+        /// <summary>Every package in the driver database. Empty when it
+        /// cannot be read.</summary>
+        internal static List<DriverPackage> ReadDriverPackages()
+        {
+            var list = new List<DriverPackage>();
+            try
+            {
+                using var pkgs = Registry.LocalMachine.OpenSubKey(@"SYSTEM\DriverDatabase\DriverPackages");
+                if (pkgs == null) return list;
+                foreach (string folder in pkgs.GetSubKeyNames())
+                {
+                    using var k = pkgs.OpenSubKey(folder);
+                    if (k == null) continue;
+                    list.Add(new DriverPackage(folder, k.GetValue("") as string, k.GetValue("InfName") as string,
+                        k.GetValue("Provider") as string, k.GetValue("SignerName") as string));
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        /// <summary>Whether BthPS3PSM is a lower filter of the Bluetooth
+        /// class.</summary>
+        internal static bool IsBthPs3ClassFilterRegistered()
+        {
+            try
+            {
+                var filters = DeviceClassFilters.GetLower(BluetoothClass);
+                return filters != null && filters.Any(f => f.Equals("BthPS3PSM", StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+
+        /// <summary>The product code of BthPS3's own setup, found by its
+        /// display name in the machine's list of installed programs, with
+        /// that name and its version. Null when that setup did not install
+        /// BthPS3, which PadForge then installed itself.</summary>
+        internal static string FindBthPs3Setup(out string displayName)
+        {
+            displayName = null;
+            try
+            {
+                using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+                using var root = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");
+                if (root == null) return null;
+                foreach (string code in root.GetSubKeyNames())
+                {
+                    if (!Guid.TryParse(code, out _)) continue;
+                    using var k = root.OpenSubKey(code);
+                    string name = k?.GetValue("DisplayName") as string;
+                    if (!string.Equals(name, BthPs3SetupName, StringComparison.OrdinalIgnoreCase)) continue;
+                    string version = k.GetValue("DisplayVersion") as string;
+                    displayName = string.IsNullOrEmpty(version) ? name : name + " " + version;
+                    return code;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Whether PadForge's signing certificate is in any of the
+        /// three machine stores <see cref="EnsureSigningCertificate"/> adds
+        /// it to.</summary>
+        internal static bool HasSigningCertificate()
+        {
+            try
+            {
+                foreach (var name in new[] { StoreName.My, StoreName.Root, StoreName.TrustedPublisher })
+                {
+                    using var store = new X509Store(name, StoreLocation.LocalMachine);
+                    store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+                    if (store.Certificates.Find(X509FindType.FindBySubjectDistinguishedName, Ds3CertSubject, false).Count > 0)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>Runs BthPS3's own setup's removal, quietly and with no
+        /// restart (msiexec /x). It removes the drivers itself
+        /// (InstallScript.cs ProjectOnAfterInstall calls UninstallDrivers),
+        /// and the files, updater and event manifests it put on the PC.
+        /// Returns msiexec's exit code: 0, 3010 when Windows finishes it at
+        /// the next start, 1605 when the product was gone already, -1 when
+        /// it did not end within ten minutes.</summary>
+        internal static int UninstallBthPs3Setup(string productCode, Action<string> log)
+        {
+            if (OffLimitsForTest) return -1;
+            var (code, output) = RunTool(Path.Combine(Environment.SystemDirectory, "msiexec.exe"),
+                $"/x {productCode} /qn /norestart", Environment.SystemDirectory, 10 * 60 * 1000);
+            log($"BthPS3's own uninstaller exited with {code}." + (string.IsNullOrEmpty(output) ? "" : " " + output));
+            return code;
+        }
+
+        /// <summary>Takes BthPS3PSM out of the Bluetooth class's lower
+        /// filters, so the radio's stack starts without it from its next
+        /// restart.</summary>
+        internal static void RemoveBthPs3ClassFilter(Action<string> log)
+        {
+            if (OffLimitsForTest) return;
+            DeviceClassFilters.RemoveLower(BluetoothClass, "BthPS3PSM");
+            log("Removed the PSM filter's registration.");
+        }
+
+        /// <summary>Stops advertising the BthPS3 profile service, which takes
+        /// away the device BthPS3.sys serves (HostRadio.DisableService, the
+        /// call <see cref="EnableBthPs3Service"/> makes with Enabled 1).
+        /// False when no radio answered or the call failed.</summary>
+        internal static bool DisableBthPs3Service(Action<string> log)
+        {
+            if (OffLimitsForTest) return false;
+            var fp = new BLUETOOTH_FIND_RADIO_PARAMS { dwSize = (uint)Marshal.SizeOf<BLUETOOTH_FIND_RADIO_PARAMS>() };
+            IntPtr hFind = BluetoothFindFirstRadio(ref fp, out IntPtr hRadio);
+            if (hFind == IntPtr.Zero) { log("No radio to withdraw the profile service from."); return false; }
+            try
+            {
+                EnablePrivilege("SeLoadDriverPrivilege");
+                var info = new BLUETOOTH_LOCAL_SERVICE_INFO { Enabled = 0, szName = BthPs3ServiceName };
+                uint rc = BluetoothSetLocalServiceInfo(hRadio, ref BthPs3ServiceGuidLocal, 0, ref info);
+                log(rc == 0 ? "Profile service withdrawn." : $"Withdraw service rc={rc}.");
+                return rc == 0;
+            }
+            finally { CloseHandle(hRadio); BluetoothFindRadioClose(hFind); }
+        }
+
+        // CTL_CODE(FILE_DEVICE_BLUETOOTH 0x41, 0x461, METHOD_BUFFERED,
+        // FILE_ANY_ACCESS): the switch Windows' own Bluetooth toggle throws
+        // (Nefarius.Utilities.Bluetooth HostRadio.IoctlSetRadioState).
+        private const uint IOCTL_BTH_SET_RADIO_STATE = 0x411184;
+
+        /// <summary>Switches the radio off (4) or on (2), as HostRadio's
+        /// DisableRadio and EnableRadio do. Off has the radio's bus driver
+        /// report every child absent, so the stack above it unloads. An off
+        /// radio gives BluetoothFindFirstRadio no handle, so the radio is
+        /// opened by its device interface, as HostRadio's constructor opens
+        /// one. False when there is no radio or the switch failed.</summary>
+        internal static bool SetRadioOn(bool on, Action<string> log)
+        {
+            if (OffLimitsForTest) return false;
+            try
+            {
+                if (!Devcon.FindByInterfaceGuid(RadioInterface, out string path, out _))
+                {
+                    log("No Bluetooth radio to switch " + (on ? "on." : "off."));
+                    return false;
+                }
+                IntPtr h = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                if (h == INVALID_HANDLE)
+                {
+                    log($"Could not open the Bluetooth radio ({Marshal.GetLastWin32Error()}).");
+                    return false;
+                }
+                try
+                {
+                    byte[] state = { (byte)(on ? 0x02 : 0x04), 0, 0, 0 };
+                    bool ok = DeviceIoControl(h, IOCTL_BTH_SET_RADIO_STATE, state, state.Length, null, 0, out _, IntPtr.Zero);
+                    log(ok ? $"Bluetooth radio switched {(on ? "on" : "off")}."
+                           : $"Could not switch the Bluetooth radio {(on ? "on" : "off")} ({Marshal.GetLastWin32Error()}).");
+                    return ok;
+                }
+                finally { CloseHandle(h); }
+            }
+            catch (Exception ex)
+            {
+                log("Could not switch the Bluetooth radio: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>Restarts the radio device while the radio is switched
+        /// off, so its stack starts again without the PSM filter, the step
+        /// BthPS3's own removal takes with HostRadio.RestartRadioDevice and a
+        /// wait for the radio's interface to arrive (RestartRadioAndAwait,
+        /// 30 seconds). The restart is <see cref="CycleBluetoothRadio"/>'s
+        /// port cycle, with its fallback. The wait is for the interface to
+        /// go and come back, since an off radio gives no handle.</summary>
+        internal static void RestartOffRadio(Action<string> log)
+        {
+            if (OffLimitsForTest) return;
+            bool restarting = false;
+            try
+            {
+                lock (_cycleLock)
+                {
+                    if (!Devcon.FindByInterfaceGuid(RadioInterface, out PnPDevice radio))
+                    {
+                        log("No Bluetooth radio to restart.");
+                        return;
+                    }
+                    restarting = true;
+                    try
+                    {
+                        radio.ToUsbPnPDevice().CyclePort();
+                        log("Bluetooth radio restarted.");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        log("Radio port cycle refused (" + ex.Message + "). Toggling the adapter instead.");
+                    }
+                    radio.Disable();
+                    Thread.Sleep(500);
+                    radio.Enable();
+                }
+                log("Bluetooth radio toggled off and on.");
+            }
+            catch (Exception ex) { log("Radio restart failed: " + ex.Message); }
+            finally
+            {
+                // The old instance answers for a moment after the cycle
+                // returns (CycleBluetoothRadio's MIRROR note), so the wait is
+                // for it to leave, briefly, and then for the new one.
+                if (restarting)
+                {
+                    static bool Present() => Devcon.FindByInterfaceGuid(RadioInterface, out PnPDevice _);
+                    WaitForCondition(() => !Present(), 5000, 100);
+                    if (!WaitForCondition(Present, 30000, 500))
+                        log("WARNING: the Bluetooth radio did not come back after the restart.");
+                    Thread.Sleep(3000);
+                }
+            }
+        }
+
+        /// <summary>Deletes one of BthPS3's packages from the driver store
+        /// by its INF there, the call BthPS3's own removal makes for each of
+        /// its packages once the stack is down (DriverStore.RemoveDriver:
+        /// DriverStoreOfflineDeleteDriverPackage).</summary>
+        internal static void RemoveBthPs3Package(DriverPackage package, Action<string> log)
+        {
+            if (OffLimitsForTest) return;
+            Nefarius.Utilities.DeviceManagement.Drivers.DriverStore.RemoveDriver(package.RepositoryInf);
+            log($"Removed {package.Published} ({package.InfName}).");
+        }
+
+        /// <summary>Uninstalls one of PadForge's packages from the devices it
+        /// serves and deletes it from the driver store (Devcon.DeleteDriver:
+        /// DiUninstallDriver, then SetupUninstallOEMInf with
+        /// SUOI_FORCEDELETE), as VendorUsbDriverInstaller.Restore gives a node
+        /// back. A docked PlayStation 3 controller goes back to the driver
+        /// Windows gives it.</summary>
+        internal static void DeletePadForgePackage(DriverPackage package, Action<string> log)
+        {
+            if (OffLimitsForTest) return;
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", package.Published);
+            Devcon.DeleteDriver(package.Published, path, forceDelete: true);
+            log($"Removed {package.Published} ({package.InfName}).");
+        }
+
+        /// <summary>Deletes a driver's service. A key the Service Control
+        /// Manager does not know, the shape <see cref="HasOrphanedServiceKey"/>
+        /// names, is deleted from the registry. A service whose driver is
+        /// still loaded is only marked, and Windows deletes it when it next
+        /// starts: true then.</summary>
+        internal static bool DeleteDriverService(string name, Action<string> log)
+        {
+            if (OffLimitsForTest) return false;
+            IntPtr scm = OpenSCManagerW(null, null, SC_MANAGER_CONNECT);
+            if (scm == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            try
+            {
+                IntPtr svc = OpenServiceW(scm, name, SERVICE_DELETE);
+                if (svc == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != ERROR_SERVICE_DOES_NOT_EXIST) throw new System.ComponentModel.Win32Exception(error);
+                    Registry.LocalMachine.DeleteSubKeyTree(ServicesRoot + @"\" + name, throwOnMissingSubKey: false);
+                    log($"Deleted the {name} service's leftover key.");
+                    return false;
+                }
+                try
+                {
+                    if (!DeleteService(svc))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error != ERROR_SERVICE_MARKED_FOR_DELETE) throw new System.ComponentModel.Win32Exception(error);
+                    }
+                }
+                finally { CloseServiceHandle(svc); }
+            }
+            finally { CloseServiceHandle(scm); }
+
+            // The Service Control Manager deletes a stopped service once the
+            // last handle closes, and marks a running one.
+            bool gone = WaitForCondition(() =>
+            {
+                using var k = Registry.LocalMachine.OpenSubKey(ServicesRoot + @"\" + name);
+                return k == null;
+            }, 2000, 100);
+            log(gone ? $"Deleted the {name} service." : $"The {name} service is deleted when Windows next starts.");
+            return !gone;
+        }
+
+        /// <summary>Whether a service's key is still there and marked for
+        /// deletion, the DeleteFlag the Service Control Manager writes.</summary>
+        internal static bool IsServiceMarkedForDelete(string name)
+        {
+            try
+            {
+                using var k = Registry.LocalMachine.OpenSubKey(ServicesRoot + @"\" + name);
+                return k?.GetValue("DeleteFlag") is int flag && flag != 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Deletes a driver binary an INF copied under
+        /// System32\drivers. One still loaded cannot be deleted, so Windows
+        /// deletes it when it next starts (MoveFileEx,
+        /// MOVEFILE_DELAY_UNTIL_REBOOT): true then.</summary>
+        internal static bool DeleteDriverFile(string path, Action<string> log)
+        {
+            if (OffLimitsForTest) return false;
+            try
+            {
+                File.Delete(path);
+                log("Deleted " + path + ".");
+                return false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (!MoveFileEx(path, null, MOVEFILE_DELAY_UNTIL_REBOOT))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                log(path + " is deleted when Windows next starts.");
+                return true;
+            }
+        }
+
+        /// <summary>Removes PadForge's signing certificate from the three
+        /// machine stores <see cref="EnsureSigningCertificate"/> adds it to,
+        /// with its private key. Only for a PC with no PadForge package left
+        /// that it signs: Windows checks a package's signer whenever it
+        /// installs the package on a device.</summary>
+        internal static void RemoveSigningCertificate(Action<string> log)
+        {
+            if (OffLimitsForTest) return;
+            foreach (var name in new[] { StoreName.My, StoreName.Root, StoreName.TrustedPublisher })
+            {
+                using var store = new X509Store(name, StoreLocation.LocalMachine);
+                store.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+                foreach (var c in store.Certificates.Find(X509FindType.FindBySubjectDistinguishedName, Ds3CertSubject, false))
+                {
+                    using (c)
+                    {
+                        if (name == StoreName.My && c.HasPrivateKey) DeletePrivateKey(c, log);
+                        store.Remove(c);
+                    }
+                }
+            }
+            log("Removed PadForge's driver signing certificate.");
+        }
+
+        /// <summary>Deletes the certificate's private key from the machine
+        /// key store, where <see cref="EnsureSigningCertificate"/> persisted
+        /// it. A key that cannot be deleted is logged and left.</summary>
+        private static void DeletePrivateKey(X509Certificate2 certificate, Action<string> log)
+        {
+            try
+            {
+                using RSA rsa = certificate.GetRSAPrivateKey();
+                switch (rsa)
+                {
+                    case RSACng cng:
+                        cng.Key.Delete();
+                        break;
+                    case RSACryptoServiceProvider csp:
+                        csp.PersistKeyInCsp = false;
+                        csp.Clear();
+                        break;
+                }
+            }
+            catch (Exception ex) { log("Could not delete the certificate's private key: " + ex.Message); }
+        }
+
+        private const uint SC_MANAGER_CONNECT = 0x0001, SERVICE_DELETE = 0x10000, MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
+        private const int ERROR_SERVICE_DOES_NOT_EXIST = 1060, ERROR_SERVICE_MARKED_FOR_DELETE = 1072;
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr OpenSCManagerW(string machineName, string databaseName, uint access);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr OpenServiceW(IntPtr scManager, string serviceName, uint access);
+        [DllImport("advapi32.dll", SetLastError = true)] private static extern bool DeleteService(IntPtr service);
+        [DllImport("advapi32.dll", SetLastError = true)] private static extern bool CloseServiceHandle(IntPtr handle);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool MoveFileEx(string existing, string replacement, uint flags);
 
         // ── P/Invoke ──────────────────────────────────────────────────────────────
 

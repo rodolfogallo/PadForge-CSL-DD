@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using PadForge.Common.Telemetry;
 using PadForge.Engine;
 using PadForge.Engine.Common;
@@ -670,8 +670,24 @@ namespace PadForge.Common.Input
         /// </summary>
         private void ApplyForceFeedback(UserDevice ud)
         {
-            if (ud == null || ud.ForceFeedbackState == null)
+            if (ud == null)
                 return;
+            if (ud.ForceFeedbackState == null)
+            {
+                // A haptic mouse, keyboard or the Razer Sensa row (#494)
+                // reports no SDL rumble, so loading the device never made its
+                // cache. It is made here, on the poll thread, which alone
+                // writes it in this pass, the way Bliss-Box makes it at its
+                // hand-off. A new cache starts from zero, so the row's stored
+                // level does too: one kept from before the row was removed
+                // and found again would otherwise play on, since a zero
+                // against a zero cache reads as no change (the #402 rule in
+                // UserDevice.LoadFromDevice).
+                if (ud.Device == null || !PadForge.Common.Input.Peripherals.PeripheralOutputs.TakesHaptics(ud))
+                    return;
+                PadForge.Common.Input.Peripherals.PeripheralOutputs.StopHaptics(ud.InstanceGuid);
+                ud.ForceFeedbackState = new ForceFeedbackState();
+            }
 
             // Abnormal-exit quiesce (crash handler / ProcessExit): the
             // panic sweep zeroed the hardware once; without this gate
@@ -711,12 +727,18 @@ namespace PadForge.Common.Input
             // Read Bliss-Box Adapters is on (#469), the converter's shape: SDL's
             // DirectInput path averages both motors into one sine effect.
             bool isBlissBox = PadForge.Engine.Common.BlissBox.BlissBoxApi.OwnsRumble(ud.VendorId, ud.ProdId);
-            if (!isXboxImpulse && !isVendorFfb && !isPadixConverter && !isBlissBox)
+            // A haptic mouse or keyboard, or the Razer Sensa row (#494): its
+            // level goes to the peripheral backends, the converter's shape.
+            // The mouse wrapper reports no SDL rumble, so this skips that
+            // gate too. A row whose device sleeps keeps taking its level, so
+            // the device plays the current one when it wakes.
+            bool isPeripheralHaptic = PadForge.Common.Input.Peripherals.PeripheralOutputs.TakesHaptics(ud);
+            if (!isXboxImpulse && !isVendorFfb && !isPadixConverter && !isBlissBox && !isPeripheralHaptic)
             {
                 if (ud.Device == null || (!ud.Device.HasRumble && !ud.Device.HasHaptic))
                     return;
             }
-            else if ((isXboxImpulse || isPadixConverter || isBlissBox) && ud.Device == null)
+            else if ((isXboxImpulse || isPadixConverter || isBlissBox || isPeripheralHaptic) && ud.Device == null)
             {
                 return;
             }
@@ -810,7 +832,7 @@ namespace PadForge.Common.Input
                         {
                             if (isXboxImpulse)
                             {
-                                XboxImpulseHidWriter.Write(ud, 0, 0, 0, 0);
+                                XboxImpulseHidWriter.Write(ud, 0, 0, 0, 0, force: true);
                                 ud.ForceFeedbackState.TryRecordXboxImpulseSnapshot(0, 0, 0, 0);
                             }
                             else if (isPadixConverter)
@@ -821,6 +843,11 @@ namespace PadForge.Common.Input
                             else if (isBlissBox)
                             {
                                 BlissBoxRuntime.SetRumble(ud.DevicePath, 0, 0);
+                                ud.ForceFeedbackState.TryRecordMotorSnapshot(0, 0);
+                            }
+                            else if (isPeripheralHaptic)
+                            {
+                                PadForge.Common.Input.Peripherals.PeripheralOutputs.SetMotors(ud.InstanceGuid, 0, 0);
                                 ud.ForceFeedbackState.TryRecordMotorSnapshot(0, 0);
                             }
                             else ud.ForceFeedbackState.StopDeviceForces(ud.Device);
@@ -1210,6 +1237,27 @@ namespace PadForge.Common.Input
                 return;
             }
 
+            if (isPeripheralHaptic)
+            {
+                // Haptic mice, keyboards and the Razer Sensa row (#494), the
+                // Bliss-Box shape: the level is recorded here and a backend
+                // worker plays it, a HID++ waveform train, the GameSense
+                // tactile handler or the Interhaptics engine. Trigger Rumble
+                // Fold applies as on SDL's path, since none of them has
+                // trigger motors. An engine silence edge (stop, focus suspend,
+                // the crash quiesce) zeroed the level without this pass, so
+                // the level a game still asks for is owed again. The level is
+                // kept whether or not the path is up, so nothing needs sending
+                // twice.
+                ushort hapticL = combinedL, hapticR = combinedR;
+                ForceFeedbackState.FoldTriggersForDirectWriter(firstPadSetting, combinedLT, combinedRT, ref hapticL, ref hapticR);
+                if (PadForge.Common.Input.Peripherals.PeripheralOutputs.ConsumeResend(ud.InstanceGuid))
+                    ud.ForceFeedbackState.MarkDirectWriteFailed();
+                if (ud.ForceFeedbackState.TryRecordMotorSnapshot(hapticL, hapticR))
+                    PadForge.Common.Input.Peripherals.PeripheralOutputs.SetMotors(ud.InstanceGuid, hapticL, hapticR);
+                return;
+            }
+
             // Native vendor FFB dispatch. Wheels: project the directional force
             // onto the steering axis (shared ForceFeedbackState helper — same math
             // as the SDL single-axis haptic path) and send a constant force.
@@ -1303,7 +1351,8 @@ namespace PadForge.Common.Input
                             hasCond ? ca.PositiveCoefficient : (short)0, hasCond ? ca.NegativeCoefficient : (short)0,
                             hasCond ? ca.Offset : (short)0, hasCond ? (int)ca.DeadBand : 0,
                             hasCond ? (int)ca.PositiveSaturation : 0, hasCond ? (int)ca.NegativeSaturation : 0, condGain,
-                            (ushort)peerRange, (ushort)ledMask, ledsOn);
+                            (ushort)peerRange, (ushort)ledMask, ledsOn,
+                            rangeLeftToWheel: !WheelRangeLimits.SendsRange(firstPadSetting));
                         return;
                     }
 
@@ -1318,7 +1367,9 @@ namespace PadForge.Common.Input
                         return;
                     }
 
-                    int desRange = System.Math.Clamp(TryParseIntStatic(firstPadSetting.RotationRange, 900), 40, 2520);
+                    // Preserve v5.1's choice to leave rotation range to the wheel.
+                    bool sendRange = WheelRangeLimits.SendsRange(firstPadSetting);
+                    int desRange = sendRange ? System.Math.Clamp(TryParseIntStatic(firstPadSetting.RotationRange, 900), 40, 2520) : 0;
                     // Fanatec range setup changes firmware force state. Apply it
                     // before the requested effect, and reapply both after a failed
                     // delivery/reopened endpoint. Never let setup overwrite a force
@@ -1326,7 +1377,7 @@ namespace PadForge.Common.Input
                     if (isFanatecWheel && (!_appliedWheelSettings.TryGetValue(ud.DevicePath, out var fanatecSettings)
                         || fanatecSettings.range != desRange || fanatecSettings.ac != desAc || fanatecSettings.epoch != ffbSig.OutputEpoch))
                     {
-                        bool configured = FanatecRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId)
+                        bool configured = (!sendRange || FanatecRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId))
                             && FanatecRawHidWriter.WriteStopAllEffects(ud.DevicePath, ud.ProdId)
                             && FanatecRawHidWriter.WriteAutocenter(ud.DevicePath, acMag);
                         if (!configured)
@@ -1406,12 +1457,12 @@ namespace PadForge.Common.Input
                         bool applied;
                         if (isLogitechWheel)
                         {
-                            applied  = LogitechRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId);
+                            applied  = !sendRange || LogitechRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId);
                             applied &= LogitechRawHidWriter.WriteAutocenter(ud.DevicePath, acMag, LogitechRawHidWriter.IsMomo(ud.ProdId));
                         }
                         else
                         {
-                            applied  = ThrustmasterRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId);
+                            applied  = !sendRange || ThrustmasterRawHidWriter.WriteRange(ud.DevicePath, desRange, ud.ProdId);
                             applied &= ThrustmasterRawHidWriter.WriteAutocenter(ud.DevicePath, acMag);
                         }
                         // Cache only once the wheel actually accepted the settings.
@@ -1868,17 +1919,6 @@ namespace PadForge.Common.Input
         }
 
         /// <summary>
-        /// Mixes audio bass rumble into the raw motor values (when the
-        /// device's PadSetting has it enabled) and applies ForceOverall ×
-        /// LeftMotorStrength / RightMotorStrength × ForceSwapMotor. The
-        /// audio detector is shared across slots (one peak source) but
-        /// the per-device sensitivity / cutoff / left-right scaling
-        /// applied here are per-PadSetting. With <paramref name="ps"/>
-        /// null all scaling falls back to identity (raw passthrough at
-        /// 100 % gain) so transient pre-init frames still produce sane
-        /// rumble.
-        /// </summary>
-        /// <summary>
         /// Applies per-device impulse-trigger scaling: per-trigger
         /// strength (<c>ImpulseLeftStrength</c> / <c>ImpulseRightStrength</c>)
         /// × impulse-tab overall gain (<c>ImpulseOverallGain</c>) +
@@ -1935,6 +1975,17 @@ namespace PadForge.Common.Input
             scaledRight = finalR;
         }
 
+        /// <summary>
+        /// Mixes audio bass rumble into the raw motor values (when the
+        /// device's PadSetting has it enabled) and applies ForceOverall ×
+        /// LeftMotorStrength / RightMotorStrength × ForceSwapMotor. The
+        /// audio detector is shared across slots (one peak source) but
+        /// the per-device sensitivity / cutoff / left-right scaling
+        /// applied here are per-PadSetting. With <paramref name="ps"/>
+        /// null all scaling falls back to identity (raw passthrough at
+        /// 100 % gain) so transient pre-init frames still produce sane
+        /// rumble.
+        /// </summary>
         public void ScaleRumbleForDevice(
             ushort rawLeft, ushort rawRight, PadSetting ps,
             out ushort scaledLeft, out ushort scaledRight)

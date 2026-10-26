@@ -348,24 +348,30 @@ namespace PadForge
                 {
                     if (elem is NavigationViewItem nvi && nvi.Tag != null)
                     {
-                        var tag = nvi.Tag.ToString();
-                        if (tag == "AddController")
-                            ShowControllerTypePopup(nvi);
-                        else if (!_rebuildingControllerSection)
-                        {
-                            // Clear active state on all items, set on clicked one.
-                            foreach (var mi in NavView.MenuItems)
-                                if (mi is NavigationViewItem other) other.IsActive = false;
-                            foreach (var mi in NavView.FooterMenuItems)
-                                if (mi is NavigationViewItem other) other.IsActive = false;
-                            nvi.IsActive = true;
-                            NavigateToTag(tag);
-                        }
+                        ActivateNavItem(nvi);
                         break;
                     }
                     // TreeWalk, not VisualTreeHelper: OriginalSource can be
                     // an inline Run, and GetParent throws on those (#333).
                     elem = PadForge.Common.TreeWalk.Parent(elem);
+                }
+            };
+
+            // The keyboard path: Enter or Space on a focused entry. wpf-ui
+            // starts navigation from a key press only for an entry with a
+            // TargetPageType (NavigationViewItem.OnClick), and these entries
+            // navigate by tag, so a key press on one did nothing. A button
+            // inside a slot card keeps its own Enter and Space: only the
+            // focused entry itself is handled.
+            NavView.PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key is not (System.Windows.Input.Key.Enter or System.Windows.Input.Key.Space)
+                    || System.Windows.Input.Keyboard.Modifiers != System.Windows.Input.ModifierKeys.None)
+                    return;
+                if (System.Windows.Input.Keyboard.FocusedElement is NavigationViewItem nvi && nvi.Tag != null)
+                {
+                    ActivateNavItem(nvi);
+                    e.Handled = true;
                 }
             };
 
@@ -660,9 +666,6 @@ namespace PadForge
                      or nameof(DashboardViewModel.HeadTrackingRangeY)
                      or nameof(DashboardViewModel.HeadTrackingRangeZ)
                      or nameof(DashboardViewModel.EnableWebController)
-                     or nameof(DashboardViewModel.EnableChromaLightbar)
-                     or nameof(DashboardViewModel.EnableLightsyncLightbar)
-                     or nameof(DashboardViewModel.EnableSensaHaptics)
                      or nameof(DashboardViewModel.WebControllerPort)
                      or nameof(DashboardViewModel.EnableWebControllerPlainHttp)
                      or nameof(DashboardViewModel.WebControllerPlainHttpPort)
@@ -689,6 +692,12 @@ namespace PadForge
                 Strings.Instance.Status_InstallingHidHide, DriverInstaller.InstallHidHide, RefreshHidHideStatus);
             _viewModel.Settings.UninstallHidHideRequested += async (s, e) => await RunDriverOperationAsync(
                 Strings.Instance.Status_UninstallingHidHide, DriverInstaller.UninstallHidHide, RefreshHidHideStatus);
+
+            // Removing HIDMaestro from the PC (#516, #518).
+            _viewModel.Settings.UninstallHIDMaestroRequested += async (s, e) => await UninstallHIDMaestroAsync();
+
+            // Removing BthPS3 from the PC.
+            _viewModel.Settings.UninstallBthPS3Requested += async (s, e) => await UninstallBthPS3Async();
 
             // Wire HidHide whitelist add (file browser).
             _viewModel.Settings.AddWhitelistPathRequested += (s, e) =>
@@ -743,35 +752,10 @@ namespace PadForge
                 _settingsService?.MarkDirty();
             };
 
-            // Wire MIDI Services install/uninstall commands.
-            _viewModel.Settings.InstallMidiServicesRequested += async (s, e) =>
-            {
-                _viewModel.SetStatus(Strings.Instance.Status_DownloadingMidi, persist: true);
-                DriverOverlayText.Text = Strings.Instance.Status_DownloadingInstallingMidi;
-                DriverOverlay.Visibility = Visibility.Visible;
-                try
-                {
-                    await DriverInstaller.InstallMidiServicesAsync();
-                    _viewModel.StatusText = Strings.Instance.Common_Ready;
-                }
-                catch (System.ComponentModel.Win32Exception)
-                {
-                    _viewModel.StatusText = Strings.Instance.Status_OperationCanceled;
-                }
-                catch (Exception ex)
-                {
-                    _viewModel.SetStatus(string.Format(Strings.Instance.Status_MidiInstallFailed_Format, ex.Message), persist: true);
-                }
-                finally
-                {
-                    DriverOverlay.Visibility = Visibility.Collapsed;
-                    RefreshMidiServicesStatus();
-                }
-            };
             // Wire the Steam-free SteamVR install (#49): steamcmd anonymous
-            // app_update 250820 into C:\SteamVR + HIDMaestro path hint. Same
-            // overlay treatment as the MIDI install; the payload is several
-            // GB, so the overlay text warns about the wait.
+            // app_update 250820 into C:\SteamVR + HIDMaestro path hint. The
+            // payload is several GB, so the overlay text warns about the
+            // wait.
             _viewModel.Settings.InstallSteamVrRequested += async (s, e) =>
             {
                 _viewModel.SetStatus(Strings.Instance.Status_DownloadingSteamVR, persist: true);
@@ -784,7 +768,8 @@ namespace PadForge
                 }
                 catch (Exception ex)
                 {
-                    _viewModel.SetStatus(string.Format(Strings.Instance.Status_SteamVRInstallFailed_Format, ex.Message), persist: true);
+                    LogDriverFailure(ex);
+                    _viewModel.SetStatus(string.Format(Strings.Instance.Status_SteamVRInstallFailed_Format, DescribeDriverFailure(ex)), persist: true);
                 }
                 finally
                 {
@@ -801,7 +786,10 @@ namespace PadForge
             // explicit confirm naming the exact directory.
             _viewModel.Settings.UninstallSteamVrRequested += async (s, e) =>
             {
-                if (System.Diagnostics.Process.GetProcessesByName("vrserver").Length > 0)
+                // One limited query per process, about 7 ms. A walk of the
+                // kernel's process records cost 240 to 360 ms on a PC with
+                // 9,000 threads, on this, the UI thread.
+                if (PadForge.Common.Input.ProcessPresence.RunningAmong(new[] { "vrserver" }).Count > 0)
                 {
                     _viewModel.SetStatus(Strings.Instance.Status_SteamVRRunningCloseFirst, persist: true);
                     return;
@@ -819,17 +807,62 @@ namespace PadForge
                     RefreshMidiServicesStatus);
             };
 
+            // The install, then the switch that moves MIDI onto the runtime:
+            // the next probe picks it, MIDI input reopens through it, and
+            // Step 5 rebuilds the MIDI slots on ports of their own. Both run
+            // on the operation's worker, not the UI thread, since the reset
+            // waits behind a probe that hangs on a dead service. An
+            // installer PadForge could not follow is marked there for the
+            // card's refresh (MidiRuntimeSwitch.RunInstall).
+            _viewModel.Settings.InstallMidiRuntimeRequested += async (s, e) =>
+            {
+                await RunDriverOperationAsync(
+                    Strings.Instance.Status_DownloadingInstallingMidi,
+                    () => Common.Input.MidiRuntimeSwitch.RunInstall(
+                        DriverInstaller.InstallMidiRuntime,
+                        () => _inputService?.SwitchMidiApi()),
+                    RefreshMidiServicesStatus);
+            };
+
             _viewModel.Settings.UninstallMidiServicesRequested += async (s, e) =>
             {
-                // The uninstall guard prevents this when MIDI slots are active, but
-                // MIDI *input* enumeration (issue #128) loads the SDK runtime whenever
-                // services are installed — tear those connections down first.
-                _inputService?.ShutdownMidiInputs();
-                // Release the SDK runtime and keep it released, so the
-                // uninstaller never has to close PadForge to reach its files.
-                Common.Input.MidiVirtualController.SuppressForUninstall();
+                // Microsoft's bundle takes its MIDI Settings app, console
+                // and PowerShell module with it, and Microsoft no longer
+                // offers any of them, so that removal asks first, as a
+                // profile delete and the SteamVR uninstall do (#175).
+                if (DriverInstaller.MidiUninstallIsIrreversible(DriverInstaller.FindMidiRuntime().Owner)
+                    && !Views.ConfirmDialog.Show(this,
+                        Strings.Instance.Settings_MidiUninstallBundle_Title,
+                        Strings.Instance.Settings_MidiUninstallBundleConfirm_Message,
+                        Strings.Instance.Common_Uninstall))
+                    return;
+
+                // This removes the App SDK runtime only, and what it holds
+                // meanwhile follows the API in use
+                // (MidiRuntimeSwitch.RunUninstall). Under the in-box API
+                // nothing in this process reaches the runtime, so nothing is
+                // held. Under the legacy API MIDI keeps running on its WinMM
+                // ports, and only a fresh start of Windows MIDI Services is
+                // held off: the check that follows a refused start, and any
+                // probe after a reset, would load the runtime again.
+                // Otherwise the runtime may be loaded. The uninstall guard
+                // prevents this when MIDI slots are active, but MIDI *input*
+                // enumeration (issue #128) loads the runtime whenever it is
+                // the API in use, so those connections are torn down first,
+                // then the runtime is released and kept released, so nothing
+                // opens new sessions on it while its uninstaller removes it.
+                // All of it runs on the operation's worker, since a release
+                // waits behind a probe that hangs on a dead service. One that
+                // does not finish in time keeps the uninstaller from starting
+                // and undoes itself.
                 await RunDriverOperationAsync(
-                    Strings.Instance.Status_UninstallingMidi, DriverInstaller.UninstallMidiServices, RefreshMidiServicesStatus);
+                    Strings.Instance.Status_UninstallingMidi,
+                    () => Common.Input.MidiRuntimeSwitch.RunUninstall(
+                        () => (DriverInstaller.UninstallMidiRuntime(out var exited), exited),
+                        () => _inputService?.ShutdownMidiInputs(),
+                        () => _inputService?.ResumeMidiInputs(),
+                        () => Dispatcher.BeginInvoke(new Action(RefreshMidiServicesStatus))),
+                    RefreshMidiServicesStatus);
             };
 
             // Wire device service events (assign to slot, hide, etc.).
@@ -1422,7 +1455,8 @@ namespace PadForge
                         nameof(PadViewModel.ForceOverallGain) or nameof(PadViewModel.LeftMotorStrength) or
                         nameof(PadViewModel.RightMotorStrength) or nameof(PadViewModel.SwapMotors) or
                         nameof(PadViewModel.TriggerRumbleFold) or
-                        nameof(PadViewModel.WheelRotationRange) or nameof(PadViewModel.WheelAutoCenter) or
+                        nameof(PadViewModel.WheelRotationRange) or nameof(PadViewModel.WheelRotationRangeEnabled) or
+                        nameof(PadViewModel.WheelAutoCenter) or
                         nameof(PadViewModel.WheelRpmLeds) or
                         nameof(PadViewModel.ImpulseOverallGain) or
                         nameof(PadViewModel.ImpulseLeftStrength) or nameof(PadViewModel.ImpulseRightStrength) or
@@ -2152,11 +2186,11 @@ namespace PadForge
             }
 
             // MIDI availability must be probed BEFORE the rail is built. The
-            // rail's type-switcher reads the cached
-            // Settings.IsMidiServicesInstalled rather than probing the registry
-            // per card, and that property starts false, so building first meant
-            // a machine WITH Windows MIDI Services installed painted its first
-            // rail without the MIDI segment. The 5 s driver timer then updates
+            // rail's type-switcher reads the cached Settings.IsMidiAvailable
+            // rather than probing the registry per card, and that property
+            // starts false, so building first meant a machine WITH Windows
+            // MIDI Services painted its first rail without the MIDI segment.
+            // The 5 s driver timer then updates
             // the property but deliberately does not rebuild on its baseline
             // sweep, so the segment stayed missing until an unrelated rebuild.
             // Safe this early: the method only writes the two view-models and
@@ -2223,15 +2257,12 @@ namespace PadForge
                     // DestroyAllVirtualControllers + HMContext.Dispose
                     // grind through (multi-second per Microsoft xinputhid
                     // VC).  Sidebar rebuild fires when the teardown
-                    // completes.
-                    _viewModel.IsEngineRunning = false;
-                    _viewModel.Dashboard.EngineStateKey = "Stopping";
-                    _viewModel.Dashboard.EngineStatus = Strings.Instance.Common_Stopping;
-                    _viewModel.SetStatus(Strings.Instance.Status_StoppingEngine, persist: true);
-                    _viewModel.RefreshCommands();
-                    System.Threading.Tasks.Task.Run(() => _inputService.Stop())
-                        .ContinueWith(_ => RebuildControllerSection(),
-                            System.Threading.Tasks.TaskScheduler.FromCurrentSynchronizationContext());
+                    // completes. The task is kept so a removal of
+                    // HIDMaestro can wait out a teardown still in flight.
+                    ShowEngineStopping();
+                    _engineStopTask = System.Threading.Tasks.Task.Run(() => _inputService.Stop());
+                    _engineStopTask.ContinueWith(_ => RebuildControllerSection(),
+                        System.Threading.Tasks.TaskScheduler.FromCurrentSynchronizationContext());
                 }
                 else
                 {
@@ -2393,6 +2424,8 @@ namespace PadForge
                 _ = Task.Run(HidHideArm64Installer.RemoveDanglingFilters);
 
             RefreshHidHideStatus();
+            RefreshHIDMaestroStatus();
+            RefreshBthPS3Status();
             StartDriverStatusTimer();
 
             // Same reason as the two above: this used to sit in the loaded
@@ -2412,6 +2445,10 @@ namespace PadForge
                 {
                     StatusMessageText.BeginAnimation(UIElement.OpacityProperty, null);
                     StatusMessageText.Opacity = 1.0;
+                    // A screen reader hears a new message once the binding
+                    // has put it on screen.
+                    if (!string.IsNullOrEmpty(_viewModel.StatusText))
+                        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, new Action(AnnounceStatus));
                 }
                 // The nav flames read engine-level state (IsEngineRunning
                 // and the idle-following HasActiveSlots) but re-render only
@@ -2494,14 +2531,32 @@ namespace PadForge
             var offer = devices.DriverOffer;
             if (offer == null || devices.DriverBusy || (bind ? offer.Bind == null : !offer.Restore)) return;
             string name = Services.VendorUsbDriverInstaller.NameOf(offer.Kind);
-            if (bind && !Views.ConfirmDialog.Show(this, Strings.Instance.Devices_DriverConfirmTitle,
-                    DriverCost(offer.Kind), Strings.Instance.Devices_DriverSwitch))
-                return;
-
-            devices.DriverBusy = true;
-            _viewModel.SetStatus(string.Format(Strings.Instance.Status_DriverSwitching_Format, name));
             Action<string> log = m => PadForge.Engine.SdlDiagLog.WriteLine("VendorUSB: " + m);
+
+            // Said before the confirm, which speaks of the one device that
+            // was chosen: Windows would move another of its model with it.
+            devices.DriverBusy = true;
             var nodes = await System.Threading.Tasks.Task.Run(Services.VendorUsbDriverInstaller.ListPresentUsbNodes);
+            if (bind && (TakesOthersAlong(offer, nodes, log)
+                    || !Views.ConfirmDialog.Show(this, Strings.Instance.Devices_DriverConfirmTitle,
+                        DriverCost(offer.Kind), Strings.Instance.Devices_DriverSwitch)))
+            {
+                devices.DriverBusy = false;
+                return;
+            }
+
+            _viewModel.SetStatus(string.Format(Strings.Instance.Status_DriverSwitching_Format, name));
+            if (bind)
+            {
+                // Listed again: the confirm can stay open for any length
+                // of time, and the bind acts on what is plugged in now.
+                nodes = await System.Threading.Tasks.Task.Run(Services.VendorUsbDriverInstaller.ListPresentUsbNodes);
+                if (TakesOthersAlong(offer, nodes, log))
+                {
+                    devices.DriverBusy = false;
+                    return;
+                }
+            }
             bool ok = await System.Threading.Tasks.Task.Run(() => bind
                 ? Services.VendorUsbDriverInstaller.Bind(offer.Bind.Value, offer.NodeId, nodes, log, default, offer.From)
                 : Services.VendorUsbDriverInstaller.Restore(offer.NodeId, log, default));
@@ -2577,12 +2632,33 @@ namespace PadForge
                 : Strings.Instance.Status_UsioTaiko);
         }
 
+        /// <summary>Whether the bind on offer would move another device of
+        /// the model with the chosen one, which it is then not made for
+        /// (VendorUsbDriverInstaller.WhyNotBind). Says so in the status bar
+        /// when it would, with what to do about it.</summary>
+        private bool TakesOthersAlong(Services.VendorUsbDriverInstaller.OptInOffer offer,
+            System.Collections.Generic.IReadOnlyList<Services.VendorUsbDriverInstaller.UsbNode> nodes, Action<string> log)
+        {
+            if (Services.VendorUsbDriverInstaller.WhyNotBind(offer.Bind.Value, offer.NodeId, nodes, offer.From, out string why)
+                != Services.VendorUsbDriverInstaller.BindRefusal.OthersPluggedIn)
+                return false;
+            log(why);
+            _viewModel.SetStatus(Strings.Instance.Status_DriverBindOthersPluggedIn, persist: true);
+            return true;
+        }
+
+        /// <summary>What the switch to PadForge's driver takes from a
+        /// device, stated before the user agrees to it. A kind with no arm
+        /// here is refused, so one appended later is never confirmed under
+        /// another kind's cost.</summary>
         private static string DriverCost(Services.VendorUsbDriverInstaller.OptInKind kind) => kind switch
         {
             Services.VendorUsbDriverInstaller.OptInKind.Xbox360Pad => Strings.Instance.Devices_DriverConfirm_Xbox360Pad,
             Services.VendorUsbDriverInstaller.OptInKind.Xbox360Receiver => Strings.Instance.Devices_DriverConfirm_Xbox360Receiver,
             Services.VendorUsbDriverInstaller.OptInKind.IntelBaseStation => Strings.Instance.Devices_DriverConfirm_IntelBaseStation,
-            _ => Strings.Instance.Devices_DriverConfirm_Prodikeys,
+            Services.VendorUsbDriverInstaller.OptInKind.Prodikeys => Strings.Instance.Devices_DriverConfirm_Prodikeys,
+            Services.VendorUsbDriverInstaller.OptInKind.TouchSenseMouse => Strings.Instance.Devices_DriverConfirm_TouchSenseMouse,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
         };
 
         /// <summary>Part 15's rule 4: Windows can hand an opted-in device its
@@ -2628,6 +2704,11 @@ namespace PadForge
             _driverStatusTimer.Tick += (s, ev) =>
             {
                 RefreshHidHideStatus();
+                // The engine installs HIDMaestro with its first virtual
+                // controller, so the card follows it here.
+                RefreshHIDMaestroStatus();
+                // A pairing installs BthPS3. Two registry reads.
+                RefreshBthPS3Status();
                 RefreshMidiServicesStatus();
                 // Status decay (#175 item 7) rides this always-on 5 s lane
                 // (started in the constructor, never stopped) instead of a
@@ -2676,6 +2757,7 @@ namespace PadForge
                 WindowStyle = WindowStyle.None;
                 WindowState = WindowState.Maximized;
                 FullScreenIcon.Text = "\uE73F";
+                FullScreenBtn.IsOn = true;
             }
 
             // Ambient-motion gate: the always-on breathes (rail heat ring,
@@ -2938,12 +3020,14 @@ namespace PadForge
                 _deviceService?.UnwireEvents();
 
                 // Run the slow shutdown work (controller disposal, Extended node removal) off the UI thread.
+                // The MIDI teardown is bounded: a dead MIDI service can hold
+                // it, and a teardown that misses its bound is left to the
+                // process's exit so PadForge still closes.
                 await System.Threading.Tasks.Task.Run(() =>
                 {
                     _recorderService?.Dispose();
                     _inputService?.Dispose();
-                    Common.Input.MidiInputRuntime.Shutdown();
-                    Common.Input.MidiVirtualController.Shutdown();
+                    Common.Input.MidiVirtualController.ShutdownForExit();
                 });
 
                 // All done — close for real.
@@ -3003,7 +3087,7 @@ namespace PadForge
             // DynamicResource reference keeps them tracking theme swaps.
             static FontIcon EmberNavIcon(string glyph)
             {
-                var icon = new FontIcon
+                var icon = new PadForge.Controls.DecorativeFontIcon
                 {
                     FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
                     Glyph = glyph,
@@ -3019,6 +3103,7 @@ namespace PadForge
                 Tag = "Dashboard",
                 Icon = EmberNavIcon("\uF404")
             };
+            SetNavAutomationId(_navDashboard, "Dashboard");
             NavView.MenuItems.Add(_navDashboard);
 
             // Profiles.
@@ -3028,6 +3113,7 @@ namespace PadForge
                 Icon = EmberNavIcon("\uE8F1"),
                 Content = Strings.Instance.Profiles_Title
             };
+            SetNavAutomationId(_navProfiles, "Profiles");
             NavView.MenuItems.Add(_navProfiles);
 
             // Devices.
@@ -3037,6 +3123,7 @@ namespace PadForge
                 Tag = "Devices",
                 Icon = EmberNavIcon("\uE772")
             };
+            SetNavAutomationId(_navDevices, "Devices");
             NavView.MenuItems.Add(_navDevices);
 
             // Controller entries (initially none — populated dynamically).
@@ -3234,7 +3321,8 @@ namespace PadForge
             };
             SuppressBuiltInSelectionVisual(menuItem);
             AttachCollapsedIconHover(menuItem);
-            System.Windows.Automation.AutomationProperties.SetName(menuItem, navItem.Tag);
+            System.Windows.Automation.AutomationProperties.SetName(menuItem, AccessibleNames.SlotTitle(navItem.SlotNumber));
+            SetNavAutomationId(menuItem, navItem.Tag);
             UpdateControllerNavItemContent(menuItem, navItem);
             if (collapsed)
             {
@@ -3282,6 +3370,7 @@ namespace PadForge
             var grid = new System.Windows.Controls.Grid { Width = size, Height = size };
             var flame = new System.Windows.Shapes.Path
             {
+                FlowDirection = FlowDirection.LeftToRight,
                 Data = (System.Windows.Media.Geometry)Application.Current.Resources["FlameOuterGeometry"],
                 Stretch = System.Windows.Media.Stretch.Uniform
             };
@@ -3339,6 +3428,16 @@ namespace PadForge
         private void UpdateControllerNavItemContent(NavigationViewItem menuItem, NavControllerItemViewModel navItem)
         {
             if (_isDraggingCard) return;
+            // The entry's screen-reader name follows its slot number, as the
+            // card does.
+            System.Windows.Automation.AutomationProperties.SetName(menuItem, AccessibleNames.SlotTitle(navItem.SlotNumber));
+            // Keyboard focus on a button of the old card returns to the same
+            // button on the new one, so a key press that rebuilds the card (a
+            // type change, the power toggle) leaves the focus where it was.
+            string focusedId = menuItem.Content is Visual oldCard
+                && System.Windows.Input.Keyboard.FocusedElement is FrameworkElement focused
+                && oldCard.IsAncestorOf(focused)
+                ? System.Windows.Automation.AutomationProperties.GetAutomationId(focused) : null;
             string iconKey = navItem.IconKey;
             bool isXbox = iconKey == "XboxControllerIcon";
             bool isPlayStation = iconKey == "DS4ControllerIcon";
@@ -3351,7 +3450,7 @@ namespace PadForge
             var row = new System.Windows.Controls.DockPanel();
 
             // Delete button — docked right so it stays at the far end of the card.
-            var deleteIcon = new System.Windows.Controls.TextBlock
+            var deleteIcon = new PadForge.Controls.GlyphText
             {
                 Text = "\uE711",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -3388,6 +3487,9 @@ namespace PadForge
                 Opacity = 0
             };
             deleteBtn.SetResourceReference(FrameworkElement.StyleProperty, "EmberIconButtonHot");
+            // Tools find the card's delete button by this id, not by a name
+            // that a translation or another button's tooltip could share.
+            System.Windows.Automation.AutomationProperties.SetAutomationId(deleteBtn, "Nav_DeleteSlot");
             deleteBtn.Click += OnSidebarDeleteSlot;
             System.Windows.Controls.DockPanel.SetDock(deleteBtn, System.Windows.Controls.Dock.Right);
             row.Children.Add(deleteBtn);
@@ -3473,8 +3575,11 @@ namespace PadForge
                 flameGlyph.BeginAnimation(System.Windows.UIElement.OpacityProperty, flashAnimation);
             }
 
-            var powerBtn = new System.Windows.Controls.Button
+            // A StateToggleButton reads to a screen reader as a toggle, on
+            // while the slot is enabled.
+            var powerBtn = new PadForge.Controls.StateToggleButton
             {
+                IsOn = navItem.IsEnabled,
                 Content = flameGlyph,
                 Background = System.Windows.Media.Brushes.Transparent,
                 BorderThickness = new Thickness(0),
@@ -3487,6 +3592,10 @@ namespace PadForge
                 Cursor = System.Windows.Input.Cursors.Hand
             };
             powerBtn.Click += OnSidebarPowerToggle;
+            System.Windows.Automation.AutomationProperties.SetAutomationId(powerBtn, "Nav_SlotPower");
+            // The toggle's name says what it switches, and its state tooltip
+            // is the help text a screen reader reads after the state.
+            System.Windows.Automation.AutomationProperties.SetName(powerBtn, Strings.Instance.Common_Enabled);
             row.Children.Add(powerBtn);
 
             // Global slot number. The pill reads "what this slot IS" (#175):
@@ -3514,14 +3623,14 @@ namespace PadForge
             // the dashboard segment in mini form. Active type is ember-filled;
             // the card rebuilds on OutputType change via RefreshNavControllerItems.
             // Read the cached status, not the live probe. This method runs once
-            // per rail card, and DriverInstaller.IsMidiServicesInstalled()
+            // per rail card, and DriverInstaller.IsMidiRuntimeInstalled()
             // enumerates the whole HKLM uninstall key under BOTH the 64-bit and
             // 32-bit registry views, so a 16-slot rail rebuild paid 32 hive
             // walks on the UI thread. RefreshMidiServicesStatus() keeps this
             // property current on a 5 s timer, and the constructor calls it
             // immediately before the rail's first build, so the value here is
             // the same answer at worst five seconds older.
-            bool hasMidi = _viewModel.Settings.IsMidiServicesInstalled;
+            bool hasMidi = _viewModel.Settings.IsMidiAvailable;
             var segRow = new System.Windows.Controls.StackPanel
             {
                 Orientation = System.Windows.Controls.Orientation.Horizontal,
@@ -3529,10 +3638,13 @@ namespace PadForge
                 HorizontalAlignment = HorizontalAlignment.Right
             };
 
-            System.Windows.Controls.Button MakeTypeButton(UIElement content, bool active, System.Windows.RoutedEventHandler click, string tip, bool enabled)
+            System.Windows.Controls.Button MakeTypeButton(UIElement content, bool active, System.Windows.RoutedEventHandler click, string tip, bool enabled, string id)
             {
-                var b = new System.Windows.Controls.Button
+                // A SegmentButton reads to a screen reader as a radio button,
+                // checked on the slot's current type.
+                var b = new PadForge.Controls.SegmentButton
                 {
+                    IsSelected = active,
                     Content = content,
                     // 2px sides (#49 seven-tile fit; was 3px since the #175
                     // two-digit fit): the VR tile pushed the worst case
@@ -3552,6 +3664,7 @@ namespace PadForge
                     IsEnabled = enabled,
                     Cursor = System.Windows.Input.Cursors.Hand
                 };
+                System.Windows.Automation.AutomationProperties.SetAutomationId(b, "Nav_SlotType_" + id);
                 b.SetResourceReference(FrameworkElement.StyleProperty,
                     active ? "MiniTypeButtonActiveStyle" : "MiniTypeButtonStyle");
                 if (active)
@@ -3566,6 +3679,7 @@ namespace PadForge
             {
                 var path = new System.Windows.Shapes.Path
                 {
+                    FlowDirection = FlowDirection.LeftToRight,
                     Data = System.Windows.Media.Geometry.Parse(data),
                     Width = 11,
                     Height = 11,
@@ -3580,7 +3694,7 @@ namespace PadForge
 
             UIElement TypeGlyph(string glyph, bool active)
             {
-                var tb = new System.Windows.Controls.TextBlock
+                var tb = new PadForge.Controls.GlyphText
                 {
                     Text = glyph,
                     FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -3593,14 +3707,14 @@ namespace PadForge
                 return tb;
             }
 
-            segRow.Children.Add(MakeTypeButton(TypeLogo(XboxSvgPath, isXbox), isXbox, OnSidebarTypeXbox, Strings.Instance.ControllerType_Xbox, true));
-            segRow.Children.Add(MakeTypeButton(TypeLogo(DS4SvgPath, isPlayStation), isPlayStation, OnSidebarTypePlayStation, Strings.Instance.ControllerType_PlayStation, true));
-            segRow.Children.Add(MakeTypeButton(TypeLogo(SwitchSvgPath, isNintendo), isNintendo, OnSidebarTypeNintendo, Strings.Instance.ControllerType_Nintendo, true));
-            segRow.Children.Add(MakeTypeButton(TypeLogo(ExtendedSvgPath, isExtended), isExtended, OnSidebarTypeExtended, Strings.Instance.ControllerType_Extended, true));
-            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uE961", isKbm), isKbm, OnSidebarTypeKeyboardMouse, Strings.Instance.ControllerType_KeyboardMouse, true));
-            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uE8D6", isMidi), isMidi, OnSidebarTypeMidi, hasMidi ? Strings.Instance.ControllerType_MIDI : Strings.Instance.Main_MIDI_RequiresMidiServices, hasMidi || isMidi));
+            segRow.Children.Add(MakeTypeButton(TypeLogo(XboxSvgPath, isXbox), isXbox, OnSidebarTypeXbox, Strings.Instance.ControllerType_Xbox, true, "Xbox"));
+            segRow.Children.Add(MakeTypeButton(TypeLogo(DS4SvgPath, isPlayStation), isPlayStation, OnSidebarTypePlayStation, Strings.Instance.ControllerType_PlayStation, true, "PlayStation"));
+            segRow.Children.Add(MakeTypeButton(TypeLogo(SwitchSvgPath, isNintendo), isNintendo, OnSidebarTypeNintendo, Strings.Instance.ControllerType_Nintendo, true, "Nintendo"));
+            segRow.Children.Add(MakeTypeButton(TypeLogo(ExtendedSvgPath, isExtended), isExtended, OnSidebarTypeExtended, Strings.Instance.ControllerType_Extended, true, "Extended"));
+            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uE961", isKbm), isKbm, OnSidebarTypeKeyboardMouse, Strings.Instance.ControllerType_KeyboardMouse, true, "KeyboardMouse"));
+            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uE8D6", isMidi), isMidi, OnSidebarTypeMidi, hasMidi ? Strings.Instance.ControllerType_MIDI : Strings.Instance.Main_MIDI_NotRunning, hasMidi || isMidi, "Midi"));
             bool hasSteamVr = PadForge.Common.Input.HMaestroVRController.IsAvailable();
-            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uF119", isVr), isVr, OnSidebarTypeVr, hasSteamVr ? Strings.Instance.ControllerType_VR : Strings.Instance.Main_VR_RequiresSteamVR, hasSteamVr || isVr));
+            segRow.Children.Add(MakeTypeButton(TypeGlyph("\uF119", isVr), isVr, OnSidebarTypeVr, hasSteamVr ? Strings.Instance.ControllerType_VR : Strings.Instance.Main_VR_RequiresSteamVR, hasSteamVr || isVr, "Vr"));
             var instanceLabel = new System.Windows.Controls.TextBlock
             {
                 // "#{n}" to match the slot card seg (#175 iter 71); guard in
@@ -3822,9 +3936,50 @@ namespace PadForge
             card.DragLeave += OnSidebarCardDragLeave;
 
             menuItem.Content = card;
+            if (!string.IsNullOrEmpty(focusedId))
+            {
+                // Loaded runs after layout, once the new card is in the tree.
+                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+                {
+                    if (FindByAutomationId(card, focusedId) is UIElement again)
+                        again.Focus();
+                }));
+            }
 
-            // Never touch Icon here — PaneClosed/PaneOpened handlers manage it exclusively.
+            // Never touch Icon here. PaneClosed/PaneOpened handlers manage it exclusively.
             // Re-rendering the bitmap on every 30Hz update causes visual flashing.
+        }
+
+        /// <summary>Opens what a sidebar entry stands for: the Add Controller
+        /// popup, or the entry's page, marked active. A click and a key press
+        /// both come here.</summary>
+        private void ActivateNavItem(NavigationViewItem nvi)
+        {
+            var tag = nvi.Tag.ToString();
+            if (tag == "AddController")
+                ShowControllerTypePopup(nvi);
+            else if (!_rebuildingControllerSection)
+            {
+                // Clear active state on all items, set on clicked one.
+                foreach (var mi in NavView.MenuItems)
+                    if (mi is NavigationViewItem other) other.IsActive = false;
+                foreach (var mi in NavView.FooterMenuItems)
+                    if (mi is NavigationViewItem other) other.IsActive = false;
+                nvi.IsActive = true;
+                NavigateToTag(tag);
+            }
+        }
+
+        /// <summary>The first element at or under root, in the visual tree,
+        /// with this AutomationId, or null.</summary>
+        private static FrameworkElement FindByAutomationId(DependencyObject root, string id)
+        {
+            if (root is FrameworkElement fe && System.Windows.Automation.AutomationProperties.GetAutomationId(fe) == id)
+                return fe;
+            for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); i++)
+                if (FindByAutomationId(System.Windows.Media.VisualTreeHelper.GetChild(root, i), id) is FrameworkElement hit)
+                    return hit;
+            return null;
         }
 
         /// <summary>Re-renders every controller nav card in its CURRENT pane
@@ -3906,8 +4061,18 @@ namespace PadForge
             SuppressBuiltInSelectionVisual(item);
             AttachCollapsedIconHover(item);
             System.Windows.Automation.AutomationProperties.SetName(item, Strings.Instance.Main_AddController);
+            SetNavAutomationId(item, "AddController");
             return item;
         }
+
+        /// <summary>Gives a sidebar entry the stable AutomationId "Nav_" plus
+        /// its tag (Nav_Dashboard, Nav_Pad1), which UI tools select it by. The
+        /// entry's UIA node is WPF's DataItem wrapper, which reports the
+        /// entry's own AutomationId (ItemAutomationPeer.GetAutomationIdCore).
+        /// The names change with the language and the slot, the ids do
+        /// not.</summary>
+        private static void SetNavAutomationId(NavigationViewItem item, string tag)
+            => System.Windows.Automation.AutomationProperties.SetAutomationId(item, "Nav_" + tag);
 
         /// <summary>Gives the COLLAPSED-rail icon of a mini-card entry the same
         /// subtle hover feedback the expanded pill has: a 2 px lift plus a faint
@@ -4278,7 +4443,7 @@ namespace PadForge
         /// so it re-tints on a theme flip.</summary>
         private static FontIcon MakeAddControllerCollapsedIcon()
         {
-            var icon = new FontIcon
+            var icon = new PadForge.Controls.DecorativeFontIcon
             {
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
                 Glyph = "",
@@ -4295,7 +4460,7 @@ namespace PadForge
         /// lift plus a faint ember bloom.</summary>
         private System.Windows.Controls.Border BuildAddControllerCard()
         {
-            var glyph = new TextBlock
+            var glyph = new PadForge.Controls.GlyphText
             {
                 Text = "",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -4467,6 +4632,7 @@ namespace PadForge
                     : iconKey == "NintendoControllerIcon" ? SwitchSvgPath : ExtendedSvgPath;
                 var path = new System.Windows.Shapes.Path
                 {
+                    FlowDirection = FlowDirection.LeftToRight,
                     Data = System.Windows.Media.Geometry.Parse(svgPath),
                     Width = 10, Height = 10,
                     Stretch = System.Windows.Media.Stretch.Uniform,
@@ -4478,7 +4644,7 @@ namespace PadForge
             {
                 string glyph = iconKey == "MidiControllerIcon" ? "\uE8D6"
                     : iconKey == "VrControllerIcon" ? "\uF119" : "\uE961";
-                row2.Children.Add(new System.Windows.Controls.TextBlock
+                row2.Children.Add(new PadForge.Controls.GlyphText
                 {
                     Text = glyph,
                     FontFamily = mdl2,
@@ -4699,7 +4865,7 @@ namespace PadForge
         private void OnSidebarTypeMidi(object sender, RoutedEventArgs e)
         {
             e.Handled = true;
-            if (!DriverInstaller.IsMidiServicesInstalled()) return;
+            if (!_viewModel.Settings.IsMidiAvailable) return;
             if (sender is System.Windows.Controls.Button btn && btn.Tag is int padIndex)
             {
                 // Merge BEFORE the type set: see the dashboard
@@ -5365,9 +5531,6 @@ namespace PadForge
         }
 
         /// <summary>
-        /// Programmatically navigates to the Devices page.
-        /// </summary>
-        /// <summary>
         /// Returns true if at least one virtual controller type has remaining capacity.
         /// </summary>
         private bool HasAnyControllerTypeCapacity()
@@ -5527,6 +5690,7 @@ namespace PadForge
             // asset to represent the Xbox family in the UI.
             var xboxPopupPath = new System.Windows.Shapes.Path
             {
+                FlowDirection = FlowDirection.LeftToRight,
                 Data = System.Windows.Media.Geometry.Parse(XboxSvgPath),
                 Width = 28,
                 Height = 28,
@@ -5536,8 +5700,9 @@ namespace PadForge
             bool xboxAtCapacity = xboxCount >= SettingsManager.MaxXbox360Slots;
             bool xboxDisabled = globalAtCapacity || xboxAtCapacity;
             if (xboxDisabled) xboxPopupPath.Opacity = 0.35;
-            var xboxBtn = new System.Windows.Controls.Button
+            var xboxBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !xboxDisabled,
                 Content = xboxPopupPath,
                 ToolTip = xboxAtCapacity
                         ? string.Format(Strings.Instance.Main_Xbox_Max_Format, SettingsManager.MaxXbox360Slots)
@@ -5549,6 +5714,10 @@ namespace PadForge
                 Cursor = xboxDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(xboxBtn, "AddXbox360Btn");
+            // Named by its type. When the type is unavailable the tooltip
+            // gives the reason, as help text, and the peer reports the
+            // entry unavailable.
+            System.Windows.Automation.AutomationProperties.SetName(xboxBtn, Strings.Instance.ControllerType_Xbox);
             xboxBtn.Click += (s, e) =>
             {
                 if (xboxDisabled) return;
@@ -5566,6 +5735,7 @@ namespace PadForge
             // asset to represent the PlayStation family in the UI.
             var playstationPopupPath = new System.Windows.Shapes.Path
             {
+                FlowDirection = FlowDirection.LeftToRight,
                 Data = System.Windows.Media.Geometry.Parse(DS4SvgPath),
                 Width = 28,
                 Height = 28,
@@ -5575,8 +5745,9 @@ namespace PadForge
             bool playstationAtCapacity = playstationCount >= SettingsManager.MaxPlayStationSlots;
             bool playstationDisabled = globalAtCapacity || playstationAtCapacity;
             if (playstationDisabled) playstationPopupPath.Opacity = 0.35;
-            var playstationBtn = new System.Windows.Controls.Button
+            var playstationBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !playstationDisabled,
                 Content = playstationPopupPath,
                 ToolTip = playstationAtCapacity
                         ? string.Format(Strings.Instance.Main_PlayStation_Max_Format, SettingsManager.MaxPlayStationSlots)
@@ -5589,6 +5760,7 @@ namespace PadForge
             };
             // AutomationId kept as "AddDS4Btn" for stable UI-automation hookup.
             System.Windows.Automation.AutomationProperties.SetAutomationId(playstationBtn, "AddDS4Btn");
+            System.Windows.Automation.AutomationProperties.SetName(playstationBtn, Strings.Instance.ControllerType_PlayStation);
             playstationBtn.Click += (s, e) =>
             {
                 if (playstationDisabled) return;
@@ -5606,6 +5778,7 @@ namespace PadForge
             // to represent the Nintendo family in the UI.
             var nintendoPopupPath = new System.Windows.Shapes.Path
             {
+                FlowDirection = FlowDirection.LeftToRight,
                 Data = System.Windows.Media.Geometry.Parse(SwitchSvgPath),
                 Width = 28,
                 Height = 28,
@@ -5615,8 +5788,9 @@ namespace PadForge
             bool nintendoAtCapacity = nintendoCount >= SettingsManager.MaxNintendoSlots;
             bool nintendoDisabled = globalAtCapacity || nintendoAtCapacity;
             if (nintendoDisabled) nintendoPopupPath.Opacity = 0.35;
-            var nintendoBtn = new System.Windows.Controls.Button
+            var nintendoBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !nintendoDisabled,
                 Content = nintendoPopupPath,
                 ToolTip = nintendoAtCapacity
                         ? string.Format(Strings.Instance.Main_Nintendo_Max_Format, SettingsManager.MaxNintendoSlots)
@@ -5628,6 +5802,7 @@ namespace PadForge
                 Cursor = nintendoDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(nintendoBtn, "AddNintendoBtn");
+            System.Windows.Automation.AutomationProperties.SetName(nintendoBtn, Strings.Instance.ControllerType_Nintendo);
             nintendoBtn.Click += (s, e) =>
             {
                 if (nintendoDisabled) return;
@@ -5644,6 +5819,7 @@ namespace PadForge
             // Extended button — theme-aware icon fill.
             var extendedPopupPath = new System.Windows.Shapes.Path
             {
+                FlowDirection = FlowDirection.LeftToRight,
                 Data = System.Windows.Media.Geometry.Parse(ExtendedSvgPath),
                 Width = 28,
                 Height = 28,
@@ -5653,8 +5829,9 @@ namespace PadForge
             bool extendedAtCapacity = extendedCount >= SettingsManager.MaxExtendedSlots;
             bool extendedDisabled = globalAtCapacity || extendedAtCapacity;
             if (extendedDisabled) extendedPopupPath.Opacity = 0.35;
-            var extendedBtn = new System.Windows.Controls.Button
+            var extendedBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !extendedDisabled,
                 Content = extendedPopupPath,
                 ToolTip = extendedAtCapacity
                         ? string.Format(Strings.Instance.Main_Extended_Max_Format, SettingsManager.MaxExtendedSlots)
@@ -5666,6 +5843,7 @@ namespace PadForge
                 Cursor = extendedDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(extendedBtn, "AddRawBtn");
+            System.Windows.Automation.AutomationProperties.SetName(extendedBtn, Strings.Instance.ControllerType_Extended);
             extendedBtn.Click += (s, e) =>
             {
                 if (extendedDisabled) return;
@@ -5681,7 +5859,7 @@ namespace PadForge
             stack.Children.Add(extendedBtn);
 
             // Keyboard+Mouse button — MDL2 glyph E961, theme-aware foreground.
-            var kbmPopupIcon = new System.Windows.Controls.TextBlock
+            var kbmPopupIcon = new PadForge.Controls.GlyphText
             {
                 Text = "\uE961",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -5693,8 +5871,9 @@ namespace PadForge
             bool kbmAtCapacity = kbmCount >= SettingsManager.MaxKeyboardMouseSlots;
             bool kbmDisabled = globalAtCapacity || kbmAtCapacity;
             if (kbmDisabled) kbmPopupIcon.Opacity = 0.35;
-            var kbmPopupBtn = new System.Windows.Controls.Button
+            var kbmPopupBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !kbmDisabled,
                 Content = kbmPopupIcon,
                 ToolTip = kbmAtCapacity ? string.Format(Strings.Instance.Main_KBM_Max_Format, SettingsManager.MaxKeyboardMouseSlots)
                         : Strings.Instance.ControllerType_KeyboardMouse,
@@ -5705,6 +5884,7 @@ namespace PadForge
                 Cursor = kbmDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(kbmPopupBtn, "AddKeyboardMouseBtn");
+            System.Windows.Automation.AutomationProperties.SetName(kbmPopupBtn, Strings.Instance.ControllerType_KeyboardMouse);
             kbmPopupBtn.Click += (s, e) =>
             {
                 if (kbmDisabled) return;
@@ -5719,7 +5899,7 @@ namespace PadForge
             stack.Children.Add(kbmPopupBtn);
 
             // MIDI button — theme-aware icon fill.
-            var midiPopupIcon = new System.Windows.Controls.TextBlock
+            var midiPopupIcon = new PadForge.Controls.GlyphText
             {
                 Text = "\uE8D6",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -5728,15 +5908,16 @@ namespace PadForge
                 VerticalAlignment = VerticalAlignment.Center
             };
             midiPopupIcon.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextFillColorPrimaryBrush");
-            bool midiAvailable = DriverInstaller.IsMidiServicesInstalled();
+            bool midiAvailable = _viewModel.Settings.IsMidiAvailable;
             bool midiAtCapacity = midiCount >= SettingsManager.MaxMidiSlots;
             bool midiDisabled = !midiAvailable || globalAtCapacity || midiAtCapacity;
             if (midiDisabled) midiPopupIcon.Opacity = 0.35;
-            string midiTooltip = !midiAvailable ? Strings.Instance.Main_MIDI_RequiresMidiServices
+            string midiTooltip = !midiAvailable ? Strings.Instance.Main_MIDI_NotRunning
                                : midiAtCapacity ? string.Format(Strings.Instance.Main_MIDI_Max_Format, SettingsManager.MaxMidiSlots)
                                : Strings.Instance.ControllerType_MIDI;
-            var midiBtn = new System.Windows.Controls.Button
+            var midiBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !midiDisabled,
                 Content = midiPopupIcon,
                 ToolTip = midiTooltip,
                 Background = System.Windows.Media.Brushes.Transparent,
@@ -5746,6 +5927,7 @@ namespace PadForge
                 Cursor = midiDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(midiBtn, "AddMidiBtn");
+            System.Windows.Automation.AutomationProperties.SetName(midiBtn, Strings.Instance.ControllerType_MIDI);
             midiBtn.Click += (s, e) =>
             {
                 if (midiDisabled) return;
@@ -5760,7 +5942,7 @@ namespace PadForge
             stack.Children.Add(midiBtn);
 
             // VR button. Theme-aware icon fill.
-            var vrPopupIcon = new System.Windows.Controls.TextBlock
+            var vrPopupIcon = new PadForge.Controls.GlyphText
             {
                 Text = "",
                 FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
@@ -5776,8 +5958,9 @@ namespace PadForge
             string vrTooltip = !vrAvailable ? Strings.Instance.Main_VR_RequiresSteamVR
                              : vrAtCapacity ? string.Format(Strings.Instance.Main_VR_Max_Format, SettingsManager.MaxVrSlots)
                              : Strings.Instance.ControllerType_VR;
-            var vrBtn = new System.Windows.Controls.Button
+            var vrBtn = new PadForge.Controls.AvailabilityButton
             {
+                IsAvailable = !vrDisabled,
                 Content = vrPopupIcon,
                 ToolTip = vrTooltip,
                 Background = System.Windows.Media.Brushes.Transparent,
@@ -5787,6 +5970,7 @@ namespace PadForge
                 Cursor = vrDisabled ? System.Windows.Input.Cursors.No : System.Windows.Input.Cursors.Hand
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(vrBtn, "AddVrBtn");
+            System.Windows.Automation.AutomationProperties.SetName(vrBtn, Strings.Instance.ControllerType_VR);
             vrBtn.Click += (s, e) =>
             {
                 if (vrDisabled) return;
@@ -5802,6 +5986,7 @@ namespace PadForge
 
             border.Child = stack;
             popup.Child = container;
+            PadForge.Common.KeyboardPopup.Wire(popup, anchor, container);
             popup.IsOpen = true;
         }
 
@@ -5920,6 +6105,7 @@ namespace PadForge
             {
                 var flame = new System.Windows.Shapes.Path
                 {
+                    FlowDirection = FlowDirection.LeftToRight,
                     Data = TryFindResource("FlameOuterGeometry") as System.Windows.Media.Geometry,
                     Width = 11,
                     Height = 13,
@@ -5999,6 +6185,7 @@ namespace PadForge
             };
             border.Child = scroller;
             popup.Child = container;
+            PadForge.Common.KeyboardPopup.Wire(popup, anchor, container);
             popup.IsOpen = true;
         }
 
@@ -6204,6 +6391,12 @@ namespace PadForge
                 _controllerTypePopup = null;
             }
         }
+
+        /// <summary>Announces the status bar's message, a polite live region.
+        /// The bar shows messages, which can repeat, so each one is announced
+        /// as it is set, on the conditions every live line shares
+        /// (LiveText.Announce).</summary>
+        private void AnnounceStatus() => PadForge.Common.LiveText.Announce(StatusMessageText);
 
         private void PaneToggleBtn_Click(object sender, RoutedEventArgs e)
         {
@@ -6437,6 +6630,17 @@ namespace PadForge
             {
                 try { _inputService?.ApplyAutomaticDeviceHiding(); }
                 catch { /* a notification must never take the window down */ }
+                // The same arrival is how a device lit on its own is found
+                // when it has no row to announce it, a light strip or a
+                // headset (#494): the peripheral host walks the present HID
+                // collections again. The ask does no more there than set a
+                // flag and wake the host's link thread. A removal asks for
+                // nothing here: the row of an unplugged device goes offline
+                // at the input manager's next device scan, which brings a
+                // walk by itself, and a device with no row is asked about
+                // by its backend once a write to it fails.
+                try { _inputService?.RequestPeripheralRescan(); }
+                catch { }
             }
             return IntPtr.Zero;
         }
@@ -6578,6 +6782,7 @@ namespace PadForge
                 WindowStyle = WindowStyle.SingleBorderWindow;
                 WindowState = _preFullScreenState;
                 FullScreenIcon.Text = "\uE740";
+                FullScreenBtn.IsOn = false;
             }
             else
             {
@@ -6602,6 +6807,7 @@ namespace PadForge
                 WindowStyle = WindowStyle.None;
                 foreach (var st in path) WindowState = st;
                 FullScreenIcon.Text = "\uE73F";
+                FullScreenBtn.IsOn = true;
             }
             _viewModel.Settings.MainWindowFullScreen = _isFullScreen;
             _settingsService.MarkDirty();
@@ -6637,6 +6843,7 @@ namespace PadForge
                 _isFullScreen = false;
                 WindowStyle = WindowStyle.SingleBorderWindow;
                 FullScreenIcon.Text = "\uE740";
+                FullScreenBtn.IsOn = false;
                 // And record it. The button path saves this; leaving through
                 // the title bar did not, so the saved flag stayed true and the
                 // next launch came up full screen, which also suppressed the
@@ -6716,7 +6923,7 @@ namespace PadForge
             string folder = System.IO.Path.GetDirectoryName(_settingsService.SettingsFilePath);
             if (!string.IsNullOrEmpty(folder) && System.IO.Directory.Exists(folder))
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                PadForge.Common.ShellLaunch.Start(new System.Diagnostics.ProcessStartInfo
                 {
                     FileName = folder,
                     UseShellExecute = true
@@ -7416,10 +7623,14 @@ namespace PadForge
                             or nameof(MappingSourceItem.ParamUp)
                             or nameof(MappingSourceItem.ParamDown)
                             or nameof(MappingSourceItem.ParamModifier)
+                            or nameof(MappingSourceItem.ParamUpDeviceGuid)
+                            or nameof(MappingSourceItem.ParamDownDeviceGuid)
+                            or nameof(MappingSourceItem.ParamModifierDeviceGuid)
                         && !InputService.SuppressMappingEditPush && !InputService.VmMappingsStale)
                         DeviceService.KeepAuthoredRow(capturedPad.PadIndex, capturedPad.ActiveLayerMask, mapping.TargetSettingName, mapping.NegSettingName);
                     if (e.PropertyName is nameof(MappingSourceItem.DeviceGuid)
                         or nameof(MappingSourceItem.Descriptor)
+                        or nameof(MappingSourceItem.DescriptorDeviceGuid)
                         or nameof(MappingSourceItem.Invert)
                         or nameof(MappingSourceItem.HalfAxis)
                         or nameof(MappingSourceItem.Bidirectional)
@@ -7436,6 +7647,9 @@ namespace PadForge
                         or nameof(MappingSourceItem.ParamMin)
                         or nameof(MappingSourceItem.ParamMax)
                         or nameof(MappingSourceItem.ParamModifier)
+                        or nameof(MappingSourceItem.ParamUpDeviceGuid)
+                        or nameof(MappingSourceItem.ParamDownDeviceGuid)
+                        or nameof(MappingSourceItem.ParamModifierDeviceGuid)
                         or nameof(MappingSourceItem.ParamAttackTime)
                         or nameof(MappingSourceItem.ParamReleaseTime)
                         or nameof(MappingSourceItem.ParamAutocenter)
@@ -8001,6 +8215,9 @@ namespace PadForge
                 bool copyIsExtended = copyOutputType is VirtualControllerType.Extended
                     or VirtualControllerType.Nintendo
                     /* raw-surface types always use the dynamic layout */;
+                // The profile names a lettered slot's wire, which a Paste onto
+                // another layout reads its raw rows by.
+                ps.SlotProfileId = padVm.ProfileId;
 
                 // Snapshot the slot's full MappingSet so Copy → Paste carries
                 // every device's contribution — not just the slot's currently-
@@ -8082,7 +8299,7 @@ namespace PadForge
                 ps.SlotPerDeviceSettingsJson = System.Text.Json.JsonSerializer.Serialize(
                     perDevice ?? Array.Empty<PadForge.Engine.Data.PerDeviceSettingsEntry>(), jsonOpts);
 
-                Clipboard.SetText(ps.ToJson(copyOutputType, copyIsExtended));
+                PadForge.Common.ShellLaunch.SetClipboardText(ps.ToJson(copyOutputType, copyIsExtended));
                 _viewModel.StatusText = Strings.Instance.Status_SettingsCopied;
             }
             catch (Exception ex)
@@ -8119,14 +8336,28 @@ namespace PadForge
                 // otherwise route only the device-scoped slice through
                 // ApplyMultiSourceRowsToCurrentDevice, retargeting all
                 // sources onto the currently-selected device.
+                // From a slot of another layout the Base rows land by
+                // position and the target keeps its shift layers
+                // (InputService.ReplaceBaseRowsTranslated).
+                //
+                // The table replaces this slot's whole on a shared layout,
+                // but for a Nintendo slot against a Valve one, whose rows
+                // land by placement like any two layouts' (copiesWhole).
+                // Copied whole from another wire of the same pads, a Switch
+                // 2 Pro's onto a Switch Pro's, everything in it that names
+                // a raw position moves by role (wire), where an index names
+                // another control.
+                var targetLayout = InputService.SlotLayoutOf(padVm);
+                var copiedFrom = InputService.ClipboardSlotLayout(ps, srcType, srcIsExtended);
+                bool copiesWhole = InputService.CopiesWhole(copiedFrom, targetLayout);
+                var wire = InputService.WireMoveOf(copiedFrom, targetLayout);
                 InputService.ApplySlotRowsFromClipboard(padVm.PadIndex, ps,
-                    MappingTranslation.IsSameLayout(srcType, srcIsExtended, targetType, targetIsExtended));
+                    srcType, srcIsExtended, InputService.SlotLayoutOf(padVm));
 
                 // Apply the slot's shift authoring (activators + Base appearance)
                 // on a same-layout paste, after the row replace above rebuilt the
                 // MappingSet. Matches Copy From so shift layers round-trip (#119).
-                if (!string.IsNullOrEmpty(ps.SlotShiftActivatorsJson)
-                    && MappingTranslation.IsSameLayout(srcType, srcIsExtended, targetType, targetIsExtended))
+                if (!string.IsNullOrEmpty(ps.SlotShiftActivatorsJson) && copiesWhole)
                 {
                     InputService.ApplyShiftLayerSnapshotJson(padVm.PadIndex, ps.SlotShiftActivatorsJson);
                 }
@@ -8135,8 +8366,7 @@ namespace PadForge
                 // ordering as the shift authoring above. Wiped otherwise: the
                 // fresh rows-only MappingSet from ApplySlotMappingSetFromRows
                 // carries no menus (#9 B-17 clipboard round-trip).
-                if (!string.IsNullOrEmpty(ps.SlotMenusJson)
-                    && MappingTranslation.IsSameLayout(srcType, srcIsExtended, targetType, targetIsExtended))
+                if (!string.IsNullOrEmpty(ps.SlotMenusJson) && copiesWhole)
                 {
                     InputService.ApplyMenusSnapshotJson(padVm.PadIndex, ps.SlotMenusJson);
                 }
@@ -8151,7 +8381,7 @@ namespace PadForge
                 if (!string.IsNullOrEmpty(ps.SlotSetExtrasJson))
                 {
                     InputService.ApplySlotSetExtrasJson(padVm.PadIndex, ps.SlotSetExtrasJson,
-                        MappingTranslation.IsSameLayout(srcType, srcIsExtended, targetType, targetIsExtended));
+                        copiesWhole, wire);
                 }
 
                 // Macros. REPLACE, not append: every other surface this paste
@@ -8178,13 +8408,15 @@ namespace PadForge
                 _inputService.ApplyPadSettingToCurrentDeviceTranslated(
                     padVm.PadIndex, ps,
                     srcType, srcIsExtended,
-                    targetType, targetIsExtended);
+                    targetType, targetIsExtended, copiedFrom: copiedFrom);
 
                 // Unpack the per-slot config tabs that traveled through the
                 // clipboard JSON as opaque strings on PadSetting. Same semantics
-                // as the in-process Copy From: device features copy
-                // unconditionally (physical-device passthrough), Extended /
-                // MIDI gated on matching slot type by their Apply methods.
+                // as the in-process Copy From: device features copy whatever
+                // the slot types (physical-device passthrough), a device the
+                // source slot lacked keeps its own Control This Device's
+                // Lighting switch and Lighting Hold, and Extended / MIDI are
+                // gated on matching slot type by their Apply methods.
                 if (!string.IsNullOrEmpty(ps.SlotDeviceConfigsJson))
                 {
                     try
@@ -8234,7 +8466,7 @@ namespace PadForge
                         var perDevice = System.Text.Json.JsonSerializer.Deserialize<
                             PadForge.Engine.Data.PerDeviceSettingsEntry[]>(ps.SlotPerDeviceSettingsJson);
                         _inputService.ApplyPerDeviceSettingsToSlot(padVm.PadIndex, perDevice,
-                            srcType, srcIsExtended, targetType, targetIsExtended);
+                            srcType, srcIsExtended, targetType, targetIsExtended, copiedFrom);
                     }
                     catch { /* malformed payload, per-device paste skipped */ }
                 }
@@ -8295,7 +8527,7 @@ namespace PadForge
                 var macro = padVm.SelectedMacro;
                 if (macro == null) return;
                 var data = SettingsService.BuildMacroDataForMacro(macro, padVm.PadIndex);
-                Clipboard.SetText(SettingsService.SerializeMacrosToClipboard(new[] { data }));
+                PadForge.Common.ShellLaunch.SetClipboardText(SettingsService.SerializeMacrosToClipboard(new[] { data }));
                 _viewModel.StatusText = Strings.Instance.Status_MacroCopied;
             }
             catch (Exception ex)
@@ -8378,10 +8610,6 @@ namespace PadForge
             }
         }
 
-        /// <summary>VC-level macro Copy From (#112): pick another virtual controller
-        /// and append its macros to this one. Mirrors the Mappings-tab Copy From, which
-        /// is VC-to-VC. A copied macro whose trigger is bound to a device not present on
-        /// this VC pastes with that trigger unresolved (re-record it), same as Paste.</summary>
         /// <summary>Formats a slot as the Copy From dialog's VC label, e.g.
         /// "Virtual Controller 3 — Xbox 2". Shared by the mapping and macro Copy From
         /// pickers (#112) so they read identically.</summary>
@@ -8447,6 +8675,10 @@ namespace PadForge
             padVm.SelectedMacro = padVm.Macros.Count > 0 ? padVm.Macros[padVm.Macros.Count - 1] : null;
         }
 
+        /// <summary>VC-level macro Copy From (#112): pick another virtual controller
+        /// and append its macros to this one. Mirrors the Mappings-tab Copy From, which
+        /// is VC-to-VC. A copied macro whose trigger is bound to a device not present on
+        /// this VC pastes with that trigger unresolved (re-record it), same as Paste.</summary>
         private void OnCopyMacroFrom(PadViewModel padVm)
         {
             // Same dialog, naming, and GUID display as the Mappings-tab Copy From, but
@@ -8685,18 +8917,42 @@ namespace PadForge
                 // Same layout boundary the clipboard paste applies before it
                 // replaces rows wholesale. Without it, copying a MIDI or a
                 // keyboard and mouse slot onto a gamepad slot installed the
-                // source layout's target names verbatim AND cleared the
-                // device-scoped rows below, which switched off the one path that
-                // knows how to translate them. The other branch covers it.
-                if (srcEntry.SourceSlot >= 0 && srcEntry.SourceSlot != padVm.PadIndex
-                    && MappingTranslation.IsSameLayout(srcEntry.OutputType, srcEntry.IsExtended,
-                        targetOutputType, targetIsExtended))
+                // source layout's target names verbatim. The next branch
+                // translates them.
+                //
+                // The boundary is the one a Paste draws (InputService.CopiesWhole):
+                // a Nintendo slot against a Valve one goes the translated
+                // way too, and a table copied whole from another wire of the
+                // same pads moves by role (InputService.WireMoveOf). The
+                // source slot's layout carries its profile, which names its
+                // wire. An entry whose slot has no view model is read by its
+                // type alone.
+                bool otherSlot = srcEntry.SourceSlot >= 0 && srcEntry.SourceSlot != padVm.PadIndex;
+                var targetLayout = InputService.SlotLayoutOf(padVm);
+                var sourceLayout = otherSlot && srcEntry.SourceSlot < _viewModel.Pads.Count
+                    ? InputService.SlotLayoutOf(_viewModel.Pads[srcEntry.SourceSlot])
+                    : new InputService.SlotLayout(srcEntry.OutputType, srcEntry.IsExtended);
+                if (otherSlot && InputService.CopiesWhole(sourceLayout, targetLayout))
                 {
-                    InputService.ReplaceSlotMappingSet(padVm.PadIndex, srcEntry.SourceSlot);
-                    // Don't also run the per-device multi-source merge below —
+                    InputService.ReplaceSlotMappingSet(padVm.PadIndex, srcEntry.SourceSlot,
+                        InputService.WireMoveOf(sourceLayout, targetLayout));
+                    // Don't also run the per-device multi-source merge below.
                     // ReplaceSlotMappingSet already set the whole table, and
                     // merging the picked device's slice on top would just
                     // reorder its sources.
+                    srcEntry.PadSetting.DeviceScopedMultiSourceRows = null;
+                }
+                else if (otherSlot && srcEntry.SourceSlot < _viewModel.Pads.Count)
+                {
+                    // Another layout. The source slot's Base rows land by
+                    // position, its rumble audio and Keep Awake cross, and
+                    // this slot keeps its shift layers, menus and SOCD pairs,
+                    // as a Paste from that slot leaves them
+                    // (InputService.ReplaceBaseRowsTranslated). The rows
+                    // carry every device's sources, so no device slice
+                    // follows.
+                    InputService.TranslateSlotMappingSet(padVm.PadIndex, srcEntry.SourceSlot,
+                        sourceLayout, targetLayout);
                     srcEntry.PadSetting.DeviceScopedMultiSourceRows = null;
                 }
                 else if (srcEntry.SourceSlot >= 0)
@@ -8738,7 +8994,7 @@ namespace PadForge
                     targetDeviceOverride = srcEntry.InstanceGuid;
 
                 ApplyCopyFromSettings(_inputService, _settingsService, padVm, srcEntry,
-                    targetOutputType, targetIsExtended, targetDeviceOverride);
+                    targetOutputType, targetIsExtended, targetDeviceOverride, otherSlot ? sourceLayout : null);
 
                 // Rebuild the target slot's shift-layer tab strip from the
                 // freshly-copied activators so layers authored on the source
@@ -8769,13 +9025,17 @@ namespace PadForge
 
         internal static void ApplyCopyFromSettings(InputService input, SettingsService settings,
             PadViewModel padVm, CopyFromDialog.DeviceEntry srcEntry,
-            VirtualControllerType targetOutputType, bool targetIsExtended, Guid? targetDeviceOverride = null)
+            VirtualControllerType targetOutputType, bool targetIsExtended, Guid? targetDeviceOverride = null,
+            InputService.SlotLayout? copiedFrom = null)
         {
+            // copiedFrom is the layout of the slot the entry sits on, where
+            // that is another slot: each device's own raw entries then move
+            // with the rows onto this slot's wire.
             input.ApplyPadSettingToCurrentDeviceTranslated(
                 padVm.PadIndex, srcEntry.PadSetting,
                 srcEntry.OutputType, srcEntry.IsExtended,
                 targetOutputType, targetIsExtended,
-                targetDeviceOverride);
+                targetDeviceOverride, copiedFrom);
 
             // Apply EVERY source-slot device's per-device tuning, not
             // just the one the dialog highlighted. Match by InstanceGuid
@@ -8791,7 +9051,7 @@ namespace PadForge
                 if (perDevice != null && perDevice.Length > 0)
                     input.ApplyPerDeviceSettingsToSlot(padVm.PadIndex, perDevice,
                         srcEntry.OutputType, srcEntry.IsExtended,
-                        targetOutputType, targetIsExtended);
+                        targetOutputType, targetIsExtended, copiedFrom);
             }
 
             // PadSetting carries deadzones, sensitivity, FFB, mapping
@@ -8811,16 +9071,53 @@ namespace PadForge
 
         /// <summary>
         /// What went wrong in a driver operation, worded for the user. An
-        /// installer's failure carries an exit code or a timeout, and its own
-        /// message is an English fallback, so it is worded here in the UI
-        /// language. Anything else keeps the message it came with.
+        /// installer's failure carries an exit code or a timeout, and a stop
+        /// on one of PadForge's own checks carries its reason. Their own
+        /// messages are English fallbacks for the log, so both are worded
+        /// here in the UI language. Anything else keeps the message it came
+        /// with.
         /// </summary>
-        private static string DescribeDriverFailure(Exception ex)
+        internal static string DescribeDriverFailure(Exception ex)
             => ex is InstallerFailedException failed
-                ? (failed.TimedOut
-                    ? Strings.Instance.Status_InstallerTimedOut
-                    : string.Format(Strings.Instance.Status_InstallerExitCode_Format, failed.ExitCode))
+                ? (failed.NotTracked
+                    ? Strings.Instance.Status_InstallerNotTracked
+                    : failed.TimedOut
+                        ? Strings.Instance.Status_InstallerTimedOut
+                        : string.Format(Strings.Instance.Status_InstallerExitCode_Format, failed.ExitCode))
+                : ex is DriverCheckException check ? DescribeDriverCheck(check)
+                : ex is HidHideSetupException setup
+                    ? (setup.Failure == HidHideSetupFailure.DriverDidNotStart
+                        ? Strings.Instance.Status_HidHideDriverDidNotStart
+                        : Strings.Instance.Status_HidHideFilterStillListed)
                 : ex.Message;
+
+        /// <summary>A stop on one of PadForge's own checks, in the UI
+        /// language. steamcmd's own words stay in steamcmd's
+        /// language.</summary>
+        internal static string DescribeDriverCheck(DriverCheckException check)
+        {
+            var s = Strings.Instance;
+            return check.Failure switch
+            {
+                DriverCheckFailure.VcRedistUnsigned => s.Status_VcRedistUnsigned,
+                DriverCheckFailure.MidiRuntimeHashMismatch => s.Status_MidiRuntimeHashMismatch,
+                DriverCheckFailure.NoMidiRuntime => s.Status_NoMidiRuntimeToRemove,
+                DriverCheckFailure.VcRuntimeHeld => s.Status_VcRuntimeHeld,
+                DriverCheckFailure.VcRuntimeStillOld => string.Format(s.Status_VcRuntimeStillOld_Format, check.Detail),
+                DriverCheckFailure.VcRedistStillRunning => s.Status_VcRedistStillRunning,
+                DriverCheckFailure.MidiReleaseTimedOut => s.Status_MidiReleaseTimedOut,
+                DriverCheckFailure.MidiReleaseTimedOutOnDriver => s.Status_MidiReleaseTimedOutDriver,
+                DriverCheckFailure.NoOwnedSteamVr => s.Status_NoOwnedSteamVRToRemove,
+                DriverCheckFailure.SteamVrRunning => s.Status_SteamVRRunningCloseFirst,
+                DriverCheckFailure.SteamVrFolderIsDriveRoot => string.Format(s.Status_SteamVRFolderIsDriveRoot_Format, check.Detail),
+                DriverCheckFailure.SteamVrNotRemoved => string.Format(s.Status_SteamVRNotRemoved_Format, check.Detail),
+                DriverCheckFailure.SteamVrLocationNotFull => s.Status_SteamVRLocationNotFull,
+                DriverCheckFailure.SteamVrLocationIsDriveRoot => s.Status_SteamVRLocationIsDriveRoot,
+                DriverCheckFailure.SteamCmdTimedOut => s.Status_SteamCmdTimedOut,
+                DriverCheckFailure.SteamVrDidNotLand => string.Format(s.Status_SteamVRDidNotLand_Format, check.Detail, check.Output),
+                _ => check.Message,
+            };
+        }
 
         /// <summary>
         /// Runs a driver install/uninstall operation on a background thread,
@@ -8851,6 +9148,7 @@ namespace PadForge
             }
             catch (Exception ex)
             {
+                LogDriverFailure(ex);
                 _viewModel.SetStatus(string.Format(Strings.Instance.Status_DriverOperationFailed_Format, DescribeDriverFailure(ex)), persist: true);
             }
             finally
@@ -8859,6 +9157,131 @@ namespace PadForge
             }
             refreshStatus();
         }
+
+        /// <summary>Writes a failed driver operation to the diagnostics log in
+        /// English, with the exception's type. The status line words the
+        /// failure in the UI language, so the log is where its English
+        /// sentence is read.</summary>
+        internal static void LogDriverFailure(Exception ex)
+            => Engine.SdlDiagLog.WriteLine($"DRIVER operation failed: {ex.GetType().Name}: {ex.Message}");
+
+        /// <summary>The engine stop the Dashboard toggle runs on a worker,
+        /// kept until the next one replaces it.</summary>
+        private Task _engineStopTask;
+
+        /// <summary>The Dashboard's Stopping state, shown at once for a stop
+        /// that runs on a worker.</summary>
+        private void ShowEngineStopping()
+        {
+            _viewModel.IsEngineRunning = false;
+            _viewModel.Dashboard.EngineStateKey = "Stopping";
+            _viewModel.Dashboard.EngineStatus = Strings.Instance.Common_Stopping;
+            _viewModel.SetStatus(Strings.Instance.Status_StoppingEngine, persist: true);
+            _viewModel.RefreshCommands();
+        }
+
+        /// <summary>
+        /// Removes HIDMaestro from the PC (#516, #518), after the user
+        /// confirmed it against HIDMaestro's own preview.
+        ///
+        /// <para>The engine stops first, through the stop the Dashboard
+        /// toggle runs, which removes PadForge's virtual controllers and
+        /// disposes its HIDMaestro context. HIDMaestro would remove those
+        /// controllers anyway, but a controller PadForge still held would
+        /// stay an object with no device behind it, and the engine could
+        /// create another while the removal ran. A stop the toggle already
+        /// started is waited out, since its teardown still holds them. The
+        /// engine stays stopped. Starting it installs HIDMaestro again, as
+        /// HIDMaestro's docs/UNINSTALL.md says a program may.</para>
+        ///
+        /// <para>The removal runs on the driver operation's worker, behind
+        /// its overlay, for seconds to minutes (HMUninstall.Run). Every item
+        /// goes to the diagnostics log. A removal that could not take
+        /// everything lists what stayed and why.</para>
+        /// </summary>
+        private async Task UninstallHIDMaestroAsync()
+        {
+            if (!Views.UninstallHIDMaestroDialog.Confirm(this,
+                    includeUsbip => Task.Run(() => HIDMaestroRemoval.Preview(includeUsbip)),
+                    out bool includeUsbip))
+                return;
+
+            bool stopEngine = _viewModel.IsEngineRunning;
+            if (stopEngine) ShowEngineStopping();
+            var pendingStop = _engineStopTask;
+
+            HIDMaestro.HMUninstallReport report = null;
+            await RunDriverOperationAsync(Strings.Instance.Status_RemovingHIDMaestro, () =>
+            {
+                // A stop that failed has nothing left to wait for.
+                try { pendingStop?.Wait(); } catch { }
+                report = HIDMaestroRemoval.Run(includeUsbip, stopEngine ? _inputService.Stop : null);
+            }, RefreshHIDMaestroStatus);
+            if (stopEngine) RebuildControllerSection();
+
+            // No report: the operation failed and its status line says why,
+            // or the test host, which removes nothing, answered.
+            if (report == null) return;
+            HIDMaestroRemoval.Log(report);
+            string line = HIDMaestroRemoval.StatusLine(report);
+            _viewModel.SetStatus(line, persist: true);
+            if (report.Status == HIDMaestro.HMUninstallStatus.Failed)
+                Views.UninstallHIDMaestroDialog.ShowReport(this, report, line);
+        }
+
+        /// <summary>Lights the Settings card's HIDMaestro status from the
+        /// driver store, never from an HIDMaestro context
+        /// (HIDMaestroRemoval.IsDriverInstalled).</summary>
+        private void RefreshHIDMaestroStatus()
+            => _viewModel.Settings.IsHIDMaestroInstalled = HIDMaestroRemoval.IsDriverInstalled();
+
+        /// <summary>
+        /// Removes BthPS3 from the PC, after the user confirmed it against
+        /// the removal's preview (BthPS3Removal).
+        ///
+        /// <para>The engine stops first, through the stop the Dashboard toggle
+        /// runs, which closes every PlayStation 3, Move and Navigation
+        /// controller PadForge reads through BthPS3 or WinUSB, and binds no
+        /// WinUSB driver while the removal runs. A stop the toggle already
+        /// started is waited out. The engine stays stopped, as after the
+        /// HIDMaestro removal.</para>
+        ///
+        /// <para>The removal runs on the driver operation's worker, behind
+        /// its overlay. Every step and item goes to the diagnostics log. A
+        /// removal that could not take everything lists what stayed and
+        /// why.</para>
+        /// </summary>
+        private async Task UninstallBthPS3Async()
+        {
+            if (!Views.UninstallBthPS3Dialog.Confirm(this, () => Task.Run(BthPS3Removal.Preview)))
+                return;
+
+            bool stopEngine = _viewModel.IsEngineRunning;
+            if (stopEngine) ShowEngineStopping();
+            var pendingStop = _engineStopTask;
+
+            BthPS3Removal.Report report = null;
+            await RunDriverOperationAsync(Strings.Instance.Status_RemovingBthPS3, () =>
+            {
+                // A stop that failed has nothing left to wait for.
+                try { pendingStop?.Wait(); } catch { }
+                report = BthPS3Removal.Run(stopEngine ? _inputService.Stop : null);
+            }, RefreshBthPS3Status);
+            if (stopEngine) RebuildControllerSection();
+
+            // No report: the operation failed and its status line says why.
+            if (report == null) return;
+            BthPS3Removal.Log(report);
+            string line = BthPS3Removal.StatusLine(report);
+            _viewModel.SetStatus(line, persist: true);
+            if (report.Status == BthPS3Removal.RemovalStatus.Failed)
+                Views.UninstallBthPS3Dialog.ShowReport(this, report, line);
+        }
+
+        /// <summary>Lights the Settings card's BthPS3 status from the two
+        /// driver services (Ds3DriverInstaller.IsAnyBthPs3DriverInstalled).</summary>
+        private void RefreshBthPS3Status()
+            => _viewModel.Settings.IsBthPS3Installed = Ds3DriverInstaller.IsAnyBthPs3DriverInstalled();
 
         /// <summary>
         /// Rebuilds the dashboard SlotSummaries from SettingsManager state.
@@ -8904,9 +9327,9 @@ namespace PadForge
             }
         }
 
-        // Last MIDI-installed state the drawer cards were rendered against.
+        // Last MIDI availability the drawer cards were rendered against.
         // null until the first status sweep records the baseline.
-        private bool? _lastMidiInstalledForNav;
+        private bool? _lastMidiAvailableForNav;
 
         // SteamVR twin of the above: the VR type tile's enabled state is
         // baked at card build, so an install/uninstall must rebuild once.
@@ -8917,26 +9340,68 @@ namespace PadForge
         /// them at install time, which does its own containment.</summary>
         private bool _steamVrPathsChecked;
 
+        /// <summary>Shows or hides the output-port picker on every MIDI bar.
+        /// Only the legacy API reads the port.</summary>
+        private void SetPadsLegacyMidi(bool legacy)
+        {
+            foreach (var pad in _viewModel.Pads)
+                pad.IsLegacyMidi = legacy;
+        }
+
         private void RefreshMidiServicesStatus()
         {
-            bool installed = false;
+            bool midiAvailable = false;
             try
             {
-                installed = DriverInstaller.IsMidiServicesInstalled();
-                _viewModel.Settings.IsMidiServicesInstalled = installed;
-                _viewModel.Dashboard.IsMidiServicesInstalled = installed;
-                // The card is already titled "Windows MIDI Services" and the
-                // line above already says Installed, so printing the product
-                // name a third time said nothing. This is the version line,
-                // the same one HidHide and ViGEm fill.
-                _viewModel.Settings.MidiServicesVersion =
-                    installed ? (DriverInstaller.GetMidiServicesVersion() ?? string.Empty) : string.Empty;
+                // One uninstall-key walk per refresh. Whether the older
+                // runtime is installed feeds the API prediction, the card's
+                // version line and its Uninstall button.
+                bool runtimeInstalled = DriverInstaller.IsMidiRuntimeInstalled();
+                // An install PadForge stopped following moves MIDI onto the
+                // runtime once it is in place, as an install that finished
+                // in time does. Off the UI thread, since the reset waits
+                // behind a probe that hangs on a dead service. Not while an
+                // uninstall holds anything: this refresh keeps running
+                // through it, the registry still lists the runtime, and the
+                // engine reads no API, or the legacy one, only because the
+                // runtime is held.
+                if (Common.Input.MidiRuntimeSwitch.TakePendingSwitch(runtimeInstalled,
+                        Common.Input.MidiVirtualController.ActiveApi,
+                        Common.Input.MidiVirtualController.IsHeldForUninstall))
+                    System.Threading.Tasks.Task.Run(() => _inputService?.SwitchMidiApi());
+                // The registry's answer until the engine's probe has run,
+                // then the probe's. Where neither Windows MIDI Services API
+                // starts, the engine takes the legacy API. A probe that found
+                // nothing it could start reads as not running, and so does
+                // MIDI held released for the runtime's uninstall. Reading the
+                // probe's cached answer never blocks.
+                var (api, notStarted) = Common.Input.MidiApiSelection.ForCard(
+                    Common.Input.MidiApiSelection.PredictForUi(runtimeInstalled),
+                    Common.Input.MidiVirtualController.ActiveApi,
+                    Common.Input.MidiVirtualController.ProbeFailed,
+                    Common.Input.MidiVirtualController.IsSuppressedForUninstall);
+                _viewModel.Settings.MidiNotRunningReason = Common.Input.MidiVirtualController.NotRunningReason;
+                _viewModel.Settings.MidiInBoxFailure = Common.Input.MidiVirtualController.InBoxActivationFailure;
+                _viewModel.Settings.MidiUninstallerRunning = Common.Input.MidiRuntimeSwitch.UninstallerRunning;
+                _viewModel.Settings.IsMidiRuntimeInstalled = runtimeInstalled;
+                _viewModel.Settings.MidiRuntimeVersion =
+                    runtimeInstalled ? (DriverInstaller.GetMidiRuntimeVersion() ?? string.Empty) : string.Empty;
+                _viewModel.Settings.CanInstallMidiRuntime =
+                    Common.Input.MidiApiSelection.CanOfferRuntimeInstall(runtimeInstalled);
+                _viewModel.Settings.MidiApiNotStarted = notStarted;
+                _viewModel.Settings.ActiveMidiApi = api;
+                midiAvailable = api != Common.Input.MidiApiKind.None;
+                _viewModel.Dashboard.IsMidiAvailable = midiAvailable;
+                SetPadsLegacyMidi(api == Common.Input.MidiApiKind.Legacy);
             }
             catch
             {
-                installed = false;
-                _viewModel.Settings.IsMidiServicesInstalled = false;
-                _viewModel.Dashboard.IsMidiServicesInstalled = false;
+                midiAvailable = false;
+                _viewModel.Settings.MidiApiNotStarted = false;
+                _viewModel.Settings.CanInstallMidiRuntime = false;
+                _viewModel.Settings.ActiveMidiApi = Common.Input.MidiApiKind.None;
+                _viewModel.Dashboard.IsMidiAvailable = false;
+                SetPadsLegacyMidi(false);
             }
 
             // SteamVR presence rides the same refresh cadence (VR slot
@@ -8975,13 +9440,13 @@ namespace PadForge
             // down and rebuilds every pill's whole Content subtree (restarting
             // the breathing heat ring and hover transforms), so calling it on
             // the always-on 5 s lane produced a visible ~5 s "bounce". Rebuild
-            // only when the installed state actually flips. The first sweep
-            // just records the baseline: the cards were already built against
-            // the current state at startup, so no rebuild is needed for it.
-            if (_navDashboard != null && _lastMidiInstalledForNav != installed)
+            // only when availability actually flips. The first sweep just
+            // records the baseline: the cards were already built against the
+            // current state at startup, so no rebuild is needed for it.
+            if (_navDashboard != null && _lastMidiAvailableForNav != midiAvailable)
             {
-                bool firstSweep = _lastMidiInstalledForNav == null;
-                _lastMidiInstalledForNav = installed;
+                bool firstSweep = _lastMidiAvailableForNav == null;
+                _lastMidiAvailableForNav = midiAvailable;
                 if (!firstSweep) RefreshControllerNavItemsInPlace();
             }
 

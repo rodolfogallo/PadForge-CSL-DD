@@ -578,10 +578,6 @@ namespace PadForge.Services
         //  Poll tick (30Hz, UI thread)
         // ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Called ~30 times per second while recording. Compares current state
-        /// against the baseline to detect which input changed.
-        /// </summary>
         /// <summary>Snapshots every active device's currently-fired
         /// gestures across all slots into <see cref="_gestureBaseline"/>.
         /// Called when a recording session (re)establishes its baselines.
@@ -689,6 +685,10 @@ namespace PadForge.Services
             return winner;
         }
 
+        /// <summary>
+        /// Called ~30 times per second while recording. Compares current state
+        /// against the baseline to detect which input changed.
+        /// </summary>
         private void PollTick(object sender, EventArgs e)
         {
             // Allow either a MappingItem-bound session or a freeform one.
@@ -924,27 +924,11 @@ namespace PadForge.Services
                     }
                 }
 
-                // Param recording (Incremental Up/Down, InvertOnHold Modifier)
-                // captures what ReadButtonLikeBool can actually read, which is
-                // Button and POV descriptors plus the hardware-bool families
-                // it forwards to (capsense, NFC tag, touchpad contact). Nothing
-                // else. An axis capture would land in ParamUp / ParamDown /
-                // ParamModifier as "Axis N" and silently do nothing, which is
-                // the "I have to record 3-4 times before it works" symptom
-                // (early tries get captured by stick drift on whichever axis
-                // crosses the detection threshold first; later tries hit the
-                // real button).
-                //
-                // The gate sits ABOVE the MIDI blocks, not below them. There
-                // is no MIDI branch anywhere in ReadButtonLikeBool or in the
-                // ReadHardwareBoolDescriptor it falls through to, so a MIDI
-                // note or encoder pulse captured into a param wrote a
-                // descriptor that reads false forever while the UI reported
-                // success. Same dead capture the axis case describes, minus
-                // the ambiguity, so it gets the same treatment.
-                if (_paramTarget != ParamTarget.None) continue;
-
                 // ── MIDI notes (button-class, instant rising edge) ──
+                // Above the param gate below: a note, an encoder detent and a
+                // CC are on/off inputs ReadButtonLikeBool reads
+                // (SourceCoercion.ReadHardwareBoolDescriptor), so an Up, Down
+                // or modifier recording takes them.
                 // MIDI input lives in the Midi sub-state, not Buttons[]/Axis[],
                 // so the sweeps above never see it. A MIDI device that hadn't
                 // sent anything at record start has a null baseline.Midi; adopt
@@ -1005,9 +989,12 @@ namespace PadForge.Services
                 }
 
                 // ── MIDI CC / pitch bend (axis-class, threshold) ──
-                // After the param gate (these are continuous, not button-class)
-                // and before the generic axis sweep. baseline.Midi is non-null
-                // here (established in the notes block above).
+                // Before the param gate and the generic axis sweep. A CC is an
+                // on/off input as well: pedals and control-surface buttons send
+                // one, and a key reads it as held from 64. Pitch bend is a wheel
+                // with no off position, so a param never records it.
+                // baseline.Midi is non-null here (established in the notes
+                // block above).
                 if (current.Midi != null && baseline.Midi != null)
                 {
                     int bestCc = -1, bestCcDelta = MidiCcThreshold;
@@ -1026,12 +1013,26 @@ namespace PadForge.Services
                         CompleteRecordingWithDescriptor($"Midi CC {bestCc}", dg);
                         return;
                     }
-                    if (Math.Abs(current.Midi.PitchBend - baseline.Midi.PitchBend) > MidiPitchThreshold)
+                    if (_paramTarget == ParamTarget.None
+                        && Math.Abs(current.Midi.PitchBend - baseline.Midi.PitchBend) > MidiPitchThreshold)
                     {
                         CompleteRecordingWithDescriptor("Midi Pitch Bend", dg);
                         return;
                     }
                 }
+
+                // Param recording (Incremental Up/Down, InvertOnHold Modifier)
+                // captures what ReadButtonLikeBool can actually read: the
+                // on/off inputs above, and nothing analog. An axis capture
+                // would land in ParamUp / ParamDown / ParamModifier as
+                // "Axis N" and silently do nothing, which is the "I have to
+                // record 3-4 times before it works" symptom (early tries get
+                // captured by stick drift on whichever axis crosses the
+                // detection threshold first, and later tries hit the real
+                // button). A stick or touchpad ring is a key too, and it is
+                // picked from the list on every row: a recording sees a push
+                // to the rim as its axis.
+                if (_paramTarget != ParamTarget.None) continue;
 
                 // ── Check axes (requires hold confirmation) ──
                 int bestAxisIndex = -1;
@@ -1205,28 +1206,16 @@ namespace PadForge.Services
             if (extraSource != null && paramTarget != ParamTarget.None)
             {
                 // ── Recording targeted a Param button on an ExtraSource ──
-                // Write the captured descriptor into the kind-specific
-                // field (ParamUp / ParamDown / ParamModifier). Don't touch
-                // the source's main DeviceGuid / Descriptor / Invert — the
-                // Param field is the only thing this record button is
-                // supposed to change.
-                switch (paramTarget)
-                {
-                    case ParamTarget.Up:       extraSource.ParamUp       = descriptor; break;
-                    case ParamTarget.Down:     extraSource.ParamDown     = descriptor; break;
-                    case ParamTarget.Modifier: extraSource.ParamModifier = descriptor; break;
-                }
-                // Stamp the winning device on the source so the engine knows
-                // which device's state to read the Param button from. Without
-                // this, an InvertOnHold modifier recorded on a SECONDARY
-                // device (e.g. Button 65 on a web/touchpad device) would be
-                // looked up against the row's primary device, which has no
-                // such index, and IsInvertOnHoldActive silently returns false.
-                if (!string.IsNullOrEmpty(winningGuidStr))
-                {
-                    extraSource.DeviceGuid = winningGuidStr;
-                    extraSource.DeviceLabel = ResolveDeviceLabel(winningDevice);
-                }
+                // The key lands with the device it fired on, which is the
+                // controller it reads. The source's Descriptor and Invert
+                // stay as they are. Stamping the winning device on the
+                // source itself moved its other keys to that device, so a
+                // Down key recorded on a second controller made the Up key
+                // read there too. The source follows the keys its kind
+                // reads, an Incremental or Ramp source its Up and Down keys
+                // and an Invert on Hold source its modifier
+                // (MappingSourceItem.FollowKeysDevice).
+                extraSource.SetParamKey(ToRecordTarget(paramTarget), descriptor, winningGuidStr);
                 finalDescriptor = descriptor;
                 _mainVm.StatusText = string.Format(
                     Strings.Instance.Status_Recorded_Format, mapping.TargetLabel, finalDescriptor);
@@ -1377,6 +1366,14 @@ namespace PadForge.Services
             return null;
         }
 
+        /// <summary>The key field a param recording fills.</summary>
+        private static MappingSourceItem.ParamRecordTarget ToRecordTarget(ParamTarget target) => target switch
+        {
+            ParamTarget.Down => MappingSourceItem.ParamRecordTarget.Down,
+            ParamTarget.Modifier => MappingSourceItem.ParamRecordTarget.Modifier,
+            _ => MappingSourceItem.ParamRecordTarget.Up,
+        };
+
         private static string ResolveDeviceLabel(Guid g)
         {
             if (g == Guid.Empty) return "";
@@ -1451,17 +1448,10 @@ namespace PadForge.Services
 
             if (extraSource != null && paramTarget != ParamTarget.None)
             {
-                // Param recording (Incremental Up/Down or InvertOnHold Modifier).
-                // Touchpad-click is technically not button-class for the
-                // engine's ReadButtonLikeBool, but the source-of-truth field
-                // is still the Param* descriptor — write it and let the
-                // engine ignore unknown forms.
-                switch (paramTarget)
-                {
-                    case ParamTarget.Up:       extraSource.ParamUp       = descriptor; break;
-                    case ParamTarget.Down:     extraSource.ParamDown     = descriptor; break;
-                    case ParamTarget.Modifier: extraSource.ParamModifier = descriptor; break;
-                }
+                // Param recording (Incremental Up/Down or InvertOnHold
+                // Modifier): the key and the device it fired on, as
+                // CompleteRecording writes them.
+                extraSource.SetParamKey(ToRecordTarget(paramTarget), descriptor, winningGuidStr);
                 finalDescriptor = descriptor;
                 _mainVm.StatusText = string.Format(
                     Strings.Instance.Status_Recorded_Format, mapping.TargetLabel, finalDescriptor);
@@ -1530,12 +1520,6 @@ namespace PadForge.Services
                    && !descriptor.EndsWith(" Up", StringComparison.Ordinal)
                    && !descriptor.EndsWith(" Down", StringComparison.Ordinal));
 
-        /// <summary>
-        /// Determines whether an axis recording should auto-apply the Invert prefix
-        /// based on the target mapping and the direction of initial movement.
-        /// </summary>
-        /// <param name="mapping">The target mapping item being recorded.</param>
-        /// <param name="axisPositive">True if the raw axis value increased (positive delta).</param>
         /// <summary>True when the recording target coerces the source as a
         /// button-style threshold (the fall-through set of
         /// <see cref="ShouldAutoInvert"/>): everything that is not a stick
@@ -1560,6 +1544,12 @@ namespace PadForge.Services
             return true;
         }
 
+        /// <summary>
+        /// Determines whether an axis recording should auto-apply the Invert prefix
+        /// based on the target mapping and the direction of initial movement.
+        /// </summary>
+        /// <param name="mapping">The target mapping item being recorded.</param>
+        /// <param name="axisPositive">True if the raw axis value increased (positive delta).</param>
         private static bool ShouldAutoInvert(MappingItem mapping, bool axisPositive, bool negRecording)
         {
             string target = mapping.TargetSettingName;

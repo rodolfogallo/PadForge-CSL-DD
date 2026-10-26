@@ -1436,9 +1436,10 @@ namespace PadForge.Tests
             foreach (string d in new[] { SourceCoercion.LeftStickRingDescriptor, "Gamepad LeftStickX", "Axis 3" })
             {
                 SourceCoercion.NumberedAxesRead(d, out _, out _);
-                long before = GC.GetAllocatedBytesForCurrentThread();
-                for (int i = 0; i < 1000; i++) SourceCoercion.NumberedAxesRead(d, out _, out _);
-                Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+                // Counted over windows the runtime left alone: the thread's
+                // count moves by itself in a full run (AllocationWindow).
+                foreach (long bytes in AllocationWindow.Clean(() => SourceCoercion.NumberedAxesRead(d, out _, out _), 1000))
+                    Assert.Equal(0, bytes);
             }
         }
 
@@ -1843,10 +1844,13 @@ namespace PadForge.Tests
             return (bool)HasAxesForSource.Invoke(null, new object[] { dev.InstanceGuidString, src, dev.InputState, stickRead });
         }
 
-        /// <summary>Every read of a source that names the family needs a
-        /// device in SDL's gamepad layout: its gate, an Incremental source's
-        /// step buttons, and a steering kind's axis. A ring in a steering
-        /// kind's Y slot is read as centered, so it asks for nothing.</summary>
+        /// <summary>Every read of a source on the pass device that names the
+        /// family needs a device in SDL's gamepad layout: its gate and a
+        /// steering kind's axis. A ring in a steering kind's Y slot is read
+        /// as centered, so it asks for nothing. An Incremental source's step
+        /// buttons read the controllers they name, which tests the family on
+        /// each device it reads (KeyDeviceTests), so the pass asks nothing of
+        /// them.</summary>
         [Fact]
         public void EveryFamilyReadOfASourceNeedsTheGamepadLayout()
         {
@@ -1861,7 +1865,7 @@ namespace PadForge.Tests
 
             var stepped = new MappingSource { DeviceGuid = "", Kind = "Incremental", ParamUp = "Gamepad ButtonA" };
             Assert.True(Answers(pad, stepped));
-            Assert.False(Answers(keyboard, stepped));
+            Assert.True(Answers(keyboard, stepped));
 
             var steered = new MappingSource { DeviceGuid = "", Kind = "AngleToAxisX", Descriptor = "Gamepad LeftStickX" };
             Assert.True(Answers(pad, steered, stickRead: true));
@@ -1939,9 +1943,8 @@ namespace PadForge.Tests
         public void AGamepadNameResolvesWithoutAllocating()
         {
             SourceCoercion.ResolveGamepadAlias("Gamepad ButtonA");
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            for (int i = 0; i < 100; i++) SourceCoercion.ResolveGamepadAlias("Gamepad ButtonA");
-            Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
+            foreach (long bytes in AllocationWindow.Clean(() => SourceCoercion.ResolveGamepadAlias("Gamepad ButtonA"), 100))
+                Assert.Equal(0, bytes);
         }
 
         /// <summary>An "(Any Device)" ring modifier checks the port's own stick,

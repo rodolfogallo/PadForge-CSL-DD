@@ -299,11 +299,12 @@ namespace PadForge.Tests
 
         /// <summary>Every live hat read outside the evaluator goes through
         /// the same rotation: the legacy PadSetting mapper's four sites, the
-        /// recorder, which must capture the held-frame direction, the two
-        /// button-like param readers (Incremental and Ramped up/down inputs,
-        /// the Invert-on-Hold modifier), the macro trigger reads and their
-        /// recorders, the expression-variable read, and the Mappings grid's
-        /// live-value fallback.</summary>
+        /// recorder, which must capture the held-frame direction, the key
+        /// reader (the Up and Down keys of Incremental and Ramped sources),
+        /// the macro trigger reads and their recorders, the
+        /// expression-variable read, and the Mappings grid's live-value
+        /// fallback. Step 3 reads an Invert-on-Hold modifier through the
+        /// Direct read, which rotates the hat itself.</summary>
         [Fact]
         public void HatReads_OutsideTheEvaluator_UseTheHeldFrame()
         {
@@ -315,19 +316,26 @@ namespace PadForge.Tests
             Assert.Contains("SourceCoercion.GripPov(", rec);
             Assert.Contains("dg.ToString(), _activePadIndex, current.Povs[i]", rec);
 
-            // The param readers: one rotation each, keyed by the evaluated
-            // device with the source guid winning, and no raw hat read left.
+            // The key reader: one rotation, keyed by the device whose state
+            // is in hand (the source guid winning over the evaluated one) or
+            // by the key's own controller, and no raw hat read left. The
+            // evaluator reads no key of its own, and no modifier: Step 3
+            // reads a row's modifier itself (IsInvertOnHoldActive).
             string skr = RepoText("PadForge.Engine", "Common", "Mapping", "SourceKindRuntime.cs");
             Assert.Equal(1, CountOf(skr, "int v = SourceCoercion.GripPov(deviceGuid, slotIndex, state.Povs[povIdx]);"));
             Assert.DoesNotContain("int v = state.Povs[povIdx];", skr);
-            Assert.Equal(2, CountOf(skr, "string gripGuid = SourceCoercion.EffectiveDeviceGuid(src, evaluatedDeviceGuid);"));
+            Assert.Equal(1, CountOf(skr, "string hand = SourceCoercion.EffectiveDeviceGuid(src, evaluatedDeviceGuid);"));
+            Assert.Equal(1, CountOf(skr, "? ReadKeyOn(state, descriptor, hand, slotIndex)"));
+            Assert.Equal(4, CountOf(skr, "src, evaluatedDeviceGuid, slotIndex);"));
             string sev = RepoText("PadForge.Engine", "Common", "Mapping", "SourceEvaluator.cs");
-            Assert.Equal(1, CountOf(sev, "int v = SourceCoercion.GripPov(deviceGuid, slotIndex, state.Povs[povIdx]);"));
+            Assert.DoesNotContain("GripPov(", sev);
             Assert.DoesNotContain("int v = state.Povs[povIdx];", sev);
             // Three Incremental and two Ramped call sites thread the guid.
             Assert.Equal(5, CountOf(sev, "src, state, frameDeltaSeconds, evaluatedDeviceGuid);"));
             Assert.Equal(5, CountOf(sev, "runtime.TickIncremental(") + CountOf(sev, "runtime.TickRamped("));
-            Assert.Equal(3, CountOf(sev, "SourceCoercion.EffectiveDeviceGuid(src, evaluatedDeviceGuid), slotIndex);"));
+            Assert.Equal(0, CountOf(sev, "src.ParamModifierDeviceGuid, src, evaluatedDeviceGuid, slotIndex,"));
+            Assert.DoesNotContain("InvertOnHold", sev);
+            Assert.DoesNotContain("ParamModifier", sev);
 
             // Macro triggers: the device-bound entry, the device-free entry,
             // the legacy list, and both expression-variable reads.
@@ -352,11 +360,12 @@ namespace PadForge.Tests
             Assert.Contains("ReadMappedValue(fallbackState, mapping.SourceDescriptor, ud.InstanceGuidString, padIndex);", svc);
         }
 
-        /// <summary>The two button-like param readers rotate the hat like
-        /// the Direct path: an Invert-on-Hold modifier naming "POV 0 Up"
+        /// <summary>The key reader and the modifier's read rotate the hat
+        /// like the Direct path: an Invert-on-Hold modifier naming "POV 0 Up"
         /// reads held from the physical Right press under a sideways grip,
-        /// and an Incremental whose up input names it counts up. The
-        /// evaluated device keys the grip when the source carries no guid.</summary>
+        /// on the row it inverts, and an Incremental whose up input names it
+        /// counts up. The evaluated device keys the grip when the source
+        /// carries no guid.</summary>
         [Fact]
         public void ParamReaders_ReadTheHatInTheHeldFrame()
         {
@@ -370,15 +379,12 @@ namespace PadForge.Tests
                 st.Buttons[0] = true;
                 st.Povs[0] = 9000; // physical Right, Up in the held frame
 
-                // Invert-on-Hold: Button 0 is held, the modifier inverts it
-                // while the held-frame Up is pressed.
-                var ioh = new MappingSource
-                {
-                    Kind = "InvertOnHold", DeviceGuid = Dev, Descriptor = "Button 0", ParamModifier = "POV 0 Up",
-                };
-                Assert.False(SourceEvaluator.EvaluateForButtonTarget(st, ioh, 50, 0, "A", 0, null, 0.016, Dev));
+                // Invert-on-Hold: Button 0 is held, and the modifier inverts
+                // its row while the held-frame Up is pressed.
+                var row = RowModifierHarness.Row("LeftTrigger", "Button 0", "POV 0 Up");
+                Assert.Equal(short.MinValue, RowModifierHarness.TriggerPull(row, st, Dev, 0));
                 st.Povs[0] = 0; // physical Up reads Left under the grip: the modifier is released
-                Assert.True(SourceEvaluator.EvaluateForButtonTarget(st, ioh, 50, 0, "A", 0, null, 0.016, Dev));
+                Assert.Equal(short.MaxValue, RowModifierHarness.TriggerPull(row, st, Dev, 0));
 
                 // Incremental: the up input counts only from the held-frame Up.
                 st.Povs[0] = 9000;
@@ -669,7 +675,7 @@ namespace PadForge.Tests
             string des = RepoText("PadForge.App", "Resources", "Strings", "Strings.Designer.cs");
             foreach (var k in new[] { "Settings_MotionGrip", "Settings_MotionGrip_Tooltip", "Pad_Gyro_Grip_Pointing", "Pad_Gyro_Grip_Sideways", "Pad_Gyro_Grip_WiiWheel", "Pad_Gyro_Grip_Upright", "Pad_ResetMotionGrip", "Pad_Gyro_Grip_Header", "Pad_Gyro_Grip_Subtitle" })
                 Assert.Contains($"public string {k} => Get(\"{k}\");", des);
-            foreach (var loc in new[] { "", ".de", ".es", ".fr", ".it", ".ja", ".ko", ".nl", ".pt-BR", ".zh-Hans" })
+            foreach (var loc in PadForge.Tests.LocaleFiles.CompleteSuffixes)
             {
                 string resx = RepoText("PadForge.App", "Resources", "Strings", "Strings" + loc + ".resx");
                 foreach (var k in new[] { "Settings_MotionGrip", "Settings_MotionGrip_Tooltip", "Pad_Gyro_Grip_Pointing", "Pad_Gyro_Grip_Sideways", "Pad_Gyro_Grip_WiiWheel", "Pad_Gyro_Grip_Upright", "Pad_ResetMotionGrip", "Pad_Gyro_Grip_Header", "Pad_Gyro_Grip_Subtitle" })

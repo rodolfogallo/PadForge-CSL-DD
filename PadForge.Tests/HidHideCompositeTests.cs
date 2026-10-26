@@ -394,6 +394,50 @@ namespace PadForge.Tests
             Assert.Equal(Set(new[] { touchpadId }), throwing);
         }
 
+        /// <summary>Before the engine has listed its devices no row is online,
+        /// so a row left visible holds new hides off its nodes whether or not
+        /// it is online, a node a row set to hide names as well. It takes no
+        /// hide away: a node already hidden is left to the online rule. An
+        /// online row keeps all its nodes out, as ever, and once the rows are
+        /// current an offline row is a memory again.</summary>
+        [Fact]
+        public void KeepOut_BeforeRowsAreCurrent_OfflineVisibleRowsHoldNewHidesBack()
+        {
+            static PadForge.Engine.Data.UserDevice Row(string node, bool hide, bool online) => new()
+            {
+                VendorId = 0x17EF, ProdId = 0x6182, HidHideEnabled = hide, IsOnline = online,
+                DevicePath = @"\\?\" + node.Replace('\\', '#') + "#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+            };
+            const string touchpad = @"HID\VID_17EF&PID_6182&MI_01&COL02\8&2A3B4C5&0&0001";
+            const string keyboard = @"HID\VID_17EF&PID_6182&MI_02\8&2A3B4C5&0&0002";
+            const string pad = @"HID\VID_17EF&PID_6182&MI_00\8&2A3B4C5&0&0000";
+            const string composite = @"USB\VID_17EF&PID_6182\5&2E4D6F8&0&3";
+            var rows = new[]
+            {
+                Row(pad, hide: true, online: false),
+                Row(touchpad, hide: false, online: false),
+                Row(keyboard, hide: false, online: true),
+                // A second record that remembers the pad's own path.
+                Row(pad, hide: false, online: false),
+            };
+            Func<string, IReadOnlyList<string>> chainOf = id => new[] { id, id + @"\PARENT", composite };
+            Func<string, bool> alreadyHidden = node =>
+                string.Equals(node, touchpad + @"\PARENT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(node, keyboard, StringComparison.OrdinalIgnoreCase);
+
+            var before = PadForge.Services.InputService.BuildHidHideKeepOut(rows, chainOf, rowsCurrent: false, alreadyHidden);
+            Assert.Equal(Set(new[] { touchpad, composite, keyboard, keyboard + @"\PARENT", pad, pad + @"\PARENT" }), before);
+
+            var current = PadForge.Services.InputService.BuildHidHideKeepOut(rows, chainOf, rowsCurrent: true, alreadyHidden);
+            Assert.Equal(Set(new[] { keyboard, keyboard + @"\PARENT", composite }), current);
+            Assert.Equal(current, PadForge.Services.InputService.BuildHidHideKeepOut(rows, chainOf));
+
+            // With nothing hidden yet, the whole chain of each offline row is kept out.
+            var fresh = PadForge.Services.InputService.BuildHidHideKeepOut(rows, chainOf, rowsCurrent: false, null);
+            Assert.Contains(touchpad + @"\PARENT", fresh);
+            Assert.Contains(pad, fresh);
+        }
+
         /// <summary>The apply loop threads the keep-out set through every
         /// expansion it performs: the resolved-path branch, the sibling
         /// sweep, and both cached-id loops of the synthetic branch, and the
@@ -405,9 +449,12 @@ namespace PadForge.Tests
             string svc = RepoText("PadForge.App", "Services", "InputService.cs");
             int at = svc.IndexOf("public void ApplyDeviceHiding()", StringComparison.Ordinal);
             Assert.True(at > 0);
-            string body = svc.Substring(at, 34000);
+            // The method's own text, up to the one that follows it.
+            int end = svc.IndexOf("private void ApplyInputHooks(", at, StringComparison.Ordinal);
+            Assert.True(end > at);
+            string body = svc.Substring(at, end - at);
 
-            Assert.Contains("var keepOutSet = BuildHidHideKeepOut(snapshot, null);", body);
+            Assert.Contains("var keepOutSet = BuildHidHideKeepOut(snapshot, null, rowsCurrent, HidHideController.IsManagedDevice);", body);
             Assert.Contains("HIDHIDE keepout n={keepOutSet.Count}", body);
             Assert.Contains("ExpandToBaseContainerAndChildren(instanceId, keepOut, kept)", body);
             Assert.Contains("if (keepOut(realId)) { kept.Add(realId); continue; }", body);
@@ -428,6 +475,51 @@ namespace PadForge.Tests
                 Assert.Contains("keepOut, kept)", call);
                 idx = close;
             }
+        }
+
+        /// <summary>Discussion #515: vJoy's joysticks are collections of a
+        /// root-enumerated HID device, "HID\HIDCLASS&amp;COLnn"
+        /// (vJoyInstallLib.cpp:444), with no vendor id in the id. A test for
+        /// a vendor id sent every vJoy row to the lookup by vendor and
+        /// product id, where no node matched, so a row set to hide hid
+        /// nothing. A synthetic path still converts to an id that is no
+        /// device node.</summary>
+        [Theory]
+        [InlineData(@"HID\HIDCLASS&COL01\1&2D595CA7&0&0000", true)]
+        [InlineData(@"HID\HIDCLASS\1&2D595CA7&0&0000", true)]
+        [InlineData(@"HID\VID_054C&PID_0CE6&MI_03\8&127E3E0&0&0000", true)]
+        [InlineData(@"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\9&1F&0&0000", true)]
+        [InlineData(@"USB\VID_057E&PID_0337\5&2E4D6F8&0&3", true)]
+        [InlineData(@"XInput\0", false)]
+        [InlineData("web://controller/1", false)]
+        [InlineData("", false)]
+        [InlineData(null, false)]
+        public void ADeviceNodeId_IsAnyHidCollection_OrAnIdWithAVendorId(string id, bool expected)
+            => Assert.Equal(expected, HidHideController.IsDeviceNodeId(id));
+
+        [Fact]
+        public void AVjoyJoystick_IsHiddenAndKeptOutByItsOwnNode()
+        {
+            const string path = @"\\?\HID#HIDCLASS&Col02#1&2d595ca7&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+            string id = HidHideController.DevicePathToInstanceId(path);
+            Assert.Equal(@"HID\HIDCLASS&Col02\1&2d595ca7&0&0001", id);
+            Assert.True(HidHideController.IsDeviceNodeId(id));
+
+            var visible = new PadForge.Engine.Data.UserDevice
+            {
+                VendorId = 0x1234, ProdId = 0xBEAD, IsOnline = true, HidHideEnabled = false, DevicePath = path,
+                CapType = PadForge.Engine.InputDeviceType.Joystick,
+            };
+            Func<string, IReadOnlyList<string>> chainOf = node => new[] { node };
+            Assert.Equal(Set(new[] { id }), PadForge.Services.InputService.BuildHidHideKeepOut(new[] { visible }, chainOf));
+
+            var counts = PadForge.Services.InputService.CountControllerRowsPerUsbDevice(new[] { visible }, chainOf);
+            Assert.True(counts.TryGetValue(id, out int rows) && rows == 1, "the vJoy row counted on its node");
+
+            // The apply loop takes the row's own node through the same test.
+            string body = RepoText("PadForge.App", "Services", "InputService.cs");
+            Assert.Contains("if (HidHideController.IsDeviceNodeId(instanceId))", body);
+            Assert.DoesNotContain("instanceId.Contains(\"VID_\", StringComparison.OrdinalIgnoreCase)", body);
         }
 
         private static string RepoText(params string[] parts)

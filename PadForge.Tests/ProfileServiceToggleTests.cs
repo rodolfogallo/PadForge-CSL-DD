@@ -12,12 +12,15 @@ using Xunit;
 namespace PadForge.Tests
 {
     /// <summary>
-    /// The four service toggles (Razer Chroma #373, Logitech LIGHTSYNC #382,
-    /// Razer Sensa #374, head tracking #355) ride profiles as NULLABLE legs.
+    /// The service toggles (head tracking #355) ride profiles as NULLABLE
+    /// legs. The Razer Chroma (#373), Logitech LIGHTSYNC (#382) and Razer
+    /// Sensa (#374) toggles rode them too until #494 replaced them with
+    /// vendor rows, and their legs are now read once by the migration and
+    /// never written.
     /// Null is "no opinion": the toggle keeps its current value, which is
     /// the global AppSettings leg or whatever the last opinionated profile
     /// set. A plain bool read as false in every pre-existing profile and the
-    /// first switch turned the mirror off, which commit 087568bd answered by
+    /// first switch turned the mirror off, which commit 6fd683ee answered by
     /// going global-only. The right shape is the #365 polling override's: a
     /// sentinel every old profile deserializes to, authored only by the user.
     ///
@@ -27,10 +30,13 @@ namespace PadForge.Tests
     [Collection("SettingsManagerStatics")]
     public partial class ProfileServiceToggleTests : IDisposable
     {
-        // The head tracking setter mirrors into the static runtime flag the
-        // engine sweep reads, so the fixture puts it back.
+        // The head tracking setters mirror into the static runtime flags the
+        // engine sweep reads, and a load writes the saved OpenXR runtime, so
+        // the fixture puts them back.
         private readonly bool _savedHeadTrackingEnabled = HeadTrackingRuntime.Enabled;
         private readonly bool _savedHeadTrackingFreeTrack = HeadTrackingRuntime.FreeTrackEnabled;
+        private readonly bool _savedHeadTrackingOpenXr = HeadTrackingRuntime.OpenXrEnabled;
+        private readonly string _savedOpenXrRuntime = HeadTrackingRuntime.OpenXrRuntimeManifest;
         private readonly SettingsCollection _savedSettings;
         private readonly DeviceCollection _savedDevices;
         private readonly List<ProfileData> _savedProfiles;
@@ -82,6 +88,8 @@ namespace PadForge.Tests
             SettingsService.AfterMappingSetsRefreshed = _savedAfterRefresh;
             HeadTrackingRuntime.Enabled = _savedHeadTrackingEnabled;
             HeadTrackingRuntime.FreeTrackEnabled = _savedHeadTrackingFreeTrack;
+            HeadTrackingRuntime.OpenXrEnabled = _savedHeadTrackingOpenXr;
+            HeadTrackingRuntime.OpenXrRuntimeManifest = _savedOpenXrRuntime;
         }
 
         private static string RepoText(params string[] parts)
@@ -150,19 +158,15 @@ namespace PadForge.Tests
             var p = new ProfileData
             {
                 Name = "Authored",
-                EnableChromaLightbar = true,
-                EnableLightsyncLightbar = false,
-                EnableSensaHaptics = null,
                 EnableHeadTracking = false,
+                EnableHeadTrackingFreeTrack = true,
             };
             using var w = new StringWriter();
             ser.Serialize(w, p);
             using var r2 = new StringReader(w.ToString());
             var back = (ProfileData)ser.Deserialize(r2);
-            Assert.True(back.EnableChromaLightbar);
-            Assert.False(back.EnableLightsyncLightbar);
-            Assert.Null(back.EnableSensaHaptics);
             Assert.False(back.EnableHeadTracking);
+            Assert.True(back.EnableHeadTrackingFreeTrack);
 
             // And the other authored value for the new leg, so both
             // opinions are proven on the wire.
@@ -182,50 +186,38 @@ namespace PadForge.Tests
             var d = vm.Dashboard;
 
             // No opinion, toggles on: stay on.
-            d.EnableChromaLightbar = true;
-            d.EnableLightsyncLightbar = true;
-            d.EnableSensaHaptics = true;
             d.HeadTrackingEnabled = true;
+            d.HeadTrackingFreeTrack = true;
             ss.ApplyProfileServiceToggles(new ProfileData { Id = "x" });
-            Assert.True(d.EnableChromaLightbar);
-            Assert.True(d.EnableLightsyncLightbar);
-            Assert.True(d.EnableSensaHaptics);
             Assert.True(d.HeadTrackingEnabled);
+            Assert.True(d.HeadTrackingFreeTrack);
             Assert.True(HeadTrackingRuntime.Enabled);   // the engine's flag follows the toggle
 
             // No opinion, toggles off: stay off.
-            d.EnableChromaLightbar = false;
-            d.EnableLightsyncLightbar = false;
-            d.EnableSensaHaptics = false;
             d.HeadTrackingEnabled = false;
+            d.HeadTrackingFreeTrack = false;
             ss.ApplyProfileServiceToggles(new ProfileData { Id = "x" });
-            Assert.False(d.EnableChromaLightbar);
-            Assert.False(d.EnableLightsyncLightbar);
-            Assert.False(d.EnableSensaHaptics);
             Assert.False(d.HeadTrackingEnabled);
+            Assert.False(d.HeadTrackingFreeTrack);
             Assert.False(HeadTrackingRuntime.Enabled);
 
             // Opinions land, each leg independently.
             ss.ApplyProfileServiceToggles(new ProfileData
             {
-                Id = "x", EnableChromaLightbar = true, EnableLightsyncLightbar = null, EnableSensaHaptics = true,
-                EnableHeadTracking = true,
+                Id = "x", EnableHeadTracking = true, EnableHeadTrackingFreeTrack = null,
+                HeadTrackingIndependentInputs = true,
             });
-            Assert.True(d.EnableChromaLightbar);
-            Assert.False(d.EnableLightsyncLightbar);   // null leg: untouched
-            Assert.True(d.EnableSensaHaptics);
             Assert.True(d.HeadTrackingEnabled);
+            Assert.False(d.HeadTrackingFreeTrack);     // null leg: untouched
             Assert.True(HeadTrackingRuntime.Enabled);
 
             ss.ApplyProfileServiceToggles(new ProfileData
             {
-                Id = "x", EnableChromaLightbar = false, EnableLightsyncLightbar = true, EnableSensaHaptics = false,
-                EnableHeadTracking = null,
+                Id = "x", EnableHeadTracking = null, EnableHeadTrackingFreeTrack = true,
+                HeadTrackingIndependentInputs = true,
             });
-            Assert.False(d.EnableChromaLightbar);
-            Assert.True(d.EnableLightsyncLightbar);
-            Assert.False(d.EnableSensaHaptics);
             Assert.True(d.HeadTrackingEnabled);        // null leg: untouched
+            Assert.True(d.HeadTrackingFreeTrack);
 
             ss.ApplyProfileServiceToggles(new ProfileData { Id = "x", EnableHeadTracking = false });
             Assert.False(d.HeadTrackingEnabled);
@@ -240,20 +232,6 @@ namespace PadForge.Tests
         {
             var (vm, _) = Arrange();
             var p1 = ArrangeActiveProfile();
-            Assert.Null(p1.EnableChromaLightbar);
-
-            vm.Dashboard.EnableChromaLightbar = true;
-            Assert.True(p1.EnableChromaLightbar);
-            vm.Dashboard.EnableChromaLightbar = false;
-            Assert.False(p1.EnableChromaLightbar);
-
-            vm.Dashboard.EnableLightsyncLightbar = true;
-            Assert.True(p1.EnableLightsyncLightbar);
-
-            vm.Dashboard.EnableSensaHaptics = true;
-            Assert.True(p1.EnableSensaHaptics);
-            vm.Dashboard.EnableSensaHaptics = false;
-            Assert.False(p1.EnableSensaHaptics);
 
             Assert.Null(p1.EnableHeadTracking);
             Assert.Null(p1.EnableHeadTrackingFreeTrack);
@@ -273,14 +251,9 @@ namespace PadForge.Tests
             SettingsManager.Profiles.Add(p1);
             SettingsManager.ActiveProfileId = null;
 
-            vm.Dashboard.EnableChromaLightbar = true;
-            vm.Dashboard.EnableLightsyncLightbar = true;
-            vm.Dashboard.EnableSensaHaptics = true;
             vm.Dashboard.HeadTrackingEnabled = true;
+            vm.Dashboard.HeadTrackingFreeTrack = true;
 
-            Assert.Null(p1.EnableChromaLightbar);
-            Assert.Null(p1.EnableLightsyncLightbar);
-            Assert.Null(p1.EnableSensaHaptics);
             Assert.Null(p1.EnableHeadTracking);
             Assert.Null(p1.EnableHeadTrackingFreeTrack);
         }
@@ -296,26 +269,26 @@ namespace PadForge.Tests
             var (vm, ss) = Arrange();
             var p1 = ArrangeActiveProfile();
             // Positive control: the authoring hook is live for p1.
-            vm.Dashboard.EnableChromaLightbar = true;
-            Assert.True(p1.EnableChromaLightbar);
-            p1.EnableChromaLightbar = null;   // then forget it, to expose a leak
+            vm.Dashboard.HeadTrackingFreeTrack = true;
+            Assert.True(p1.EnableHeadTrackingFreeTrack);
+            p1.EnableHeadTrackingFreeTrack = null;   // then forget it, to expose a leak
 
-            // All three applies change the VM (true to false, false to
-            // true), so PropertyChanged fires under the guard each time.
-            ss.ApplyProfileServiceToggles(new ProfileData { Id = "other", EnableChromaLightbar = false, EnableSensaHaptics = true, EnableHeadTracking = true });
+            // Both applies change the VM (true to false, false to true), so
+            // PropertyChanged fires under the guard each time.
+            ss.ApplyProfileServiceToggles(new ProfileData
+            {
+                Id = "other", EnableHeadTrackingFreeTrack = false, EnableHeadTracking = true,
+                HeadTrackingIndependentInputs = true,
+            });
 
-            Assert.False(vm.Dashboard.EnableChromaLightbar);   // the apply landed
-            Assert.True(vm.Dashboard.EnableSensaHaptics);
+            Assert.False(vm.Dashboard.HeadTrackingFreeTrack);   // the apply landed
             Assert.True(vm.Dashboard.HeadTrackingEnabled);
-            Assert.Null(p1.EnableChromaLightbar);               // and authored nothing
-            Assert.Null(p1.EnableSensaHaptics);
+            Assert.Null(p1.EnableHeadTrackingFreeTrack);         // and authored nothing
             Assert.Null(p1.EnableHeadTracking);
-            Assert.Null(p1.EnableHeadTrackingFreeTrack);
 
             string ss_src = RepoText("PadForge.App", "Services", "SettingsService.cs");
             foreach (var line in new[]
             {
-                "_mainVm.Dashboard.EnableChromaLightbar = appSettings.EnableChromaLightbar;",
                 "_mainVm.Dashboard.HeadTrackingEnabled = appSettings.HeadTrackingEnabled;",
             })
             {
@@ -337,28 +310,20 @@ namespace PadForge.Tests
         {
             var (vm, ss) = Arrange();
             // Global on, set before any profile is active so nothing authors.
-            vm.Dashboard.EnableChromaLightbar = true;
-            vm.Dashboard.EnableLightsyncLightbar = true;
-            vm.Dashboard.EnableSensaHaptics = true;
             vm.Dashboard.HeadTrackingEnabled = true;
+            vm.Dashboard.HeadTrackingFreeTrack = true;
             var p1 = ArrangeActiveProfile();
 
             ss.UpdateActiveProfileSnapshot();
-            Assert.Null(p1.EnableChromaLightbar);
-            Assert.Null(p1.EnableLightsyncLightbar);
-            Assert.Null(p1.EnableSensaHaptics);
             Assert.Null(p1.EnableHeadTracking);
             Assert.Null(p1.EnableHeadTrackingFreeTrack);
 
-            // A stale opinion is refreshed from the live value.
-            p1.EnableChromaLightbar = false;
-            p1.EnableSensaHaptics = false;
+            // A stale opinion is refreshed from the live value, and a null
+            // leg stays null.
             p1.EnableHeadTracking = false;
             ss.UpdateActiveProfileSnapshot();
-            Assert.True(p1.EnableChromaLightbar);
-            Assert.Null(p1.EnableLightsyncLightbar);
-            Assert.True(p1.EnableSensaHaptics);
             Assert.True(p1.EnableHeadTracking);
+            Assert.Null(p1.EnableHeadTrackingFreeTrack);
         }
 
         /// <summary>No runtime-state mirror invents an opinion: the two
@@ -447,36 +412,51 @@ namespace PadForge.Tests
             Assert.Contains("if (profile.EnableHeadTracking is bool headTracking)", ss);
         }
 
-        /// <summary>Dashboard rule: one glyph per section. Chroma and
-        /// LIGHTSYNC forward the same lightbar color for two vendors, so they
-        /// are two rows of one Lightbar Mirrors section under a single E781,
-        /// each row keeping its own toggle, status line and footer. Sensa
-        /// stays its own section under E877.</summary>
+        /// <summary>The Lightbar Mirrors section (Razer Chroma #373, Logitech
+        /// LIGHTSYNC #382) left the Dashboard for the vendor rows (#494), the
+        /// way the Razer Sensa section and its E877 left for the Sensa row:
+        /// the switches, their status lines, their strings, their resets and
+        /// their autosave entries all went, and the settings legs are read
+        /// once by the migration and never written.</summary>
         [Fact]
-        public void LightbarMirrors_OneSection_OneGlyph_TwoRows()
+        public void LightbarMirrors_LeftTheDashboard_ForTheVendorRows()
         {
             string page = RepoText("PadForge.App", "Views", "DashboardPage.xaml");
-            Assert.Equal(1, page.Split(new[] { "&#xE781;" }, StringSplitOptions.None).Length - 1);
-            Assert.Equal(1, page.Split(new[] { "&#xE877;" }, StringSplitOptions.None).Length - 1);
-            Assert.Contains("Binding Dashboard_LightbarMirrors,", page);
-            Assert.DoesNotContain("Binding Dashboard_Chroma, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}", page);
-            Assert.DoesNotContain("Binding Dashboard_Lightsync, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}", page);
-
-            int section = page.IndexOf("Binding Dashboard_LightbarMirrors,", StringComparison.Ordinal);
-            int sensa = page.IndexOf("Binding Dashboard_Sensa,", StringComparison.Ordinal);
-            Assert.True(section > 0 && sensa > section);
-            string card = page.Substring(section, sensa - section);
-            foreach (var needle in new[]
-            {
-                "Binding Dashboard_Chroma,", "Binding EnableChromaLightbar", "Binding ChromaStatus", "Binding Dashboard_ChromaFooter",
-                "Binding Dashboard_Lightsync,", "Binding EnableLightsyncLightbar", "Binding LightsyncStatus", "Binding Dashboard_LightsyncFooter",
-            })
-                Assert.Contains(needle, card);
-            // One card: a single CardBorder between the section title and Sensa.
-            Assert.Equal(1, card.Split(new[] { "StaticResource CardBorder" }, StringSplitOptions.None).Length - 1);
+            Assert.Equal(0, page.Split(new[] { "&#xE781;" }, StringSplitOptions.None).Length - 1);
+            Assert.Equal(0, page.Split(new[] { "&#xE877;" }, StringSplitOptions.None).Length - 1);
+            foreach (var gone in new[] { "Dashboard_LightbarMirrors", "Dashboard_Chroma", "Dashboard_Lightsync",
+                                         "EnableChromaLightbar", "EnableLightsyncLightbar", "ChromaStatus", "LightsyncStatus" })
+                Assert.DoesNotContain(gone, page);
 
             string designer = RepoText("PadForge.App", "Resources", "Strings", "Strings.Designer.cs");
-            Assert.Contains("public string Dashboard_LightbarMirrors => Get(\"Dashboard_LightbarMirrors\");", designer);
+            Assert.DoesNotContain("Dashboard_LightbarMirrors", designer);
+            Assert.DoesNotContain("Dashboard_Chroma", designer);
+            Assert.DoesNotContain("Dashboard_Lightsync", designer);
+
+            string dashboardVm = RepoText("PadForge.App", "ViewModels", "DashboardViewModel.cs");
+            Assert.DoesNotContain("EnableChromaLightbar", dashboardVm);
+            Assert.DoesNotContain("EnableLightsyncLightbar", dashboardVm);
+            string mw = RepoText("PadForge.App", "MainWindow.xaml.cs");
+            Assert.DoesNotContain("EnableChromaLightbar", mw);
+            Assert.DoesNotContain("EnableLightsyncLightbar", mw);
+
+            // The legs still read, for the migration, and never write.
+            Assert.False(new AppSettingsData().ShouldSerializeEnableChromaLightbar());
+            Assert.False(new AppSettingsData().ShouldSerializeEnableLightsyncLightbar());
+            Assert.False(new ProfileData().ShouldSerializeEnableChromaLightbar());
+            Assert.False(new ProfileData().ShouldSerializeEnableLightsyncLightbar());
+            var ser = new XmlSerializer(typeof(ProfileData));
+            using (var r = new StringReader("<ProfileData Id=\"abc\"><EnableChromaLightbar>true</EnableChromaLightbar>"
+                + "<EnableLightsyncLightbar>false</EnableLightsyncLightbar></ProfileData>"))
+            {
+                var old = (ProfileData)ser.Deserialize(r);
+                Assert.True(old.EnableChromaLightbar);
+                Assert.False(old.EnableLightsyncLightbar);
+            }
+            using var w = new StringWriter();
+            ser.Serialize(w, new ProfileData { EnableChromaLightbar = true, EnableLightsyncLightbar = true });
+            Assert.DoesNotContain("EnableChromaLightbar", w.ToString());
+            Assert.DoesNotContain("EnableLightsyncLightbar", w.ToString());
         }
     }
 }

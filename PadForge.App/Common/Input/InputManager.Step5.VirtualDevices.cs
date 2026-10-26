@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using HIDMaestro;
 using PadForge.Engine;
+using PadForge.Resources.Strings;
 using PadForge.ViewModels;
 
 namespace PadForge.Common.Input
@@ -99,18 +100,26 @@ namespace PadForge.Common.Input
         /// </summary>
         private static HMContext _hmaestroContext;
         private static readonly object _hmaestroContextLock = new object();
-        private static bool _hmaestroContextFailed;
-        private static bool _processExitHookRegistered;
 
-        /// <summary>
-        /// Set once <see cref="DisposeHMaestroContextOnShutdown"/> has run a
-        /// full synchronous teardown inside OnClosing's Task.Run. The AppDomain
-        /// ProcessExit handler checks this flag and skips its static
-        /// <see cref="HMContext.RemoveAllVirtualControllers"/> call — otherwise
-        /// the safety-net sweep enumerates the PnP tree after Close() returns
-        /// and adds 5–6s of lingering headless work after the window vanishes.
-        /// </summary>
-        private static volatile bool _cleanShutdownPerformed;
+        /// <summary>When the last HIDMaestro setup failed, as
+        /// Environment.TickCount64, or 0. A failed setup used to stay failed
+        /// until the engine stopped, so no slot could get a virtual controller
+        /// again without an engine restart. Now the next create after
+        /// <see cref="HmSetupRetryHoldMs"/> runs the setup again. A slot whose
+        /// create failed keeps its own latch, which only a change to that slot
+        /// clears, so a retry follows the user's next change to a slot, or a
+        /// slot created later, and never loops on its own. Inside the hold the
+        /// other slots of the same burst fail fast instead of each running
+        /// the setup again, since creates run one at a time.</summary>
+        private static long _hmaestroSetupFailedTick;
+        private const long HmSetupRetryHoldMs = 5_000;
+        private const string HmSetupFailedMessage = "Failed to initialize HIDMaestro.";
+
+        internal static bool HmSetupHeldAt(long failedTick, long nowTick)
+            => failedTick != 0 && nowTick - failedTick < HmSetupRetryHoldMs;
+
+        private static bool HmSetupHeld()
+            => HmSetupHeldAt(Volatile.Read(ref _hmaestroSetupFailedTick), Environment.TickCount64);
 
         /// <summary>
         /// Virtual controller targets, indexed by pad index. The VC at
@@ -283,33 +292,6 @@ namespace PadForge.Common.Input
         /// math, four voice masks, one volatile store per slot; no
         /// allocations, no syscalls.
         /// </summary>
-        /// <summary>Sensa HD haptics feed (#374): the max feedback voice
-        /// across every slot, normalized 0..1, published for the
-        /// SensaHapticsService worker. Same rumble authority as the
-        /// rumble-audio lane above (VC inbound pack max-merged with the
-        /// live vibration state, so test rumble counts too), and one
-        /// volatile read exits when the service is off.</summary>
-        private void UpdateSensaLane()
-        {
-            if (!PadForge.Services.SensaHapticsService.PublisherArmed) return;
-            float best = 0f;
-            int n = System.Math.Min(SettingsManager.SlotMappingSets?.Length ?? 0, MaxPads);
-            for (int slot = 0; slot < n; slot++)
-            {
-                long pack = GetInboundRumblePack(slot);
-                var vibe = VibrationStates[slot];
-                if (vibe != null)
-                {
-                    pack = Engine.Common.LfeOutputState.MaxMerge(pack,
-                        vibe.LeftMotorSpeed, vibe.RightMotorSpeed,
-                        vibe.LeftTriggerMotorSpeed, vibe.RightTriggerMotorSpeed);
-                }
-                float amp = PadForge.Services.SensaHapticsService.PackToAmplitude(pack);
-                if (amp > best) best = amp;
-            }
-            PadForge.Services.SensaHapticsService.PublishAmplitude(best);
-        }
-
         private void UpdateRumbleAudioLane()
         {
             var sets = SettingsManager.SlotMappingSets;
@@ -370,7 +352,7 @@ namespace PadForge.Common.Input
         public VirtualControllerType[] SlotControllerTypes { get; } = new VirtualControllerType[MaxPads];
 
         /// <summary>
-        /// Per-slot HIDMaestro profile slug. Identifies which of the 232
+        /// Per-slot HIDMaestro profile slug. Identifies which of the 233
         /// embedded profiles the slot uses (e.g. "xbox-360-wired",
         /// "dualsense", "logitech-g920"). Empty string falls back to a
         /// category-appropriate default in CreateHMaestroController.
@@ -513,6 +495,59 @@ namespace PadForge.Common.Input
         private ExtendedBuild CaptureExtendedBuild(int padIndex) => new ExtendedBuild(
             SlotExtendedCustomize[padIndex], SlotOemOverrideEnabled[padIndex], SlotOemOverrideLabel[padIndex],
             SlotCustomLayouts[padIndex], SlotExtendedFfbEnabled[padIndex], SlotExtendedVendorId[padIndex], SlotExtendedProductId[padIndex]);
+
+        /// <summary>
+        /// The virtual keyboard and mouse a Keyboard + Mouse slot is built
+        /// with (HIDMaestro 1.12.0), captured with the type and the profile
+        /// when the create is kicked, for the reason <see cref="ExtendedBuild"/>
+        /// is. Each is a HIDMaestro profile id, or empty for Windows input.
+        /// </summary>
+        internal readonly struct KbmBuild
+        {
+            private readonly string _keyboard, _mouse;
+            public KbmBuild(string keyboard, string mouse) { _keyboard = keyboard; _mouse = mouse; }
+            public string Keyboard => _keyboard ?? string.Empty;
+            public string Mouse => _mouse ?? string.Empty;
+            public bool UsesDevices => Keyboard.Length > 0 || Mouse.Length > 0;
+            public bool Matches(string keyboard, string mouse) =>
+                string.Equals(Keyboard, keyboard ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(Mouse, mouse ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            public bool Matches(in KbmBuild other) => Matches(other.Keyboard, other.Mouse);
+            public override string ToString() =>
+                $"keyboard={(Keyboard.Length > 0 ? Keyboard : "windows")} mouse={(Mouse.Length > 0 ? Mouse : "windows")}";
+        }
+
+        /// <summary>The devices the slot's Keyboard + Mouse configuration asks
+        /// for now. A half the surface mode turns off asks for none: a
+        /// virtual mouse on a keyboard-only slot would sit on the bus with
+        /// nothing to send.</summary>
+        internal KbmBuild DesiredKbmBuild(int padIndex)
+        {
+            var cfg = _kbmConfigs[padIndex];
+            if (cfg == null) return default;
+            return new KbmBuild(cfg.KeyboardEnabled ? cfg.KeyboardDevice : null,
+                cfg.MouseEnabled ? cfg.MouseDevice : null);
+        }
+
+        private KbmBuild CaptureKbmBuild(int padIndex) => DesiredKbmBuild(padIndex);
+
+        /// <summary>The lock lights Windows last set on the slot's virtual
+        /// keyboard as HMKeyboardLeds bits, or -1 when the slot has no virtual
+        /// keyboard or Windows has set none. Read off the live controller,
+        /// which the UI thread reaches by reference like every snapshot.</summary>
+        internal int KbmKeyboardLedsOf(int padIndex)
+        {
+            if (padIndex < 0 || padIndex >= MaxPads) return -1;
+            return _virtualControllers[padIndex] is KeyboardMouseVirtualController kbm
+                   && kbm.KeyboardLeds is { } leds
+                ? (int)leds
+                : -1;
+        }
+
+        /// <summary>True when a Keyboard + Mouse controller runs on other
+        /// devices than its slot now asks for.</summary>
+        private bool KbmDevicesChanged(int padIndex, KeyboardMouseVirtualController kbm)
+            => !DesiredKbmBuild(padIndex).Matches(kbm.KeyboardDeviceId, kbm.MouseDeviceId);
 
         /// <summary>
         /// Set by <see cref="DestroyAllVirtualControllers"/> under the lifecycle
@@ -853,21 +888,263 @@ namespace PadForge.Common.Input
         private readonly VirtualControllerType[] _createFailedType = new VirtualControllerType[MaxPads];
         private readonly string[] _createFailedProfile = new string[MaxPads];
 
+        /// <summary>The legacy MIDI output port a failed MIDI create was
+        /// started with. Under the legacy API the commonest failure is a
+        /// slot with no port picked yet, and picking one is the
+        /// reconfigure that must clear the latch.</summary>
+        private readonly string[] _createFailedMidiPort = new string[MaxPads];
+
+        /// <summary>The keyboard and mouse devices a failed Keyboard + Mouse
+        /// create was started with. Picking another device, or Windows input,
+        /// is the reconfigure that clears the latch.</summary>
+        private readonly KbmBuild[] _createFailedKbm = new KbmBuild[MaxPads];
+
+        /// <summary>The MIDI API in use when a MIDI create failed. A slot that
+        /// failed under one API gets a fresh attempt once the probe settles
+        /// on another, as when the runtime goes in under the legacy
+        /// API.</summary>
+        private readonly MidiApiKind[] _createFailedMidiApi = new MidiApiKind[MaxPads];
+
+        /// <summary>The MIDI generation (<see cref="MidiVirtualController.Generation"/>)
+        /// when a MIDI create failed, read after the create's own service
+        /// restart. A failed slot gets a fresh attempt once a later reset
+        /// starts a new generation (a service restart from any path, an
+        /// install or an uninstall), the rule a running slot already follows,
+        /// since the service the create failed against is gone.</summary>
+        private readonly int[] _createFailedMidiGen = new int[MaxPads];
+
+        /// <summary>The legacy MIDI output port the slot's MIDI bar names
+        /// now.</summary>
+        private string MidiOutputPortOf(int padIndex) => _midiConfigs[padIndex]?.OutputPort ?? string.Empty;
+
+        /// <summary>The legacy MIDI output ports, listed on a worker while a
+        /// legacy MIDI slot needs them: one listing in flight, the polling
+        /// thread reading the newest, as the MIDI input sweep does (Phase
+        /// 1e). WinMM numbers a port by an index that shifts when a device
+        /// comes or goes, and a handle opened with CALLBACK_NULL hears
+        /// nothing when its device leaves, so the listing is how a slot
+        /// learns its port went away or came back.</summary>
+        private sealed class LegacyPortListing
+        {
+            public List<string> Ports;
+            public long Generation;
+        }
+
+        private volatile LegacyPortListing _legacyPortListing;
+        private volatile bool _legacyPortListingRunning;
+        private long _legacyPortListingKicks;
+        private long _legacyPortListingKickMs;
+        private long _legacyPortListingRescueMs;
+
+        /// <summary>The least time between two listings. Tests set 0.</summary>
+        internal int LegacyPortListingIntervalMs = 1_000;
+
+        /// <summary>How long a listing may stay in flight before the
+        /// watchdog acts: the availability probe's bound. A healthy WinMM
+        /// listing reads cached port state and returns in milliseconds.
+        /// Tests shorten it.</summary>
+        internal int LegacyPortListingHungMs = 10_000;
+
+        /// <summary>The listing generation a failed MIDI create latched at,
+        /// and whether its port was missing: the create found it unlisted,
+        /// or a listing started since then left it out.</summary>
+        private readonly long[] _createFailedListingGen = new long[MaxPads];
+        private readonly bool[] _createFailedPortMissing = new bool[MaxPads];
+
+        /// <summary>Set by the create when its legacy port was not listed
+        /// (<see cref="MidiPortNotConnectedException"/>), for the latch
+        /// that follows on the same worker. Every create starts with it
+        /// cleared.</summary>
+        private readonly bool[] _createPortMissing = new bool[MaxPads];
+
+        /// <summary>Whether a failed MIDI create found its legacy port in use
+        /// with another MIDI slot set to the same port: set by the create
+        /// for the latch that follows on the same worker, then kept with the
+        /// latch. Such a slot tries again once no other MIDI slot is set to
+        /// its port, so the status line's advice works on either slot.
+        /// Every create starts with it cleared, like the mark above, so a
+        /// failure that takes no latch leaves nothing for the next
+        /// one.</summary>
+        private readonly bool[] _createPortShared = new bool[MaxPads];
+        private readonly bool[] _createFailedPortShared = new bool[MaxPads];
+
+        /// <summary>The legacy MIDI controller Pass 1 last saw on each slot,
+        /// with the listing generation at that sighting, so only a listing
+        /// started after the controller connected can call its port
+        /// missing.</summary>
+        private readonly MidiVirtualController[] _legacyWatchedVc = new MidiVirtualController[MaxPads];
+        private readonly long[] _legacyWatchedGen = new long[MaxPads];
+
+        /// <summary>Starts a listing on a worker when none is running, the
+        /// interval has passed and the legacy API is the one in use. Polling
+        /// thread only.
+        ///
+        /// <para>A listing that stays in flight past
+        /// <see cref="LegacyPortListingHungMs"/> is stuck behind the MIDI
+        /// service: on the new MIDI stack wdmaud2 answers the port count
+        /// under the lock a port open or close holds across its service RPC
+        /// (Microsoft's MidiSrvPorts.cpp), so a close orphaned in a wedged
+        /// service blocks it. Its gate then never cleared, and the slot's
+        /// port-gone and port-back checks stopped for the session with
+        /// nothing in the log. The watchdog writes a diagnostics line that
+        /// says what follows and asks for a service restart, as the probe's
+        /// recovery does, which fails the RPC holding the lock, so the
+        /// listing returns and the generation bump rebuilds the legacy slots.
+        /// Where WinMM talks to classic drivers instead (Windows before 24H2,
+        /// Legacy API mode, Hybrid mode) no restart reaches the listing, none
+        /// is asked for, the line says so, and the listing's gate stays set
+        /// until the driver answers. Inside another restart's cooldown none
+        /// is asked for either, and the watchdog looks again when it next
+        /// fires. One listing stays in flight: no second worker starts beside
+        /// a stuck one.</para></summary>
+        private void KickLegacyPortListing()
+        {
+            long now = Environment.TickCount64;
+            if (_legacyPortListingRunning)
+            {
+                long inFlight = now - _legacyPortListingKickMs;
+                if (inFlight >= LegacyPortListingHungMs && now - _legacyPortListingRescueMs >= LegacyPortListingHungMs)
+                {
+                    bool first = _legacyPortListingRescueMs < _legacyPortListingKickMs;
+                    _legacyPortListingRescueMs = now;
+                    string follows = MidiVirtualController.DescribeRestartRequest(legacyCall: true, out bool restarts);
+                    if (first)
+                        PadForge.Engine.SdlDiagLog.WriteLine(
+                            $"VCTRACE legacy MIDI port listing in flight {inFlight} ms: {follows}");
+                    if (restarts)
+                        System.Threading.Tasks.Task.Run(() =>
+                            MidiVirtualController.RestartService("a legacy MIDI port listing hung", legacyCall: true));
+                }
+                return;
+            }
+            if (now - _legacyPortListingKickMs < LegacyPortListingIntervalMs) return;
+            if (MidiVirtualController.Backend is not MidiBackendLegacy legacy) return;
+            _legacyPortListingKickMs = now;
+            long generation = Interlocked.Increment(ref _legacyPortListingKicks);
+            _legacyPortListingRunning = true;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { _legacyPortListing = new LegacyPortListing { Ports = legacy.EnumerateOutputPorts(), Generation = generation }; }
+                catch (Exception ex)
+                {
+                    // The next kick lists again.
+                    PadForge.Engine.SdlDiagLog.WriteLine(
+                        $"VCTRACE legacy MIDI port listing failed: {ex.GetType().Name} 0x{ex.HResult:X8}");
+                }
+                finally { _legacyPortListingRunning = false; }
+            });
+        }
+
+        /// <summary>Whether the newest listing started after
+        /// <paramref name="afterGeneration"/> names the port: true or false,
+        /// or null while there is no such listing yet.</summary>
+        private bool? LegacyPortListed(string port, long afterGeneration)
+        {
+            KickLegacyPortListing();
+            var listing = _legacyPortListing;
+            if (listing == null || listing.Generation <= afterGeneration) return null;
+            return listing.Ports.Contains(port);
+        }
+
+        /// <summary>Whether a legacy MIDI slot that failed for want of its
+        /// output port may try again: the port was missing, at the create or
+        /// in a listing since, and a listing started after the failure shows
+        /// it back, as when a synth or interface is switched on after
+        /// PadForge starts. A port that never went missing (another program
+        /// holds it) keeps the slot failed until it is reconfigured, as
+        /// before.</summary>
+        private bool LegacyMidiPortCameBack(int padIndex)
+        {
+            if (MidiVirtualController.ActiveApi != MidiApiKind.Legacy) return false;
+            string port = MidiOutputPortOf(padIndex);
+            if (port.Length == 0) return false;
+            bool? listed = LegacyPortListed(port, Volatile.Read(ref _createFailedListingGen[padIndex]));
+            if (listed == false) _createFailedPortMissing[padIndex] = true;
+            return listed == true && _createFailedPortMissing[padIndex];
+        }
+
+        /// <summary>Whether a running legacy MIDI slot's port is gone: a
+        /// listing started after Pass 1 first saw the controller leaves it
+        /// out. The slot then rebuilds, its create fails until the port
+        /// returns, and <see cref="LegacyMidiPortCameBack"/> lets it try
+        /// again.</summary>
+        private bool LegacyMidiPortGone(int padIndex, MidiVirtualController midi)
+        {
+            if (!ReferenceEquals(_legacyWatchedVc[padIndex], midi))
+            {
+                _legacyWatchedVc[padIndex] = midi;
+                _legacyWatchedGen[padIndex] = Interlocked.Read(ref _legacyPortListingKicks);
+            }
+            return midi.OutputPort.Length > 0
+                && LegacyPortListed(midi.OutputPort, _legacyWatchedGen[padIndex]) == false;
+        }
+
+        /// <summary>Why a failed slot may try its create again, for the
+        /// latch's CLEAR trace, or null while nothing that failed has changed.
+        /// The tests run in the order the clear has always run them, and
+        /// <see cref="LegacyMidiPortCameBack"/> runs last and only when every
+        /// other test is false, since it starts a port listing and marks a
+        /// missing port. Called only while the slot's latch is set.</summary>
+        private string CreateFailedClearReason(int padIndex)
+        {
+            var type = SlotControllerTypes[padIndex];
+            if (_createFailedType[padIndex] != type)
+                return $"type changed to {type}";
+            if (!string.Equals(_createFailedProfile[padIndex], SlotProfileIds[padIndex], StringComparison.Ordinal))
+                return "profile changed";
+            if (type == VirtualControllerType.KeyboardMouse && !_createFailedKbm[padIndex].Matches(DesiredKbmBuild(padIndex)))
+                return "keyboard or mouse device changed";
+            if (type != VirtualControllerType.Midi)
+                return null;
+            if (!string.Equals(_createFailedMidiPort[padIndex], MidiOutputPortOf(padIndex), StringComparison.Ordinal))
+                return "MIDI port changed";
+            // Both API tests wait for the probe to settle, so the retry runs
+            // on an API that answers.
+            var api = MidiVirtualController.ActiveApi;
+            if (api != MidiApiKind.None)
+            {
+                if (_createFailedMidiApi[padIndex] != api)
+                    return $"MIDI API is now {api}";
+                if (_createFailedMidiGen[padIndex] != MidiVirtualController.Generation)
+                    return "MIDI started in a newer generation";
+            }
+            // The other slot was moved to another port, disabled or deleted.
+            // Pass 2 creates nothing while a teardown is pending, so the
+            // retry opens the port after that slot has closed it.
+            if (_createFailedPortShared[padIndex] && OtherMidiSlotOnPort(padIndex, MidiOutputPortOf(padIndex)) < 0)
+                return "no other MIDI slot is set to its port";
+            if (LegacyMidiPortCameBack(padIndex))
+                return "MIDI port is back";
+            return null;
+        }
+
         private void LatchCreateFailed(int padIndex)
-            => LatchCreateFailed(padIndex, SlotControllerTypes[padIndex], SlotProfileIds[padIndex]);
+            => LatchCreateFailed(padIndex, SlotControllerTypes[padIndex], SlotProfileIds[padIndex], MidiOutputPortOf(padIndex),
+                DesiredKbmBuild(padIndex));
 
         /// <summary>The async overload records the configuration the create
         /// was STARTED for, not the slot's current one: a retype during the
         /// create window (the MIDI probe alone can run 10 s) would otherwise
         /// stamp the failure onto the NEW type and permanently block it
         /// (owner race, 2026-07-23).</summary>
-        private void LatchCreateFailed(int padIndex, VirtualControllerType failedType, string failedProfile)
+        private void LatchCreateFailed(int padIndex, VirtualControllerType failedType, string failedProfile, string failedMidiPort,
+            KbmBuild failedKbm)
         {
             _createFailedType[padIndex] = failedType;
             _createFailedProfile[padIndex] = failedProfile;
+            _createFailedMidiPort[padIndex] = failedMidiPort ?? string.Empty;
+            _createFailedKbm[padIndex] = failedKbm;
+            _createFailedMidiApi[padIndex] = MidiVirtualController.ActiveApi;
+            _createFailedMidiGen[padIndex] = MidiVirtualController.Generation;
+            _createFailedListingGen[padIndex] = Interlocked.Read(ref _legacyPortListingKicks);
+            _createFailedPortMissing[padIndex] = _createPortMissing[padIndex];
+            _createPortMissing[padIndex] = false;
+            _createFailedPortShared[padIndex] = _createPortShared[padIndex];
+            _createPortShared[padIndex] = false;
             _createFailed[padIndex] = true;
             PadForge.Engine.SdlDiagLog.WriteLine(
-                $"VCTRACE slot={padIndex} createFailed LATCH type={failedType} profile={failedProfile ?? "<null>"}");
+                $"VCTRACE slot={padIndex} createFailed LATCH type={failedType} profile={failedProfile ?? "<null>"}"
+                + (failedType == VirtualControllerType.KeyboardMouse ? " " + failedKbm : ""));
         }
 
         /// <summary>
@@ -1093,18 +1370,32 @@ namespace PadForge.Common.Input
 
                 var vc = _virtualControllers[padIndex];
 
+                // The line a MIDI create left for this slot has nothing to
+                // report once the slot is no longer a MIDI slot, latched or
+                // not. A create that fails after its slot lost its device
+                // raises its line and takes no latch, so this clear cannot
+                // sit under the latch: it did, and a slot retyped after such
+                // a create kept its MIDI line on the status bar. One read a
+                // pass while no line is remembered.
+                if (Volatile.Read(ref _midiCreateError[padIndex]) != null
+                    && SlotControllerTypes[padIndex] != VirtualControllerType.Midi)
+                    ResolveMidiCreateError(padIndex);
+
                 // A failed slot has no VC, so the vc-based change detection
-                // below cannot clear its latch. Clear it here the moment
-                // the slot is reconfigured away from the combination that
-                // failed (type or profile), so the new configuration gets
-                // its create attempt.
-                if (_createFailed[padIndex]
-                    && (_createFailedType[padIndex] != SlotControllerTypes[padIndex]
-                        || !string.Equals(_createFailedProfile[padIndex], SlotProfileIds[padIndex], StringComparison.Ordinal)))
+                // below cannot clear its latch. Clear it here once the slot
+                // has moved away from what failed, so it gets a new create
+                // attempt: its type or profile changed, or for a MIDI slot,
+                // its port changed, the probe settled on another API or in a
+                // newer generation (both wait for the probe, so the retry
+                // runs on an API that answers), the other slot set to its
+                // legacy port let go of it, or its legacy port came back
+                // (CreateFailedClearReason). A MIDI slot's retry clears or
+                // replaces its line.
+                if (_createFailed[padIndex] && CreateFailedClearReason(padIndex) is string clearReason)
                 {
                     _createFailed[padIndex] = false;
                     PadForge.Engine.SdlDiagLog.WriteLine(
-                        $"VCTRACE slot={padIndex} createFailed CLEAR (reconfigured to {SlotControllerTypes[padIndex]})");
+                        $"VCTRACE slot={padIndex} createFailed CLEAR ({clearReason})");
                 }
 
                 // Detect controller type change — destroy old if type differs.
@@ -1169,6 +1460,53 @@ namespace PadForge.Common.Input
                     vc = null;
                 }
 
+                // A Keyboard + Mouse slot rebuilds on the keyboard and mouse it
+                // now asks for: a device picked, put back to Windows input, or a
+                // half the surface mode turned on or off. The creation gate
+                // uses the same comparison.
+                if (vc is KeyboardMouseVirtualController kbmOnDevices
+                    && KbmDevicesChanged(padIndex, kbmOnDevices))
+                {
+                    if (IsSlotActive(padIndex)) BeginInitializing(padIndex);
+                    else _slotInitializing[padIndex] = false;
+                    PadForge.Engine.SdlDiagLog.WriteLine(
+                        $"VCTRACE slot={padIndex} keyboard-mouse device change destroy -> {DesiredKbmBuild(padIndex)}");
+                    DestroyVirtualController(padIndex, asyncDispose: true);
+                    _virtualControllers[padIndex] = null;
+                    _createFailed[padIndex] = false;
+                    vc = null;
+                }
+
+                // Under the legacy API a MIDI slot sends to the port its bar
+                // names. A new pick closes the old port and the next pass
+                // opens the new one, and a port whose device went away
+                // closes the same way, so the slot reopens it once it is
+                // back. So does a port whose handle died with its device
+                // while the name stayed listed, as after a replug faster
+                // than one listing: its sends fail for good. A slot built on
+                // one API also rebuilds once the probe settles on another:
+                // installing the runtime moves legacy slots onto ports of
+                // their own. So does a slot built before the backend was
+                // last torn down, as every service restart ends, PadForge's
+                // own and one made under it: its endpoint talks to a backend
+                // or a service that is gone, and it went silent.
+                if (vc is MidiVirtualController midiOnPort
+                    && ((MidiVirtualController.ActiveApi == MidiApiKind.Legacy
+                         && (!string.Equals(midiOnPort.OutputPort, MidiOutputPortOf(padIndex), StringComparison.Ordinal)
+                             || LegacyMidiPortGone(padIndex, midiOnPort)
+                             || midiOnPort.EndpointLost))
+                        || (MidiVirtualController.ActiveApi != MidiApiKind.None
+                            && (midiOnPort.ApiKind != MidiVirtualController.ActiveApi
+                                || midiOnPort.CreatedGeneration != MidiVirtualController.Generation))))
+                {
+                    if (IsSlotActive(padIndex)) BeginInitializing(padIndex);
+                    else _slotInitializing[padIndex] = false;
+                    DestroyVirtualController(padIndex, asyncDispose: true);
+                    _virtualControllers[padIndex] = null;
+                    _createFailed[padIndex] = false;
+                    vc = null;
+                }
+
                 // Slot deleted or disabled by user — destroy immediately.
                 // The grace period only applies to transient device disconnects
                 // (slot still created + enabled, but physical device offline).
@@ -1210,6 +1548,7 @@ namespace PadForge.Common.Input
                 {
                     _slotInitializing[padIndex] = false;
                     _createFailed[padIndex] = false;
+                    ResolveMidiCreateError(padIndex);
                 }
 
                 bool slotActive = IsSlotActive(padIndex);
@@ -1681,7 +2020,9 @@ namespace PadForge.Common.Input
                             int capturedIndex = padIndex;
                             var capturedType = slotType;
                             var capturedProfile = SlotProfileIds[padIndex];
+                            var capturedMidiPort = MidiOutputPortOf(padIndex);
                             var capturedBuild = CaptureExtendedBuild(padIndex);
+                            var capturedKbm = CaptureKbmBuild(padIndex);
                             var capturedPersonaOwner = _personaAudioOwner;
                             PadForge.Engine.SdlDiagLog.WriteLine(
                                 $"VCTRACE slot={padIndex} async create KICK type={slotType}");
@@ -1691,7 +2032,7 @@ namespace PadForge.Common.Input
                                 bool published = false;
                                 try
                                 {
-                                    vcAsync = CreateVirtualController(capturedIndex, capturedType, capturedProfile, capturedBuild);
+                                    vcAsync = CreateVirtualController(capturedIndex, capturedType, capturedProfile, capturedBuild, capturedKbm);
                                     PadForge.Engine.SdlDiagLog.WriteLine(
                                         $"VCTRACE slot={capturedIndex} async create RESULT vc={(vcAsync == null ? "null" : vcAsync.GetType().Name)} connected={vcAsync?.IsConnected ?? false}");
                                     if (vcAsync != null && vcAsync.IsConnected)
@@ -1747,6 +2088,9 @@ namespace PadForge.Common.Input
                                         }
                                         else
                                         {
+                                            // A MIDI slot whose port failed before starts now, so
+                                            // its status line goes.
+                                            ResolveMidiCreateError(capturedIndex);
                                             // Provider walks, timers, and physical output run after
                                             // publication, outside the lifecycle lock. Teardown can
                                             // dispose this captured dispatcher before it starts.
@@ -1757,7 +2101,8 @@ namespace PadForge.Common.Input
                                             {
                                                 RaiseError($"Failed to apply effects for pad {capturedIndex}", ex);
                                             }
-                                            if (vcAsync is HMaestroVirtualController)
+                                            if (vcAsync is HMaestroVirtualController
+                                                || vcAsync is KeyboardMouseVirtualController { HasHidDevices: true })
                                             {
                                                 try { _hmaestroContext?.FinalizeNames(); }
                                                 catch { /* best effort */ }
@@ -1788,10 +2133,21 @@ namespace PadForge.Common.Input
                                             && SlotControllerTypes[capturedIndex] == capturedType
                                             && IsSlotActive(capturedIndex, new Engine.Data.UserSetting[64]);
                                         if (stillEligible)
-                                            LatchCreateFailed(capturedIndex, capturedType, capturedProfile);
+                                        {
+                                            LatchCreateFailed(capturedIndex, capturedType, capturedProfile, capturedMidiPort, capturedKbm);
+                                        }
                                         else
+                                        {
                                             PadForge.Engine.SdlDiagLog.WriteLine(
                                                 $"VCTRACE slot={capturedIndex} async create ABANDONED (slot no longer eligible, no latch)");
+                                            // Retyped while this create was
+                                            // under way: the line it raised a
+                                            // moment ago is for a port the
+                                            // slot no longer wants, so it goes
+                                            // here and not a pass later.
+                                            if (SlotControllerTypes[capturedIndex] != capturedType)
+                                                ResolveMidiCreateError(capturedIndex);
+                                        }
                                     }
                                     else
                                     {
@@ -1803,7 +2159,7 @@ namespace PadForge.Common.Input
                                         // as eligible-but-unbuilt and kicks off another
                                         // connect, accumulating leaked VCs.
                                         try { vcAsync.Dispose(); } catch { /* best effort */ }
-                                        LatchCreateFailed(capturedIndex, capturedType, capturedProfile);
+                                        LatchCreateFailed(capturedIndex, capturedType, capturedProfile, capturedMidiPort, capturedKbm);
                                     }
                                 }
                                 catch (Exception ex)
@@ -1814,8 +2170,15 @@ namespace PadForge.Common.Input
                                     }
                                     PadForge.Engine.SdlDiagLog.WriteLine(
                                         $"VCTRACE slot={capturedIndex} async create THREW {ex.GetType().Name}: {ex.Message}");
-                                    RaiseError($"Failed to create virtual controller for pad {capturedIndex}", ex);
-                                    LatchCreateFailed(capturedIndex, capturedType, capturedProfile);
+                                    // The slot by the name the UI shows, as
+                                    // the create's own failures name it. This
+                                    // line read "for pad" and the pad index.
+                                    // The log gets its English line.
+                                    string threwLine = string.Format(Strings.Instance.Status_SlotCreateFailed_Format, SlotLabel(capturedIndex));
+                                    string threwLog = CreateFailedLogLine(capturedIndex, capturedType);
+                                    if (capturedType == VirtualControllerType.Midi) RaiseMidiCreateError(capturedIndex, threwLine, threwLog, ex);
+                                    else RaiseError(threwLine, threwLog, ex);
+                                    LatchCreateFailed(capturedIndex, capturedType, capturedProfile, capturedMidiPort, capturedKbm);
                                 }
                                 finally
                                 {
@@ -1891,7 +2254,16 @@ namespace PadForge.Common.Input
                         // HMGamepadState can't carry. Other Xbox / PlayStation /
                         // Extended-non-custom slots use plain SubmitGamepadState.
                         if (vc is MidiVirtualController midiVc)
+                        {
+                            // The slot's MIDI bar, live: a channel, number
+                            // or velocity edit reaches the running
+                            // controller without closing its port.
+                            var midiCfg = _midiConfigs[padIndex];
+                            if (midiCfg != null)
+                                midiVc.ApplyLayout(midiCfg.Channel - 1, midiCfg.StartCc, midiCfg.CcCount,
+                                    midiCfg.StartNote, midiCfg.NoteCount, midiCfg.Velocity);
                             midiVc.SubmitMidiRawState(CombinedMidiRawStates[padIndex]);
+                        }
                         else if (vc is KeyboardMouseVirtualController kbmVc)
                         {
                             // SOCD config (discussion #205): live reference from
@@ -1950,10 +2322,15 @@ namespace PadForge.Common.Input
                                     CombinedTouchpadStates[padIndex],
                                     MotionSnapshots[padIndex],
                                     unchecked((uint)_deckFrameCounter++),
+                                    ValveReportPackers.MicrosNow(),
                                     _deckReportScratch);
                                 hmExt.SubmitRawReport(new ReadOnlySpan<byte>(_deckReportScratch, 0, valvePacker.Size));
                             }
-                            else if (ExtendedReportPacker.NeedsRawReport(layout))
+                            // A persona that builds its own reports takes no
+                            // finished frame, whatever its layout counts say.
+                            // The raw submit throws on it, and would on every
+                            // poll, so its slot always submits state.
+                            else if (!hmExt.BuildsItsOwnReports && ExtendedReportPacker.NeedsRawReport(layout))
                             {
                                 // Past 32 buttons or one hat the fixed gamepad
                                 // state has nowhere to put the rest, so the
@@ -2137,71 +2514,78 @@ namespace PadForge.Common.Input
         /// </summary>
         private void EnsureHMaestroContext()
         {
-            if (_hmaestroContext != null || _hmaestroContextFailed)
+            if (_hmaestroContext != null || HmSetupHeld())
                 return;
+            // The test host installs no driver and sets up no context.
+            if (HMaestroVirtualController.OffLimitsForTest) return;
 
             lock (_hmaestroContextLock)
             {
-                if (_hmaestroContext != null || _hmaestroContextFailed)
+                if (_hmaestroContext != null || HmSetupHeld())
                     return;
 
+                HMContext ctx = null;
                 try
                 {
-                    // Preflight: sweep any leftover HIDMaestro virtual devices
-                    // from prior sessions (crash, forced kill, ungraceful exit).
-                    // Without this, InstallDriver's internal RemoveOldDriverPackages
-                    // step fails with "device using INF" because stale device nodes
-                    // still reference the old driver package.
+                    // Preflight: remove what programs that have ended left
+                    // behind, a crashed or killed PadForge's controllers among
+                    // them. Since HIDMaestro 2.0.0 this sweep never touches a
+                    // running program's controllers, this one's included
+                    // (HMContext.RemoveAllVirtualControllers). InstallDriver
+                    // reclaims the devices of ended programs by itself before
+                    // it deploys, because a device bound to the old INF keeps
+                    // pnputil from replacing the package. The sweep also prunes
+                    // HIDMaestro's registry ledger and the records Windows
+                    // keeps of removed devices (OwnerSweep.RemoveOrphaned).
                     //
-                    // preserveInstall: TRUE, same as the startup sweep. The
-                    // stale DEVICE NODES are what block the install, and the
-                    // preserving overload still evicts every one of them; the
-                    // flag guards only package removal and the
-                    // HKLM\SOFTWARE\HIDMaestro delete. Nuking that tree here
-                    // re-armed the exact bug the startup sweep's own fix had
-                    // just closed: it holds the VR driver's registration gate
-                    // and the SteamVRPath hint, so on any session mixing a
-                    // conventional HM slot with a VR slot, creating the
-                    // conventional one sent the VR slot back to re-extracting
-                    // driver_hidmaestro.dll into a running vrserver.exe. It
-                    // also costs the ~3 s full deploy on the next launch by
-                    // discarding the manifest hash. InstallDriver runs its own
-                    // preserving sweep internally (HMContext.cs), so this
-                    // preflight only needs to be at least as thorough, never
-                    // more destructive.
-                    try { HMContext.RemoveAllVirtualControllers(preserveInstall: true); }
+                    // preserveInstall: TRUE. The flag guards the driver
+                    // packages and HKLM\SOFTWARE\HIDMaestro, and HIDMaestro
+                    // names a program's own launch sweep as the case for
+                    // keeping them. That tree holds the manifest hash behind
+                    // InstallDriver's fast path, so removing it costs the
+                    // ~3 s full deploy for nothing. It also holds the VR
+                    // driver's install hash and the SteamVRPath hint, and an
+                    // earlier preflight that removed it sent a VR slot back to
+                    // extracting driver_hidmaestro.dll into a running
+                    // vrserver.exe whenever a session mixed a conventional
+                    // slot with a VR slot.
+                    try { HMaestroVirtualController.SweepVirtualControllers(); }
                     catch (Exception)
                     {
                     }
 
-                    var ctx = new HMContext();
+                    ctx = new HMContext();
                     int n = ctx.LoadDefaultProfiles();
                     ctx.InstallDriver();
-                    _hmaestroContext = ctx;
+                    bool recovered = _hmaestroSetupFailedTick != 0;
+                    Volatile.Write(ref _hmaestroSetupFailedTick, 0);
+                    if (recovered) RaiseErrorResolved(HmSetupFailedMessage);
 
-                    // Safety net: purge any devices we created if the process
-                    // exits ungracefully without disposing HMController instances.
-                    // Registered exactly once per process since _hmaestroContext
-                    // init is one-shot. preserveInstall: TRUE for the same
-                    // reason as the preflight above, and HM names the exit
-                    // sweep as the other case for it: the purge is about
-                    // DEVICES, and taking the packages and the registry tree
-                    // with them only makes the NEXT launch reinstall from
-                    // scratch and re-lose the VR gate.
-                    if (!_processExitHookRegistered)
-                    {
-                        _processExitHookRegistered = true;
-                        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
-                        {
-                            if (_cleanShutdownPerformed) return;
-                            try { HMContext.RemoveAllVirtualControllers(preserveInstall: true); } catch { }
-                        };
-                    }
+                    // No exit sweep of PadForge's own. Through 1.x the sweep
+                    // removed every controller on the PC, so a ProcessExit
+                    // hook here was the safety net for a process that ended
+                    // without disposing its controllers. Since 2.0.0 the sweep
+                    // leaves a running program's controllers alone, this
+                    // one's included, and HIDMaestro's own ProcessExit handler,
+                    // added with its owner claim at the program's first
+                    // cleanup, InstallDriver or create (MachineClaims.EnsureOwner),
+                    // removes the controllers a program did not dispose. A killed
+                    // PadForge's controllers go with the next sweep of any
+                    // program on the PC, this preflight's among them.
+
+                    // Published last, after everything that can throw. A
+                    // context published before a throw stayed in the field
+                    // disposed, and every later call returned early on it.
+                    // A created controller is published after its Connect.
+                    _hmaestroContext = ctx;
                 }
                 catch (Exception ex)
                 {
-                    _hmaestroContextFailed = true;
-                    RaiseError("Failed to initialize HIDMaestro.", ex);
+                    // Never published, so it holds no controllers, and its
+                    // Dispose returns at once (HMContext.Dispose).
+                    try { ctx?.Dispose(); } catch { }
+                    Volatile.Write(ref _hmaestroSetupFailedTick, Math.Max(1, Environment.TickCount64));
+                    RaiseError(HmSetupFailedMessage, ex);
                 }
             }
         }
@@ -2417,8 +2801,15 @@ namespace PadForge.Common.Input
         /// lock. A controller built for a type the slot no longer has is
         /// retired by Pass 1's type check on the next cycle.</summary>
         private IVirtualController CreateVirtualController(int padIndex, VirtualControllerType controllerType,
-            string capturedProfileId, in ExtendedBuild build)
+            string capturedProfileId, in ExtendedBuild build, in KbmBuild kbm)
         {
+            // Neither mark of an earlier create outlives it. A create that
+            // failed and took no latch, as when its slot lost its device
+            // meanwhile, left its shared-port mark for the latch of the
+            // slot's next failure, whatever that failure was.
+            _createPortMissing[padIndex] = false;
+            _createPortShared[padIndex] = false;
+
             // MIDI and KeyboardMouse stay on their dedicated implementations.
             // Xbox / PlayStation / Nintendo / Extended route through HIDMaestro.
             if (controllerType == VirtualControllerType.Xbox
@@ -2450,7 +2841,7 @@ namespace PadForge.Common.Input
                     VirtualControllerType.Extended => CreateHMaestroController(VirtualControllerType.Extended, profileId, padIndex, in build),
                     VirtualControllerType.Nintendo => CreateHMaestroController(VirtualControllerType.Nintendo, profileId, padIndex, in build),
                     VirtualControllerType.Midi => CreateMidiController(padIndex),
-                    VirtualControllerType.KeyboardMouse => new KeyboardMouseVirtualController(padIndex),
+                    VirtualControllerType.KeyboardMouse => CreateKeyboardMouseController(padIndex, in kbm),
                     VirtualControllerType.Vr => new HMaestroVRController(),
                     _ => null
                 };
@@ -2482,9 +2873,186 @@ namespace PadForge.Common.Input
             catch (Exception ex)
             {
                 vc?.Dispose();
-                RaiseError($"Failed to create {SlotControllerTypes[padIndex]} virtual controller for pad {padIndex}", ex);
+                _createPortMissing[padIndex] = ex is MidiPortNotConnectedException;
+                RaiseCreateError(padIndex, controllerType, ex);
                 return null;
             }
+        }
+
+        /// <summary>Builds a Keyboard + Mouse controller. A half on Windows
+        /// input needs nothing more. A half on a device needs the HIDMaestro
+        /// context, set up here on the create worker as it is for the
+        /// HIDMaestro types, and its profile: the catalog's own context first,
+        /// then PadForge's wrapper catalog for user-imported profiles. A
+        /// device the slot cannot have fails the create, and the slot does not
+        /// fall back to Windows input it was not set to.</summary>
+        private IVirtualController CreateKeyboardMouseController(int padIndex, in KbmBuild kbm)
+        {
+            if (!kbm.UsesDevices) return new KeyboardMouseVirtualController(padIndex);
+            EnsureHMaestroContext();
+            if (_hmaestroContext == null) return null;
+            HMProfile keyboard = null, mouse = null;
+            if (kbm.Keyboard.Length > 0 && (keyboard = ResolveKbmProfile(kbm.Keyboard)) == null) return null;
+            if (kbm.Mouse.Length > 0 && (mouse = ResolveKbmProfile(kbm.Mouse)) == null) return null;
+            return new KeyboardMouseVirtualController(padIndex, _hmaestroContext, keyboard, mouse);
+        }
+
+        private HMProfile ResolveKbmProfile(string profileId)
+        {
+            var profile = _hmaestroContext.GetProfile(profileId)
+                          ?? HMaestroProfileCatalog.GetProfileById(profileId);
+            if (profile == null) RaiseError($"HIDMaestro profile '{profileId}' not found.", null);
+            return profile;
+        }
+
+        /// <summary>Raises a failed create's status line, naming the slot the
+        /// way the UI does, in the UI language. Every failure of a MIDI
+        /// create is remembered for its slot
+        /// (<see cref="RaiseMidiCreateError"/>), whether or not the failure
+        /// latches. The remembered line clears at exactly these points:
+        /// when the slot's controller is published, which is when the slot
+        /// starts, when the slot is disabled or deleted (Pass 1), when the
+        /// slot is no longer a MIDI slot (Pass 1, or the create worker at
+        /// once when it finds the slot retyped as its create returns), and
+        /// when a later failure of the slot raises another line in its
+        /// place. A failure that is not the port's (a session the service
+        /// refused, a create that hung) is one the slot can get past by
+        /// itself, since a later generation retries it, and its line used
+        /// to stay up after the slot ran. That line says Windows MIDI
+        /// Services did not create the port while one of its APIs is the
+        /// one in use, and that MIDI is not running otherwise, as after the
+        /// create's own service restart left no API started. The diagnostics
+        /// log gets its own line, in English
+        /// (<see cref="CreateFailedLogLine"/>).</summary>
+        private void RaiseCreateError(int padIndex, VirtualControllerType controllerType, Exception ex)
+        {
+            string logLine = CreateFailedLogLine(padIndex, controllerType);
+            if (ex is MidiPortException portFault)
+            {
+                int other = portFault.Problem == MidiPortProblem.InUse
+                    ? OtherMidiSlotOnPort(padIndex, portFault.PortKey) : -1;
+                _createPortShared[padIndex] = other >= 0;
+                RaiseMidiCreateError(padIndex, MidiPortMessage(padIndex, portFault, other), logLine, ex);
+            }
+            else if (controllerType == VirtualControllerType.Midi)
+            {
+                string format = MidiVirtualController.ActiveApi is MidiApiKind.InBox or MidiApiKind.AppSdk
+                    ? Strings.Instance.Status_MidiCreateFailed_Format
+                    : Strings.Instance.Status_MidiNotRunning_Format;
+                RaiseMidiCreateError(padIndex, string.Format(format, SlotLabel(padIndex)), logLine, ex);
+            }
+            else
+            {
+                RaiseError(string.Format(Strings.Instance.Status_SlotCreateFailed_Format, SlotLabel(padIndex)), logLine, ex);
+            }
+        }
+
+        /// <summary>The slot's name as the UI shows it: "Virtual Controller"
+        /// and the number its card, its page and the Devices badges carry,
+        /// which counts the slots in group order
+        /// (<see cref="SettingsManager.SlotOrders.GetGlobalSlotNumber"/>),
+        /// not the pad index. A slot in no group's order has no shown number
+        /// and falls back to its pad.</summary>
+        private static string SlotLabel(int padIndex)
+            => string.Format(Strings.Instance.Main_VirtualController_Format, ShownSlotNumber(padIndex));
+
+        private static int ShownSlotNumber(int padIndex)
+        {
+            int shown = SettingsManager.SlotOrders.GetGlobalSlotNumber(padIndex);
+            return shown > 0 ? shown : padIndex + 1;
+        }
+
+        /// <summary>A failed create's line for the diagnostics log: English
+        /// whatever the UI language, since the people who read the log need
+        /// not share the user's, and naming the controller type, the slot by
+        /// the number the UI shows, and its pad, which the VCTRACE lines
+        /// beside it carry. The status text names the slot alone, in the UI
+        /// language, and the log line had become that text.</summary>
+        private static string CreateFailedLogLine(int padIndex, VirtualControllerType controllerType)
+            => $"Failed to create {controllerType} virtual controller for Virtual Controller {ShownSlotNumber(padIndex)} (pad {padIndex})";
+
+        /// <summary>A MIDI create failure's line: the status text, in the UI
+        /// language, and the diagnostics log's, in English. Swapped as one,
+        /// so the line that clears is logged as the line that was
+        /// raised.</summary>
+        private sealed class CreateErrorLine
+        {
+            public CreateErrorLine(string status, string log)
+            {
+                Status = status;
+                Log = log;
+            }
+
+            public readonly string Status, Log;
+        }
+
+        /// <summary>The line a MIDI create failure raised for each slot, kept
+        /// so it clears once the slot starts or is reconfigured.</summary>
+        private readonly CreateErrorLine[] _midiCreateError = new CreateErrorLine[MaxPads];
+
+        /// <summary>What the user can do about a legacy port that did not
+        /// open, naming the slot the way the UI does. The exception's own
+        /// text reached only the diagnostics log, so a new legacy slot read
+        /// "Failed to create Midi virtual controller for pad 0" with no word
+        /// about picking a port.
+        ///
+        /// <para>A port that is already in use names the other MIDI slot
+        /// that is set to it (<paramref name="other"/>, from
+        /// <see cref="OtherMidiSlotOnPort"/>, or -1): on the classic MIDI
+        /// stack a port serves one client, and PadForge's own second slot is
+        /// such a client, so a line that blamed another program sent the user
+        /// looking for one that did not exist. With no such slot the line
+        /// says the port is in use and names no culprit.</para></summary>
+        private static string MidiPortMessage(int padIndex, MidiPortException fault, int other)
+        {
+            if (fault.Problem == MidiPortProblem.InUse && other >= 0)
+                return string.Format(Strings.Instance.Status_MidiPortShared_Format,
+                    SlotLabel(padIndex), fault.PortKey, SlotLabel(other));
+            string format = fault.Problem switch
+            {
+                MidiPortProblem.NotPicked => Strings.Instance.Status_MidiPortNotPicked_Format,
+                MidiPortProblem.NotConnected => Strings.Instance.Status_MidiPortNotConnected_Format,
+                MidiPortProblem.InUse => Strings.Instance.Status_MidiPortInUse_Format,
+                _ => Strings.Instance.Status_MidiPortDidNotOpen_Format,
+            };
+            return string.Format(format, SlotLabel(padIndex), fault.PortKey);
+        }
+
+        /// <summary>Another created, enabled MIDI slot whose bar names
+        /// <paramref name="port"/>, or -1. The bar is asked, not the running
+        /// controllers: two slots that start together open the port from
+        /// two workers, and the one that loses can fail before the other is
+        /// published.</summary>
+        private int OtherMidiSlotOnPort(int padIndex, string port)
+        {
+            if (string.IsNullOrEmpty(port)) return -1;
+            for (int i = 0; i < MaxPads; i++)
+            {
+                if (i == padIndex || SlotControllerTypes[i] != VirtualControllerType.Midi) continue;
+                if (!SettingsManager.SlotCreated[i] || !SettingsManager.SlotEnabled[i]) continue;
+                if (string.Equals(MidiOutputPortOf(i), port, StringComparison.Ordinal)) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>Raises a MIDI create failure and remembers it for the
+        /// slot, clearing the one it replaces: <paramref name="message"/> for
+        /// the status line, <paramref name="logLine"/> for the diagnostics
+        /// log.</summary>
+        private void RaiseMidiCreateError(int padIndex, string message, string logLine, Exception ex)
+        {
+            var prior = Interlocked.Exchange(ref _midiCreateError[padIndex], new CreateErrorLine(message, logLine));
+            if (prior != null && prior.Status != message) RaiseErrorResolved(prior.Status, prior.Log);
+            RaiseError(message, logLine, ex);
+        }
+
+        /// <summary>Clears the slot's MIDI create failure from the status line
+        /// once it no longer holds: the slot started, or was reconfigured,
+        /// disabled or deleted.</summary>
+        private void ResolveMidiCreateError(int padIndex)
+        {
+            var prior = Interlocked.Exchange(ref _midiCreateError[padIndex], null);
+            if (prior != null) RaiseErrorResolved(prior.Status, prior.Log);
         }
 
         private readonly AudioPassthroughService.PersonaFeed[] _personaAudioFeeds = new AudioPassthroughService.PersonaFeed[MaxPads];
@@ -2540,7 +3108,8 @@ namespace PadForge.Common.Input
         /// <summary>
         /// Constructs a HIDMaestro-backed virtual controller using the named
         /// embedded profile. The profile slug must match a profile shipped in
-        /// HIDMaestro.Core's embedded catalog (232 profiles across 32 vendors).
+        /// HIDMaestro.Core's embedded catalog (337 profiles in HIDMaestro 2.0.2),
+        /// or a user profile the catalog loaded beside it.
         ///
         /// For Extended slots, applies per-slot customizations on top of the
         /// catalog profile via <see cref="HMProfileBuilder"/>:
@@ -2776,9 +3345,10 @@ namespace PadForge.Common.Input
         }
 
         /// <summary>
-        /// Creates a MIDI virtual controller for the given pad slot.
-        /// Reads port name and config from the PadViewModel's MidiConfig.
-        /// Returns null if the configured port is not found.
+        /// Creates a MIDI virtual controller for the given pad slot from the
+        /// slot's MidiConfig: channel, CC and note numbers, velocity, and the
+        /// output port the legacy API sends to. Returns null when the slot has
+        /// no config or no MIDI API started.
         /// </summary>
         private IVirtualController CreateMidiController(int padIndex)
         {
@@ -2787,7 +3357,8 @@ namespace PadForge.Common.Input
 
             if (!MidiVirtualController.IsAvailable())
             {
-                RaiseError("Windows MIDI Services is not available. MIDI output requires Windows 11 with MIDI Services enabled.", null);
+                RaiseMidiCreateError(padIndex, string.Format(Strings.Instance.Status_MidiNotRunning_Format, SlotLabel(padIndex)),
+                    CreateFailedLogLine(padIndex, VirtualControllerType.Midi), null);
                 return null;
             }
 
@@ -2798,9 +3369,9 @@ namespace PadForge.Common.Input
                     midiInstanceNum++;
 
             var vc = new MidiVirtualController(padIndex, midiConfig.Channel - 1, midiInstanceNum);
-            vc.CcNumbers = midiConfig.GetCcNumbers();
-            vc.NoteNumbers = midiConfig.GetNoteNumbers();
-            vc.Velocity = midiConfig.Velocity;
+            vc.ApplyLayout(midiConfig.Channel - 1, midiConfig.StartCc, midiConfig.CcCount,
+                midiConfig.StartNote, midiConfig.NoteCount, midiConfig.Velocity);
+            vc.OutputPort = midiConfig.OutputPort ?? string.Empty;
             return vc;
         }
 
@@ -2923,6 +3494,7 @@ namespace PadForge.Common.Input
                     if (SlotControllerTypes[i] == VirtualControllerType.Extended
                         && ExtendedConfigurationChanged(i)) return true;
                 }
+                if (vc is KeyboardMouseVirtualController kbm && KbmDevicesChanged(i, kbm)) return true;
             }
             return false;
         }
@@ -3398,6 +3970,14 @@ namespace PadForge.Common.Input
             // inactivity timeout, which uses the parameterless overload.
             if (midiVc != null) asyncDispose = true;
 
+            // A Keyboard + Mouse controller on a virtual keyboard or mouse goes
+            // async too: removing the device waits on Windows PnP, which no
+            // poll may sit through. Shutdown keeps it synchronous, the way it
+            // keeps the HIDMaestro controllers, so the context's own dispose
+            // that follows never races a teardown of the same device.
+            if (vc is KeyboardMouseVirtualController { HasHidDevices: true } && !_lifecycleClosed)
+                asyncDispose = true;
+
             if (asyncDispose)
             {
                 // Publish the dispose task, then empty the slot. Pass 2 gates
@@ -3448,10 +4028,9 @@ namespace PadForge.Common.Input
         /// so the synchronous HIDMaestro teardown (each Xbox Series BT profile
         /// takes ~11s per the README) runs inside OnClosing's Task.Run and
         /// keeps the shutdown overlay visible the whole time. Without this
-        /// explicit call the actual teardown would happen in the AppDomain
-        /// ProcessExit handler, which fires AFTER the window has closed —
-        /// making it look like the window closed early with cleanup still
-        /// running headless.
+        /// explicit call the teardown would happen in HIDMaestro's own
+        /// ProcessExit handler, which runs AFTER the window has closed, so
+        /// the window would look closed with cleanup still running headless.
         /// </summary>
         private void DisposeHMaestroContextOnShutdown()
         {
@@ -3460,14 +4039,13 @@ namespace PadForge.Common.Input
             {
                 ctx = _hmaestroContext;
                 _hmaestroContext = null;
-                _hmaestroContextFailed = false;
+                Volatile.Write(ref _hmaestroSetupFailedTick, 0);
             }
             if (ctx != null)
             {
                 try { ctx.Dispose(); }
                 catch (Exception ex) { RaiseError("Error disposing HIDMaestro context", ex); }
             }
-            _cleanShutdownPerformed = true;
         }
 
         private void ReleaseSlotEffectsAndClaims(int padIndex)

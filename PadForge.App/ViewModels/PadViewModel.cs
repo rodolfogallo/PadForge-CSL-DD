@@ -73,8 +73,10 @@ namespace PadForge.ViewModels
             // ItemsSource binding picks up the new entries.
             HMaestroProfileCatalog.CatalogReloaded += OnCatalogReloaded;
             // #390 macro cells: a macro rename retags this slot's menu
-            // cells. Static hook, filtered by PadIndex inside; pad VMs
-            // live for the app's lifetime, so no unsubscribe leg exists.
+            // cells. Static hook, filtered by PadIndex inside. Both hooks
+            // hold this VM weakly, so no unsubscribe leg exists: the app's
+            // sixteen live as long as the main view model holds them, and a
+            // VM nothing holds is collected and stops being rebuilt.
             MacroItem.Renamed += OnMacroRenamed;
             // #175 telemetry board: keep the "{n} DIRECT" readout in sync
             // with row edits and rebuilds. Hooked before the first
@@ -883,6 +885,18 @@ namespace PadForge.ViewModels
             set => SetProperty(ref _midiConfig, value ?? new());
         }
 
+        private bool _isLegacyMidi;
+
+        /// <summary>True while the legacy MIDI API runs MIDI slots. The MIDI
+        /// bar then shows its output-port picker, since that API sends to an
+        /// existing port instead of creating one. MainWindow sets it from
+        /// the Settings card's refresh.</summary>
+        public bool IsLegacyMidi
+        {
+            get => _isLegacyMidi;
+            set => SetProperty(ref _isLegacyMidi, value);
+        }
+
         // ═══════════════════════════════════════════════
         //  KBM per-slot configuration (discussion #205)
         // ═══════════════════════════════════════════════
@@ -938,6 +952,14 @@ namespace PadForge.ViewModels
             OnPropertyChanged(nameof(KbmSurfaces));
             OnPropertyChanged(nameof(KbmSocdEditorVisible));
             OnPropertyChanged(nameof(KbmSurfaceScopeVisible));
+            // The device pickers follow the halves the mode leaves on, and
+            // the table hides what a picked device cannot send.
+            OnPropertyChanged(nameof(KbmKeyboardDevice));
+            OnPropertyChanged(nameof(KbmMouseDevice));
+            OnPropertyChanged(nameof(KbmKeyboardDeviceVisible));
+            OnPropertyChanged(nameof(KbmMouseDeviceVisible));
+            OnPropertyChanged(nameof(KbmKeyboardCapabilities));
+            OnPropertyChanged(nameof(KbmMouseCapabilities));
             // A mode that hides the scope box has to retire the scope with it,
             // or the box comes back later still narrowed to a half that is now
             // the only half.
@@ -947,6 +969,84 @@ namespace PadForge.ViewModels
                 OnPropertyChanged(nameof(MappingSurfaceScope));
             }
             ApplyMappingPickerFilter();
+        }
+
+        /// <summary>The keyboard half's device (HIDMaestro 1.12.0), forwarded
+        /// from <see cref="KbmConfig"/> for the device bar, for the reason
+        /// <see cref="KbmSurfaces"/> is forwarded.</summary>
+        public string KbmKeyboardDevice
+        {
+            get => _kbmConfig?.KeyboardDevice ?? KbmSlotConfig.WindowsInput;
+            set
+            {
+                // A null write is a picker artifact, never a user pick
+                // (KbmSlotConfig.KeyboardDevice).
+                if (value == null) return;
+                var cfg = _kbmConfig;
+                if (cfg == null || cfg.KeyboardDevice == value) return;
+                cfg.KeyboardDevice = value;
+                NotifyKbmSurfacesChanged();
+            }
+        }
+
+        /// <summary>The mouse half's device, the twin of
+        /// <see cref="KbmKeyboardDevice"/>.</summary>
+        public string KbmMouseDevice
+        {
+            get => _kbmConfig?.MouseDevice ?? KbmSlotConfig.WindowsInput;
+            set
+            {
+                if (value == null) return;
+                var cfg = _kbmConfig;
+                if (cfg == null || cfg.MouseDevice == value) return;
+                cfg.MouseDevice = value;
+                NotifyKbmSurfacesChanged();
+            }
+        }
+
+        /// <summary>The keyboard picker shows while the slot drives its
+        /// keyboard half.</summary>
+        public bool KbmKeyboardDeviceVisible => _kbmConfig?.KeyboardEnabled ?? true;
+
+        /// <summary>The mouse picker shows while the slot drives its mouse
+        /// half.</summary>
+        public bool KbmMouseDeviceVisible => _kbmConfig?.MouseEnabled ?? true;
+
+        /// <summary>What the picked keyboard can send, as short labels for
+        /// the device bar. Empty on Windows input.</summary>
+        public IReadOnlyList<string> KbmKeyboardCapabilities
+        {
+            get
+            {
+                var caps = KbmDeviceCatalog.CapsOf(_kbmConfig?.KeyboardDevice);
+                if (caps == null || !caps.HasKeyboard) return Array.Empty<string>();
+                var s = Strings.Instance;
+                var list = new List<string>(3)
+                {
+                    caps.NKeyRollover
+                        ? s.Pad_Kbm_Caps_KeysAtOnceAny
+                        : string.Format(s.Pad_Kbm_Caps_KeysAtOnce_Format, caps.KeyArraySlots),
+                };
+                if (caps.HasConsumer) list.Add(s.Pad_Kbm_Caps_MediaKeys);
+                if (caps.HasKeyboardLeds) list.Add(s.Pad_Kbm_Caps_LockLights);
+                return list;
+            }
+        }
+
+        /// <summary>What the picked mouse can send, the twin of
+        /// <see cref="KbmKeyboardCapabilities"/>.</summary>
+        public IReadOnlyList<string> KbmMouseCapabilities
+        {
+            get
+            {
+                var caps = KbmDeviceCatalog.CapsOf(_kbmConfig?.MouseDevice);
+                if (caps == null || !caps.HasMouse) return Array.Empty<string>();
+                var s = Strings.Instance;
+                var list = new List<string>(3) { string.Format(s.Pad_Kbm_Caps_Buttons_Format, caps.MouseButtonCount) };
+                if (caps.HasWheel) list.Add(s.Pad_Kbm_Caps_Wheel);
+                if (caps.HasPan) list.Add(s.Pad_Kbm_Caps_TiltWheel);
+                return list;
+            }
         }
 
         // ═══════════════════════════════════════════════
@@ -1134,6 +1234,14 @@ namespace PadForge.ViewModels
         /// accelerometer sources.</summary>
         public ObservableCollection<InputChoice> SlotMotionAccelInputs { get; } = new();
 
+        /// <summary>The Up and Down pickers' list: the entries of
+        /// <see cref="SlotAvailableInputs"/> an Incremental or Ramp source
+        /// reads as a key (<c>SourceKindRuntime.ReadsAsKey</c>). They are
+        /// the same <see cref="InputChoice"/> instances, so a row's stored
+        /// key selects by reference in either list. A stick, a trigger or
+        /// another axis is in the full list and not in this one.</summary>
+        public ObservableCollection<InputChoice> SlotKeyInputs { get; } = new();
+
         private ICollectionView _slotAvailableInputsView;
         /// <summary>Grouped CollectionView over <see cref="SlotAvailableInputs"/>
         /// keyed on <c>DeviceLabel</c> for the picker's GroupStyle header.</summary>
@@ -1248,6 +1356,11 @@ namespace PadForge.ViewModels
             // no business showing rows the engine will not dispatch.
             if (cfg != null && !cfg.Allows(kind.Value)) return false;
 
+            // Then the half's device: a key, button or wheel the slot's
+            // keyboard or mouse model cannot send is a row that can never
+            // fire, so it hides the same way and keeps its binding.
+            if (cfg != null && !cfg.DeviceCanSend(m.TargetSettingName)) return false;
+
             // Then the transient view scope.
             if (scope == "Keyboard") return kind.Value == KbmSurfaceKind.Keyboard;
             if (scope == "Mouse") return kind.Value == KbmSurfaceKind.Mouse;
@@ -1273,9 +1386,10 @@ namespace PadForge.ViewModels
         internal void ApplyMappingPickerFilter()
         {
             // The dropdown side: what every picker OFFERS. The Motion rows'
-            // two lists (#475) take the same filter as the shared one.
+            // two lists (#475) and the Up and Down pickers' list take the
+            // same filter as the shared one.
             int shown = -1;
-            foreach (var list in new[] { SlotAvailableInputs, SlotMotionGyroInputs, SlotMotionAccelInputs })
+            foreach (var list in new[] { SlotAvailableInputs, SlotMotionGyroInputs, SlotMotionAccelInputs, SlotKeyInputs })
             {
                 var view = ReferenceEquals(list, SlotAvailableInputs)
                     ? SlotAvailableInputsView : CollectionViewSource.GetDefaultView(list);
@@ -1300,7 +1414,7 @@ namespace PadForge.ViewModels
                 // three are inert (#408).
                 var kbmCfg = OutputType == VirtualControllerType.KeyboardMouse ? KbmConfig : null;
                 bool surfaceNarrows = _mappingSurfaceScope != "All"
-                    || (kbmCfg != null && kbmCfg.Surfaces != KbmSlotConfig.DefaultSurfaces);
+                    || (kbmCfg != null && (kbmCfg.Surfaces != KbmSlotConfig.DefaultSurfaces || kbmCfg.UsesDevices));
 
                 if (string.IsNullOrEmpty(_mappingInputSearch) && !surfaceNarrows)
                     rowView.Filter = null;
@@ -1655,6 +1769,14 @@ namespace PadForge.ViewModels
         private bool _leftTouchpadClick, _rightTouchpadClick;
         public bool LeftTouchpadClick { get => _leftTouchpadClick; set => SetProperty(ref _leftTouchpadClick, value); }
         public bool RightTouchpadClick { get => _rightTouchpadClick; set => SetProperty(ref _rightTouchpadClick, value); }
+        // The capacitive sensors HIDMaestro 1.12.0 names on the Deck and the
+        // 2026 pad: the stick tops on both, the grips on the 2026 pad. The
+        // previews draw a stick touch as a faint wash over the stick's cap.
+        private bool _leftStickTouch, _rightStickTouch, _leftGripTouch, _rightGripTouch;
+        public bool LeftStickTouch { get => _leftStickTouch; set => SetProperty(ref _leftStickTouch, value); }
+        public bool RightStickTouch { get => _rightStickTouch; set => SetProperty(ref _rightStickTouch, value); }
+        public bool LeftGripTouch { get => _leftGripTouch; set => SetProperty(ref _leftGripTouch, value); }
+        public bool RightGripTouch { get => _rightGripTouch; set => SetProperty(ref _rightGripTouch, value); }
 
         private bool _dpadUp;
         public bool DPadUp { get => _dpadUp; set => SetProperty(ref _dpadUp, value); }
@@ -3031,6 +3153,12 @@ namespace PadForge.ViewModels
             // Numpad Enter's own index (RawInputListener.NumpadEnterKey). It
             // goes out as VK_RETURN with the extended flag (OutputKey).
             AddKey(string.Format(Strings.Instance.Key_Numpad, Strings.Instance.Key_Enter), 0x88);
+
+            // ── F13-F24, the non-US and Japanese keys, media keys ──
+            // Last, so the rows above keep their places. The engine's key
+            // list and the SOCD list read the same table.
+            foreach (byte vk in KbmExtraKeys.Vks)
+                AddKey(KbmExtraKeys.Label(vk), vk);
         }
 
         /// <summary>Which half of a Keyboard + Mouse slot a mapping row
@@ -3100,7 +3228,9 @@ namespace PadForge.ViewModels
                     "LeftThumbButton", "RightThumbButton",
                     "LeftTouchpadClick", "RightTouchpadClick",
                     "Paddle1", "Paddle2", "Paddle3", "Paddle4",
-                    "LeftGrip", "RightGrip" })
+                    "LeftGrip", "RightGrip",
+                    "LeftStickTouch", "RightStickTouch",
+                    "LeftGripTouch", "RightGripTouch" })
                     AddValve(role);
 
                 foreach (var (label, role, pov) in new[] {
@@ -4298,9 +4428,60 @@ namespace PadForge.ViewModels
         public bool TriggerRumbleFold { get => _triggerRumbleFold; set => SetProperty(ref _triggerRumbleFold, value); }
 
         private int _wheelRotationRange = 900;
-        /// <summary>Native-FFB wheel hardware rotation range (40–1080°). Persisted
-        /// in PadSetting.RotationRange; applied via the vendor HID writer in Step 2.</summary>
-        public int WheelRotationRange { get => _wheelRotationRange; set => SetProperty(ref _wheelRotationRange, Math.Clamp(value, 40, 2520)); }
+        /// <summary>Native-FFB wheel hardware rotation range in degrees, within
+        /// the loaded wheel's range (<see cref="WheelRangeMinimum"/>,
+        /// <see cref="WheelRangeMaximum"/>). Persisted in PadSetting.RotationRange;
+        /// applied via the vendor HID writer in Step 2.</summary>
+        public int WheelRotationRange
+        {
+            get => _wheelRotationRange;
+            set => SetProperty(ref _wheelRotationRange, Math.Clamp(value, _wheelRangeMinimum, _wheelRangeMaximum));
+        }
+
+        private bool _wheelRotationRangeEnabled = true;
+        /// <summary>Whether PadForge sends <see cref="WheelRotationRange"/> to the
+        /// wheel. Off leaves the range to the wheel and its own software, and
+        /// PadForge sends none (discussion #512). Persisted in
+        /// PadSetting.RotationRangeEnabled.</summary>
+        public bool WheelRotationRangeEnabled { get => _wheelRotationRangeEnabled; set => SetProperty(ref _wheelRotationRangeEnabled, value); }
+
+        private int _wheelRangeMinimum = Common.Input.WheelRangeLimits.AnyMin;
+        private int _wheelRangeMaximum = Common.Input.WheelRangeLimits.AnyMax;
+
+        /// <summary>The least range the loaded wheel takes, which bounds the
+        /// slider and <see cref="WheelRotationRange"/> (discussion #512: a
+        /// TS-PC set to 40° was sent 140° behind a slider that offered 40°).</summary>
+        public int WheelRangeMinimum { get => _wheelRangeMinimum; private set => SetProperty(ref _wheelRangeMinimum, value); }
+
+        /// <summary>The greatest range the loaded wheel takes.</summary>
+        public int WheelRangeMaximum { get => _wheelRangeMaximum; private set => SetProperty(ref _wheelRangeMaximum, value); }
+
+        /// <summary>Loads a device's stored range with the bounds of that
+        /// device's wheel (<see cref="Common.Input.WheelRangeLimits"/>), or
+        /// the widest any writer takes when no native writer drives it. A
+        /// stored range outside the bounds loads as the bound, the range the
+        /// wheel gets. The bounds change only here, with the values of the
+        /// device they belong to: a device switch saves the outgoing device's
+        /// values before the incoming device loads, and bounds changed
+        /// between the two would clamp the outgoing device's range by the
+        /// incoming wheel and save it that way.</summary>
+        public void LoadWheelRotationRange(int degrees, (int Min, int Max)? limits)
+        {
+            var (min, max) = limits ?? (Common.Input.WheelRangeLimits.AnyMin, Common.Input.WheelRangeLimits.AnyMax);
+            if (min > max) (min, max) = (max, min);
+            // Ordered so the slider's Minimum never passes its Maximum.
+            if (min > _wheelRangeMaximum)
+            {
+                WheelRangeMaximum = max;
+                WheelRangeMinimum = min;
+            }
+            else
+            {
+                WheelRangeMinimum = min;
+                WheelRangeMaximum = max;
+            }
+            WheelRotationRange = degrees;
+        }
 
         private int _wheelAutoCenter;
         /// <summary>Native-FFB wheel auto-center strength (0–100%; 0 = off).
@@ -4329,6 +4510,7 @@ namespace PadForge.ViewModels
             _resetWheelAllCommand ??= new RelayCommand(() =>
             {
                 WheelRotationRange = 900;
+                WheelRotationRangeEnabled = true;
                 WheelAutoCenter = 0;
                 WheelRpmLeds = false;
             });
@@ -5909,10 +6091,6 @@ namespace PadForge.ViewModels
         //  Audio tab (issue #83) — per-slot sound output for macro sounds
         // ═══════════════════════════════════════════════
 
-        /// <summary>True when the SELECTED assigned device has a built-in
-        /// speaker (DualSense / Edge / DualShock 4). The Audio tab is per
-        /// assigned device by convention — this gates the mirror toggle and
-        /// the routing notes.</summary>
         /// <summary>True when the SELECTED assigned device has a 3.5 mm
         /// headset jack PadForge can drive the hardware volume of:
         /// DualSense (0x0CE6) and DualSense Edge (0x0DF2). DS4 declares
@@ -5950,6 +6128,10 @@ namespace PadForge.ViewModels
             }
         }
 
+        /// <summary>True when the SELECTED assigned device has a built-in
+        /// speaker (DualSense / Edge / DualShock 4). The Audio tab is per
+        /// assigned device by convention — this gates the mirror toggle and
+        /// the routing notes.</summary>
         public bool SelectedDeviceHasSpeaker
         {
             get
@@ -6340,12 +6522,13 @@ namespace PadForge.ViewModels
             });
 
         /// <summary>A render endpoint the mirror can capture; Id "" = the
-        /// system default device.</summary>
-        /// <summary>One entry in an audio endpoint picker. Observable because
+        /// system default device.
+        ///
+        /// <para>One entry in an audio endpoint picker. Observable because
         /// the refresh below RETAINS the instance on purpose (rebuilding the
         /// list drops the ComboBox's selected item and WPF clears the
         /// selection), so a caption change has to reach the binding through
-        /// the object rather than through the collection.</summary>
+        /// the object rather than through the collection.</para></summary>
         public sealed class MirrorSourceOption : ObservableObject
         {
             public string Id { get; set; }
@@ -6650,8 +6833,8 @@ namespace PadForge.ViewModels
         /// cell on this slot that referenced the old name, the
         /// RetagMacrosEverywhere discipline applied to this reference.
         /// Subscribed once per pad VM to the static
-        /// <see cref="MacroItem.Renamed"/> hook (pad VMs live for the
-        /// app's lifetime). Runs on the UI thread like every other
+        /// <see cref="MacroItem.Renamed"/> hook, which holds it weakly.
+        /// Runs on the UI thread like every other
         /// editor mutation. The match is case-insensitive, the menu
         /// runtime's own comparer: a cell the runtime resolved to this
         /// macro under the old name must follow it to the new one.</summary>
@@ -8678,7 +8861,6 @@ namespace PadForge.ViewModels
         }
 
         /// <summary>
-        /// <summary>
         /// Updates the CurveEditor live input values for a stick config item.
         /// normX/normY are 0-1 normalized where 0.5 = center.
         /// CurveEditor handles the dot rendering internally.
@@ -8740,6 +8922,13 @@ namespace PadForge.ViewModels
         /// Updated at 30Hz alongside UpdateFromEngineState.
         /// </summary>
         public KbmRawState KbmOutputSnapshot { get; set; }
+
+        /// <summary>The lock lights Windows last set on the slot's virtual
+        /// keyboard (HIDMaestro 1.12.0 HMKeyboardLeds: bit 0 Num Lock, 1 Caps
+        /// Lock, 2 Scroll Lock), or -1 while it has none. A plain field the
+        /// poll fills beside <see cref="KbmOutputSnapshot"/>, which the
+        /// preview reads per frame.</summary>
+        public int KbmKeyboardLeds { get; set; } = -1;
 
         /// <summary>
         /// Latest VrRawState snapshot for the VR preview (#49). Same plain
@@ -8897,6 +9086,10 @@ namespace PadForge.ViewModels
                     case "DPadDown": DPadDown = down; dpadOnButtons = true; break;
                     case "DPadLeft": DPadLeft = down; dpadOnButtons = true; break;
                     case "DPadRight": DPadRight = down; dpadOnButtons = true; break;
+                    case "LeftStickTouch": LeftStickTouch = down; break;
+                    case "RightStickTouch": RightStickTouch = down; break;
+                    case "LeftGripTouch": LeftGripTouch = down; break;
+                    case "RightGripTouch": RightGripTouch = down; break;
                 }
             }
 

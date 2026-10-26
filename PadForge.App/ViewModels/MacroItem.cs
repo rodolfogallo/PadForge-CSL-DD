@@ -92,17 +92,25 @@ namespace PadForge.ViewModels
                 if (SetProperty(ref _name, value) && armed && !string.IsNullOrEmpty(old)
                     && !string.Equals(old, value, StringComparison.Ordinal))
                 {
-                    try { Renamed?.Invoke(this, old, value); } catch { }
+                    try { foreach (var renamed in s_renamed.Live()) renamed(this, old, value); } catch { }
                 }
             }
         }
+
+        private static readonly WeakHandlers<Action<MacroItem, string, string>> s_renamed = new();
 
         /// <summary>Raised after a macro's name changes, with the old and
         /// new names. Static because the subscriber (the menu-cell retag
         /// in the view layer) outlives any one macro and needs no
         /// per-instance wiring. The macro's <see cref="PadIndex"/> scopes
-        /// the sweep.</summary>
-        public static event Action<MacroItem, string, string> Renamed;
+        /// the sweep. A subscriber is held weakly (WeakHandlers): every pad
+        /// view model subscribes, and a strong hook kept each one alive for
+        /// the rest of the process.</summary>
+        public static event Action<MacroItem, string, string> Renamed
+        {
+            add => s_renamed.Add(value);
+            remove => s_renamed.Remove(value);
+        }
 
         /// <summary>Pad index (0-based) of the slot that owns this macro.
         /// Set when the macro is added to a slot's collection or loaded
@@ -1065,7 +1073,8 @@ namespace PadForge.ViewModels
         /// no entry shape for (finger position axes, sliders, continuous
         /// gesture axes). Buttons, POV directions, gamepad-layout axes 0-5,
         /// the touchpad click (raw button 16), bool-valued touchpad
-        /// gestures, gyro axes, and "Finger M Down" all convert.
+        /// gestures, gyro axes, "Finger M Down", MIDI notes, CCs and
+        /// encoder detents, and IR Offscreen all convert.
         /// An empty <see cref="InputChoice.DeviceGuid"/> converts too
         /// (#9 B-9): it is the picker's "(Any device)" group and stores
         /// <see cref="Guid.Empty"/>, the persisted "the device on the
@@ -1320,6 +1329,18 @@ namespace PadForge.ViewModels
             // imported Workshop menu cells whose bindings are macro-shaped
             // (cursor warps, latches).
             if (PadForge.Engine.Common.Mapping.SourceCoercion.IsMenuItemDescriptor(d))
+            {
+                entry = new TriggerInputEntry { DeviceGuid = g, SourceDescriptor = d };
+                return true;
+            }
+
+            // MIDI notes, CCs and encoder detents, and IR Offscreen (#203):
+            // on/off inputs the engine's button read answers, so each rides a
+            // descriptor entry like the NFC family. A CC fires at the
+            // entry's threshold, from 64 by default, MIDI's own on point for
+            // its on/off controllers. Pitch bend is a wheel and stays out.
+            if (PadForge.Engine.Common.Mapping.SourceCoercion.IsMidiKeyDescriptor(d)
+                || PadForge.Engine.Common.Mapping.SourceCoercion.IsIrOffscreenDescriptor(d))
             {
                 entry = new TriggerInputEntry { DeviceGuid = g, SourceDescriptor = d };
                 return true;
@@ -2645,6 +2666,14 @@ namespace PadForge.ViewModels
         /// only.</summary>
         [System.Xml.Serialization.XmlIgnore]
         public long MenuTriggerTick { get; set; } = -1;
+
+        /// <summary>The layer a cell's commit was made in, when leaving that
+        /// layer made it (DC20), stamped beside <see cref="MenuTriggerTick"/>.
+        /// The macro's Layer scope reads that commit against this layer, not
+        /// the one engaged after the exit. Null for every other fire. Poll
+        /// thread only.</summary>
+        [System.Xml.Serialization.XmlIgnore]
+        public string MenuTriggerExitLayer { get; set; }
 
         /// <summary>Raw trigger state on the previous frame for the Toggle
         /// mode's edge detector (#238). Separate from
@@ -6597,15 +6626,18 @@ namespace PadForge.ViewModels
         /// the Steam Input action-set-layer graph shape.</summary>
         SwitchLayer = 55,
 
-        /// <summary>Paints every Razer Chroma device the action's color
+        /// <summary>Paints the action's color
         /// (<see cref="MacroAction.LightbarR"/>, G, B) while the action is
         /// current (issue #468, asked in discussion #463), the
-        /// <see cref="AxisHold"/> duration shape: asserted every frame, so
-        /// the color leaves when the action ends. Several macros asserting in
-        /// one frame resolve to the last one evaluated, which is how a
-        /// full-press macro listed below a soft-press one wins at the bottom
-        /// of the press. The Chroma service hands the lighting back to Synapse
-        /// once nothing asserts and the lightbar mirror is off. At the tail;
+        /// <see cref="AxisHold"/> duration shape: asserted every frame through
+        /// PeripheralOutputs.AssertChromaMacro for the macro's slot, so the
+        /// color leaves within MacroAssertWindowMs of the action ending. The
+        /// Chroma worker paints the categories of the Razer devices assigned
+        /// to that slot (every category when the Razer Chroma row is), ahead
+        /// of every Lighting-tab claim, whether or not those tabs control the
+        /// devices. Several macros asserting in one frame resolve to the last
+        /// one evaluated, which is how a full-press macro listed below a
+        /// soft-press one wins at the bottom of the press. At the tail;
         /// ordinal pinned.</summary>
         SetChromaColor = 56,
 
@@ -7453,12 +7485,14 @@ namespace PadForge.ViewModels
         /// slot's HIDMaestro profile is a Switch Pro family pad whose
         /// descriptor button order is the Nintendo standard (B A Y X, L R,
         /// ZL ZR, Minus Plus, stick clicks, Home, Capture). Grounded in the
-        /// switch-pro profile's layout roles. Covers "switch-pro" and the
-        /// "switch2-pro" id family ("switch2-pro-controller" in the current
-        /// catalog).</summary>
+        /// switch-pro profile's layout roles. Covers "switch-pro", its USB
+        /// descriptor "switch-pro-usb" (HIDMaestro 2.0.0, the same button
+        /// order), and the "switch2-pro" id family ("switch2-pro-controller"
+        /// in the current catalog).</summary>
         public static bool IsNintendoLetteredProfile(string profileId) =>
             !string.IsNullOrEmpty(profileId)
             && (string.Equals(profileId, "switch-pro", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(profileId, "switch-pro-usb", StringComparison.OrdinalIgnoreCase)
                 || profileId.StartsWith("switch2-pro", StringComparison.OrdinalIgnoreCase));
 
         /// <summary>Valve lettering gate: the Steam Deck, the 2015 Steam
@@ -7573,6 +7607,12 @@ namespace PadForge.ViewModels
                 "RightGrip" => Strings.Instance.Btn_RightGrip,
                 "LeftTouchpadClick" => Strings.Instance.Btn_LeftPadClick,
                 "RightTouchpadClick" => Strings.Instance.Btn_RightPadClick,
+                // The capacitive sensors take the names their input rows
+                // carry, so a real pad's touch maps across under one word.
+                "LeftStickTouch" => Strings.Instance.Mapping_CapSenseLeftStickTouch,
+                "RightStickTouch" => Strings.Instance.Mapping_CapSenseRightStickTouch,
+                "LeftGripTouch" => Strings.Instance.Mapping_CapSenseLeftGripTouch,
+                "RightGripTouch" => Strings.Instance.Mapping_CapSenseRightGripTouch,
                 "DPadUp" => Strings.Instance.Btn_DPadUp,
                 "DPadDown" => Strings.Instance.Btn_DPadDown,
                 "DPadLeft" => Strings.Instance.Btn_DPadLeft,
@@ -7699,10 +7739,6 @@ namespace PadForge.ViewModels
         public override string ToString() => DisplayName;
     }
 
-    /// <summary>Checkbox-bindable option representing one
-    /// <see cref="LightbarMode"/> value in the LightbarModeCycle editor's
-    /// grid. Reads / writes the parent action's
-    /// <c>LightbarCycleModesCsv</c>.</summary>
     /// <summary>One checkbox in the PointerModeCycle editor (issue #203),
     /// mirroring <see cref="LightbarModeCycleOption"/>: IsChecked reads and
     /// rewrites the parent action's CSV, and Label resolves live so a
@@ -7743,6 +7779,10 @@ namespace PadForge.ViewModels
         }
     }
 
+    /// <summary>Checkbox-bindable option representing one
+    /// <see cref="LightbarMode"/> value in the LightbarModeCycle editor's
+    /// grid. Reads / writes the parent action's
+    /// <c>LightbarCycleModesCsv</c>.</summary>
     public class LightbarModeCycleOption : ObservableObject
     {
         internal void RefreshCheckedState() => OnPropertyChanged(nameof(IsChecked));

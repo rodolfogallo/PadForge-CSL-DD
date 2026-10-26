@@ -6,7 +6,8 @@
              xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              mc:Ignorable="po"
-             xmlns:reset="clr-namespace:PadForge.Controls">
+             xmlns:reset="clr-namespace:PadForge.Controls"
+             xmlns:common="clr-namespace:PadForge.Common">
 
     <UserControl.Resources>
         <!-- Hover glow (#175): hover color changes carry a hue-matched
@@ -56,20 +57,20 @@
         </Style>
     </UserControl.Resources>
 
-    <ScrollViewer Padding="24,0">
+    <ScrollViewer AutomationProperties.Name="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Padding="24,0">
         <StackPanel Margin="0,16,0,16">
 
             <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
-                <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                <reset:GlyphText Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                            VerticalAlignment="Center" Margin="0,0,10,0"/>
-                <TextBlock Text="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
+                <TextBlock AutomationProperties.HeadingLevel="Level1" Text="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26"/>
             </StackPanel>
 
             <!-- ═══ Language ═══ -->
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xF2B7;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xF2B7;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Language, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -77,9 +78,32 @@
                                Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
                     <DockPanel LastChildFill="True" HorizontalAlignment="Left">
                         <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="SelectedLanguage" SettingLabel="{Binding Settings_Language, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_SelectedLanguage_80"/>
+                        <!-- The rows are LanguageCatalog's (#505): each language under its own
+                             name, its English name beside it, and typing jumps by own name. -->
                         <ComboBox ItemsSource="{Binding AvailableLanguages}"
-                                  SelectedItem="{Binding SelectedLanguage}"
-                                  DisplayMemberPath="NativeName" Width="250"/>
+                                  SelectedValuePath="Culture"
+                                  SelectedValue="{Binding SelectedLanguage}"
+                                  TextSearch.TextPath="NativeName" Width="340">
+                            <!-- Each language is listed by its own name, so each row declares
+                                 its own language: 中文 takes the Chinese font and 日本語 the
+                                 Japanese one whatever the interface is in (#504). WPF refuses
+                                 a binding on Language that names no ConverterCulture, since
+                                 the culture would come from the property being set. -->
+                            <ComboBox.ItemContainerStyle>
+                                <Style TargetType="ComboBoxItem" BasedOn="{StaticResource {x:Type ComboBoxItem}}">
+                                    <Setter Property="Language" Value="{Binding Culture, Converter={StaticResource CultureLanguageConverter}, ConverterCulture=en-US}"/>
+                                </Style>
+                            </ComboBox.ItemContainerStyle>
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="{Binding NativeName}"/>
+                                        <TextBlock Text="{Binding EnglishNameIfDifferent}" Margin="10,0,0,0"
+                                                   Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
                     </DockPanel>
                 </StackPanel>
             </Border>
@@ -88,7 +112,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE790;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE790;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Appearance, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -112,7 +136,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE737;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE737;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Window, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -164,7 +188,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE896;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE896;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Updates, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -196,7 +220,7 @@
                     </StackPanel>
                     <!-- Empty until a check has run, the G-key status's shape.
                          Ember while an update is waiting. -->
-                    <TextBlock Text="{Binding UpdateStatusText}"
+                    <TextBlock common:LiveText.Polite="True" Text="{Binding UpdateStatusText}"
                                Visibility="{Binding UpdateStatusText, Converter={StaticResource StringToVisibility}}"
                                TextWrapping="Wrap" Margin="0,4,0,8">
                         <TextBlock.Style>
@@ -233,7 +257,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE9F5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE9F5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_InputEngine, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -272,7 +296,7 @@
                     <!-- Which of the seven cases the machine is in, so a
                          quiet G-key is never a mystery. Empty while the
                          feature is off, the polling-override note's shape. -->
-                    <TextBlock Text="{Binding GKeysStatus}"
+                    <TextBlock common:LiveText.Polite="True" Text="{Binding GKeysStatus}"
                                Visibility="{Binding GKeysStatus, Converter={StaticResource StringToVisibility}}"
                                TextWrapping="Wrap" Margin="0,0,0,8"
                                Foreground="{DynamicResource EmberBrush}"/>
@@ -287,7 +311,7 @@
                     </StackPanel>
                     <!-- Which keyboards are being read, and which wait for
                          Razer Synapse. Empty while the feature is off. -->
-                    <TextBlock Text="{Binding AnalogKeyboardsStatus}"
+                    <TextBlock common:LiveText.Polite="True" Text="{Binding AnalogKeyboardsStatus}"
                                Visibility="{Binding AnalogKeyboardsStatus, Converter={StaticResource StringToVisibility}}"
                                TextWrapping="Wrap" Margin="0,0,0,8"
                                Foreground="{DynamicResource EmberBrush}"/>
@@ -302,7 +326,7 @@
                     </StackPanel>
                     <!-- Each port and the controller in it. Empty while the
                          feature is off. -->
-                    <TextBlock Text="{Binding BlissBoxStatus}"
+                    <TextBlock common:LiveText.Polite="True" Text="{Binding BlissBoxStatus}"
                                Visibility="{Binding BlissBoxStatus, Converter={StaticResource StringToVisibility}}"
                                TextWrapping="Wrap" Margin="0,0,0,8"
                                Foreground="{DynamicResource EmberBrush}"/>
@@ -325,7 +349,7 @@
                                    Margin="0,0,8,8"/>
                         <DockPanel LastChildFill="True" Grid.Column="1" Margin="0,0,0,8">
                             <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="PollingRateMs" SettingLabel="{Binding Settings_PollingInterval, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_PollingRateMs_179"/>
-                            <ui:NumberBox Value="{Binding PollingRateMs, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding PollingRateMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="1" Maximum="16"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Settings_PollingIntervalTooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -346,7 +370,7 @@
                                    Margin="0,0,8,0"/>
                         <DockPanel LastChildFill="True" Grid.Row="2" Grid.Column="1">
                             <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="HmInactivityDestroyTimeoutSeconds" SettingLabel="{Binding Settings_HmInactivityTimeout, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_SettingsViewModel_HmInactivityDestroyTimeoutSeconds_197"/>
-                            <ui:NumberBox Value="{Binding HmInactivityDestroyTimeoutSeconds, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HmInactivityDestroyTimeoutSeconds, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="3600"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Settings_HmInactivityTimeoutTooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -365,7 +389,7 @@
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
                         <!-- Matches the banner this card governs (E8DE). -->
-                        <TextBlock Text="&#xE8DE;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE8DE;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_AssignOffer, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -395,7 +419,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE7F8;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE7F8;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Handheld, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -415,7 +439,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE83F;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE83F;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_BatteryNotify, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -431,7 +455,7 @@
                         <TextBlock Text="{Binding Settings_BatteryNotifyThreshold, Source={x:Static strings:Strings.Instance}}"
                                    VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0"/>
-                        <ui:NumberBox Value="{Binding BatteryNotifyThreshold, Mode=TwoWay}"
+                        <ui:NumberBox Value="{Binding BatteryNotifyThreshold, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                       Minimum="5" Maximum="50"
                                       SpinButtonPlacementMode="Inline" Width="160" IsEnabled="{Binding DataContext.BatteryNotifyEnabled, RelativeSource={RelativeSource AncestorType={x:Type UserControl}}}"/>
                         <TextBlock Text="%" VerticalAlignment="Center" Margin="6,0,0,0"
@@ -455,7 +479,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xED1A;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xED1A;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_HidHide, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -469,7 +493,7 @@
 
                         <StackPanel>
                             <StackPanel Orientation="Horizontal">
-                                <Path Margin="0,0,8,0">
+                                <Path FlowDirection="LeftToRight" Margin="0,0,8,0">
                                     <Path.Style>
                                         <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
                                             <Style.Triggers>
@@ -486,7 +510,7 @@
                                         </Style>
                                     </Path.Style>
                                 </Path>
-                                <TextBlock Text="{Binding HidHideStatusText}" FontWeight="SemiBold"/>
+                                <TextBlock common:LiveText.Polite="True" Text="{Binding HidHideStatusText}" FontWeight="SemiBold"/>
                             </StackPanel>
                             <TextBlock Text="{Binding HidHideVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
                         </StackPanel>
@@ -507,7 +531,14 @@
                             <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
                                     Command="{Binding UninstallHidHideCommand}"
                                     Style="{StaticResource EmberDestructiveButton}"
-                                    Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                    Visibility="{Binding IsHidHideInstalled, Converter={StaticResource BoolToVisibilityConverter}}">
+                                <AutomationProperties.Name>
+                                    <MultiBinding StringFormat="{}{0}: {1}">
+                                        <Binding Path="Settings_HidHide" Source="{x:Static strings:Strings.Instance}"/>
+                                        <Binding Path="Common_Uninstall" Source="{x:Static strings:Strings.Instance}"/>
+                                    </MultiBinding>
+                                </AutomationProperties.Name>
+                            </Button>
                         </StackPanel>
                     </Grid>
 
@@ -564,27 +595,131 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE7FC;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE7FC;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_HIDMaestro, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
                     <TextBlock Text="{Binding Settings_HIDMaestroDesc, Source={x:Static strings:Strings.Instance}}"
                                Style="{StaticResource CardDescription}" Margin="0,0,0,12"
                                TextWrapping="Wrap"/>
-                    <StackPanel>
-                        <StackPanel Orientation="Horizontal">
-                            <Path Style="{StaticResource LivenessFlameBase}" Margin="0,0,8,0"
-                                  Fill="{DynamicResource EmberBrush}" Stroke="{x:Null}">
-                                <!-- Always lit, so the glow is static (#175 glow sweep). -->
-                                <Path.Effect>
-                                    <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
-                                </Path.Effect>
-                            </Path>
-                            <TextBlock Text="{Binding Common_Installed, Source={x:Static strings:Strings.Instance}}"
-                                       FontWeight="SemiBold"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Lit while the driver is in the driver store, as the
+                             HidHide card's flame is lit while HidHide is. The
+                             version line is the SDK PadForge carries, which
+                             installs the driver with the first virtual
+                             controller. -->
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Path FlowDirection="LeftToRight" Margin="0,0,8,0">
+                                    <Path.Style>
+                                        <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsHIDMaestroInstalled}" Value="True">
+                                                    <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                    <Setter Property="Stroke" Value="{x:Null}"/>
+                                                    <Setter Property="Effect">
+                                                        <Setter.Value>
+                                                            <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Path.Style>
+                                </Path>
+                                <TextBlock common:LiveText.Polite="True" Text="{Binding HIDMaestroStatusText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding HIDMaestroVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
                         </StackPanel>
-                        <TextBlock Text="{Binding HIDMaestroVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+
+                        <!-- Uninstall removes HIDMaestro from the PC (#518), so it
+                             wears the shared destructive chrome. It opens a
+                             preview to confirm in, and stays available with
+                             the driver gone, since HIDMaestro can leave other
+                             things behind. -->
+                        <Button Grid.Column="1" VerticalAlignment="Center"
+                                Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding UninstallHIDMaestroCommand}"
+                                Style="{StaticResource EmberDestructiveButton}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{}{0}: {1}">
+                                    <Binding Path="Settings_HIDMaestro" Source="{x:Static strings:Strings.Instance}"/>
+                                    <Binding Path="Common_Uninstall" Source="{x:Static strings:Strings.Instance}"/>
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </Button>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ═══ BthPS3 Bluetooth Driver ═══ -->
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <reset:GlyphText Text="&#xE702;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="{Binding Settings_BthPS3, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
+                    <TextBlock Text="{Binding Settings_BthPS3Desc, Source={x:Static strings:Strings.Instance}}"
+                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"
+                               TextWrapping="Wrap"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Lit while either BthPS3 driver is installed as a
+                             service, as the HIDMaestro card's flame is lit
+                             while its driver is in the store. The version
+                             line is the BthPS3 PadForge carries, which a
+                             pairing installs. -->
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Path FlowDirection="LeftToRight" Margin="0,0,8,0">
+                                    <Path.Style>
+                                        <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsBthPS3Installed}" Value="True">
+                                                    <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                    <Setter Property="Stroke" Value="{x:Null}"/>
+                                                    <Setter Property="Effect">
+                                                        <Setter.Value>
+                                                            <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                        </Setter.Value>
+                                                    </Setter>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Path.Style>
+                                </Path>
+                                <TextBlock Text="{Binding BthPS3StatusText}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding BthPS3Version}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
+                        </StackPanel>
+
+                        <!-- Uninstall removes BthPS3 from the PC, so it wears
+                             the shared destructive chrome. It opens a preview
+                             to confirm in, and stays available with the
+                             drivers gone, since PadForge's WinUSB package and
+                             certificate can remain. -->
+                        <Button Grid.Column="1" VerticalAlignment="Center"
+                                Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
+                                Command="{Binding UninstallBthPS3Command}"
+                                Style="{StaticResource EmberDestructiveButton}">
+                            <AutomationProperties.Name>
+                                <MultiBinding StringFormat="{}{0}: {1}">
+                                    <Binding Path="Settings_BthPS3" Source="{x:Static strings:Strings.Instance}"/>
+                                    <Binding Path="Common_Uninstall" Source="{x:Static strings:Strings.Instance}"/>
+                                </MultiBinding>
+                            </AutomationProperties.Name>
+                        </Button>
+                    </Grid>
                 </StackPanel>
             </Border>
 
@@ -592,7 +727,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_MidiServices, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -606,11 +741,11 @@
 
                         <StackPanel>
                             <StackPanel Orientation="Horizontal">
-                                <Path Margin="0,0,8,0">
+                                <Path FlowDirection="LeftToRight" Margin="0,0,8,0">
                                     <Path.Style>
                                         <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
                                             <Style.Triggers>
-                                                <DataTrigger Binding="{Binding IsMidiServicesInstalled}" Value="True">
+                                                <DataTrigger Binding="{Binding IsMidiAvailable}" Value="True">
                                                     <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
                                                     <Setter Property="Stroke" Value="{x:Null}"/>
                                                     <Setter Property="Effect">
@@ -623,35 +758,58 @@
                                         </Style>
                                     </Path.Style>
                                 </Path>
-                                <TextBlock Text="{Binding MidiServicesStatusText}" FontWeight="SemiBold"/>
+                                <TextBlock common:LiveText.Polite="True" Text="{Binding MidiServicesStatusText}" FontWeight="SemiBold"/>
                             </StackPanel>
-                            <TextBlock Text="{Binding MidiServicesVersion}" FontSize="12" FontFamily="{StaticResource TelemetryFontFamily}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
-                        </StackPanel>
-
-                        <!-- Verb classes (#175 dialog language): same split as
-                             the HidHide card. Install accent, Uninstall
-                             destructive (removes the service, no confirm). -->
-                        <StackPanel Grid.Column="1" Orientation="Horizontal"
-                                    VerticalAlignment="Center">
-                            <Button Content="{Binding Common_Install, Source={x:Static strings:Strings.Instance}}"
-                                    Command="{Binding InstallMidiServicesCommand}"
-                                    Visibility="{Binding IsMidiServicesInstalled, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}"
-                                    ToolTipService.ShowOnDisabled="True"
-                                    Margin="0,0,8,0">
-                                <Button.Style>
-                                    <Style TargetType="Button" BasedOn="{StaticResource EmberAccentButton}">
+                            <!-- The older runtime's version reads in the telemetry
+                                 face like the other cards' versions. The notes
+                                 (a leftover runtime, a service that did not
+                                 start, what the PC lacks) read as text. -->
+                            <TextBlock Text="{Binding MidiServicesDetailText}" FontSize="12" TextWrapping="Wrap"
+                                       Visibility="{Binding MidiServicesDetailText, Converter={StaticResource StringToVisibility}}"
+                                       Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,12,0">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding MidiOsSupported}" Value="False">
-                                                <Setter Property="ToolTip" Value="{Binding Settings_MidiOsRequired, Source={x:Static strings:Strings.Instance}}"/>
+                                            <DataTrigger Binding="{Binding MidiDetailIsVersion}" Value="True">
+                                                <Setter Property="FontFamily" Value="{StaticResource TelemetryFontFamily}"/>
                                             </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
-                                </Button.Style>
-                            </Button>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </StackPanel>
+
+                        <!-- Install fetches PadForge's build of the runtime
+                             (Microsoft withdrew its installers on 2026-10-01)
+                             where the PC has no in-box API and is not in
+                             Legacy API mode. Uninstall (#175 destructive verb)
+                             removes whichever runtime is installed, Microsoft's
+                             or PadForge's, and asks first when it is Microsoft's
+                             bundle, whose tools Microsoft no longer offers.
+                             While an uninstaller PadForge started still runs,
+                             both wait for it, and Install's tooltip, shown
+                             though the button is off, says so. -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                    VerticalAlignment="Center">
+                            <Button Content="{Binding Common_Install, Source={x:Static strings:Strings.Instance}}"
+                                    Command="{Binding InstallMidiRuntimeCommand}"
+                                    Style="{StaticResource EmberAccentButton}"
+                                    ToolTip="{Binding MidiInstallTooltip}"
+                                    ToolTipService.ShowOnDisabled="True"
+                                    AutomationProperties.AutomationId="MidiRuntimeInstallButton"
+                                    Visibility="{Binding CanInstallMidiRuntime, Converter={StaticResource BoolToVisibilityConverter}}"/>
                             <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
                                     Command="{Binding UninstallMidiServicesCommand}"
                                     Style="{StaticResource EmberDestructiveButton}"
-                                    Visibility="{Binding IsMidiServicesInstalled, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                    AutomationProperties.AutomationId="MidiRuntimeUninstallButton"
+                                    Visibility="{Binding IsMidiRuntimeInstalled, Converter={StaticResource BoolToVisibilityConverter}}">
+                                <AutomationProperties.Name>
+                                    <MultiBinding StringFormat="{}{0}: {1}">
+                                        <Binding Path="Settings_MidiServices" Source="{x:Static strings:Strings.Instance}"/>
+                                        <Binding Path="Common_Uninstall" Source="{x:Static strings:Strings.Instance}"/>
+                                    </MultiBinding>
+                                </AutomationProperties.Name>
+                            </Button>
                         </StackPanel>
                     </Grid>
                 </StackPanel>
@@ -661,7 +819,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xF119;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xF119;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_SteamVR, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -675,7 +833,7 @@
 
                         <StackPanel>
                             <StackPanel Orientation="Horizontal">
-                                <Path Margin="0,0,8,0">
+                                <Path FlowDirection="LeftToRight" Margin="0,0,8,0">
                                     <Path.Style>
                                         <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
                                             <Style.Triggers>
@@ -692,8 +850,19 @@
                                         </Style>
                                     </Path.Style>
                                 </Path>
-                                <TextBlock Text="{Binding SteamVrStatusText}" FontWeight="SemiBold"/>
+                                <TextBlock common:LiveText.Polite="True" Text="{Binding SteamVrStatusText}" FontWeight="SemiBold"/>
                             </StackPanel>
+
+                            <!-- HIDMaestro 1.12.0 lists other OpenVR drivers
+                                 SteamVR can see under HIDMaestro's driver name
+                                 (HMVR.FindDriverNameConflicts). OpenVR loads
+                                 one driver per name, so with one present the
+                                 VR slot's controllers can fail to appear for
+                                 no other visible reason. -->
+                            <TextBlock Text="{Binding SteamVrDriverConflictText}"
+                                       Margin="0,8,12,0" TextWrapping="Wrap"
+                                       Foreground="{DynamicResource SystemFillColorCautionBrush}"
+                                       Visibility="{Binding HasSteamVrDriverConflict, Converter={StaticResource BoolToVisibilityConverter}}"/>
 
                             <!-- Install-location picker: shown only before an
                                  install exists. Not persisted by PadForge; on
@@ -726,7 +895,14 @@
                             <Button Content="{Binding Common_Uninstall, Source={x:Static strings:Strings.Instance}}"
                                     Command="{Binding UninstallSteamVrCommand}"
                                     Style="{StaticResource EmberDestructiveButton}"
-                                    Visibility="{Binding ShowSteamVrUninstall, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                    Visibility="{Binding ShowSteamVrUninstall, Converter={StaticResource BoolToVisibilityConverter}}">
+                                <AutomationProperties.Name>
+                                    <MultiBinding StringFormat="{}{0}: {1}">
+                                        <Binding Path="Settings_SteamVR" Source="{x:Static strings:Strings.Instance}"/>
+                                        <Binding Path="Common_Uninstall" Source="{x:Static strings:Strings.Instance}"/>
+                                    </MultiBinding>
+                                </AutomationProperties.Name>
+                            </Button>
                         </StackPanel>
                     </Grid>
                 </StackPanel>
@@ -736,7 +912,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE716;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE716;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_CommunityConfigs, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -775,7 +951,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE8A5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE8A5;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_SettingsFile, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>
@@ -812,7 +988,7 @@
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,20">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="&#xE9D9;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                        <reset:GlyphText Text="&#xE9D9;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="{Binding Settings_Diagnostics, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardTitle}"/>
                     </StackPanel>

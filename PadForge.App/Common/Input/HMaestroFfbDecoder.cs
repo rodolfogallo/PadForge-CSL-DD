@@ -138,9 +138,6 @@ namespace PadForge.Common.Input
             }
         }
 
-        /// <summary>Decode an HM HID-output packet and update internal effect state.
-        /// Caller passes the report ID and the packet payload (no leading ID byte —
-        /// HMOutputPacket already separates ReportId from Data).</summary>
         /// <summary>Handle a HidD_SetFeature write from the host. Currently only
         /// the Create New Effect Feature report (ID 0x11) needs handling — game
         /// writes [effectType:1, byteCountRemaining:2] via SetFeature. As of
@@ -203,6 +200,9 @@ namespace PadForge.Common.Input
             return es;
         }
 
+        /// <summary>Decode an HM HID-output packet and update internal effect state.
+        /// Caller passes the report ID and the packet payload (no leading ID byte —
+        /// HMOutputPacket already separates ReportId from Data).</summary>
         public void OnHidOutput(byte reportId, ReadOnlySpan<byte> data)
         {
             _applyDirty = true;
@@ -981,7 +981,11 @@ namespace PadForge.Common.Input
                     {
                         byte parent = collectionStack.Count > 0 ? collectionStack.Peek() : (byte)0;
                         bool sawMagUsage = pendingUsages.Contains(0x70) || pendingUsages.Contains(0x75);
-                        int absMax = Math.Max(Math.Abs(logMin), Math.Abs(logMax));
+                        // As a long: a 32-bit field's Logical Minimum,
+                        // -2147483648, has no positive int, and Math.Abs
+                        // throws on it. This walk runs in Connect once the
+                        // controller exists, where a throw fails the slot.
+                        long absMax = Math.Max(Math.Abs((long)logMin), Math.Abs((long)logMax));
 
                         if (parent == 0x73 && sawMagUsage && absMax > 0)
                         {

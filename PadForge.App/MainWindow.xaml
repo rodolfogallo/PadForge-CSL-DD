@@ -6,6 +6,7 @@
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         xmlns:local="clr-namespace:PadForge"
         xmlns:views="clr-namespace:PadForge.Views"
+        xmlns:controls="clr-namespace:PadForge.Controls"
         xmlns:viewControls="clr-namespace:PadForge.Views.Controls"
         xmlns:strings="clr-namespace:PadForge.Resources.Strings"
         ExtendsContentIntoTitleBar="True"
@@ -57,13 +58,13 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-            <Button x:Name="PaneToggleBtn" Grid.Column="0" Click="PaneToggleBtn_Click"
+            <controls:StateToggleButton AutomationProperties.Name="{Binding Main_NavigationPane, Source={x:Static strings:Strings.Instance}}" x:Name="PaneToggleBtn" IsOn="{Binding IsPaneOpen, ElementName=NavView}" Grid.Column="0" Click="PaneToggleBtn_Click"
                     Width="48" Height="48"
                     Background="Transparent"
                     BorderThickness="0" Padding="0"
                     HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
-                <TextBlock Text="&#xE700;" FontFamily="Segoe MDL2 Assets" FontSize="16"/>
-            </Button>
+                <controls:GlyphText Text="&#xE700;" FontFamily="Segoe MDL2 Assets" FontSize="16"/>
+            </controls:StateToggleButton>
             <ui:TitleBar x:Name="AppTitleBar" Grid.Column="1"
                          CloseClicked="TitleBar_CloseClicked"
                          MaximizeClicked="TitleBar_MaximizeClicked"
@@ -72,7 +73,7 @@
                     <Border x:Name="AppBrandingBorder" Padding="12,0"
                             Background="Transparent" MouseLeftButtonDown="BrandingBar_MouseDown">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <Image Source="/Resources/PadForge-icon.png" Width="20" Height="20"
+                            <controls:DecorativeImage FlowDirection="LeftToRight" Source="/Resources/PadForge-icon.png" Width="20" Height="20"
                                    RenderOptions.BitmapScalingMode="HighQuality" VerticalAlignment="Center"/>
                             <TextBlock Text="PadForge" FontSize="12"
                                        VerticalAlignment="Center" Margin="8,0,0,0"/>
@@ -80,7 +81,7 @@
                     </Border>
                 </ui:TitleBar.Header>
                 <ui:TitleBar.TrailingContent>
-                    <Button x:Name="FullScreenBtn" Click="FullScreenBtn_Click" Width="44" Height="30"
+                    <controls:StateToggleButton x:Name="FullScreenBtn" AutomationProperties.Name="{Binding Main_FullScreen, Source={x:Static strings:Strings.Instance}}" Click="FullScreenBtn_Click" Width="44" Height="30"
                             Background="Transparent" BorderThickness="0" Padding="0"
                             VerticalAlignment="Top" Margin="0"
                             WindowChrome.IsHitTestVisibleInChrome="True">
@@ -119,8 +120,8 @@
                              both FindAncestor and ElementName bindings
                              evaluated before the tree connects and logged a
                              BINDERR on every launch. -->
-                        <TextBlock x:Name="FullScreenIcon" Text="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="10"/>
-                    </Button>
+                        <controls:GlyphText x:Name="FullScreenIcon" Text="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="10"/>
+                    </controls:StateToggleButton>
                 </ui:TitleBar.TrailingContent>
             </ui:TitleBar>
         </Grid>
@@ -157,16 +158,16 @@
             <!-- MenuItems built programmatically in code-behind (BuildNavigationItems) -->
 
             <ui:NavigationView.FooterMenuItems>
-                <ui:NavigationViewItemSeparator/>
-                <ui:NavigationViewItem x:Name="NavSettings" Content="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Tag="Settings">
+                <controls:QuietNavigationSeparator/>
+                <ui:NavigationViewItem x:Name="NavSettings" Content="{Binding Settings_Title, Source={x:Static strings:Strings.Instance}}" Tag="Settings" AutomationProperties.AutomationId="Nav_Settings" AutomationProperties.PositionInSet="1" AutomationProperties.SizeOfSet="2">
                     <ui:NavigationViewItem.Icon>
                         <!-- Ember, matching the page header's icon color. -->
-                        <ui:FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE713;" Foreground="{DynamicResource EmberBrush}"/>
+                        <controls:DecorativeFontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE713;" Foreground="{DynamicResource EmberBrush}"/>
                     </ui:NavigationViewItem.Icon>
                 </ui:NavigationViewItem>
-                <ui:NavigationViewItem x:Name="NavAbout" Content="{Binding About_Title, Source={x:Static strings:Strings.Instance}}" Tag="About">
+                <ui:NavigationViewItem x:Name="NavAbout" Content="{Binding About_Title, Source={x:Static strings:Strings.Instance}}" Tag="About" AutomationProperties.AutomationId="Nav_About" AutomationProperties.PositionInSet="2" AutomationProperties.SizeOfSet="2">
                     <ui:NavigationViewItem.Icon>
-                        <ui:FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE946;" Foreground="{DynamicResource EmberBrush}"/>
+                        <controls:DecorativeFontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE946;" Foreground="{DynamicResource EmberBrush}"/>
                     </ui:NavigationViewItem.Icon>
                 </ui:NavigationViewItem>
             </ui:NavigationView.FooterMenuItems>
@@ -202,7 +203,7 @@
 
                 <!-- Named so the #175 item 7 decay sweep can fade it out
                      before the clear (code-behind BeginAnimation). -->
-                <TextBlock x:Name="StatusMessageText" Grid.Column="0"
+                <TextBlock x:Name="StatusMessageText" Grid.Column="0" AutomationProperties.LiveSetting="Polite"
                            Text="{Binding StatusText}"
                            VerticalAlignment="Center"
                            Foreground="{DynamicResource TextFillColorTertiaryBrush}"
@@ -239,7 +240,7 @@
 
                 <StackPanel Grid.Column="4" Orientation="Horizontal"
                             VerticalAlignment="Center" Margin="16,0,0,0">
-                    <Path Data="{StaticResource FlameOuterGeometry}"
+                    <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                           Width="12" Height="12" Stretch="Uniform"
                           VerticalAlignment="Center" Margin="0,0,6,0">
                         <Path.Style>
@@ -350,7 +351,7 @@
                  unreadable). The hole rect is positioned in code-behind
                  beside the ring; while the welcome panel is up the hole is
                  Empty and the dim covers everything, in both themes. -->
-            <Path Fill="#D9070A0E">
+            <Path FlowDirection="LeftToRight" Fill="#D9070A0E">
                 <Path.Data>
                     <CombinedGeometry GeometryCombineMode="Exclude">
                         <CombinedGeometry.Geometry1>
@@ -370,7 +371,7 @@
                     HorizontalAlignment="Center" VerticalAlignment="Center"
                     MaxWidth="470">
                 <StackPanel HorizontalAlignment="Center">
-                    <Path Data="{StaticResource FlameOuterGeometry}"
+                    <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                           Width="46" Height="46" Stretch="Uniform"
                           Fill="{DynamicResource EmberBrush}" HorizontalAlignment="Center">
                         <Path.Effect>

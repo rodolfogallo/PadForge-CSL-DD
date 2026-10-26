@@ -14,7 +14,7 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
-    <PackageReference Include="Jint" Version="4.16.2" PrivateAssets="all" />
+    <PackageReference Include="Jint" Version="4.17.0" PrivateAssets="all" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
@@ -37,5 +37,24 @@
     <Using Include="Xunit" />
     <None Update="TestData\GyroTiltReference.csv" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!-- MSBuild copies a referenced project's satellite assemblies only for the
+       culture names it knows, and it does not know chk, tzo, nv, ksw, hyw, kos,
+       sto, cuk or apw. Every translation the app builds is copied here, so the
+       tests read each one as the app does (#505). -->
+  <Target Name="CopyEveryAppSatellite" AfterTargets="CopyFilesToOutputDirectory">
+    <ItemGroup>
+      <_PadForgeAppAssembly Include="@(ReferencePath)" Condition="'%(Filename)%(Extension)' == 'PadForge.dll'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_PadForgeAppDirectory>@(_PadForgeAppAssembly->'%(RootDir)%(Directory)')</_PadForgeAppDirectory>
+    </PropertyGroup>
+    <ItemGroup>
+      <_PadForgeAppSatellite Include="$(_PadForgeAppDirectory)**\PadForge.resources.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_PadForgeAppSatellite)"
+          DestinationFiles="@(_PadForgeAppSatellite->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

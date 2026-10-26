@@ -323,8 +323,8 @@ namespace PadForge.Tests
         {
             string step2 = Repo("PadForge.App", "Common", "Input", "InputManager.Step2.UpdateInputStates.cs");
             Assert.Contains("bool isBlissBox = PadForge.Engine.Common.BlissBox.BlissBoxApi.OwnsRumble(ud.VendorId, ud.ProdId);", step2);
-            Assert.Contains("if (!isXboxImpulse && !isVendorFfb && !isPadixConverter && !isBlissBox)", step2);
-            Assert.Contains("else if ((isXboxImpulse || isPadixConverter || isBlissBox) && ud.Device == null)", step2);
+            Assert.Contains("if (!isXboxImpulse && !isVendorFfb && !isPadixConverter && !isBlissBox && !isPeripheralHaptic)", step2);
+            Assert.Contains("else if ((isXboxImpulse || isPadixConverter || isBlissBox || isPeripheralHaptic) && ud.Device == null)", step2);
             Assert.Contains("BlissBoxRuntime.SetRumble(ud.DevicePath, 0, 0);", step2);
             Assert.Contains("if (!BlissBoxRuntime.SetRumble(ud.DevicePath, blissL, blissR))", step2);
             int dispatch = step2.IndexOf("if (!BlissBoxRuntime.SetRumble(ud.DevicePath, blissL, blissR))", StringComparison.Ordinal);
@@ -1508,7 +1508,7 @@ namespace PadForge.Tests
             // stop, under the gate relayed frames take.
             Assert.Contains("bool impulse = !peer && !padix && !blissBox", code);
             Assert.Contains("lock (row.OutputSync)", code);
-            Assert.Contains("Buzz(0, 0);\n                                ushort lt = fs?.LeftTriggerMotorSpeed ?? 0, rt = fs?.RightTriggerMotorSpeed ?? 0;\n                                if (_inputManager?.OutputsQuiesced == true && (left | right | lt | rt) != 0) return;\n                                PadForge.Common.Input.XboxImpulseHidWriter.Write(row, left, right, lt, rt);", code);
+            Assert.Contains("Buzz(0, 0);\n                                ushort lt = fs?.LeftTriggerMotorSpeed ?? 0, rt = fs?.RightTriggerMotorSpeed ?? 0;\n                                if (_inputManager?.OutputsQuiesced == true && (left | right | lt | rt) != 0) return;\n                                PadForge.Common.Input.XboxImpulseHidWriter.Write(row, left, right, lt, rt, force: true);", code);
             // A row removed during the last pulse gets a stop, as does a peer
             // row, whose level belongs to the relay.
             Assert.Contains("if (row == null || peer) { Buzz(0, 0); return; }", code);
@@ -1606,7 +1606,7 @@ namespace PadForge.Tests
             Assert.Contains("if (_enumerationTimer.ElapsedMilliseconds >= 5000 || ConsumeBlissBoxSwitchChange())", loop);
             Assert.Contains("if (firstCycle || _enumerationTimer.ElapsedMilliseconds >= EnumerationIntervalMs || ConsumeBlissBoxSwitchChange())", loop);
             // Every cycle, right after the sweep, in both loops.
-            Assert.Contains("                                UpdateDevices();\n                            }\n                            RetryPendingBlissBoxRows();", loop);
+            Assert.Contains("                                    Engine.SdlDiagLog.WriteLine($\"STALL idle enum={idleEnumMs}ms\");\n                            }\n                            RetryPendingBlissBoxRows();", loop);
             Assert.Contains("                            enumMs = (Stopwatch.GetTimestamp() - tsEnum) * 1000 / Stopwatch.Frequency;\n                        }\n                        RetryPendingBlissBoxRows();", loop);
             // Phase 1l catches the sweep's generation up, so a phase before it
             // that throws costs one extra sweep, not one a cycle.

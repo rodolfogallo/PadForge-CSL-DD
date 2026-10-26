@@ -117,7 +117,6 @@ $map = @{
     # membership in this table decides whether a picture updates, and a stale
     # one looks exactly like a fresh one until somebody opens it. jpg names
     # drop the pad- prefix, like the rest of the map.
-    "dashboard-lightbar-mirrors"    = "dashboard-lightbar-mirrors"
     "dashboard-head-tracking"       = "dashboard-head-tracking"
     "settings-handheld-buttons"     = "settings-handheld-buttons"
     "settings-assignment-prompts"   = "settings-assignment-prompts"
@@ -151,6 +150,14 @@ $map = @{
     "pad-playstation-ds3"           = "playstation-ds3"
     "pad-menus"                     = "menus"
     "icon-picker"                   = "icon-picker"
+    # v5.1.0 additions
+    "pad-lighting-peripheral"       = "lighting-peripheral"
+    "pad-forcefeedback-peripheral"  = "force-feedback-peripheral"
+    "settings-language-list"        = "settings-language-list"
+    "settings-language-rtl"         = "settings-language-rtl"
+    "settings-bthps3"               = "settings-bthps3"
+    "settings-hidmaestro-uninstall" = "settings-hidmaestro-uninstall"
+    "settings-bthps3-uninstall"     = "settings-bthps3-uninstall"
 }
 
 $jpgEncoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq "image/jpeg" }

@@ -1036,7 +1036,7 @@ namespace PadForge.Services
                         Nefarius.Utilities.DeviceManagement.PnP.DeviceLocationFlags.Normal);
                 // {2BD67D8B-8BEB-48D5-87E0-6CDA3428040A},1 is
                 // DEVPKEY_Bluetooth_DeviceAddress, twelve hex digits with no
-                // separators ("00265C507543"), which is the exact shape
+                // separators ("00005E005343"), which is the exact shape
                 // TryDisconnect parses.
                 var key = Nefarius.Utilities.DeviceManagement.PnP.CustomDeviceProperty
                     .CreateCustomDeviceProperty(
@@ -1699,14 +1699,15 @@ namespace PadForge.Services
         // ── local Bluetooth radio address (human/big-endian order per DsHidMini) ─
 
         /// <summary>The local radio's MAC in the byte order the DS3 expects (human /
-        /// big-endian, i.e. rgBytes reversed - DsHidMini Ds3.c:364-368).</summary>
-        /// <summary>Reads the local radio's address. Waits for the radio
+        /// big-endian, i.e. rgBytes reversed - DsHidMini Ds3.c:364-368).
+        ///
+        /// <para>Reads the local radio's address. Waits for the radio
         /// first: this is step 1 of the ceremony and it runs immediately after
         /// the driver install, whose last act is a radio re-enumeration. A
         /// straight read there returned null 300 ms after the install reported
         /// success, so the FIRST Pair click failed with "No Bluetooth radio
         /// found" and only a second click, seconds later, got through
-        /// (arcade-PC log, 00:09:11.807 then 00:09:24.294).</summary>
+        /// (arcade-PC log, 00:09:11.807 then 00:09:24.294).</para></summary>
         public byte[] ReadRadioMac()
         {
             Ds3DriverInstaller.WaitForBluetoothRadio(20000);
@@ -1907,7 +1908,15 @@ namespace PadForge.Services
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref SP_DEVICE_INTERFACE_DATA d, IntPtr det, int ds, ref int req, IntPtr di);
         [DllImport("setupapi.dll")] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateFile(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")] private static extern IntPtr CreateFileNative(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);
+
+        /// <summary>The one way the ceremony opens a controller: a DualShock
+        /// 3 or Navigation controller's WinUSB interface, a PS Move's HID
+        /// collection. Its writes store a host address in the pad. The test
+        /// host opens none (Ds3DriverInstaller.OffLimitsForTest) and is
+        /// answered a failed open.</summary>
+        private static IntPtr CreateFile(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t)
+            => Ds3DriverInstaller.OffLimitsForTest ? INVALID_HANDLE : CreateFileNative(n, a, s, sa, d, f, t);
         [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
     }
 }

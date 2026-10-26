@@ -8,7 +8,8 @@
              xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              mc:Ignorable="po"
-             xmlns:reset="clr-namespace:PadForge.Controls">
+             xmlns:reset="clr-namespace:PadForge.Controls"
+             xmlns:controls="clr-namespace:PadForge.Controls">
 
     <UserControl.Resources>
         <!-- Hover glow (#175): every hover color change carries a glow in
@@ -170,19 +171,19 @@
          the identical 24px inset, but the clip edge now sits at the viewer
          bounds, giving edge cards 24+8 = 32px of aura room per side
          (BlurRadius 30). -->
-    <ScrollViewer>
+    <ScrollViewer AutomationProperties.Name="{Binding Dashboard_Title, Source={x:Static strings:Strings.Instance}}">
         <StackPanel Margin="24,16,24,16">
 
             <!-- Page header -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
-                <TextBlock Text="&#xF404;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
+                <reset:GlyphText Text="&#xF404;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="{DynamicResource EmberBrush}"
                            VerticalAlignment="Center" Margin="0,0,10,0"/>
-                <TextBlock Text="{Binding Dashboard_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+                <TextBlock AutomationProperties.HeadingLevel="Level1" Text="{Binding Dashboard_Title, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource TitleTextBlockStyle}" FontFamily="{StaticResource DisplayFontFamily}" FontWeight="650" FontSize="26" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
             </StackPanel>
 
             <!-- ═══ Input Engine ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-                <TextBlock Text="&#xE9F5;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE9F5;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_InputEngine, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -221,8 +222,9 @@
                          the same hover fill + NeutralHoverGlow the slot power
                          flames wear, and the tooltip mirrors their state-aware
                          pattern (#175 phase 2 item 3). -->
-                    <Button Padding="2" VerticalAlignment="Center"
-                            Click="EngineToggle_Click" Margin="0,0,8,0">
+                    <controls:StateToggleButton IsOn="{Binding IsEngineOn}" Padding="2" VerticalAlignment="Center"
+                            Click="EngineToggle_Click" Margin="0,0,8,0"
+                            AutomationProperties.Name="{Binding Dashboard_InputEngine, Source={x:Static strings:Strings.Instance}}">
                         <Button.Style>
                             <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
                                 <!-- Default = stopped, like the slot flame's
@@ -241,7 +243,7 @@
                                 </Style.Triggers>
                             </Style>
                         </Button.Style>
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="16" Height="16" Stretch="Uniform">
                             <Path.Style>
                                 <Style TargetType="Path">
@@ -307,9 +309,9 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                    </Button>
+                    </controls:StateToggleButton>
 
-                    <TextBlock Grid.Column="1" Text="{Binding EngineStatus}"
+                    <TextBlock common:LiveText.Polite="True" Grid.Column="1" Text="{Binding EngineStatus}"
                                VerticalAlignment="Center">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
@@ -340,7 +342,7 @@
 
             <!-- ═══ Virtual controller slot cards ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,8,0,12">
-                <TextBlock Text="&#xE7FC;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE7FC;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_VirtualControllers, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -363,11 +365,12 @@
                              Same click handler and hover lift as the old
                              full-width band it replaces. -->
                         <Grid Margin="8"
-                              Visibility="{Binding ShowAddController, Converter={StaticResource BoolToVisibilityConverter}}">
-                            <Border x:Name="AddControllerCard"
+                              Visibility="{Binding ShowAddController, Converter={StaticResource BoolToVisibilityConverter}}"
+                              AutomationProperties.Name="{Binding Main_AddController, Source={x:Static strings:Strings.Instance}}">
+                            <reset:ClickBorder x:Name="AddControllerCard"
                                     Width="252" MinHeight="132"
                                     Background="Transparent" CornerRadius="8"
-                                    Cursor="Hand" MouseLeftButtonUp="AddControllerCard_Click">
+                                    Cursor="Hand" Click="AddControllerCard_Click">
                                 <Border.RenderTransform>
                                     <TranslateTransform/>
                                 </Border.RenderTransform>
@@ -414,7 +417,7 @@
                                                SnapsToDevicePixels="True"/>
                                     <StackPanel Orientation="Horizontal"
                                                 HorizontalAlignment="Center" VerticalAlignment="Center">
-                                        <TextBlock Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="16"
+                                        <reset:GlyphText Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="16"
                                                    VerticalAlignment="Center" Margin="0,0,8,0"
                                                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
                                         <TextBlock Text="{Binding Main_AddController, Source={x:Static strings:Strings.Instance}}"
@@ -422,7 +425,7 @@
                                                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"/>
                                     </StackPanel>
                                 </Grid>
-                            </Border>
+                            </reset:ClickBorder>
                         </Grid>
                     </CompositeCollection>
                 </ItemsControl.ItemsSource>
@@ -701,7 +704,7 @@
                                 <!-- Row 0: [Flame] Slot N ... [X] -->
                                 <StackPanel Orientation="Horizontal" Margin="0,0,20,0">
                                     <!-- Power button -->
-                                    <Button Click="PowerToggle_Click" Tag="{Binding PadIndex}">
+                                    <controls:StateToggleButton AutomationProperties.Name="{Binding Common_Enabled, Source={x:Static strings:Strings.Instance}}" IsOn="{Binding IsEnabled}" Click="PowerToggle_Click" Tag="{Binding PadIndex}">
                                         <Button.Style>
                                             <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
                                                 <Setter Property="Cursor" Value="Hand"/>
@@ -740,7 +743,7 @@
                                                 </Style.Triggers>
                                             </Style>
                                         </Button.Style>
-                                        <Path Data="{StaticResource FlameOuterGeometry}"
+                                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                                               Width="12" Height="12" Stretch="Uniform">
                                             <Path.Style>
                                                 <Style TargetType="Path">
@@ -838,7 +841,7 @@
                                                 </Style>
                                             </Path.Style>
                                         </Path>
-                                    </Button>
+                                    </controls:StateToggleButton>
 
                                     <!-- Slot title. Card headline, so it wears CardTitle
                                          (display face); 14px keeps the compact card scale. -->
@@ -864,7 +867,7 @@
                                     <StackPanel Orientation="Horizontal">
 
                                         <!-- Xbox type button -->
-                                        <Button Click="XboxType_Click" Tag="{Binding PadIndex}">
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=Xbox}" Click="XboxType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
                                                     <!-- 5px sides (#49 seven-tile fit, all seven type
@@ -900,11 +903,11 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <Path Data="M16 5.425c-1.888-1.125-4.106-1.922-6.473-2.249l-0.092-0.010c-0.070-0.005-0.152-0.008-0.234-0.008-0.613 0-1.188 0.16-1.687 0.441l0.017-0.009c2.357-1.634 5.277-2.61 8.426-2.61 0.008 0 0.016 0 0.024 0h0.019c0.005 0 0.011 0 0.018 0 3.157 0 6.086 0.976 8.501 2.642l-0.050-0.033c-0.478-0.272-1.051-0.433-1.662-0.433-0.085 0-0.169 0.003-0.252 0.009l0.011-0.001c-2.459 0.336-4.677 1.13-6.648 2.297l0.082-0.045zM5.554 5.268c-0.041 0.014-0.077 0.032-0.11 0.054l0.002-0.001c-2.758 2.723-4.466 6.504-4.466 10.684 0 3.584 1.256 6.875 3.353 9.457l-0.022-0.028c-1.754-3.261 4.48-12.455 7.61-16.159-3.53-3.521-5.277-4.062-6.015-4.062-0.010-0-0.021-0.001-0.032-0.001-0.115 0-0.225 0.021-0.326 0.060l0.006-0.002zM20.083 9.275c3.129 3.706 9.367 12.908 7.605 16.161 2.075-2.554 3.332-5.845 3.332-9.43 0-4.181-1.709-7.962-4.467-10.684l-0.002-0.002c-0.029-0.021-0.063-0.039-0.1-0.052l-0.003-0.001c-0.1-0.036-0.216-0.056-0.336-0.056-0.005 0-0.011 0-0.016 0h0.001c-0.741-0-2.485 0.543-6.014 4.063zM6.114 27.306c2.627 2.306 6.093 3.714 9.888 3.714s7.261-1.407 9.905-3.728l-0.017 0.015c2.349-2.393-5.402-10.901-9.89-14.29-4.483 3.39-12.24 11.897-9.886 14.29z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                                        </Button>
+                                            <Path FlowDirection="LeftToRight" Data="M16 5.425c-1.888-1.125-4.106-1.922-6.473-2.249l-0.092-0.010c-0.070-0.005-0.152-0.008-0.234-0.008-0.613 0-1.188 0.16-1.687 0.441l0.017-0.009c2.357-1.634 5.277-2.61 8.426-2.61 0.008 0 0.016 0 0.024 0h0.019c0.005 0 0.011 0 0.018 0 3.157 0 6.086 0.976 8.501 2.642l-0.050-0.033c-0.478-0.272-1.051-0.433-1.662-0.433-0.085 0-0.169 0.003-0.252 0.009l0.011-0.001c-2.459 0.336-4.677 1.13-6.648 2.297l0.082-0.045zM5.554 5.268c-0.041 0.014-0.077 0.032-0.11 0.054l0.002-0.001c-2.758 2.723-4.466 6.504-4.466 10.684 0 3.584 1.256 6.875 3.353 9.457l-0.022-0.028c-1.754-3.261 4.48-12.455 7.61-16.159-3.53-3.521-5.277-4.062-6.015-4.062-0.010-0-0.021-0.001-0.032-0.001-0.115 0-0.225 0.021-0.326 0.060l0.006-0.002zM20.083 9.275c3.129 3.706 9.367 12.908 7.605 16.161 2.075-2.554 3.332-5.845 3.332-9.43 0-4.181-1.709-7.962-4.467-10.684l-0.002-0.002c-0.029-0.021-0.063-0.039-0.1-0.052l-0.003-0.001c-0.1-0.036-0.216-0.056-0.336-0.056-0.005 0-0.011 0-0.016 0h0.001c-0.741-0-2.485 0.543-6.014 4.063zM6.114 27.306c2.627 2.306 6.093 3.714 9.888 3.714s7.261-1.407 9.905-3.728l-0.017 0.015c2.349-2.393-5.402-10.901-9.89-14.29-4.483 3.39-12.24 11.897-9.886 14.29z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                                        </controls:SegmentButton>
 
                                         <!-- PlayStation type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=PlayStation}" Margin="1,0,0,0"
                                                 Click="DS4Type_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -934,11 +937,11 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <Path Data="M3.262 24.248c-2.374-0.681-2.767-2.084-1.69-2.899 0.776-0.51 1.668-0.954 2.612-1.288l0.087-0.027 7.017-2.516v2.89l-5.030 1.839c-0.881 0.339-1.031 0.79-0.299 1.032 0.365 0.093 0.783 0.147 1.214 0.147 0.615 0 1.204-0.109 1.749-0.308l-0.035 0.011 2.422-0.882v2.592c-0.15 0.037-0.32 0.055-0.487 0.091-0.775 0.136-1.667 0.214-2.577 0.214-1.778 0-3.486-0.298-5.078-0.846l0.110 0.033zM18.049 24.544l7.868-2.843c0.893-0.322 1.032-0.781 0.307-1.022-0.363-0.089-0.779-0.14-1.208-0.14-0.622 0-1.22 0.108-1.774 0.305l0.037-0.011-5.255 1.874v-2.983l0.3-0.106c1.050-0.349 2.284-0.62 3.557-0.761l0.083-0.008c0.468-0.050 1.010-0.078 1.559-0.078 1.877 0 3.677 0.331 5.343 0.939l-0.108-0.035c2.309 0.751 2.549 1.839 1.969 2.589-0.559 0.557-1.235 0.998-1.988 1.282l-0.039 0.013-10.677 3.883v-2.869zM12.231 4.248v21.927l4.892 1.576v-18.39c0-0.862 0.38-1.438 0.992-1.238 0.795 0.225 0.95 1.017 0.95 1.881v7.342c3.050 1.491 5.451-0.003 5.451-3.939 0-4.045-1.407-5.842-5.546-7.282-1.785-0.648-4.040-1.294-6.347-1.805l-0.389-0.072z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                                        </Button>
+                                            <Path FlowDirection="LeftToRight" Data="M3.262 24.248c-2.374-0.681-2.767-2.084-1.69-2.899 0.776-0.51 1.668-0.954 2.612-1.288l0.087-0.027 7.017-2.516v2.89l-5.030 1.839c-0.881 0.339-1.031 0.79-0.299 1.032 0.365 0.093 0.783 0.147 1.214 0.147 0.615 0 1.204-0.109 1.749-0.308l-0.035 0.011 2.422-0.882v2.592c-0.15 0.037-0.32 0.055-0.487 0.091-0.775 0.136-1.667 0.214-2.577 0.214-1.778 0-3.486-0.298-5.078-0.846l0.110 0.033zM18.049 24.544l7.868-2.843c0.893-0.322 1.032-0.781 0.307-1.022-0.363-0.089-0.779-0.14-1.208-0.14-0.622 0-1.22 0.108-1.774 0.305l0.037-0.011-5.255 1.874v-2.983l0.3-0.106c1.050-0.349 2.284-0.62 3.557-0.761l0.083-0.008c0.468-0.050 1.010-0.078 1.559-0.078 1.877 0 3.677 0.331 5.343 0.939l-0.108-0.035c2.309 0.751 2.549 1.839 1.969 2.589-0.559 0.557-1.235 0.998-1.988 1.282l-0.039 0.013-10.677 3.883v-2.869zM12.231 4.248v21.927l4.892 1.576v-18.39c0-0.862 0.38-1.438 0.992-1.238 0.795 0.225 0.95 1.017 0.95 1.881v7.342c3.050 1.491 5.451-0.003 5.451-3.939 0-4.045-1.407-5.842-5.546-7.282-1.785-0.648-4.040-1.294-6.347-1.805l-0.389-0.072z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                                        </controls:SegmentButton>
 
                                         <!-- Nintendo type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=Nintendo}" Margin="1,0,0,0"
                                                 Click="NintendoType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -968,11 +971,11 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <Path Data="M 21.661,0 C 20.071,0 18.746,0.02 18.726,0.046 C 18.699,0.066 18.679,7.248 18.679,16.007 C 18.679,30.458 18.686,31.922 18.785,31.962 C 18.964,32.028 24.106,32.001 24.742,31.935 C 27.432,31.63 29.804,29.994 31.096,27.562 C 31.261,27.251 31.48,26.727 31.592,26.403 C 32.01,25.157 31.997,25.488 31.997,15.968 C 31.997,8.368 31.983,7.235 31.891,6.751 C 31.235,3.3 28.604,0.696 25.146,0.099 C 24.682,0.02 23.966,0 21.661,0 L 21.661,0 M 13.635,0.006 C 13.077,0.004 12.342,0.005 11.371,0.007 C 8.218,0.013 7.27,0.033 6.853,0.106 C 3.666,0.676 1.102,3.035 0.293,6.135 C 0.002,7.255 -0.018,7.911 0.015,16.597 C 0.035,24.574 0.042,24.76 0.174,25.376 C 0.91,28.695 3.268,31.061 6.621,31.842 C 7.058,31.942 7.615,31.962 11.199,31.981 C 14.909,32.008 15.294,32.001 15.393,31.902 C 15.492,31.803 15.499,30.524 15.499,16.027 C 15.499,5.281 15.479,0.219 15.433,0.126 C 15.383,0.036 15.307,0.01 13.635,0.006 L 13.635,0.006 M 12.849,2.584 L 12.849,16.007 L 12.849,29.431 L 10.152,29.397 C 7.668,29.371 7.403,29.358 6.906,29.232 C 4.772,28.682 3.189,27.039 2.745,24.899 C 2.599,24.23 2.599,7.745 2.738,7.089 C 3.136,5.228 4.428,3.684 6.17,2.988 C 7.045,2.637 7.449,2.597 10.285,2.591 L 12.849,2.584 M 7.967,6.575 C 7.787,6.577 7.605,6.596 7.423,6.632 C 7.005,6.712 6.369,7.03 6.031,7.328 C 5.335,7.931 4.991,8.785 5.044,9.793 C 5.071,10.316 5.104,10.455 5.316,10.879 C 5.627,11.522 6.097,11.992 6.74,12.31 C 7.184,12.529 7.297,12.555 7.873,12.575 C 8.396,12.595 8.582,12.575 8.933,12.456 C 10.371,11.972 11.239,10.574 10.994,9.143 C 10.74,7.627 9.43,6.557 7.967,6.575 M 25.025,14.374 C 25.283,14.376 25.543,14.41 25.802,14.477 C 26.835,14.748 27.683,15.537 28.028,16.544 C 28.247,17.167 28.24,18.081 28.021,18.651 C 27.617,19.698 26.822,20.433 25.802,20.705 C 24.145,21.135 22.383,20.135 21.899,18.492 C 21.754,17.988 21.76,17.14 21.926,16.623 C 22.345,15.254 23.637,14.361 25.025,14.374 L 25.025,14.374" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                                        </Button>
+                                            <Path FlowDirection="LeftToRight" Data="M 21.661,0 C 20.071,0 18.746,0.02 18.726,0.046 C 18.699,0.066 18.679,7.248 18.679,16.007 C 18.679,30.458 18.686,31.922 18.785,31.962 C 18.964,32.028 24.106,32.001 24.742,31.935 C 27.432,31.63 29.804,29.994 31.096,27.562 C 31.261,27.251 31.48,26.727 31.592,26.403 C 32.01,25.157 31.997,25.488 31.997,15.968 C 31.997,8.368 31.983,7.235 31.891,6.751 C 31.235,3.3 28.604,0.696 25.146,0.099 C 24.682,0.02 23.966,0 21.661,0 L 21.661,0 M 13.635,0.006 C 13.077,0.004 12.342,0.005 11.371,0.007 C 8.218,0.013 7.27,0.033 6.853,0.106 C 3.666,0.676 1.102,3.035 0.293,6.135 C 0.002,7.255 -0.018,7.911 0.015,16.597 C 0.035,24.574 0.042,24.76 0.174,25.376 C 0.91,28.695 3.268,31.061 6.621,31.842 C 7.058,31.942 7.615,31.962 11.199,31.981 C 14.909,32.008 15.294,32.001 15.393,31.902 C 15.492,31.803 15.499,30.524 15.499,16.027 C 15.499,5.281 15.479,0.219 15.433,0.126 C 15.383,0.036 15.307,0.01 13.635,0.006 L 13.635,0.006 M 12.849,2.584 L 12.849,16.007 L 12.849,29.431 L 10.152,29.397 C 7.668,29.371 7.403,29.358 6.906,29.232 C 4.772,28.682 3.189,27.039 2.745,24.899 C 2.599,24.23 2.599,7.745 2.738,7.089 C 3.136,5.228 4.428,3.684 6.17,2.988 C 7.045,2.637 7.449,2.597 10.285,2.591 L 12.849,2.584 M 7.967,6.575 C 7.787,6.577 7.605,6.596 7.423,6.632 C 7.005,6.712 6.369,7.03 6.031,7.328 C 5.335,7.931 4.991,8.785 5.044,9.793 C 5.071,10.316 5.104,10.455 5.316,10.879 C 5.627,11.522 6.097,11.992 6.74,12.31 C 7.184,12.529 7.297,12.555 7.873,12.575 C 8.396,12.595 8.582,12.575 8.933,12.456 C 10.371,11.972 11.239,10.574 10.994,9.143 C 10.74,7.627 9.43,6.557 7.967,6.575 M 25.025,14.374 C 25.283,14.376 25.543,14.41 25.802,14.477 C 26.835,14.748 27.683,15.537 28.028,16.544 C 28.247,17.167 28.24,18.081 28.021,18.651 C 27.617,19.698 26.822,20.433 25.802,20.705 C 24.145,21.135 22.383,20.135 21.899,18.492 C 21.754,17.988 21.76,17.14 21.926,16.623 C 22.345,15.254 23.637,14.361 25.025,14.374 L 25.025,14.374" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                                        </controls:SegmentButton>
 
                                         <!-- Extended (custom DI) type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=Extended}" Margin="1,0,0,0"
                                                 Click="ExtendedType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -1002,11 +1005,11 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <Path Data="M11.915 15H13V9.874A4.002 4.002 0 0 1 14 2a4 4 0 0 1 1 7.874V15h2a3 3 0 0 1 3 3v4H4v-4a3 3 0 0 1 3-3h.085A1.5 1.5 0 0 1 8.5 14h2a1.5 1.5 0 0 1 1.415 1z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                                        </Button>
+                                            <Path FlowDirection="LeftToRight" Data="M11.915 15H13V9.874A4.002 4.002 0 0 1 14 2a4 4 0 0 1 1 7.874V15h2a3 3 0 0 1 3 3v4H4v-4a3 3 0 0 1 3-3h.085A1.5 1.5 0 0 1 8.5 14h2a1.5 1.5 0 0 1 1.415 1z" Width="13" Height="13" Stretch="Uniform" Margin="2,1" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                                        </controls:SegmentButton>
 
                                         <!-- Keyboard+Mouse type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=KeyboardMouse}" Margin="1,0,0,0"
                                                 Click="KeyboardMouseType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -1036,11 +1039,11 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <TextBlock Text="&#xE961;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
-                                        </Button>
+                                            <reset:GlyphText Text="&#xE961;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
+                                        </controls:SegmentButton>
 
                                         <!-- MIDI type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=Midi}" Margin="1,0,0,0"
                                                 Click="MidiType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -1067,18 +1070,18 @@
                                                             <Setter Property="Background" Value="{DynamicResource SteelRaisedBrush}"/>
                                                             <Setter Property="Effect" Value="{x:Null}"/>
                                                         </MultiDataTrigger>
-                                                        <DataTrigger Binding="{Binding DataContext.IsMidiServicesInstalled, RelativeSource={RelativeSource AncestorType=ItemsControl}}" Value="False">
+                                                        <DataTrigger Binding="{Binding DataContext.IsMidiAvailable, RelativeSource={RelativeSource AncestorType=ItemsControl}}" Value="False">
                                                             <Setter Property="Cursor" Value="No"/>
-                                                            <Setter Property="ToolTip" Value="{Binding Main_MIDI_RequiresMidiServices, Source={x:Static strings:Strings.Instance}}"/>
+                                                            <Setter Property="ToolTip" Value="{Binding Main_MIDI_NotRunning, Source={x:Static strings:Strings.Instance}}"/>
                                                         </DataTrigger>
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
-                                        </Button>
+                                            <reset:GlyphText Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
+                                        </controls:SegmentButton>
 
                                         <!-- VR type button -->
-                                        <Button Margin="1,0,0,0"
+                                        <controls:SegmentButton IsSelected="{Binding OutputType, Converter={StaticResource EnumEqualityConverter}, ConverterParameter=Vr}" Margin="1,0,0,0"
                                                 Click="VrType_Click" Tag="{Binding PadIndex}">
                                             <Button.Style>
                                                 <Style TargetType="Button" BasedOn="{StaticResource TypeSwitchButton}">
@@ -1112,8 +1115,8 @@
                                                     </Style.Triggers>
                                                 </Style>
                                             </Button.Style>
-                                            <TextBlock Text="&#xF119;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
-                                        </Button>
+                                            <reset:GlyphText Text="&#xF119;" FontFamily="Segoe MDL2 Assets" FontSize="13" Margin="2,0"/>
+                                        </controls:SegmentButton>
                                         <TextBlock Text="{Binding TypeInstanceLabel, StringFormat={}#{0}}"
                                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                                    FontSize="10" FontWeight="SemiBold"
@@ -1155,7 +1158,7 @@
                                             </Style.Triggers>
                                         </Style>
                                     </ui:Button.Style>
-                                    <TextBlock Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                    <reset:GlyphText Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
                                 </ui:Button>
 
                                 <!-- Row 2: Device name (compact). Cold: the
@@ -1217,7 +1220,7 @@
                                                                         </Style>
                                                                     </StackPanel.Style>
                                                                     <!-- Same device-class glyph as the roster line (#175). -->
-                                                                    <TextBlock Text="{Binding TypeGlyph}"
+                                                                    <reset:GlyphText Text="{Binding TypeGlyph}"
                                                                                FontFamily="Segoe MDL2 Assets" FontSize="11"
                                                                                Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                                                                                VerticalAlignment="Center" Margin="0,0,6,0"/>
@@ -1235,12 +1238,12 @@
                                                                             </Style>
                                                                         </TextBlock.Style>
                                                                     </TextBlock>
-                                                                    <TextBlock Text="{Binding TransportGlyph}"
+                                                                    <reset:GlyphText Text="{Binding TransportGlyph}"
                                                                                FontFamily="Segoe MDL2 Assets" FontSize="10"
                                                                                Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                                                                                VerticalAlignment="Center" Margin="5,0,0,0"
                                                                                Visibility="{Binding HasTransportGlyph, Converter={StaticResource BoolToVisibilityConverter}}"/>
-                                                                    <TextBlock Text="{Binding BatteryGlyph}"
+                                                                    <reset:GlyphText Text="{Binding BatteryGlyph}"
                                                                                FontFamily="Segoe MDL2 Assets" FontSize="11"
                                                                                Foreground="{DynamicResource ColdBrush}"
                                                                                VerticalAlignment="Center" Margin="6,0,0,0"
@@ -1292,7 +1295,7 @@
                                                         <!-- Device-class glyph (#175): keyboards read as keyboards,
                                                              mice as mice (DeviceTypeGlyph vocabulary); rides inside
                                                              each roster item so it repeats per device. -->
-                                                        <TextBlock Text="{Binding TypeGlyph}"
+                                                        <reset:GlyphText Text="{Binding TypeGlyph}"
                                                                    FontFamily="Segoe MDL2 Assets" FontSize="11"
                                                                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                                                                    VerticalAlignment="Center" Margin="0,0,5,0"/>
@@ -1313,12 +1316,12 @@
                                                         <!-- Transport (#175 competitor item 9): Bluetooth
                                                              links carry the E702 glyph, wired stays
                                                              unmarked. -->
-                                                        <TextBlock Text="{Binding TransportGlyph}"
+                                                        <reset:GlyphText Text="{Binding TransportGlyph}"
                                                                    FontFamily="Segoe MDL2 Assets" FontSize="10"
                                                                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                                                                    VerticalAlignment="Center" Margin="5,0,0,0"
                                                                    Visibility="{Binding HasTransportGlyph, Converter={StaticResource BoolToVisibilityConverter}}"/>
-                                                        <TextBlock Text="{Binding BatteryGlyph}"
+                                                        <reset:GlyphText Text="{Binding BatteryGlyph}"
                                                                    FontFamily="Segoe MDL2 Assets" FontSize="11"
                                                                    Foreground="{DynamicResource ColdBrush}"
                                                                    VerticalAlignment="Center" Margin="6,0,0,0"
@@ -1338,7 +1341,7 @@
                                 <!-- Row 3: Status -->
                                 <StackPanel Grid.Row="3" Orientation="Horizontal"
                                             Margin="0,2,0,0">
-                                    <TextBlock Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold">
+                                    <TextBlock common:LiveText.Polite="True" Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold">
                                         <TextBlock.Style>
                                             <Style TargetType="TextBlock">
                                                 <Setter Property="Foreground" Value="{DynamicResource TextFillColorTertiaryBrush}"/>
@@ -1413,16 +1416,16 @@
                                                 <!-- Zacksly stick silhouette (Sticks stage). -->
                                                 <Grid Width="12" Height="12"
                                                       Visibility="{Binding IsStickShape, Converter={StaticResource BoolToVisibilityConverter}}">
-                                                    <Path Data="{StaticResource ZackslyStickOuterRingGeometry}" Style="{StaticResource StageGlyphShape}"/>
-                                                    <Path Data="{StaticResource ZackslyStickInnerDiscGeometry}" Style="{StaticResource StageGlyphShape}"/>
+                                                    <Path FlowDirection="LeftToRight" Data="{StaticResource ZackslyStickOuterRingGeometry}" Style="{StaticResource StageGlyphShape}"/>
+                                                    <Path FlowDirection="LeftToRight" Data="{StaticResource ZackslyStickInnerDiscGeometry}" Style="{StaticResource StageGlyphShape}"/>
                                                 </Grid>
                                                 <!-- Zacksly trigger silhouette (Triggers stage). -->
                                                 <Grid Width="12" Height="12"
                                                       Visibility="{Binding IsTriggerShape, Converter={StaticResource BoolToVisibilityConverter}}">
-                                                    <Path Data="{StaticResource ZackslyTriggerOuterBodyGeometry}" Style="{StaticResource StageGlyphShape}"/>
+                                                    <Path FlowDirection="LeftToRight" Data="{StaticResource ZackslyTriggerOuterBodyGeometry}" Style="{StaticResource StageGlyphShape}"/>
                                                 </Grid>
                                                 <!-- Font stages (gyro / lighting / touchpad / audio). -->
-                                                <TextBlock Text="{Binding Glyph}">
+                                                <reset:GlyphText Text="{Binding Glyph}">
                                                     <TextBlock.Style>
                                                         <Style TargetType="TextBlock" BasedOn="{StaticResource StageGlyphText}">
                                                             <Style.Triggers>
@@ -1432,7 +1435,7 @@
                                                             </Style.Triggers>
                                                         </Style>
                                                     </TextBlock.Style>
-                                                </TextBlock>
+                                                </reset:GlyphText>
                                             </Grid>
                                         </DataTemplate>
                                     </ItemsControl.ItemTemplate>
@@ -1444,7 +1447,7 @@
                                      (E72A, same as the PadPage routing arrows)
                                      at the right edge. Opacity swap only; no
                                      layout shift, no hit-testing. -->
-                                <TextBlock Grid.RowSpan="5" Text="&#xE72A;"
+                                <reset:GlyphText Grid.RowSpan="5" Text="&#xE72A;"
                                            FontFamily="Segoe MDL2 Assets" FontSize="12"
                                            IsHitTestVisible="False"
                                            HorizontalAlignment="Right" VerticalAlignment="Center"
@@ -1460,7 +1463,7 @@
                                             </Style.Triggers>
                                         </Style>
                                     </TextBlock.Style>
-                                </TextBlock>
+                                </reset:GlyphText>
                             </Grid>
                         </Border>
                         </Grid>
@@ -1493,7 +1496,7 @@
 
             <!-- ═══ Web Controller ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE774;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE774;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_WebController, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -1512,7 +1515,7 @@
                         <TextBlock Text="{Binding Dashboard_Port, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                    Margin="0,0,8,0"/>
-                        <ui:NumberBox Value="{Binding WebControllerPort, Mode=TwoWay}"
+                        <ui:NumberBox Value="{Binding WebControllerPort, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, Delay=1000}"
                                       Minimum="1024" Maximum="65535"
                                       SpinButtonPlacementMode="Inline" Width="200"/>
                         <reset:SettingResetButton Command="{Binding ResetWebPortCommand}" SettingLabel="{Binding Dashboard_WebControllerPort, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"/>
@@ -1520,7 +1523,7 @@
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                         <!-- Serving = flame (#175 item 76). Running truth,
                              not the enable checkbox (#175 phase 2 item 2). -->
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="11" Height="11" Stretch="Uniform"
                               VerticalAlignment="Center" Margin="0,0,6,0">
                             <Path.Style>
@@ -1542,7 +1545,7 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                        <TextBlock Text="{Binding WebControllerStatus}" FontSize="12"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding WebControllerStatus}" FontSize="12"
                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                    Foreground="{DynamicResource ColdBrush}"/>
                     </StackPanel>
@@ -1555,7 +1558,7 @@
                             Background="{DynamicResource SystemFillColorCautionBackgroundBrush}"
                             CornerRadius="6" Padding="10,8" Margin="0,8,0,0" HorizontalAlignment="Left">
                         <StackPanel Orientation="Horizontal">
-                            <TextBlock Text="&#xE7BA;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Top"
+                            <reset:GlyphText Text="&#xE7BA;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Top"
                                        Foreground="{DynamicResource SystemFillColorCautionBrush}" Margin="0,1,8,0"/>
                             <TextBlock Text="{Binding WebControllerHttpsWarning}" TextWrapping="Wrap"
                                        Foreground="{DynamicResource TextFillColorSecondaryBrush}" MaxWidth="360"/>
@@ -1567,7 +1570,7 @@
                     <StackPanel Orientation="Horizontal" Margin="0,10,0,0"
                                 Visibility="{Binding HasWebControllerQr, Converter={StaticResource BoolToVisibilityConverter}}">
                         <Border Background="White" CornerRadius="6" Padding="6" VerticalAlignment="Top">
-                            <Image Source="{Binding WebControllerQr}" Width="132" Height="132"
+                            <Image AutomationProperties.Name="{Binding WebControllerUrl, TargetNullValue=''}" FlowDirection="LeftToRight" Source="{Binding WebControllerQr}" Width="132" Height="132"
                                    RenderOptions.BitmapScalingMode="NearestNeighbor"
                                    RenderOptions.EdgeMode="Aliased"/>
                         </Border>
@@ -1581,7 +1584,7 @@
                                            Command="{Binding CopyWebControllerUrlCommand}" Margin="6,0,0,0"
                                            VerticalAlignment="Center"
                                            ToolTip="{Binding Common_Copy, Source={x:Static strings:Strings.Instance}}">
-                                    <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="13"
+                                    <reset:GlyphText Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="13"
                                                Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
                                 </ui:Button>
                             </StackPanel>
@@ -1631,7 +1634,7 @@
                         </Grid.RowDefinitions>
                         <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding Dashboard_Port, Source={x:Static strings:Strings.Instance}}"
                                    VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
-                        <ui:NumberBox Grid.Row="0" Grid.Column="1" Value="{Binding WebControllerPlainHttpPort, Mode=TwoWay}"
+                        <ui:NumberBox Grid.Row="0" Grid.Column="1" Value="{Binding WebControllerPlainHttpPort, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, Delay=1000}"
                                       Minimum="1024" Maximum="65535"
                                       SpinButtonPlacementMode="Inline" Width="200" Margin="0,0,0,8"/>
                         <!-- Left, or it centers in a column the wider New Code
@@ -1653,7 +1656,7 @@
 
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,4"
                                 Visibility="{Binding WebControllerPlainStatus, Converter={StaticResource StringToVisibility}}">
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="11" Height="11" Stretch="Uniform"
                               VerticalAlignment="Center" Margin="0,0,6,0">
                             <Path.Style>
@@ -1675,7 +1678,7 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                        <TextBlock Text="{Binding WebControllerPlainStatus}" FontSize="12"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding WebControllerPlainStatus}" FontSize="12"
                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                    Foreground="{DynamicResource ColdBrush}"/>
                     </StackPanel>
@@ -1687,7 +1690,7 @@
                                 Visibility="{Binding WebControllerPlainUrl, Converter={StaticResource StringToVisibility}}">
                         <Border Background="White" CornerRadius="6" Padding="6" VerticalAlignment="Top" Margin="0,0,12,0"
                                 Visibility="{Binding HasWebControllerPlainQr, Converter={StaticResource BoolToVisibilityConverter}}">
-                            <Image Source="{Binding WebControllerPlainQr}" Width="132" Height="132"
+                            <Image AutomationProperties.Name="{Binding WebControllerPlainUrl, TargetNullValue=''}" FlowDirection="LeftToRight" Source="{Binding WebControllerPlainQr}" Width="132" Height="132"
                                    RenderOptions.BitmapScalingMode="NearestNeighbor"
                                    RenderOptions.EdgeMode="Aliased"/>
                         </Border>
@@ -1705,7 +1708,7 @@
                                            Command="{Binding CopyWebControllerPlainUrlCommand}" Margin="6,0,0,0"
                                            VerticalAlignment="Center"
                                            ToolTip="{Binding Common_Copy, Source={x:Static strings:Strings.Instance}}">
-                                    <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="13"
+                                    <reset:GlyphText Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="13"
                                                Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
                                 </ui:Button>
                             </StackPanel>
@@ -1716,7 +1719,7 @@
 
             <!-- Remote Link (issue #138) -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE969;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE969;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_RemoteLink, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -1743,7 +1746,7 @@
                         <TextBlock Text="{Binding Dashboard_Port, Source={x:Static strings:Strings.Instance}}"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                    VerticalAlignment="Center" Margin="0,0,8,0"/>
-                        <ui:NumberBox Value="{Binding RemoteLinkPort, Mode=TwoWay}"
+                        <ui:NumberBox Value="{Binding RemoteLinkPort, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, Delay=1000}"
                                       Minimum="1024" Maximum="65535"
                                       SpinButtonPlacementMode="Inline" Width="200"/>
                         <reset:SettingResetButton Command="{Binding ResetRemoteLinkPortCommand}" SettingLabel="{Binding Dashboard_RemoteLinkPort, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"/>
@@ -1753,7 +1756,7 @@
                              not the enable checkbox: identity-unlock errors
                              leave the server down while the box stays
                              checked (#175 phase 2 item 2). -->
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="11" Height="11" Stretch="Uniform"
                               VerticalAlignment="Center" Margin="0,0,6,0">
                             <Path.Style>
@@ -1775,7 +1778,7 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                        <TextBlock Text="{Binding RemoteLinkStatus}" FontSize="12"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding RemoteLinkStatus}" FontSize="12"
                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                    Foreground="{DynamicResource ColdBrush}"/>
                     </StackPanel>
@@ -1805,66 +1808,81 @@
                                Style="{StaticResource CardSectionTitle}" FontSize="14" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6"/>
                     <TextBlock Text="{Binding RemoteLink_PairedPeersDescription, Source={x:Static strings:Strings.Instance}}"
                                Style="{StaticResource CardDescription}"/>
-                    <ItemsControl ItemsSource="{Binding RemoteLink.TrustedPeers}" Margin="0,12,0,0">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Grid Margin="0,0,0,10">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <Path Grid.Column="0" Margin="2,0,10,0" ToolTip="{Binding OnlineText}">
-                                        <Path.Style>
-                                            <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding IsOnline}" Value="True">
-                                                        <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
-                                                        <Setter Property="Stroke" Value="{x:Null}"/>
-                                                        <Setter Property="Effect">
-                                                            <Setter.Value>
-                                                                <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
-                                                            </Setter.Value>
-                                                        </Setter>
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </Path.Style>
-                                    </Path>
-                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                        <DockPanel LastChildFill="True" HorizontalAlignment="Left">
-                                            <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="Name" SettingLabel="{Binding Macro_Name, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_RemoteLinkTrustedPeer_Name_1678"/>
-                                            <ui:TextBox Text="{Binding Name, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
-                                                        PlaceholderText="{Binding RemoteLink_PeerNamePlaceholder, Source={x:Static strings:Strings.Instance}}" MaxLength="40" MinWidth="240"/>
-                                        </DockPanel>
-                                        <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="2,3,0,0" TextTrimming="CharacterEllipsis">
-                                            <Run Text="{Binding HostName, Mode=OneWay}" FontWeight="SemiBold"/>
-                                            <Run Text="{Binding FingerprintDisplay, Mode=OneWay, StringFormat='  ·  {0}'}" FontFamily="{StaticResource TelemetryFontFamily}"/>
-                                        </TextBlock>
-                                        <StackPanel Orientation="Horizontal" Margin="0,6,8,0">
-                                            <CheckBox VerticalAlignment="Center" IsChecked="{Binding AllowRemoteAssignments, Mode=TwoWay}"
-                                                      Content="{Binding RemoteLink_AllowAssignments, Source={x:Static strings:Strings.Instance}}"
-                                                      ToolTip="{Binding RemoteLink_AssignmentPermissionDescription, Source={x:Static strings:Strings.Instance}}"/>
-                                            <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AllowRemoteAssignments" SettingLabel="{Binding RemoteLink_AllowAssignments, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_RemoteLinkTrustedPeer_AllowRemoteAssignments_1685"/>
+                    <Border Margin="0,12,0,0">
+                        <ItemsControl ItemsSource="{Binding RemoteLink.TrustedPeers}">
+                            <!-- Out of the screen-reader tree while empty, as the Devices page's
+                                 slot badges are: an empty list draws nothing and has no size,
+                                 so collapsing it changes nothing on screen. -->
+                            <ItemsControl.Style>
+                                <Style TargetType="ItemsControl" BasedOn="{StaticResource {x:Type ItemsControl}}">
+                                    <Setter Property="Focusable" Value="False"/>
+                                    <Style.Triggers>
+                                        <Trigger Property="HasItems" Value="False">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </Trigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </ItemsControl.Style>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,0,0,10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Path FlowDirection="LeftToRight" Grid.Column="0" Margin="2,0,10,0" ToolTip="{Binding OnlineText}">
+                                            <Path.Style>
+                                                <Style TargetType="Path" BasedOn="{StaticResource LivenessFlameBase}">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsOnline}" Value="True">
+                                                            <Setter Property="Fill" Value="{DynamicResource EmberBrush}"/>
+                                                            <Setter Property="Stroke" Value="{x:Null}"/>
+                                                            <Setter Property="Effect">
+                                                                <Setter.Value>
+                                                                    <DropShadowEffect Color="#FF6B2C" BlurRadius="8" ShadowDepth="0" Opacity="0.5"/>
+                                                                </Setter.Value>
+                                                            </Setter>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Path.Style>
+                                        </Path>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <DockPanel LastChildFill="True" HorizontalAlignment="Left">
+                                                <reset:SettingResetButton DockPanel.Dock="Right" Command="{Binding ResetSettingCommand}" CommandParameter="Name" SettingLabel="{Binding Macro_Name, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_RemoteLinkTrustedPeer_Name_1678"/>
+                                                <ui:TextBox Text="{Binding Name, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
+                                                            PlaceholderText="{Binding RemoteLink_PeerNamePlaceholder, Source={x:Static strings:Strings.Instance}}" MaxLength="40" MinWidth="240"/>
+                                            </DockPanel>
+                                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="2,3,0,0" TextTrimming="CharacterEllipsis">
+                                                <Run Text="{Binding HostName, Mode=OneWay}" FontWeight="SemiBold"/>
+                                                <Run Text="{Binding FingerprintDisplay, Mode=OneWay, StringFormat='  ·  {0}'}" FontFamily="{StaticResource TelemetryFontFamily}"/>
+                                            </TextBlock>
+                                            <StackPanel Orientation="Horizontal" Margin="0,6,8,0">
+                                                <CheckBox VerticalAlignment="Center" IsChecked="{Binding AllowRemoteAssignments, Mode=TwoWay}"
+                                                          Content="{Binding RemoteLink_AllowAssignments, Source={x:Static strings:Strings.Instance}}"
+                                                          ToolTip="{Binding RemoteLink_AssignmentPermissionDescription, Source={x:Static strings:Strings.Instance}}"/>
+                                                <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="AllowRemoteAssignments" SettingLabel="{Binding RemoteLink_AllowAssignments, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_RemoteLinkTrustedPeer_AllowRemoteAssignments_1685"/>
+                                            </StackPanel>
                                         </StackPanel>
-                                    </StackPanel>
-                                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                                        <!-- No Appearance=Primary (dark text on the accent
-                                             slab): Connect is the row's primary affirmative
-                                             and wears the shared ember accent instead. -->
-                                        <ui:Button Content="{Binding Dashboard_RemoteLinkConnectButton, Source={x:Static strings:Strings.Instance}}"
-                                                   Command="{Binding ConnectCommand}" Style="{StaticResource EmberPrimaryButton}" Margin="0,0,8,0"
-                                                   Visibility="{Binding CanConnect, Converter={StaticResource BoolToVisibilityConverter}}"/>
-                                        <Button Content="{Binding RemoteLink_Revoke, Source={x:Static strings:Strings.Instance}}"
-                                                Command="{Binding RevokeCommand}"/>
-                                        <Button Content="{Binding RemoteLink_AssignDevices, Source={x:Static strings:Strings.Instance}}"
-                                                Command="{Binding AssignmentsCommand}" Margin="8,0,0,0"
-                                                Visibility="{Binding IsOnline, Converter={StaticResource BoolToVisibilityConverter}}"/>
-                                    </StackPanel>
-                                </Grid>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
+                                        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <!-- No Appearance=Primary (dark text on the accent
+                                                 slab): Connect is the row's primary affirmative
+                                                 and wears the shared ember accent instead. -->
+                                            <ui:Button Content="{Binding Dashboard_RemoteLinkConnectButton, Source={x:Static strings:Strings.Instance}}"
+                                                       Command="{Binding ConnectCommand}" Style="{StaticResource EmberPrimaryButton}" Margin="0,0,8,0"
+                                                       Visibility="{Binding CanConnect, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                            <Button Content="{Binding RemoteLink_Revoke, Source={x:Static strings:Strings.Instance}}"
+                                                    Command="{Binding RevokeCommand}"/>
+                                            <Button Content="{Binding RemoteLink_AssignDevices, Source={x:Static strings:Strings.Instance}}"
+                                                    Command="{Binding AssignmentsCommand}" Margin="8,0,0,0"
+                                                    Visibility="{Binding IsOnline, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Border>
                     <Button Content="{Binding RemoteLink_RevokeAll, Source={x:Static strings:Strings.Instance}}"
                             Command="{Binding RemoteLink.RevokeAllPeersCommand}" HorizontalAlignment="Left" Margin="0,4,0,0"/>
 
@@ -1919,7 +1937,7 @@
                             Background="{DynamicResource SystemFillColorCautionBackgroundBrush}"
                             CornerRadius="6" Padding="10,8" Margin="0,0,0,12">
                         <StackPanel Orientation="Horizontal">
-                            <TextBlock Text="&#xE7BA;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Top"
+                            <reset:GlyphText Text="&#xE7BA;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Top"
                                        Foreground="{DynamicResource SystemFillColorCautionBrush}" Margin="0,1,8,0"/>
                             <TextBlock Text="{Binding RemoteLinkNatWarning}" TextWrapping="Wrap"
                                        Foreground="{DynamicResource TextFillColorSecondaryBrush}" MaxWidth="360"/>
@@ -1931,7 +1949,8 @@
                                Style="{StaticResource CardSectionTitle}" FontSize="14" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6"/>
                     <StackPanel Orientation="Horizontal">
                         <ui:TextBox Text="{Binding RemoteLinkConnectHost, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                    PlaceholderText="192.168.1.20:27500" Width="220" VerticalAlignment="Center"/>
+                                    PlaceholderText="192.168.1.20:27500" Width="220" VerticalAlignment="Center"
+                                    AutomationProperties.Name="{Binding Dashboard_RemoteLinkConnect, Source={x:Static strings:Strings.Instance}}"/>
                         <ui:Button Command="{Binding ConnectToPeerCommand}" Margin="8,0,0,0"
                                    Content="{Binding Dashboard_RemoteLinkConnectButton, Source={x:Static strings:Strings.Instance}}"/>
                     </StackPanel>
@@ -1949,7 +1968,7 @@
                  contract). The status line is the Devices row's source
                  line, pushed by InputService on the dashboard tick. -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE77B;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE77B;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_HeadTracking, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -2025,7 +2044,7 @@
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel x:Name="HeadTrackingUdpPortControls" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8"
                                     IsEnabled="{Binding HeadTrackingEnabled}">
-                            <ui:NumberBox Value="{Binding HeadTrackingUdpPort, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingUdpPort, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, Delay=1000}"
                                           Minimum="1" Maximum="65535"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingPort_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2034,7 +2053,7 @@
                         <TextBlock Grid.Row="1" Text="{Binding Dashboard_HeadTrackingRotationRange, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRotationRange, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRotationRange, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="1" Maximum="180"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingRotationRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2043,7 +2062,7 @@
                         <TextBlock Grid.Row="2" Text="{Binding Dashboard_HeadTrackingTranslationRange, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0"/>
                         <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,0">
-                            <ui:NumberBox Value="{Binding HeadTrackingTranslationRange, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingTranslationRange, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="1" Maximum="500"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingTranslationRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2061,7 +2080,7 @@
                         <TextBlock Grid.Row="5" Text="{Binding Dashboard_HeadTrackingAxisYaw, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangeYaw, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangeYaw, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="180"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2070,7 +2089,7 @@
                         <TextBlock Grid.Row="6" Text="{Binding Dashboard_HeadTrackingAxisPitch, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangePitch, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangePitch, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="180"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2079,7 +2098,7 @@
                         <TextBlock Grid.Row="7" Text="{Binding Dashboard_HeadTrackingAxisRoll, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="7" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangeRoll, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangeRoll, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="180"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2088,7 +2107,7 @@
                         <TextBlock Grid.Row="8" Text="{Binding Dashboard_HeadTrackingAxisX, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangeX, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangeX, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="500"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2097,7 +2116,7 @@
                         <TextBlock Grid.Row="9" Text="{Binding Dashboard_HeadTrackingAxisY, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,8"/>
                         <StackPanel Grid.Row="9" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangeY, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangeY, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="500"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2106,7 +2125,7 @@
                         <TextBlock Grid.Row="10" Text="{Binding Dashboard_HeadTrackingAxisZ, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0"/>
                         <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,0">
-                            <ui:NumberBox Value="{Binding HeadTrackingRangeZ, Mode=TwoWay}"
+                            <ui:NumberBox Value="{Binding HeadTrackingRangeZ, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                           Minimum="0" Maximum="500"
                                           SpinButtonPlacementMode="Inline" Width="200"
                                           ToolTip="{Binding Dashboard_HeadTrackingAxisRange_Tooltip, Source={x:Static strings:Strings.Instance}}"/>
@@ -2121,7 +2140,7 @@
                     <!-- The Devices row's source line: which of the three
                          sources is live, or why none is. Stopped while the
                          feature is off or the engine is down. -->
-                    <TextBlock Text="{Binding HeadTrackingStatus}" FontSize="12"
+                    <TextBlock common:LiveText.Polite="True" Text="{Binding HeadTrackingStatus}" FontSize="12"
                                FontFamily="{StaticResource TelemetryFontFamily}"
                                Foreground="{DynamicResource ColdBrush}" Margin="0,0,0,4"/>
                     <TextBlock Text="{Binding Dashboard_HeadTrackingFooter, Source={x:Static strings:Strings.Instance}}"
@@ -2131,7 +2150,7 @@
 
             <!-- ═══ Motion Server ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE7AD;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE7AD;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_MotionServer, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -2149,7 +2168,7 @@
                         <TextBlock Text="{Binding Dashboard_Port, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"
                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                    Margin="0,0,8,0"/>
-                        <ui:NumberBox Value="{Binding DsuMotionServerPort, Mode=TwoWay}"
+                        <ui:NumberBox Value="{Binding DsuMotionServerPort, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, Delay=1000}"
                                       Minimum="1024" Maximum="65535"
                                       SpinButtonPlacementMode="Inline" Width="200"/>
                         <reset:SettingResetButton Command="{Binding ResetDsuPortCommand}" SettingLabel="{Binding Dashboard_MotionServerPort, Source={x:Static strings:Strings.Instance}}" VerticalAlignment="Center"/>
@@ -2158,7 +2177,7 @@
                         <!-- Serving = flame (#175 item 76); the green dot stays
                              strictly health. Binds the server's running truth,
                              not the enable checkbox (#175 phase 2 item 2). -->
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="11" Height="11" Stretch="Uniform"
                               VerticalAlignment="Center" Margin="0,0,6,0">
                             <Path.Style>
@@ -2180,7 +2199,7 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                        <TextBlock Text="{Binding DsuServerStatus}" FontSize="12"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding DsuServerStatus}" FontSize="12"
                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                    Foreground="{DynamicResource ColdBrush}"/>
                     </StackPanel>
@@ -2189,83 +2208,10 @@
                 </StackPanel>
             </Border>
 
-            <!-- ═══ Lightbar mirrors: Razer Chroma (#373) and Logitech LIGHTSYNC (#382) ═══
-                 One section, one glyph, one card with a row per vendor. Both
-                 rows forward the same virtual-pad lightbar color, so they
-                 share the section rather than repeating its icon. Each row
-                 keeps its own strings, bindings, status line and footer. -->
-            <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE781;" Style="{StaticResource SectionGlyph}"/>
-                <TextBlock Text="{Binding Dashboard_LightbarMirrors, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
-            </StackPanel>
-
-            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,0">
-                <StackPanel>
-                    <!-- Razer Chroma row. Divider-separated sub-title inside the
-                         card (the Remote Link identity idiom). -->
-                    <TextBlock Text="{Binding Dashboard_Chroma, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardSectionTitle}" FontSize="14" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6"/>
-                    <TextBlock Text="{Binding Dashboard_ChromaDescription, Source={x:Static strings:Strings.Instance}}"
-                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
-                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <CheckBox VerticalAlignment="Center" Content="{Binding Dashboard_EnableChroma, Source={x:Static strings:Strings.Instance}}"
-                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                                  IsChecked="{Binding EnableChromaLightbar}"/>
-                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnableChromaLightbar" SettingLabel="{Binding Dashboard_EnableChroma, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DashboardViewModel_EnableChromaLightbar_1964"/>
-                    </StackPanel>
-                    <TextBlock Text="{Binding ChromaStatus}" FontSize="12"
-                               FontFamily="{StaticResource TelemetryFontFamily}"
-                               Foreground="{DynamicResource ColdBrush}" Margin="0,0,0,4"/>
-                    <TextBlock Text="{Binding Dashboard_ChromaFooter, Source={x:Static strings:Strings.Instance}}"
-                               FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
-
-                    <Border Height="1" Background="{DynamicResource DividerStrokeColorDefaultBrush}" Margin="0,14,0,14"/>
-
-                    <!-- Logitech LIGHTSYNC row. -->
-                    <TextBlock Text="{Binding Dashboard_Lightsync, Source={x:Static strings:Strings.Instance}}" Style="{StaticResource CardSectionTitle}" FontSize="14" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6"/>
-                    <TextBlock Text="{Binding Dashboard_LightsyncDescription, Source={x:Static strings:Strings.Instance}}"
-                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
-                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <CheckBox VerticalAlignment="Center" Content="{Binding Dashboard_EnableLightsync, Source={x:Static strings:Strings.Instance}}"
-                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                                  IsChecked="{Binding EnableLightsyncLightbar}"/>
-                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnableLightsyncLightbar" SettingLabel="{Binding Dashboard_EnableLightsync, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DashboardViewModel_EnableLightsyncLightbar_1979"/>
-                    </StackPanel>
-                    <TextBlock Text="{Binding LightsyncStatus}" FontSize="12"
-                               FontFamily="{StaticResource TelemetryFontFamily}"
-                               Foreground="{DynamicResource ColdBrush}" Margin="0,0,0,4"/>
-                    <TextBlock Text="{Binding Dashboard_LightsyncFooter, Source={x:Static strings:Strings.Instance}}"
-                               FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
-                </StackPanel>
-            </Border>
-
-            <!-- ═══ Razer Sensa HD haptics translation (#374) ═══ -->
-            <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xE877;" Style="{StaticResource SectionGlyph}"/>
-                <TextBlock Text="{Binding Dashboard_Sensa, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
-            </StackPanel>
-
-            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,0">
-                <StackPanel>
-                    <TextBlock Text="{Binding Dashboard_SensaDescription, Source={x:Static strings:Strings.Instance}}"
-                               Style="{StaticResource CardDescription}" Margin="0,0,0,12"/>
-                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                        <CheckBox VerticalAlignment="Center" Content="{Binding Dashboard_EnableSensa, Source={x:Static strings:Strings.Instance}}"
-                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                                  IsChecked="{Binding EnableSensaHaptics}"/>
-                        <reset:SettingResetButton Command="{Binding ResetSettingCommand}" CommandParameter="EnableSensaHaptics" SettingLabel="{Binding Dashboard_EnableSensa, Source={x:Static strings:Strings.Instance}}" AutomationProperties.AutomationId="Reset_DashboardViewModel_EnableSensaHaptics_2000"/>
-                    </StackPanel>
-                    <TextBlock Text="{Binding SensaStatus}" FontSize="12"
-                               FontFamily="{StaticResource TelemetryFontFamily}"
-                               Foreground="{DynamicResource ColdBrush}" Margin="0,0,0,4"/>
-                    <TextBlock Text="{Binding Dashboard_SensaFooter, Source={x:Static strings:Strings.Instance}}"
-                               FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,4,0,0"/>
-                </StackPanel>
-            </Border>
-
             <!-- ═══ Overlays (menu #9 B-17, shift layer, profile switch) ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
                 <!-- E700 = Segoe MDL2 GlobalNavButton, the canonical menu glyph. -->
-                <TextBlock Text="&#xE700;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xE700;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_Overlays, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -2297,7 +2243,7 @@
 
             <!-- ═══ Touchpad Overlay ═══ -->
             <StackPanel Orientation="Horizontal" Margin="0,20,0,12">
-                <TextBlock Text="&#xEDA4;" Style="{StaticResource SectionGlyph}"/>
+                <reset:GlyphText Text="&#xEDA4;" Style="{StaticResource SectionGlyph}"/>
                 <TextBlock Text="{Binding Dashboard_TouchpadOverlay, Source={x:Static strings:Strings.Instance}, Converter={StaticResource UpperConverter}}" Style="{StaticResource SectionTitle}"/>
             </StackPanel>
 
@@ -2336,7 +2282,7 @@
                         <!-- 200 like the port boxes: the focus-time clear X plus
                              the inline spin buttons cramped the value at 130
                              (same fix as the Menus tab's number boxes). -->
-                        <ui:NumberBox Value="{Binding TouchpadOverlayOpacityPercent, Mode=TwoWay}"
+                        <ui:NumberBox Value="{Binding TouchpadOverlayOpacityPercent, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                       Minimum="0" Maximum="100"
                                       SpinButtonPlacementMode="Inline" Width="200"
                                       Margin="8,0,0,0"/>
@@ -2351,7 +2297,7 @@
                         <!-- Serving = flame (#175 item 76). Binds the overlay
                              window's running truth, which already drives the
                              status text (#175 phase 2 item 2). -->
-                        <Path Data="{StaticResource FlameOuterGeometry}"
+                        <Path FlowDirection="LeftToRight" Data="{StaticResource FlameOuterGeometry}"
                               Width="11" Height="11" Stretch="Uniform"
                               VerticalAlignment="Center" Margin="0,0,6,0">
                             <Path.Style>
@@ -2373,7 +2319,7 @@
                                 </Style>
                             </Path.Style>
                         </Path>
-                        <TextBlock Text="{Binding TouchpadOverlayStatus}" FontSize="12"
+                        <TextBlock common:LiveText.Polite="True" Text="{Binding TouchpadOverlayStatus}" FontSize="12"
                                    FontFamily="{StaticResource TelemetryFontFamily}"
                                    Foreground="{DynamicResource ColdBrush}"/>
                     </StackPanel>

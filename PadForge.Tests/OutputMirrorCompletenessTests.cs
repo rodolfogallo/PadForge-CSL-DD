@@ -170,8 +170,10 @@ namespace PadForge.Tests
         /// <summary>
         /// EVERY HIDMaestro sweep call site passes preserveInstall.
         ///
-        /// <para>The parameterless overload is uninstall-grade: it deletes
-        /// the whole HKLM\SOFTWARE\HIDMaestro tree, which carries the HID
+        /// <para>The parameterless overload passes preserveInstall false: once
+        /// no controller of any program remains on the driver, it deletes the
+        /// driver packages and the whole HKLM\SOFTWARE\HIDMaestro tree, which
+        /// carries the HID
         /// manifest hash (the same-version fast path), the SteamVRPath hint
         /// that locates a steamcmd SteamVR, and the VR driver's registration
         /// gate. Losing that gate makes the next VR slot re-extract
@@ -194,23 +196,35 @@ namespace PadForge.Tests
             {
                 "PadForge.App/App.xaml.cs",
                 "PadForge.App/Common/Input/InputManager.Step5.VirtualDevices.cs",
+                "PadForge.App/Common/Input/HMaestroVirtualController.cs",
             };
 
-            int callSites = 0;
+            // Every site runs the sweep through one member, which passes
+            // preserveInstall and which the test host refuses
+            // (VirtualControllerOffLimits).
+            int callSites = 0, sweeps = 0;
             foreach (string f in files)
                 foreach (string line in Live(Read(f)).Split('\n'))
                 {
+                    if (line.Contains("HMaestroVirtualController.SweepVirtualControllers();", StringComparison.Ordinal))
+                        sweeps++;
                     int at = line.IndexOf("RemoveAllVirtualControllers(", StringComparison.Ordinal);
                     if (at < 0) continue;
                     callSites++;
+                    Assert.EndsWith("HMaestroVirtualController.cs", f, StringComparison.Ordinal);
                     string args = line.Substring(at + "RemoveAllVirtualControllers(".Length);
                     Assert.True(args.StartsWith("preserveInstall", StringComparison.Ordinal),
                         $"{f}: sweep call site must pass preserveInstall, got: {line.Trim()}");
                 }
 
-            // A guard that finds nothing to guard is not a guard. Both known
-            // sites plus the startup one must be present.
-            Assert.Equal(3, callSites);
+            // A guard that finds nothing to guard is not a guard. The one
+            // member, and its two callers: the launch sweep and the context
+            // preflight. The process-exit hook went with HIDMaestro 2.0.0,
+            // whose sweep leaves a running program's controllers alone and
+            // whose own exit handler removes the ones a program did not
+            // dispose.
+            Assert.Equal(1, callSites);
+            Assert.Equal(2, sweeps);
         }
 
     }

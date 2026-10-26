@@ -994,6 +994,70 @@ namespace PadForge.ViewModels
             set => SetProperty(ref _lightbarColorCycleSmooth, value);
         }
 
+        private bool _peripheralLightingEnabled;
+        /// <summary>Whether this virtual controller lights a mouse or
+        /// keyboard whose own software sets its lighting (#494). Off by
+        /// default, so assigning a keyboard for its keys never repaints it.
+        /// The vendor lighting rows ignore it, since lighting is all they
+        /// carry.</summary>
+        public bool PeripheralLightingEnabled
+        {
+            get => _peripheralLightingEnabled;
+            set
+            {
+                if (_peripheralLightingEnabled == value) return;
+                // The pair first: the change notice runs a dispatcher pass,
+                // which reads it.
+                PublishPeripheralClaim(value, _peripheralClaimLevel);
+                SetProperty(ref _peripheralLightingEnabled, value);
+            }
+        }
+
+        private PeripheralClaimLevel _peripheralClaimLevel = PeripheralClaimLevel.Colors;
+        /// <summary>How firmly this virtual controller may hold the device's
+        /// lighting while it lights it (#494), the Lighting tab's Lighting
+        /// Hold. It qualifies <see cref="PeripheralLightingEnabled"/> for
+        /// the same (slot, device) pair and starts at the lowest hold, so a
+        /// device is asked for nothing but its colors until its own tab
+        /// says more. Only a device that offers a hold shows the choice,
+        /// and a backend holds a device at no more than it offers. A vendor
+        /// row and a unit row have no such choice and ask for colors alone.
+        /// A value the enum does not name leaves the property as it was:
+        /// the clipboard carries the number, and a number with no name
+        /// would go out as a level nobody chose and fail the next save,
+        /// which writes the name.</summary>
+        public PeripheralClaimLevel PeripheralClaimLevel
+        {
+            get => _peripheralClaimLevel;
+            set
+            {
+                if (!Enum.IsDefined(value) || _peripheralClaimLevel == value) return;
+                PublishPeripheralClaim(_peripheralLightingEnabled, value);
+                SetProperty(ref _peripheralClaimLevel, value);
+            }
+        }
+
+        // Bit 8 the switch, the low byte the hold. One field, so a reader
+        // on another thread never pairs the switch of one moment with the
+        // hold of the next.
+        private int _peripheralClaim = (int)PeripheralClaimLevel.Colors;
+
+        private void PublishPeripheralClaim(bool enabled, PeripheralClaimLevel level)
+            => System.Threading.Volatile.Write(ref _peripheralClaim, (enabled ? 0x100 : 0) | ((int)level & 0xFF));
+
+        /// <summary>The Control This Device's Lighting switch and the
+        /// Lighting Hold as they stood together, in one read. The
+        /// dispatcher's pass can run on its timer's thread while a load
+        /// writes the two one after the other on the UI thread, in the
+        /// order that keeps every pair in between a safe one. True when the
+        /// switch is on.</summary>
+        internal bool PeripheralLightingClaim(out PeripheralClaimLevel level)
+        {
+            int pair = System.Threading.Volatile.Read(ref _peripheralClaim);
+            level = (PeripheralClaimLevel)(pair & 0xFF);
+            return (pair & 0x100) != 0;
+        }
+
         private int _lightbarRainbowBrightness = 100;
         /// <summary>Rainbow mode brightness, 0..100. The base Rainbow effect
         /// runs at full HSV value (V=1.0) which the firmware renders as
@@ -1715,6 +1779,14 @@ namespace PadForge.ViewModels
             _resetLightbarColorCycleSmooth ??= new RelayCommand(() => LightbarColorCycleSmooth = true);
         private RelayCommand _resetLightbarColorCycleSmooth;
 
+        public RelayCommand ResetPeripheralLightingEnabledCommand =>
+            _resetPeripheralLightingEnabled ??= new RelayCommand(() => PeripheralLightingEnabled = false);
+        private RelayCommand _resetPeripheralLightingEnabled;
+
+        public RelayCommand ResetPeripheralClaimLevelCommand =>
+            _resetPeripheralClaimLevel ??= new RelayCommand(() => PeripheralClaimLevel = PeripheralClaimLevel.Colors);
+        private RelayCommand _resetPeripheralClaimLevel;
+
         public RelayCommand ResetAudioLightbarSensitivityCommand =>
             _resetAudSens ??= new RelayCommand(() => AudioLightbarSensitivity = 4.0);
         private RelayCommand _resetAudSens;
@@ -1761,13 +1833,6 @@ namespace PadForge.ViewModels
         MultiplePositionVibration = 6,
     }
 
-    /// <summary>Mic mute LED mode. Values 0-2 map directly to byte 8
-    /// (muteLedControl) per dualsense-tester's MuteButtonLedControl
-    /// (0=Off, 1=Solid, 2=Pulse). FollowDeviceMute is resolved by the
-    /// synthesizer via <c>AudioMuteService.GetMuteState</c> against
-    /// <c>MicLedFollowDeviceId</c> — muted endpoint -> Solid (1),
-    /// unmuted -> Off (0). Unknown / disconnected device falls back to
-    /// Off so a stale config doesn't strand the LED in a wrong state.</summary>
     /// <summary>Where the DualSense plays its audio (output report
     /// byte 7 bits 4-5, OutputPathSelect). Values 1-4 map to firmware
     /// paths 0-3, the four Sony names in duaLib's scePad surface
@@ -1793,6 +1858,13 @@ namespace PadForge.ViewModels
         FollowHeadphoneJack = 5,
     }
 
+    /// <summary>Mic mute LED mode. Values 0-2 map directly to byte 8
+    /// (muteLedControl) per dualsense-tester's MuteButtonLedControl
+    /// (0=Off, 1=Solid, 2=Pulse). FollowDeviceMute is resolved by the
+    /// synthesizer via <c>AudioMuteService.GetMuteState</c> against
+    /// <c>MicLedFollowDeviceId</c> — muted endpoint -> Solid (1),
+    /// unmuted -> Off (0). Unknown / disconnected device falls back to
+    /// Off so a stale config doesn't strand the LED in a wrong state.</summary>
     public enum MicLedMode
     {
         Off = 0,
@@ -2009,6 +2081,29 @@ namespace PadForge.ViewModels
         CrossFade = 3,
     }
 
+    /// <summary>How firmly a virtual controller may hold a Logitech device's
+    /// lighting while it lights it (#494), the Lighting tab's Lighting
+    /// Hold. Each step up takes one more thing from the device for as long
+    /// as it is lit, for a device whose own behavior takes the color away
+    /// at the step below. The number is the level a lighting claim carries
+    /// (<see cref="PadForge.Common.Input.Peripherals.PeripheralOutputs.SetLighting"/>)
+    /// and the place of the option in the tab's picker, and the clipboard
+    /// carries it, so a member is appended and never renumbered. The saved
+    /// form is the name.</summary>
+    public enum PeripheralClaimLevel
+    {
+        /// <summary>Colors alone, the default. The device keeps its own
+        /// power saving, and the profile saved on it keeps running.</summary>
+        Colors = 0,
+        /// <summary>Its lighting power too: the device stops dimming and
+        /// switching off its lights by itself.</summary>
+        Power = 1,
+        /// <summary>Its on-board memory mode off as well, so the profile
+        /// saved on the device (its buttons, DPI and report rate) does not
+        /// apply while it is lit.</summary>
+        HostMode = 2,
+    }
+
     /// <summary>Serializable mirror of <see cref="DeviceSlotConfig"/>.
     /// XML round-trip via SettingsService. Fields use XmlAttribute to
     /// keep the serialized form compact and aligned with the adjacent
@@ -2112,6 +2207,12 @@ namespace PadForge.ViewModels
         [XmlAttribute] public LightbarMode LightbarMode { get; set; } = LightbarMode.Off;
         [XmlAttribute] public int LightbarPeriodMs { get; set; } = 3000;
         [XmlAttribute] public bool LightbarColorCycleSmooth { get; set; } = true;
+        /// <summary>#494: off when absent, so a save from before the switch
+        /// leaves every mouse and keyboard to its own software.</summary>
+        [XmlAttribute] public bool PeripheralLightingEnabled { get; set; }
+        /// <summary>#494: the lowest hold when absent, so a save from before
+        /// the choice asks no device for more than its colors.</summary>
+        [XmlAttribute] public PeripheralClaimLevel PeripheralClaimLevel { get; set; } = PeripheralClaimLevel.Colors;
         [XmlAttribute] public int LightbarRainbowBrightness { get; set; } = 100;
         [XmlAttribute] public byte LightbarBatteryLowR  { get; set; } = 0xFF;
         [XmlAttribute] public byte LightbarBatteryLowG  { get; set; } = 0x00;

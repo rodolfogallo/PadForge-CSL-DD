@@ -489,18 +489,79 @@ namespace PadForge.Tests
                 "Settings_MinimizeToTrayTip", "Settings_StartMinimizedTip", "Settings_StartAtLoginTip",
                 "DeviceType_LogitechGKeys", "DeviceType_VrController",
             };
-            foreach (string locale in new[]
-                     {
-                         "Strings.resx", "Strings.de.resx", "Strings.es.resx", "Strings.fr.resx",
-                         "Strings.it.resx", "Strings.ja.resx", "Strings.ko.resx", "Strings.nl.resx",
-                         "Strings.pt-BR.resx", "Strings.zh-Hans.resx",
-                     })
+            foreach (string locale in PadForge.Tests.LocaleFiles.Complete)
             {
                 string text = RepoFile("PadForge.App", "Resources", "Strings", locale);
                 foreach (string key in keys)
                     Assert.True(text.Contains("name=\"" + key + "\"", StringComparison.Ordinal),
                                 $"{locale} is missing {key}");
             }
+        }
+
+        /// <summary>
+        /// The setup text names both steps Logitech Gaming Software needs.
+        ///
+        /// <para>Logitech's G-key SDK manual ("User experience") says a key
+        /// reports to an application only after the user drags the "G-key"
+        /// command onto it in that application's profile. The hint and the
+        /// tooltip named the persistent profile alone, so a user who did
+        /// what they said still saw no key.</para>
+        /// </summary>
+        [Fact]
+        public void TheSetupTextNamesTheGKeyCommandInEveryLocale()
+        {
+            foreach (string locale in PadForge.Tests.LocaleFiles.Complete)
+            {
+                string text = RepoFile("PadForge.App", "Resources", "Strings", locale);
+
+                // The hint has no other reason to say "G-key".
+                Assert.True(CommandMentions(ResxValue(text, "Settings_GKeysStatus_NoKeysYet")) >= 1,
+                            $"{locale}: the no-key hint leaves out the G-key command");
+                // The tooltip already names the G-key SDK, so the command is
+                // its second mention.
+                Assert.True(CommandMentions(ResxValue(text, "Settings_GKeysTooltip")) >= 2,
+                            $"{locale}: the tooltip leaves out the G-key command");
+            }
+        }
+
+        /// <summary>
+        /// The setup text names the third condition: a G600 or G300 mouse
+        /// out of on-board memory mode.
+        ///
+        /// <para>Logitech's G-key SDK manual (LogitechGamingGkeySDK.pdf,
+        /// page 4, "User experience"): "For mice with on-board modes (G600
+        /// and G300), the SDK only works if the mouse is not in on-board
+        /// mode." A G600 owner who followed every step the hint and the
+        /// tooltip gave still saw "Connected, no key seen yet", with nothing
+        /// naming the mode. The model numbers are not translated, so they
+        /// anchor the check in every locale. The English text and the
+        /// README name the mode as Logitech Gaming Software's own toggle
+        /// does, On-Board Memory mode (Logitech support article
+        /// 360023411353), the name the Lighting tab uses for it too.</para>
+        /// </summary>
+        [Fact]
+        public void TheSetupTextNamesTheOnBoardModeRuleInEveryLocale()
+        {
+            foreach (string locale in PadForge.Tests.LocaleFiles.Complete)
+            {
+                string text = RepoFile("PadForge.App", "Resources", "Strings", locale);
+                foreach (string key in new[] { "Settings_GKeysStatus_NoKeysYet", "Settings_GKeysTooltip" })
+                {
+                    string value = ResxValue(text, key);
+                    Assert.True(value.Contains("G600", StringComparison.Ordinal) && value.Contains("G300", StringComparison.Ordinal),
+                                $"{locale}: {key} does not name the G600 and G300 on-board memory mode rule");
+                }
+            }
+
+            string readme = RepoFile("README.md");
+            int section = readme.IndexOf("### Logitech G-keys", StringComparison.Ordinal);
+            Assert.True(section >= 0, "README has no Logitech G-keys section");
+            int end = readme.IndexOf("\n###", section + 1, StringComparison.Ordinal);
+            string body = end > section ? readme.Substring(section, end - section) : readme.Substring(section);
+            Assert.True(body.Contains("on-board memory mode", StringComparison.Ordinal),
+                        "README's Logitech G-keys section does not name on-board memory mode");
+            Assert.False(body.Contains("on-board mode", StringComparison.Ordinal),
+                         "README's Logitech G-keys section still names the mode a second way");
         }
 
 
@@ -556,6 +617,29 @@ namespace PadForge.Tests
             string src = RepoFile("PadForge.Engine", "Common", "Logitech", "LogitechGKeySource.cs");
             Assert.Contains("foreach (string candidate in candidates)", src);
         }
+        /// <summary>How often a string says "G-key" as a name. The English
+        /// plural "G-keys" names the hardware and does not count.</summary>
+        private static int CommandMentions(string value)
+        {
+            int count = 0;
+            for (int at = value.IndexOf("G-key", StringComparison.Ordinal); at >= 0;
+                 at = value.IndexOf("G-key", at + 5, StringComparison.Ordinal))
+            {
+                int after = at + 5;
+                if (after >= value.Length || value[after] != 's') count++;
+            }
+            return count;
+        }
+
+        private static string ResxValue(string resx, string key)
+        {
+            int at = resx.IndexOf("<data name=\"" + key + "\"", StringComparison.Ordinal);
+            Assert.True(at >= 0, key + " is missing");
+            int open = resx.IndexOf("<value>", at, StringComparison.Ordinal) + "<value>".Length;
+            int close = resx.IndexOf("</value>", open, StringComparison.Ordinal);
+            return resx.Substring(open, close - open);
+        }
+
         private static string RepoFile(params string[] parts)
         {
             var dir = new DirectoryInfo(AppContext.BaseDirectory);

@@ -247,6 +247,30 @@ namespace PadForge
             // this way on 2026-09-23 (see FirstKnownFolderLookup in the tests).
             Environment.GetFolderPath(Environment.SpecialFolder.Windows);
 
+            // The Windows display language reads its own row of the language
+            // table, which .NET's parent chain never reaches: nb-NO reads
+            // Norwegian and en-AU British English (#505). Done first, so the
+            // update helper's windows below read it too. A saved language
+            // replaces it further down.
+            var windowsLanguage = Thread.CurrentThread.CurrentUICulture;
+            var interfaceLanguage = PadForge.Common.LanguageCatalog.InterfaceCulture(windowsLanguage);
+            if (!Equals(interfaceLanguage, windowsLanguage))
+            {
+                Thread.CurrentThread.CurrentUICulture = interfaceLanguage;
+                System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = interfaceLanguage;
+            }
+
+            // Every window declares the interface language as it loads, so
+            // Chinese, Japanese and Korean text takes its own font (#504).
+            // Started before the update helper below, whose windows open
+            // ahead of everything else here.
+            PadForge.Common.UiLanguage.Start();
+
+            // Buttons, inputs and list items take their screen-reader names
+            // from text the UI already shows (a label, a tooltip, the text
+            // inside) as they first show, nothing on screen changing.
+            PadForge.Common.AccessibleNames.Start();
+
             // In-app updates (#457). A copy started from the update folder with
             // --apply-update is the installer, not PadForge: it replaces the
             // copy that started it and exits. This runs before everything below,
@@ -413,8 +437,8 @@ namespace PadForge
             // (owner report 2026-08-08).
             OrphanSweepTask = System.Threading.Tasks.Task.Run(() =>
             {
-                try { HIDMaestro.HMContext.RemoveAllVirtualControllers(preserveInstall: true); }
-                catch { /* best effort — continue without sweep */ }
+                try { PadForge.Common.Input.HMaestroVirtualController.SweepVirtualControllers(); }
+                catch { /* Best effort. Continue without the sweep. */ }
                 // HM#38 consumer-side ordering hygiene: RemoveAll returns when
                 // the CALL completes, not when PnP removal completes, and a
                 // create racing an in-flight removal was one of the freeze's
@@ -448,8 +472,9 @@ namespace PadForge
             });
 
             // Capture the pre-override UI culture first: this is the
-            // Windows display language a fresh install runs under, and
-            // Reset to Defaults restores it. InstalledUICulture is the
+            // Windows display language, read through its row of the
+            // language table at the top of this method, that a fresh
+            // install runs under, and Reset to Defaults restores it. InstalledUICulture is the
             // wrong stand-in (OS install language, which can differ from
             // the user's display language).
             StartupUICulture = Thread.CurrentThread.CurrentUICulture;

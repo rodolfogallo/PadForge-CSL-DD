@@ -305,6 +305,8 @@ namespace PadForge.ViewModels
             "LogitechGKeys" => Strings.Instance.DeviceType_LogitechGKeys,
             "AnalogKeyboard" => Strings.Instance.DeviceType_AnalogKeyboard,
             "WebMenus" => Strings.Instance.DeviceType_WebMenus,
+            "PeripheralHaptics" => Strings.Instance.DeviceType_PeripheralHaptics,
+            "PeripheralLighting" => Strings.Instance.DeviceType_PeripheralLighting,
             _ => Strings.Instance.DeviceType_Device
         };
 
@@ -466,7 +468,19 @@ namespace PadForge.ViewModels
         public bool ForceRawJoystickMode
         {
             get => _forceRawJoystickMode;
-            set => SetProperty(ref _forceRawJoystickMode, value);
+            set
+            {
+                if (SetProperty(ref _forceRawJoystickMode, value))
+                {
+                    // A row read raw shows the checkbox whatever its type
+                    // (ShowInputModeSection), and the dividers follow the
+                    // section.
+                    OnPropertyChanged(nameof(ShowInputModeSection));
+                    OnPropertyChanged(nameof(ShowInputModeOrHidingSection));
+                    OnPropertyChanged(nameof(ShowRawInputDivider));
+                    OnPropertyChanged(nameof(ShowGunCalibrationDivider));
+                }
+            }
         }
 
         private int _idleDisconnectMinutes;
@@ -742,7 +756,18 @@ namespace PadForge.ViewModels
              // collection. Cloaking it would hide the keyboard's analog
              // interface from its own vendor software, which Razer's needs
              // to make the keyboard report at all.
-             || _devicePath.StartsWith("analogkb://", StringComparison.Ordinal));
+             || _devicePath.StartsWith("analogkb://", StringComparison.Ordinal)
+             // The Razer Chroma, Logitech LIGHTSYNC, SteelSeries GG and
+             // Razer Sensa rows (#494) stand for a vendor's software, not
+             // a HID device, so HidHide has no instance to cloak for them.
+             || _devicePath.StartsWith("razerchroma://", StringComparison.Ordinal)
+             || _devicePath.StartsWith("logilightsync://", StringComparison.Ordinal)
+             || _devicePath.StartsWith("steelseriesgg://", StringComparison.Ordinal)
+             || _devicePath.StartsWith("razersensa://", StringComparison.Ordinal)
+             // A unit row (#494) stands for one lit device no mouse or
+             // keyboard row reaches, under a path of PadForge's own that
+             // names no HID instance, and it has no input to hide.
+             || _devicePath.StartsWith("lightunit://", StringComparison.Ordinal));
 
         /// <summary>True for a merged row (All Keyboards, All Mice, All
         /// Touchpads, All Consumer Controls). It stands for every device of
@@ -786,9 +811,13 @@ namespace PadForge.ViewModels
         };
 
         /// <summary>True when the "Input Mode" section (Force raw joystick mode)
-        /// should be shown. Only real gamepads — virtual web/overlay sources are
-        /// WYSIWYG and have no SDL gamepad-mapping layer to bypass.</summary>
-        public bool ShowInputModeSection => IsGamepad && !IsInternalVirtual;
+        /// should be shown. Only real gamepads. Virtual web/overlay sources are
+        /// WYSIWYG and have no SDL gamepad-mapping layer to bypass. A row whose
+        /// flag is on shows it whatever its type or path: the flag is read all
+        /// the same (a hand-edited file, a record whose type changed after it
+        /// was set), and this checkbox is the page's one control that turns it
+        /// off.</summary>
+        public bool ShowInputModeSection => _forceRawJoystickMode || (IsGamepad && !IsInternalVirtual);
 
         /// <summary>True when either the Input Mode or Input Hiding section will
         /// render. Gates the Separator that sits between Slot Assignment and those
@@ -1127,7 +1156,7 @@ namespace PadForge.ViewModels
         /// a row has nothing to submit. A device on a linked PC is hardware
         /// and keeps the button: its row carries the remote device's own
         /// vendor id, product id and SDL GUID.</summary>
-        public bool ShowSubmitMapping => DeviceTypeKey != "Gamepad" && DeviceTypeKey != "Mouse" && DeviceTypeKey != "Keyboard" && DeviceTypeKey != "Touchpad" && DeviceTypeKey != "Tablet" && DeviceTypeKey != "Midi" && DeviceTypeKey != "Nfc" && DeviceTypeKey != "HeadsetMotion" && DeviceTypeKey != "Microphone" && DeviceTypeKey != "HandheldButtons" && DeviceTypeKey != "ConsumerControl" && DeviceTypeKey != "SystemMotion" && DeviceTypeKey != "HeadTracker" && DeviceTypeKey != "VrController" && DeviceTypeKey != "LogitechGKeys" && DeviceTypeKey != "AnalogKeyboard" && DeviceTypeKey != "WebMenus";
+        public bool ShowSubmitMapping => DeviceTypeKey != "Gamepad" && DeviceTypeKey != "Mouse" && DeviceTypeKey != "Keyboard" && DeviceTypeKey != "Touchpad" && DeviceTypeKey != "Tablet" && DeviceTypeKey != "Midi" && DeviceTypeKey != "Nfc" && DeviceTypeKey != "HeadsetMotion" && DeviceTypeKey != "Microphone" && DeviceTypeKey != "HandheldButtons" && DeviceTypeKey != "ConsumerControl" && DeviceTypeKey != "SystemMotion" && DeviceTypeKey != "HeadTracker" && DeviceTypeKey != "VrController" && DeviceTypeKey != "LogitechGKeys" && DeviceTypeKey != "AnalogKeyboard" && DeviceTypeKey != "WebMenus" && DeviceTypeKey != "PeripheralLighting" && DeviceTypeKey != "PeripheralHaptics";
 
         /// <summary>True for an NFC reader (issue #150): shows the "Register/Manage
         /// NFC Tags" button, which opens the tap-to-name registration flow.
@@ -1247,6 +1276,11 @@ namespace PadForge.ViewModels
 
         /// <summary>MDL2 glyph for the non-vector types, empty otherwise.</summary>
         public string TypeGlyph => SlotTypeIconMap.GlyphFor(VcType);
+
+        /// <summary>The badge's screen-reader name, "Slot 3": the badge is a
+        /// list item, and ItemAutomationPeer.GetNameCore falls back to the
+        /// item's ToString().</summary>
+        public override string ToString() => Common.AccessibleNames.SlotTitle(SlotNumber);
     }
 
     /// <summary>Branded VC-type icon lookup for the slot pills (#175 phase 2
