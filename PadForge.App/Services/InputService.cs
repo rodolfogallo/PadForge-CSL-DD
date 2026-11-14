@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Windows.Threading;
@@ -10215,6 +10215,7 @@ namespace PadForge.Services
                 // so the host walks the present collections again as well.
                 _peripheralHost?.DevicesChanged();
                 SyncDevicesList();
+                AssignShellGamepads();
                 RefreshVoiceObjects();
                 UpdatePadDeviceInfo();
                 // After the rosters, so "slot has devices" and "already on
@@ -10713,7 +10714,7 @@ namespace PadForge.Services
             // next engine start brings the pipe up.
             if (!SettingsManager.EnableExternalControl || _inputManager == null) return;
             if (_externalControl != null) return; // already serving
-            _externalControl = new ExternalControlService(ExecuteExternalControlCommand);
+            _externalControl = new ExternalControlService(ExecuteExternalControlCommand, ShellManaged ? "PS5EmuShell.ControllerEngine" : null);
             _externalControl.Start();
         }
 
@@ -10751,6 +10752,13 @@ namespace PadForge.Services
 
             switch (verb)
             {
+                case "devices":
+                case "exclude":
+                case "include":
+                case "combine":
+                case "edit-combined":
+                    return ShellDevicesCommand(verb, arg);
+
                 case "activate":
                     if (string.IsNullOrEmpty(arg)) return "error empty";
                     return _dispatcher.Invoke(() => ExternalActivate(arg));

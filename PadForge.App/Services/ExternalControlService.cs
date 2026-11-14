@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.AccessControl;
@@ -144,7 +144,9 @@ namespace PadForge.Services
             // Authenticated Users get read-write so an unelevated launcher can
             // drive an elevated PadForge. No Everyone, no anonymous.
             var security = new PipeSecurity();
-            var authUsers = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+            var authUsers = pipeName == "PS5EmuShell.ControllerEngine"
+                ? WindowsIdentity.GetCurrent().User
+                : new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
             security.AddAccessRule(new PipeAccessRule(
                 authUsers,
                 PipeAccessRights.ReadWrite,

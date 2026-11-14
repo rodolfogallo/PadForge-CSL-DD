@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -294,7 +294,7 @@ namespace PadForge
                 return;
             }
 
-            _singleInstanceMutex = new Mutex(true, "PadForge_SingleInstance", out bool isNewInstance);
+            _singleInstanceMutex = new Mutex(true, Services.InputService.ShellManaged ? "PS5EmuShell_ControllerEngine" : "PadForge_SingleInstance", out bool isNewInstance);
             if (!isNewInstance)
             {
                 // A second instance carrying a profile argument is a launcher

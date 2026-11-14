@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Xml.Serialization;
@@ -564,6 +564,10 @@ namespace PadForge.Engine.Data
         /// <summary>Whether this device should be hidden from games via HidHide when assigned to a slot.</summary>
         [XmlElement]
         public bool HidHideEnabled { get; set; }
+
+        public bool ExcludeFromShellAutoAssign { get; set; }
+
+        public int ShellAutoSlot { get; set; } = -1;
 
         /// <summary>Whether this device's mapped inputs should be consumed via low-level hooks (keyboards and mice).</summary>
         [XmlElement]
