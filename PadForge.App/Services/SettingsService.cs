@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Windows.Threading;
@@ -2386,7 +2386,7 @@ namespace PadForge.Services
             vm.DefaultProfileDreamcastPicture = appSettings.DefaultProfileDreamcastPicture;
             // The hint must be in place before SDL_Init, and a hint set early
             // persists, so the load applies it (#395).
-            PadForge.Common.Input.InputManager.ApplyFlydigiEnhancedProtocol(appSettings.FlydigiEnhancedProtocol);
+            PadForge.Common.Input.InputManager.ApplyFlydigiEnhancedProtocol(!InputService.ShellManaged && appSettings.FlydigiEnhancedProtocol);
             // Default-profile custom-gesture catalog. InputService
             // wires the applier from StartEngine, which runs AFTER
             // this load path on cold start, so stash the loaded list
