@@ -2972,7 +2972,7 @@ namespace PadForge
 
                 // Show shutdown overlay and ensure window is visible.
                 ShutdownOverlay.Visibility = System.Windows.Visibility.Visible;
-                if (WindowState == WindowState.Minimized || !IsVisible)
+                if (!Services.InputService.ShellManaged && (WindowState == WindowState.Minimized || !IsVisible))
                 {
                     try { Show(); } catch (InvalidOperationException) { }
                     WindowState = WindowState.Normal;

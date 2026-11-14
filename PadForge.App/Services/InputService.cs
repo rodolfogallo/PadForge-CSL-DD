@@ -2544,7 +2544,7 @@ namespace PadForge.Services
             // Mid-session toggling EnableInputHiding off still decloaks
             // immediately (handled by the property-change branch around
             // line ~2080), as expected.
-            RemoveDeviceHiding(keepCloaks: _mainVm.Settings.KeepHidHideCloaksBetweenLaunches);
+            RemoveDeviceHiding(keepCloaks: !ShellManaged && _mainVm.Settings.KeepHidHideCloaksBetweenLaunches);
 
             // Heavy engine teardown — InputManager.Stop calls
             // AwaitPendingLifecycleTasks (waits for in-flight HM connect /
@@ -10752,6 +10752,18 @@ namespace PadForge.Services
 
             switch (verb)
             {
+                case "shutdown":
+                    if (!ShellManaged) return "error standalone";
+                    _dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (System.Windows.Application.Current.MainWindow is PadForge.MainWindow window)
+                        {
+                            window.PrepareForExit();
+                            window.Close();
+                        }
+                    }));
+                    return "ok stopping";
+
                 case "engine-version":
                     return ShellManaged ? "ok 2" : "error standalone";
 

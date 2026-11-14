@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using PadForge.Engine;
 using PadForge.Engine.Common.Mapping;
 using PadForge.Engine.Data;
@@ -100,6 +100,8 @@ namespace PadForge.Common.Input
                     MappingSet ms = (slotIndex >= 0 && slotIndex < SettingsManager.SlotMappingSets.Length)
                         ? SettingsManager.SlotMappingSets[slotIndex]
                         : null;
+                    if (PadForge.Services.InputService.ShellManaged && slotIndex == 0)
+                        UpdateShellTouchpadMouse(ud);
                     Gamepad rawMapped;
                     if (ms != null && ms.Rows != null && ms.Rows.Count > 0)
                     {
