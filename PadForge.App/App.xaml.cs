@@ -297,6 +297,12 @@ namespace PadForge
             _singleInstanceMutex = new Mutex(true, Services.InputService.ShellManaged ? "PS5EmuShell_ControllerEngine" : "PadForge_SingleInstance", out bool isNewInstance);
             if (!isNewInstance)
             {
+                if (Services.InputService.ShellManaged)
+                {
+                    Shutdown();
+                    return;
+                }
+
                 // A second instance carrying a profile argument is a launcher
                 // driving the running one (#366): forward the command over the
                 // pipe and exit silently, with no "already running" box.
@@ -318,7 +324,7 @@ namespace PadForge
 
             // An update Install Updates Automatically downloaded last session
             // installs now, before the engine, the drivers or a window start.
-            if (Services.UpdateService.TryStartPendingInstall(StartupArgs))
+            if (!Services.InputService.ShellManaged && Services.UpdateService.TryStartPendingInstall(StartupArgs))
             {
                 Shutdown();
                 return;
@@ -533,7 +539,7 @@ namespace PadForge
             var window = new MainWindow();
             MainWindow = window;
 
-            if (window.ShouldStartMinimizedToTray)
+            if (Services.InputService.ShellManaged || window.ShouldStartMinimizedToTray)
             {
                 // Don't call Show() at all. The tray icon handles restore.
             }

@@ -10712,7 +10712,7 @@ namespace PadForge.Services
             // "while the engine is running" (the docs' contract), so a
             // checkbox toggle with the engine stopped arms nothing and the
             // next engine start brings the pipe up.
-            if (!SettingsManager.EnableExternalControl || _inputManager == null) return;
+            if ((!ShellManaged && !SettingsManager.EnableExternalControl) || _inputManager == null) return;
             if (_externalControl != null) return; // already serving
             _externalControl = new ExternalControlService(ExecuteExternalControlCommand, ShellManaged ? "PS5EmuShell.ControllerEngine" : null);
             _externalControl.Start();
@@ -10752,6 +10752,9 @@ namespace PadForge.Services
 
             switch (verb)
             {
+                case "engine-version":
+                    return ShellManaged ? "ok 2" : "error standalone";
+
                 case "devices":
                 case "exclude":
                 case "include":

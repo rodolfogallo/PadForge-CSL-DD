@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -2402,7 +2402,7 @@ namespace PadForge
             // If starting minimized to tray, make the tray icon visible now.
             // With Always Show in System Tray on the icon stays up from the
             // start (#439), so Exit in its menu never needs the window closed.
-            if (ShouldStartMinimizedToTray || _viewModel.Settings.AlwaysShowTrayIcon)
+            if (!Services.InputService.ShellManaged && (ShouldStartMinimizedToTray || _viewModel.Settings.AlwaysShowTrayIcon))
                 _notifyIcon.Visible = true;
 
             // Per-group ordering is built into settings load now (see
@@ -2479,7 +2479,7 @@ namespace PadForge
             // Virtual controllers are created on demand by the engine
             // (CreateHMaestroController) when slots become active. No
             // pre-creation needed at startup.
-            if (_viewModel.Settings.AutoStartEngine)
+            if (Services.InputService.ShellManaged || _viewModel.Settings.AutoStartEngine)
                 _inputService.Start();
 
             CheckOptedInDrivers();
@@ -2503,8 +2503,11 @@ namespace PadForge
 
             // In-app updates (#457). Started here rather than in OnLoaded,
             // which never fires for a launch straight to the tray.
-            _updateController = new Services.UpdateController(_viewModel, ExitForUpdate);
-            _updateController.Start();
+            if (!Services.InputService.ShellManaged)
+            {
+                _updateController = new Services.UpdateController(_viewModel, ExitForUpdate);
+                _updateController.Start();
+            }
         }
 
         private Services.UpdateController _updateController;
