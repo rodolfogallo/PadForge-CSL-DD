@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -185,6 +185,13 @@ namespace PadForge.Common.Input
                     // composite personas' ancestry walk, which also reads a
                     // persona's own USB serial, and records the id it
                     // rejects.
+                    if (PadForge.Services.InputService.ShellManaged &&
+                        wrapper.DevicePath?.StartsWith("XInput#", StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        wrapper.Dispose();
+                        continue;
+                    }
+
                     if (_suppressedSelfVirtualIds.PassOver(instanceId, wrapper.SerialNumber,
                             wrapper.DevicePath, wrapper.VendorId, wrapper.ProductId))
                     {

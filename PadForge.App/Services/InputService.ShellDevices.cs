@@ -22,6 +22,16 @@ namespace PadForge.Services
             lock (store.SyncRoot) devices = store.Items.ToArray();
             foreach (var device in devices)
             {
+                if (device.ShellAutoSlot >= 0 &&
+                    device.DevicePath?.StartsWith("XInput#", StringComparison.OrdinalIgnoreCase) == true &&
+                    DeviceAssignments.SetDeviceSlotAssignment(device.InstanceGuid, device.ShellAutoSlot, false))
+                {
+                    DeviceAssignments.SetSlotEnabled(device.ShellAutoSlot, false);
+                    SettingsManager.SlotCreated[device.ShellAutoSlot] = false;
+                    device.ShellAutoSlot = -1;
+                    device.HidHideEnabled = false;
+                    _settingsService.MarkDirty();
+                }
                 if (!device.IsOnline || !IsShellPad(device) || device.ExcludeFromShellAutoAssign ||
                     SettingsManager.GetAssignedSlots(device.InstanceGuid).Count != 0) continue;
                 int slot = Array.FindIndex(SettingsManager.SlotCreated, created => !created);

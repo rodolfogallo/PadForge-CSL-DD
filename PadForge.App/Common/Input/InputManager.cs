@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -886,7 +886,7 @@ namespace PadForge.Common.Input
                 // intent explicit against a changed upstream default.
                 // Do NOT set SDL_HINT_JOYSTICK_RAWINPUT. It conflicts with
                 // XInput enumeration and prevents Xbox controllers from appearing.
-                SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "1");
+                SDL_SetHint(SDL_HINT_XINPUT_ENABLED, PadForge.Services.InputService.ShellManaged ? "0" : "1");
 
                 // #395: replay the Flydigi driver switch. The previous SDL_Quit
                 // dropped every hint, and this manager is a new instance.
